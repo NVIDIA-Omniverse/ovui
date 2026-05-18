@@ -1,0 +1,205 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# Manual helper to regenerate golden baselines under the canonical
+# hosted-CI environment, then commit them back to the dispatched
+# branch. Use after intentional visual changes (renderer tweak, font
+# update, layout fix) — never to mask an unexplained drift.
+#
+# Inputs:
+#   backend     — vulkan | egl  (selects the runtime + golden subdir)
+#   test_filter — optional pytest -k expression to limit regeneration
+#                 to a subset of tests (default: all)
+#
+# The job pushes a single commit "test(goldens): regenerate <backend>
+# goldens (workflow_dispatch)" back to the source ref. Run from
+# protected branches at your own risk — no force-push.
+#
+# Refs: ovui issue #36 (Phase 6, golden helper).
+
+name: Generate goldens (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: "Backend to regenerate goldens for"
+        required: true
+        type: choice
+        options:
+          - vulkan
+          - egl
+      test_filter:
+        description: "Optional pytest -k expression (leave blank for all)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: generate-goldens-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  regenerate:
+    name: Regenerate ${{ inputs.backend }} goldens
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    permissions:
+      contents: write
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      OMNI_UI_GENERATE_GOLDEN: "1"
+
+    defaults:
+      run:
+        working-directory: ovui
+
+    steps:
+      - name: Checkout repository (full history, persist creds)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Vulkan + Lavapipe deps
+        if: inputs.backend == 'vulkan'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev \
+            mesa-vulkan-drivers \
+            libglfw3-dev \
+            libfreetype-dev \
+            libfontconfig1-dev \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3-dev
+
+      - name: Install EGL + Mesa deps
+        if: inputs.backend == 'egl'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libegl-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            mesa-utils \
+            libglfw3-dev \
+            libfreetype-dev \
+            libfontconfig1-dev \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3-dev
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip toolchain
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+
+      - name: Build and install ovui (Vulkan)
+        if: inputs.backend == 'vulkan'
+        run: |
+          pip install -e . -v
+
+      - name: Build and install ovui (EGL)
+        if: inputs.backend == 'egl'
+        env:
+          OMNIUI_CMAKE_ARGS: "-DOMNIUI_HEADLESS_GL=ON"
+        run: |
+          pip install -e . -v
+
+      - name: Install test requirements
+        run: |
+          pip install -r requirements-test.txt
+
+      - name: Regenerate Vulkan goldens
+        if: inputs.backend == 'vulkan'
+        shell: bash
+        env:
+          OMNIUI_HEADLESS: "1"
+          OMNIUI_BACKEND: "vulkan"
+          OMNIUI_LAVAPIPE: "1"
+          # Pass user input through env, not direct ${{ }} interpolation,
+          # to avoid shell-injection via the workflow_dispatch input box.
+          GH_FILTER: ${{ inputs.test_filter }}
+        run: |
+          set -o pipefail
+          ulimit -c 0
+          if [ -n "${GH_FILTER}" ]; then
+            pytest tests/ --forked -m "not requires_gl and not requires_cuda" \
+              -k "${GH_FILTER}" -q --color=yes
+          else
+            pytest tests/ --forked -m "not requires_gl and not requires_cuda" \
+              -q --color=yes
+          fi
+
+      - name: Regenerate EGL goldens
+        if: inputs.backend == 'egl'
+        shell: bash
+        env:
+          OMNIUI_HEADLESS: "1"
+          OMNIUI_HEADLESS_GL: "1"
+          OMNIUI_EGL_FORCE_SURFACELESS: "1"
+          MESA_GL_VERSION_OVERRIDE: "3.3"
+          GH_FILTER: ${{ inputs.test_filter }}
+        run: |
+          set -o pipefail
+          ulimit -c 0
+          if [ -n "${GH_FILTER}" ]; then
+            pytest tests/ --forked -m "not requires_cuda" \
+              -k "${GH_FILTER}" -q --color=yes
+          else
+            pytest tests/ --forked -m "not requires_cuda" \
+              -q --color=yes
+          fi
+
+      - name: Show regenerated golden diff
+        run: |
+          git status --porcelain tests/golden/
+          git diff --stat tests/golden/ || true
+
+      - name: Commit and push regenerated goldens
+        shell: bash
+        env:
+          GH_BACKEND: ${{ inputs.backend }}
+          GH_FILTER: ${{ inputs.test_filter }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git config user.name "ovui-ci-bot"
+          git config user.email "ovui-ci-bot@users.noreply.github.com"
+          # Only stage the backend-tagged golden subdirectory so an
+          # accidental mixed run never cross-contaminates the other backend.
+          git add "tests/golden/${GH_BACKEND}/"
+          if git diff --staged --quiet; then
+            echo "No golden changes to commit — exiting cleanly."
+            exit 0
+          fi
+          filter_note=""
+          if [ -n "${GH_FILTER}" ]; then
+            filter_note=" (filter: ${GH_FILTER})"
+          fi
+          msg_file=$(mktemp)
+          {
+            echo "test(goldens): regenerate ${GH_BACKEND} goldens via workflow_dispatch${filter_note}"
+            echo
+            echo "Triggered by ${GH_ACTOR} on ${GH_REF_NAME}."
+            echo "Run: ${GH_SERVER_URL}/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}"
+            echo
+            echo "Refs: #36"
+          } > "$msg_file"
+          git commit -F "$msg_file"
+          git push origin "HEAD:${GH_REF_NAME}"

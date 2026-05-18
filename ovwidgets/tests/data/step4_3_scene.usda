@@ -1,0 +1,48 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    # Step 4.3: exercise the ControlStateIndicator state icons.
+    #
+    # ``StateSphere`` authors three explicit state attributes so the
+    # Property Inspector renders three different control-state icons in
+    # one full-app screenshot — proving the priority-ordered registry
+    # and the per-row indicator slot work end-to-end:
+    #
+    #   * ``radius`` — time-sampled (two keys); TimeSampled predicate
+    #     fires (priority 30) → info icon on the row.
+    #   * ``someLocked`` — customData["locked"]=True; Locked predicate
+    #     fires (priority 20) → lock icon. Takes precedence over the
+    #     authored NotDefault state (priority 40).
+    #   * ``xformOp:translate`` — authored (non-default) → NotDefault
+    #     predicate fires (priority 40) → check icon on the row.
+    #     Clicking the icon in-app calls adapter.clear_value and resets
+    #     the attribute to the schema default.
+    #
+    # UsdGeomImageable schema attributes (``visibility``, ``purpose``,
+    # ``doubleSided``, ``orientation``, ``extent``) stay unauthored, so
+    # the NotDefault predicate returns False for them — their rows show
+    # no indicator icon, proving the "hidden when no handler matches"
+    # path.
+    def Sphere "StateSphere" (
+        kind = "component"
+    )
+    {
+        double radius.timeSamples = {
+            0: 1.0,
+            24: 2.5,
+        }
+        custom float someLocked = 0.5 (
+            customData = {
+                bool locked = 1
+            }
+        )
+        double3 xformOp:translate = (3, 1, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

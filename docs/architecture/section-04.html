@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UI Framework</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .ui-diagram {
+      padding: 18px;
+    }
+
+    .ui-chain {
+      display: grid;
+      grid-template-columns: minmax(118px, 1fr) auto minmax(132px, 1fr) auto minmax(132px, 1fr) auto minmax(132px, 1fr) auto minmax(126px, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .ui-card,
+    .source-card,
+    .source-note {
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+    }
+
+    .ui-card {
+      min-height: 126px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+      padding: 14px;
+    }
+
+    .ui-card.is-start {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .ui-name,
+    .source-name,
+    .source-note-title {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .ui-text,
+    .source-text {
+      color: #44554b;
+      font-size: 0.94rem;
+      line-height: 1.45;
+    }
+
+    .ui-arrow,
+    .source-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .source-chain {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) auto minmax(150px, 1fr) auto minmax(150px, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .source-card {
+      min-height: 146px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 14px;
+    }
+
+    .source-card.is-start {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .source-pill {
+      display: inline-block;
+      width: fit-content;
+      max-width: 100%;
+      padding: 3px 8px;
+      border: 1px solid #dce3ea;
+      border-radius: 999px;
+      background: #f7f9fa;
+      color: #24384a;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 0.82rem;
+      overflow-wrap: anywhere;
+    }
+
+    .source-note {
+      margin-top: 12px;
+      padding: 14px;
+    }
+
+    .source-note-title {
+      margin-bottom: 7px;
+    }
+
+    .source-note-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 900px) {
+      .ui-chain,
+      .source-chain {
+        grid-template-columns: 1fr;
+      }
+
+      .ui-arrow,
+      .source-arrow {
+        transform: rotate(90deg);
+      }
+
+      .ui-card,
+      .source-card {
+        min-height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="section-03.html">Previous</a>
+      <a href="../architecture.html#section-04" target="_top">Index</a>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Section 4</p>
+      <h1>UI Framework</h1>
+      <p class="lead">ovui gives Python code the base UI runtime used by standalone apps and widgets in ovwidgets: windows, layout containers, widgets, value models, callbacks, and an async frame loop.</p>
+    </header>
+
+    <section>
+      <h2>Purpose</h2>
+      <p>Python code imports the package with <code>import omni.ui as ui</code>. The package loads bound C++ UI classes and, outside a larger app, adds standalone helpers such as <code>ui.init()</code>, <code>ui.run()</code>, <code>ui.run_async()</code>, and <code>ui.next_frame()</code>.</p>
+      <ul>
+        <li><code>ui.Window</code> creates a window; <code>window.frame</code> is where child widgets are added.</li>
+        <li><code>ui.VStack</code>, <code>ui.HStack</code>, <code>ui.ZStack</code>, and related containers arrange child widgets.</li>
+        <li>Fields, sliders, progress bars, and trees read from model objects; buttons and tree widgets call Python callbacks.</li>
+        <li><code>ui.run()</code> drives the frame loop, and <code>await ui.next_frame()</code> waits for a rendered frame.</li>
+      </ul>
+      <div class="diagram ui-diagram" role="img" aria-label="Simple UI app flow from Python code to a rendered window">
+        <div class="ui-chain">
+          <div class="ui-card is-start">
+            <div class="ui-name">Python app code</div>
+            <div class="ui-text">Imports <code>omni.ui</code> and starts the UI runtime.</div>
+          </div>
+          <div class="ui-arrow" aria-hidden="true">&rarr;</div>
+          <div class="ui-card">
+            <div class="ui-name">Window and frame</div>
+            <div class="ui-text"><code>ui.Window</code> creates the visible place; <code>window.frame</code> receives children.</div>
+          </div>
+          <div class="ui-arrow" aria-hidden="true">&rarr;</div>
+          <div class="ui-card">
+            <div class="ui-name">Containers</div>
+            <div class="ui-text">Stacks and frames arrange the children into rows, columns, and overlays.</div>
+          </div>
+          <div class="ui-arrow" aria-hidden="true">&rarr;</div>
+          <div class="ui-card">
+            <div class="ui-name">Widgets and models</div>
+            <div class="ui-text">Fields, sliders, trees, buttons, values, and callbacks hold behavior.</div>
+          </div>
+          <div class="ui-arrow" aria-hidden="true">&rarr;</div>
+          <div class="ui-card">
+            <div class="ui-name">Rendered window</div>
+            <div class="ui-text">Each frame shows current values and responds to user input.</div>
+          </div>
+        </div>
+        <p class="diagram-note">The frame loop keeps the UI active: Python creates the parts, models carry values, callbacks run Python work, and the window redraws.</p>
+      </div>
+      <p>The result is a small Python app: create a window, add widgets, wire model values or callbacks, then let the frame loop keep drawing and handling input.</p>
+    </section>
+
+    <section>
+      <h2>Python classes</h2>
+      <p>Most app code meets a compact set of classes first. These names appear in the Python package docs, examples, tests, or bindings, and they are enough to read common app code without a full class inventory.</p>
+      <ul>
+        <li><code>Window</code>, <code>Frame</code>, <code>Workspace</code>, and <code>DockSpace</code> create windows and docked work areas.</li>
+        <li><code>VStack</code>, <code>HStack</code>, <code>ZStack</code>, <code>ScrollingFrame</code>, and <code>Spacer</code> arrange widgets.</li>
+        <li><code>TreeView</code>, <code>AbstractItemModel</code>, and <code>AbstractItemDelegate</code> handle tree-style data.</li>
+        <li><code>AbstractValueModel</code>, <code>SimpleStringModel</code>, <code>SimpleFloatModel</code>, <code>SimpleIntModel</code>, and <code>SimpleBoolModel</code> carry values for fields, sliders, checkboxes, and progress bars.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Common widgets</h2>
+      <p>The common widgets cover text, commands, editable values, hierarchical views, images, markdown, progress, and menu actions. Widgets in ovwidgets reuse these widgets instead of drawing a separate widget set.</p>
+      <ul>
+        <li>Text and display: <code>Label</code>, <code>Image</code>, <code>ImageWithProvider</code>, <code>MarkdownWidget</code>, and <code>ProgressBar</code>.</li>
+        <li>Controls: <code>Button</code>, <code>ToolButton</code>, <code>CheckBox</code>, <code>ComboBox</code>, <code>RadioButton</code>, and <code>RadioCollection</code>.</li>
+        <li>Editable values: <code>StringField</code>, <code>FloatField</code>, <code>IntField</code>, <code>FloatSlider</code>, <code>IntSlider</code>, <code>FloatDrag</code>, and <code>IntDrag</code>.</li>
+        <li>Structured views: <code>TreeView</code> reads an item model and can use a delegate to build row widgets.</li>
+      </ul>
+      <p>The examples show the everyday pattern: create widgets inside a frame, set model values with <code>set_value()</code>, and attach callbacks such as <code>clicked_fn</code> where user action should call Python code.</p>
+    </section>
+
+    <section>
+      <h2>Sources</h2>
+      <p>The source is split by job, so debugging starts by asking where a behavior lives: Python setup, C++ widget work, Python binding, or an example/test.</p>
+      <div class="diagram ui-diagram" role="img" aria-label="UI framework sources from examples through Python package bindings and C++ core">
+        <div class="source-chain">
+          <div class="source-card is-start">
+            <div class="source-name">Python package</div>
+            <span class="source-pill">ovui/python/omni/ui</span>
+            <div class="source-text">Imports bound classes, style helpers, markdown helpers, and standalone runtime helpers.</div>
+          </div>
+          <div class="source-arrow" aria-hidden="true">&harr;</div>
+          <div class="source-card">
+            <div class="source-name">Python bindings</div>
+            <span class="source-pill">ovui/bindings</span>
+            <div class="source-text">Makes C++ classes available to Python code as windows, widgets, models, and callbacks.</div>
+          </div>
+          <div class="source-arrow" aria-hidden="true">&harr;</div>
+          <div class="source-card">
+            <div class="source-name">C++ core</div>
+            <span class="source-pill">ovui/core</span>
+            <div class="source-text">Defines widget behavior, layout calculation, styling, images, and rendering support.</div>
+          </div>
+        </div>
+        <div class="source-note">
+          <div class="source-note-title">Examples and tests cover Python use, bindings, and C++ behavior</div>
+          <div class="source-note-list">
+            <span class="source-pill">ovui/examples</span>
+            <span class="source-pill">ovui/tests</span>
+            <span class="source-pill">showcase widgets</span>
+            <span class="source-pill">screenshot checks</span>
+          </div>
+        </div>
+        <p class="diagram-note">Debugging usually starts from Python use, checks the binding, then inspects the C++ widget code when native behavior owns the result.</p>
+      </div>
+      <ul>
+        <li>The Python package imports <code>_ui</code>, style helpers, markdown helpers, and standalone runtime functions.</li>
+        <li>The C++ core defines widget behavior, layout calculation, styling, image providers, and rendering support.</li>
+        <li>The Python bindings expose classes such as <code>Window</code>, <code>Frame</code>, <code>Button</code>, <code>TreeView</code>, and model classes.</li>
+        <li>Examples and tests show real use: showcase widgets, markdown, images, scene tools, model updates, input helpers, and screenshot checks.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>How data reaches widgets</h2>
+      <p>Data enters widgets through models and callback functions. The base UI framework does not know about USD; widgets in ovwidgets can ask a data adapter for values, put those values into item or value models, and let ovui widgets render them.</p>
+      <ul>
+        <li><code>AbstractValueModel</code> stores one value and exposes bool, float, int, and string accessors, plus value-changed and edit callbacks.</li>
+        <li><code>AbstractItemModel</code> exposes child items and value models per item; <code>TreeView</code> asks it for rows and values.</li>
+        <li><code>AbstractItemDelegate</code> can build row widgets, so the same tree model can draw names, icons, badges, fields, or checkboxes.</li>
+        <li>Buttons and menu items call Python functions through callbacks such as <code>clicked_fn</code> or setter callbacks.</li>
+        <li>Adapter-fed widgets use a direct handoff: a data adapter feeds a widget model, and the widget model feeds ovui widgets.</li>
+      </ul>
+      <p>For a new widget behavior, start with a small Python app, confirm the model and callback flow, then inspect the C++ core or Python bindings when the behavior needs native widget changes.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="section-03.html">Previous: Code Organization</a>
+      <a href="../architecture.html#section-04" target="_top">Index</a>
+    </nav>
+  </main>
+</body>
+</html>

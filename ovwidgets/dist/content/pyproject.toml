@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovwidgets-content"
+dynamic = ["version"]
+description = "OvWidgets Content Browser"
+requires-python = ">=3.10"
+dependencies = ["ovwidgets-common>=0.1.0"]
+
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["ovwidgets.content*"]
+where = ["../.."]

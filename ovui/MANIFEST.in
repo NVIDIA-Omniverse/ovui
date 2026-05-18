@@ -1,0 +1,10 @@
+recursive-include resources/fonts *.ttf *.txt *.md
+recursive-include resources/glyphs *.svg
+recursive-include core *.cpp *.h
+recursive-include standalone *.cpp *.h
+recursive-include bindings *.cpp *.h
+include third_party/CMakeLists.txt
+recursive-include third_party/imgui *
+include third_party/glad_extensions.txt
+include CMakeLists.txt
+recursive-include python *.py

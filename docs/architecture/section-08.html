@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Data Adapters</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .data-diagram {
+      padding: 18px;
+    }
+
+    .data-flow {
+      display: grid;
+      grid-template-columns: minmax(160px, 0.95fr) auto minmax(172px, 1fr) auto minmax(210px, 1.15fr) auto minmax(160px, 0.9fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .data-card,
+    .record-row {
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+    }
+
+    .data-card {
+      min-height: 150px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 10px;
+      padding: 14px;
+    }
+
+    .data-card.is-start {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .data-name,
+    .record-title {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .data-text {
+      color: #44554b;
+      font-size: 0.94rem;
+      line-height: 1.45;
+    }
+
+    .data-pill {
+      display: inline-block;
+      width: fit-content;
+      max-width: 100%;
+      padding: 3px 8px;
+      border: 1px solid #dce3ea;
+      border-radius: 999px;
+      background: #f7f9fa;
+      color: #24384a;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 0.82rem;
+      overflow-wrap: anywhere;
+    }
+
+    .data-card .data-pill {
+      padding: 3px 7px;
+      font-size: 0.75rem;
+    }
+
+    .data-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .record-row {
+      margin-top: 12px;
+      padding: 14px;
+    }
+
+    .record-title {
+      margin-bottom: 8px;
+      color: #33463b;
+    }
+
+    .record-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 900px) {
+      .data-flow {
+        grid-template-columns: 1fr;
+      }
+
+      .data-arrow {
+        transform: rotate(90deg);
+      }
+
+      .data-card {
+        min-height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="section-07.html">Previous</a>
+      <a href="../architecture.html#section-08" target="_top">Index</a>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Section 8</p>
+      <h1>Data Adapters</h1>
+      <p class="lead">Data adapters are the Python objects that let app widgets work with scene data, object values, transforms, renderer frames, and files without baking one backend into the widget code.</p>
+    </header>
+
+    <section>
+      <h2>Purpose</h2>
+      <p>The widgets receive adapters from the application. The adapter packages explain how data reaches widgets: one package names the plain Python classes and shared records, while the OpenUSD package fills those classes from a real USD stage and renderer.</p>
+      <ul>
+        <li><code>ovui_data_adapters.common</code> holds the shared adapter classes and records used by stage, property, transform, renderer, selection, command, and event code.</li>
+        <li><code>ovui_data_adapters.openusd</code> contains USD-backed classes for scene hierarchy, object properties, transforms, renderer frames, picking, and undoable USD edits.</li>
+        <li>ovwidgets tests use mock adapters, so stage rows, property rows, viewport behavior, and file browsing can be checked without a USD runtime or GPU.</li>
+        <li>The content browser uses the same adapter approach with <code>BackendAdapter</code>, <code>LocalFSBackend</code>, and file records in <code>ovwidgets.content.backends</code>.</li>
+      </ul>
+      <div class="diagram data-diagram" role="img" aria-label="Widgets ask common adapters for data, OpenUSD-backed adapters read real data, and shared records carry events and values back">
+        <div class="data-flow">
+          <div class="data-card is-start">
+            <div class="data-name">Widgets</div>
+            <div class="data-text">Stage browser, property inspector, viewport, and content browser ask for values and send edits.</div>
+          </div>
+          <div class="data-arrow" aria-hidden="true">&harr;</div>
+          <div class="data-card">
+            <div class="data-name">Common adapters</div>
+            <span class="data-pill">StageAdapter</span>
+            <span class="data-pill">PropertyAdapter</span>
+            <span class="data-pill">TransformAdapter</span>
+            <span class="data-pill">RendererAdapter</span>
+          </div>
+          <div class="data-arrow" aria-hidden="true">&harr;</div>
+          <div class="data-card">
+            <div class="data-name">OpenUSD-backed adapters</div>
+            <span class="data-pill">UsdStageAdapter</span>
+            <span class="data-pill">UsdPropertyAdapter</span>
+            <span class="data-pill">UsdTransformAdapter</span>
+            <span class="data-pill">OvRtxRendererAdapter</span>
+          </div>
+          <div class="data-arrow" aria-hidden="true">&harr;</div>
+          <div class="data-card">
+            <div class="data-name">Data source</div>
+            <div class="data-text">USD stage, renderer output, file storage, or test data created in Python.</div>
+          </div>
+        </div>
+        <div class="record-row">
+          <div class="record-title">Shared records and events travel between widgets and adapters</div>
+          <div class="record-pills">
+            <span class="data-pill">ChangeEvent</span>
+            <span class="data-pill">AttributeMetadata</span>
+            <span class="data-pill">BoundCameraPose</span>
+            <span class="data-pill">GpuFrame</span>
+            <span class="data-pill">Command</span>
+          </div>
+        </div>
+        <p class="diagram-note">Widgets stay written against common adapter behavior. The app chooses whether the active objects come from mocks, OpenUSD, a renderer, local files, or another backend.</p>
+      </div>
+      <p>This is why the widgets can be reused. A tree row, attribute editor, or viewport gesture does not need to know how USD stores the value it shows; it needs an adapter object that can answer the widget's question and perform the requested edit.</p>
+    </section>
+
+    <section>
+      <h2>Common adapter classes</h2>
+      <p>The common package is the plain Python starting point. It avoids external runtime dependencies, exports the adapter class family from <code>ovui_data_adapters.common</code>, and gives mocks and real backends the same class names.</p>
+      <ul>
+        <li><code>StageAdapter</code> supplies root items, children, paths, display names, type names, icons, badge flags, visibility, rename, reparent, filtering, world bounds, and camera pose reads.</li>
+        <li><code>PropertyAdapter</code> supplies selected paths, attribute names, <code>AttributeMetadata</code>, current values, ambiguity checks, edit begin/set/end calls, change notices, reset support, and the backend scheme name.</li>
+        <li><code>TransformAdapter</code> reads local and world 4x4 transforms, writes local transforms, and reports whether a selected path can be transformed.</li>
+        <li><code>RendererAdapter</code> loads a stage, renders RGBA frames, updates resolution, handles point and rectangle picking, updates selection highlight, and shuts down renderer resources.</li>
+        <li><code>SelectionAdapter</code>, <code>Command</code>, <code>SubscriptionProtocol</code>, and <code>UndoManagerProtocol</code> cover selection conversion, undoable edits, and change subscription handles.</li>
+      </ul>
+      <p>Those classes are intentionally small enough to mock. <code>MockStageAdapter</code>, <code>MockPropertyAdapter</code>, <code>MockTransformAdapter</code>, and <code>MockRendererAdapter</code> prove that the widgets can run from in-memory data while still exercising the same reads, writes, subscriptions, and frame calls used by the full app.</p>
+    </section>
+
+    <section>
+      <h2>OpenUSD-backed adapters</h2>
+      <p>The OpenUSD package is one concrete backend. Its files import USD, numeric array support, and the renderer only where they are needed, while callers continue to receive the common adapter objects described above. Its renderer path also authors the session RenderProduct data used by ovrtx, including <code>uniform uint[] deviceIds = [0]</code> for ovrtx 0.3 render and pick work.</p>
+      <ul>
+        <li><code>UsdStageAdapter</code> wraps a <code>Usd.Stage</code>, reads hierarchy data, computes visibility and flags, performs rename and reparent edits, emits <code>ChangeEvent</code>, and asks the undo manager to run USD edit commands.</li>
+        <li><code>UsdPropertyAdapter</code> builds the selected-object property set, converts USD values into Python values, reports range and state metadata, handles multi-selection ambiguity, and writes edited values back to USD.</li>
+        <li><code>UsdTransformAdapter</code> reads local and world transforms through <code>UsdGeom.Xformable</code> and writes a matrix transform when the viewport manipulator commits a drag.</li>
+        <li><code>OvRtxRendererAdapter</code> loads stage data into the renderer, updates camera values each frame, returns an RGBA array or <code>GpuFrame</code>, supports point and rectangle picking through renderer queries, and mirrors selection through native ovrtx selection-outline groups.</li>
+        <li><code>SetVisibilityCommand</code>, <code>DeletePrimCommand</code>, and <code>NamespaceEditCommand</code> make common undo behavior work for USD mutations.</li>
+      </ul>
+      <p>The result is a normal handoff: the app opens a USD stage, creates the USD-backed adapters, gives them to widgets, and the visible widgets continue to use the common adapter methods they already know.</p>
+    </section>
+
+    <section>
+      <h2>Shared data types</h2>
+      <p>Adapters and widgets pass plain records, enums, and command objects instead of passing raw USD objects through the UI. That keeps the widget code easier to read and makes tests able to create the same kind of data directly in Python.</p>
+      <ul>
+        <li><code>ChangeEvent</code> and <code>ChangeEventType</code> tell the stage browser and application what changed and which paths should be refreshed.</li>
+        <li><code>AttributeMetadata</code> tells property rows how to label an attribute, choose an editor, show allowed values, show range hints, and mark authored, locked, animated, or large-array values.</li>
+        <li><code>VisibilityState</code>, <code>ItemFlags</code>, <code>BadgeFlags</code>, and <code>ReparentPosition</code> carry stage-row state without exposing backend objects to the tree widget.</li>
+        <li><code>BoundCameraPose</code> gives the viewport a saved camera pose when the stage provides one; otherwise the viewport can fall back to framing selected bounds.</li>
+        <li><code>GpuFrame</code> and <code>ZeroCopyState</code> let renderer output reach <code>ImageBridge</code> while still falling back to a regular RGBA array when direct GPU presentation is unavailable.</li>
+        <li><code>BackendListEntry</code>, <code>BackendChangeEvent</code>, <code>BackendFileFlags</code>, and <code>BackendResult</code> do the same job for content-browser storage.</li>
+      </ul>
+      <p>These types are the vocabulary that crosses the gap between data and UI. The names describe what the widget needs to know, not how the backend stores it.</p>
+    </section>
+
+    <section>
+      <h2>How widgets stay backend-independent</h2>
+      <p>Widgets stay backend-independent because they ask adapters for data and send edits back through adapters. The widget owns the visible rows, fields, gestures, filters, and local state; the adapter owns the data source details.</p>
+      <ul>
+        <li>The stage browser asks <code>StageAdapter</code> for children, names, type data, visibility, rename, reparent, and change notices.</li>
+        <li>The property inspector receives a <code>PropertyAdapter</code> for the current selection and builds rows from its attribute names, metadata, values, and edit calls.</li>
+        <li>The viewport receives <code>RendererAdapter</code>, <code>TransformAdapter</code>, and <code>StageAdapter</code> objects, so frame output, picking, transform edits, native selection-outline state, and camera framing do not depend on one backend.</li>
+        <li>The content browser receives <code>BackendAdapter</code>, so the same browser model can list, rename, copy, move, delete, and refresh storage entries from local files or another storage backend.</li>
+        <li>New adapters can be added for another scene source, storage source, renderer, or test fixture while leaving the widget code mostly unchanged.</li>
+      </ul>
+      <p>That completes the adapter explanation: ovui supplies core widgets, ovwidgets supplies app widgets, and adapters give those widgets a replaceable data source without forcing every widget to learn every backend.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="section-07.html">Previous: Widgets and Data Adapters</a>
+      <a href="section-09.html">Next: Renderer Frames and Selection Outline</a>
+    </nav>
+  </main>
+</body>
+</html>

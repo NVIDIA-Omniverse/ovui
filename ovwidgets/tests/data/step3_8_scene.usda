@@ -1,0 +1,45 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    # Step 3.8: exercise array attribute rendering. ``GeoSphere`` carries
+    # a mix of array sizes so the Property Inspector screenshot shows both
+    # branches of the array display (small → full tuple repr, big → the
+    # ``"[N items]"`` summary).
+    #
+    #   * ``smallArr`` — 4-element ``float[]``; renders as
+    #     ``"(1.0, 2.0, 3.0, 4.0)"`` (below the 16-element threshold).
+    #   * ``bigArr`` — 20-element ``float[]``; renders as
+    #     ``"[20 items]"`` (above the 16-element threshold; the full
+    #     element list is never stringified).
+    #   * ``tokenArr`` — 3-element ``token[]``; renders as the full tuple
+    #     repr, exercising the non-numeric element path.
+    #
+    # The Sphere additionally inherits ``extent`` (``float3[]``, 2
+    # elements) and ``xformOpOrder`` (``token[]``, 1 element) from
+    # UsdGeomImageable / UsdGeomXformable — both were silently dropped
+    # pre-Step-3.8 and now render as small-array rows alongside the custom
+    # attributes above. ``radius`` (``double``) renders as a FloatDrag
+    # (was ``(unsupported double)`` pre-3.8 — Step 3.8 also registers the
+    # ``double`` → ``build_float`` slot in ``WidgetBuilderTable``).
+    def Sphere "GeoSphere" (
+        kind = "component"
+    )
+    {
+        double radius = 1.0
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        float[] smallArr = [1.0, 2.0, 3.0, 4.0]
+        float[] bigArr = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+            10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+        ]
+        token[] tokenArr = ["alpha", "beta", "gamma"]
+    }
+}

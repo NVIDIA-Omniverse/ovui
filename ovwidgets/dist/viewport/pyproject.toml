@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovwidgets-viewport"
+dynamic = ["version"]
+description = "OvWidgets Viewport"
+requires-python = ">=3.10"
+dependencies = [
+    "ovwidgets-common>=0.1.0",
+    "ovui-data-adapters-common>=0.1.0",
+    "numpy>=1.20",
+]
+
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["ovwidgets.viewport*"]
+where = ["../.."]

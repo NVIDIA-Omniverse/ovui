@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Wireframe cube — override opinion (Sdf.SpecifierOver) -->
+  <g fill="none" stroke="#D8C89E" stroke-width="1.1" stroke-linejoin="round" stroke-linecap="round">
+    <!-- Top face -->
+    <polygon points="8,2 13,4.5 8,7 3,4.5"/>
+    <!-- Left silhouette -->
+    <polyline points="3,4.5 3,10.5 8,13"/>
+    <!-- Right silhouette -->
+    <polyline points="13,4.5 13,10.5 8,13"/>
+    <!-- Front vertical edge -->
+    <line x1="8" y1="7" x2="8" y2="13"/>
+  </g>
+</svg>

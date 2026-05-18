@@ -1,0 +1,29 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def Cube "ColorCube" (
+        kind = "component"
+    )
+    {
+        double size = 2.0
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        # Step 3.4: exercise colour attributes with the live swatch preview.
+        # A ``color3f`` and a ``color4f`` render as R/G/B(/A) FloatDrag rows
+        # plus a ``ui.Rectangle`` swatch whose ``background_color`` tracks
+        # the current value.
+        #
+        # ``primvars:displayColor`` on UsdGeomGprim is a colour3f[] array, so
+        # we skip it (arrays come in Step 3.8) and declare two plain
+        # colour-typed custom attrs on the prim.
+        custom color3f tintColor = (0.8, 0.3, 0.15)
+        custom color4f fillColor = (0.2, 0.5, 0.9, 0.75)
+    }
+}

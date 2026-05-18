@@ -1,0 +1,44 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    # Step 4.1: exercise soft/hard range wiring on FloatDrag/IntDrag.
+    #
+    # ``GeoSphere.radius`` authors ``customData`` entries that
+    # :class:`UsdPropertyAdapter` reads via ``attr.GetCustomData()`` and
+    # projects into :class:`AttributeMetadata.soft_range_*` /
+    # ``hard_range_*``:
+    #
+    #   * ``range = {min: 0, max: 5}`` → hard clamp applied by
+    #     :class:`AttributeModelBase._apply_hard_range_clamp` in
+    #     ``set_value``.
+    #   * ``soft_range = {min: 0, max: 2}`` → FloatDrag widget's
+    #     ``min``/``max`` properties, visible on the drag handle.
+    #
+    # The screenshot captures the Property Inspector with the radius
+    # row's FloatDrag now bounded by the soft range.
+    def Sphere "GeoSphere" (
+        kind = "component"
+    )
+    {
+        double radius = 1.0 (
+            customData = {
+                dictionary range = {
+                    double min = 0.0
+                    double max = 5.0
+                }
+                dictionary soft_range = {
+                    double min = 0.0
+                    double max = 2.0
+                }
+            }
+        )
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

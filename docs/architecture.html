@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ovui Architecture Summary</title>
+  <link rel="stylesheet" href="architecture/style.css">
+</head>
+<body>
+  <main class="architecture-page">
+    <header class="hero architecture-hero">
+      <p class="eyebrow">Architecture summary</p>
+      <h1>ovui Architecture Summary</h1>
+      <p class="lead">Select a section from the table of contents to read it here, or open any section as its own page.</p>
+    </header>
+
+    <div class="architecture-layout">
+      <aside class="architecture-nav" aria-labelledby="toc">
+        <h2 id="toc">Contents</h2>
+        <p>Each link opens the matching section page in the reader on the right. The links also work as plain hyperlinks to the standalone pages, including when JavaScript is unavailable.</p>
+        <ol class="toc-list">
+          <li id="section-01">
+            <a href="architecture/section-01.html" target="architecture-frame" data-section-link data-section="section-01">ovui Project Overview</a>
+            <ul>
+              <li>What ovui is</li>
+              <li>The project in three parts</li>
+              <li>Ways to use ovui</li>
+            </ul>
+          </li>
+          <li id="section-02">
+            <a href="architecture/section-02.html" target="architecture-frame" data-section-link data-section="section-02">What You Can Build With ovui</a>
+            <ul>
+              <li>Standalone Python UI apps</li>
+              <li>Scene tools built from ovwidgets</li>
+              <li>Headless rendering and automation runs</li>
+              <li>Live streaming</li>
+            </ul>
+          </li>
+          <li id="section-03">
+            <a href="architecture/section-03.html" target="architecture-frame" data-section-link data-section="section-03">Code Organization</a>
+            <ul>
+              <li>UI framework</li>
+              <li>Scene tools</li>
+              <li>Application</li>
+              <li>Widgets</li>
+              <li>Data adapters</li>
+              <li>OpenUSD data adapters</li>
+              <li>Tests, examples, and entry points</li>
+            </ul>
+          </li>
+          <li id="section-04">
+            <a href="architecture/section-04.html" target="architecture-frame" data-section-link data-section="section-04">UI Framework</a>
+            <ul>
+              <li>Purpose</li>
+              <li>Python classes</li>
+              <li>Common widgets</li>
+              <li>Sources</li>
+              <li>How data reaches widgets</li>
+            </ul>
+          </li>
+          <li id="section-05">
+            <a href="architecture/section-05.html" target="architecture-frame" data-section-link data-section="section-05">Scene Tools</a>
+            <ul>
+              <li>Purpose</li>
+              <li>Python classes</li>
+              <li>Common scene objects</li>
+              <li>Sources</li>
+              <li>How scene data reaches views</li>
+            </ul>
+          </li>
+          <li id="section-06">
+            <a href="architecture/section-06.html" target="architecture-frame" data-section-link data-section="section-06">Application</a>
+            <ul>
+              <li>Purpose</li>
+              <li>App state classes</li>
+              <li>Sources</li>
+              <li>How app state reaches widgets</li>
+            </ul>
+          </li>
+          <li id="section-07">
+            <a href="architecture/section-07.html" target="architecture-frame" data-section-link data-section="section-07">Widgets and Data Adapters</a>
+            <ul>
+              <li>Purpose</li>
+              <li>Stage browser and scene data</li>
+              <li>Property inspector and object data</li>
+              <li>Content browser and files</li>
+              <li>Viewport and rendered output</li>
+              <li>Composition stack data</li>
+              <li>How widgets stay independent</li>
+            </ul>
+          </li>
+          <li id="section-08">
+            <a href="architecture/section-08.html" target="architecture-frame" data-section-link data-section="section-08">Data Adapters</a>
+            <ul>
+              <li>Purpose</li>
+              <li>Common adapter classes</li>
+              <li>OpenUSD-backed adapters</li>
+              <li>Shared data types</li>
+              <li>How widgets stay backend-independent</li>
+            </ul>
+          </li>
+          <li id="section-09">
+            <a href="architecture/section-09.html" target="architecture-frame" data-section-link data-section="section-09">Renderer Frames and Selection Outline</a>
+            <ul>
+              <li>From ovrtx to the viewport image</li>
+              <li>Zero-copy and CPU fallback</li>
+              <li>Selection across widgets</li>
+              <li>Selection outline and picking</li>
+            </ul>
+          </li>
+          <li id="section-10">
+            <a href="architecture/section-10.html" target="architecture-frame" data-section-link data-section="section-10">Startup, Data Flow, and Verification</a>
+            <ul>
+              <li>Desktop startup</li>
+              <li>Headless startup</li>
+              <li>Runtime frames</li>
+              <li>Stage loading</li>
+              <li>Data flow</li>
+              <li>Tests and examples</li>
+            </ul>
+          </li>
+          <li id="section-11">
+            <a href="architecture/section-11.html" target="architecture-frame" data-section-link data-section="section-11">Inspector Pipeline</a>
+            <ul>
+              <li>How the agent works</li>
+              <li>What the agent can do</li>
+              <li>Available control APIs</li>
+              <li>How the agent connects and runs</li>
+              <li>Using the pipeline from Claude or Codex</li>
+            </ul>
+          </li>
+        </ol>
+      </aside>
+
+      <!--
+        The reader is a plain iframe pointing at the source section page. The
+        standalone files under docs/architecture/section-NN.html stay the only
+        copy of the section content - this page does not embed or duplicate
+        any of it. The iframe shows the chosen section both when the index is
+        opened from disk (file://) and when it is served by an HTTP server.
+      -->
+      <iframe id="architecture-frame"
+              name="architecture-frame"
+              class="architecture-frame section-view"
+              src="architecture/section-01.html"
+              title="Selected architecture section"
+              aria-labelledby="toc"
+              loading="eager"></iframe>
+    </div>
+
+    <noscript>
+      <section class="load-state">
+        <h2>JavaScript is unavailable</h2>
+        <p>Each table of contents link opens the matching standalone section page directly.</p>
+      </section>
+    </noscript>
+  </main>
+
+  <script>
+    (() => {
+      const defaultSection = "section-01";
+      const sectionLinks = Array.from(document.querySelectorAll("[data-section-link]"));
+      const sections = new Map(sectionLinks.map((link) => [
+        link.dataset.section,
+        {
+          path: link.getAttribute("href"),
+          title: link.textContent.trim()
+        }
+      ]));
+      const frame = document.getElementById("architecture-frame");
+      // The iframe ships with section-01 as its initial src, so record that as
+      // the current section to avoid a redundant reload on the default route.
+      frame.dataset.currentSection = defaultSection;
+
+      function normalizeSection(value) {
+        const raw = String(value || "").trim().replace(/^#/, "").toLowerCase();
+        const numeric = raw.match(/^(?:section-?)?(\d{1,2})$/);
+        if (numeric) {
+          return `section-${numeric[1].padStart(2, "0")}`;
+        }
+        return sections.has(raw) ? raw : defaultSection;
+      }
+
+      function sectionFromLocation() {
+        const params = new URLSearchParams(window.location.search);
+        return normalizeSection(params.get("section") || params.get("s") || window.location.hash);
+      }
+
+      function setActiveSection(sectionId) {
+        sectionLinks.forEach((link) => {
+          const isActive = link.dataset.section === sectionId;
+          link.classList.toggle("is-active", isActive);
+          if (isActive) {
+            link.setAttribute("aria-current", "page");
+          } else {
+            link.removeAttribute("aria-current");
+          }
+        });
+      }
+
+      function showSection(sectionId, options = {}) {
+        const normalizedId = normalizeSection(sectionId);
+        const section = sections.get(normalizedId);
+        if (!section) {
+          return;
+        }
+        setActiveSection(normalizedId);
+        if (frame.dataset.currentSection !== normalizedId) {
+          frame.src = section.path;
+          frame.dataset.currentSection = normalizedId;
+        }
+        document.title = `${section.title} - ovui Architecture Summary`;
+        if (options.push) {
+          history.pushState({ section: normalizedId }, "", `#${normalizedId}`);
+        }
+      }
+
+      sectionLinks.forEach((link) => {
+        link.addEventListener("click", (event) => {
+          // Let the native target="architecture-frame" navigation handle the
+          // frame swap (it also works when JavaScript is disabled). The JS
+          // here just keeps the parent URL hash in sync so the current view
+          // remains shareable and survives a refresh.
+          showSection(link.dataset.section, { push: true });
+        });
+      });
+
+      window.addEventListener("popstate", () => {
+        showSection(sectionFromLocation());
+      });
+
+      window.addEventListener("hashchange", () => {
+        showSection(sectionFromLocation());
+      });
+
+      showSection(sectionFromLocation());
+    })();
+  </script>
+</body>
+</html>

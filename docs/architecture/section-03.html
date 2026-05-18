@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Code Organization</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .flow-diagram {
+      padding: 18px;
+    }
+
+    .flow-grid {
+      display: grid;
+      grid-template-columns: minmax(145px, 1fr) auto minmax(145px, 1fr) auto minmax(145px, 1fr) auto minmax(145px, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .flow-card {
+      min-height: 172px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 14px;
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+    }
+
+    .flow-card.is-start {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .flow-name {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .flow-text {
+      color: #44554b;
+      font-size: 0.93rem;
+      line-height: 1.42;
+    }
+
+    .flow-pill {
+      display: inline-block;
+      width: fit-content;
+      max-width: 100%;
+      padding: 3px 8px;
+      border: 1px solid #dce3ea;
+      border-radius: 999px;
+      background: #f7f9fa;
+      color: #24384a;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 0.82rem;
+      overflow-wrap: anywhere;
+    }
+
+    .flow-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .use-row {
+      margin-top: 12px;
+      padding: 14px;
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #33463b;
+    }
+
+    .use-title {
+      margin-bottom: 7px;
+      font-weight: 700;
+    }
+
+    .use-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 900px) {
+      .flow-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .flow-arrow {
+        transform: rotate(90deg);
+      }
+
+      .flow-card {
+        min-height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="section-02.html">Previous</a>
+      <a href="../architecture.html#section-03" target="_top">Index</a>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Section 3</p>
+      <h1>Code Organization</h1>
+      <p class="lead">ovui provides Python UI building blocks and scene drawing helpers. ovwidgets combines them into an application, common Python classes, and app widgets. Data adapters feed those widgets from real or mock data, with OpenUSD adapters as one concrete backend.</p>
+    </header>
+
+    <div class="diagram flow-diagram" role="img" aria-label="How ovui, ovwidgets, data adapters, OpenUSD adapters, and tests fit together">
+      <div class="flow-grid">
+        <div class="flow-card is-start">
+          <div class="flow-name">ovui</div>
+          <span class="flow-pill">omni.ui</span>
+          <div class="flow-text">Window, Frame, stacks, fields, sliders, menus, and value models.</div>
+          <span class="flow-pill">omni.ui.scene</span>
+          <div class="flow-text">SceneView, gestures, manipulators, camera helpers, and scene drawing.</div>
+        </div>
+        <div class="flow-arrow" aria-hidden="true">&rarr;</div>
+        <div class="flow-card">
+          <div class="flow-name">ovwidgets</div>
+          <span class="flow-pill">Application</span>
+          <div class="flow-text">Settings, SelectionBus, UndoManager, menus, status UI, and frame timing.</div>
+          <span class="flow-pill">stage / property / content / viewport</span>
+          <div class="flow-text">Widgets that users see, edit, browse, and render through.</div>
+        </div>
+        <div class="flow-arrow" aria-hidden="true">&harr;</div>
+        <div class="flow-card">
+          <div class="flow-name">Data adapters</div>
+          <span class="flow-pill">ovui_data_adapters.common</span>
+          <div class="flow-text">StageAdapter, PropertyAdapter, TransformAdapter, RendererAdapter.</div>
+          <span class="flow-pill">ovwidgets.common.testing</span>
+          <div class="flow-text">Mock data for widget and app tests.</div>
+        </div>
+        <div class="flow-arrow" aria-hidden="true">&harr;</div>
+        <div class="flow-card">
+          <div class="flow-name">OpenUSD adapters</div>
+          <span class="flow-pill">ovui_data_adapters.openusd</span>
+          <div class="flow-text">UsdStageAdapter, UsdPropertyAdapter, UsdTransformAdapter, and renderer data.</div>
+        </div>
+      </div>
+      <div class="use-row">
+        <div class="use-title">Tests, examples, and entry points cover UI, widgets, adapters, and app startup</div>
+        <div class="use-list">
+          <span class="flow-pill">ovui/examples</span>
+          <span class="flow-pill">ovui/tests</span>
+          <span class="flow-pill">ovwidgets/tests</span>
+          <span class="flow-pill">python -m ovwidgets.app</span>
+          <span class="flow-pill">python -m ovwidgets.app.headless</span>
+        </div>
+      </div>
+      <p class="diagram-note">The flow starts with ovui widgets and scene parts, grows into app widgets in ovwidgets, then reaches data through common adapters and OpenUSD adapters.</p>
+    </div>
+
+    <section>
+      <h2>UI framework</h2>
+      <p>The lowest starting point is <code>ovui</code>. Its package name is <code>ovui</code>, and Python code imports the widget API as <code>omni.ui</code>. A small app opens a <code>Window</code>, builds inside <code>window.frame</code>, and uses stacks, fields, sliders, menus, and value models to hold state and react to input.</p>
+      <ul>
+        <li><code>Window</code>, <code>Frame</code>, <code>Workspace</code>, and <code>DockSpace</code> give apps visible places to put UI.</li>
+        <li><code>Button</code>, <code>Label</code>, <code>TreeView</code>, <code>StringField</code>, <code>FloatSlider</code>, <code>ProgressBar</code>, <code>Menu</code>, and <code>MenuItem</code> are common widget classes.</li>
+        <li><code>ui.run()</code> and <code>ui.next_frame()</code> keep input, drawing, and async Python work moving with each frame.</li>
+      </ul>
+      <p>Read this part when the change is about base widget behavior, style helpers, value models, frame timing, or standalone window startup.</p>
+    </section>
+
+    <section>
+      <h2>Scene tools</h2>
+      <p>The scene helpers live in <code>omni.ui.scene</code>. They add 3D drawing and input helpers that can sit inside a normal UI window, so a viewport can combine regular widgets with camera motion, picking, and transform handles.</p>
+      <ul>
+        <li>Main names include <code>SceneView</code>, <code>Scene</code>, <code>Manipulator</code>, <code>CameraModel</code>, and <code>GestureBinding</code>.</li>
+        <li>The package covers geometry, labels, images, camera interaction, picking, and manipulator behavior.</li>
+        <li>The viewport uses these pieces for camera movement, selection outlines, transform handles, and HUD content.</li>
+      </ul>
+      <p>Read this area when a feature needs scene drawing, gesture handling, or a manipulator that follows the camera and selected object.</p>
+    </section>
+
+    <section>
+      <h2>Application</h2>
+      <p><code>ovwidgets.app.Application</code> starts the app. It initializes the UI runtime, creates the workspace, opens the stage, property, content, and viewport windows, runs the frame loop, and owns the common Python classes that several widgets need.</p>
+      <ul>
+        <li><code>Application</code> owns <code>Settings</code>, <code>SelectionBus</code>, <code>UndoManager</code>, <code>RecentFileList</code>, <code>FrameClock</code>, and <code>call_later()</code>.</li>
+        <li><code>ovwidgets.common</code> supplies <code>ManagedWindow</code>, <code>ErrorReporter</code>, <code>SnapSystem</code>, common style helpers, and mock adapters.</li>
+        <li>Menus, status messages, key routing, theme changes, delayed callbacks, file open requests, and viewport render cadence all meet in this app code.</li>
+      </ul>
+      <p>This is the place to read when a change affects several widgets at once, especially selection, undo, settings, recent files, status messages, or app startup.</p>
+    </section>
+
+    <section>
+      <h2>Widgets</h2>
+      <p>The widgets in ovwidgets are the visible tools users work with. Each widget owns its child widgets and models, while instances of common Python classes and data adapters carry values between the widgets and the data they show or edit.</p>
+      <ul>
+        <li><strong>Stage Browser:</strong> <code>StageWindow</code>, <code>StageWidget</code>, <code>HierarchyModel</code>, and <code>StageDelegate</code> show hierarchy rows, type badges, visibility controls, filtering, rename, and drag feedback.</li>
+        <li><strong>Property Inspector:</strong> <code>PropertyWindow</code>, <code>PropertyWidget</code>, <code>AttributesWidget</code>, and <code>AttributeModel</code> show selected-object attributes and editors.</li>
+        <li><strong>Content Browser:</strong> <code>ContentBrowserWindow</code>, <code>FileBrowserWidget</code>, <code>BackendAdapter</code>, and <code>LocalFSBackend</code> handle file navigation, bookmarks, recent files, import, export, and open-file handoff.</li>
+        <li><strong>Viewport:</strong> <code>ViewportWidget</code>, <code>CameraController</code>, <code>TransformManipulator</code>, and <code>ImageBridge</code> handle rendered frames, camera motion, picks, selection outlines, and transform tools.</li>
+      </ul>
+      <p>Read the widget package closest to the visible tool, then follow its adapter calls when the widget needs scene data, file data, properties, transforms, or renderer output.</p>
+    </section>
+
+    <section>
+      <h2>Data adapters</h2>
+      <p>Common data adapters live in <code>ovui_data_adapters.common</code> and are plain Python. They give widgets a consistent way to ask for stage items, properties, transforms, selection, rendered frames, and undoable commands.</p>
+      <ul>
+        <li>Main adapter classes include <code>StageAdapter</code>, <code>PropertyAdapter</code>, <code>TransformAdapter</code>, <code>RendererAdapter</code>, and <code>SelectionAdapter</code>.</li>
+        <li>Shared data names include <code>ChangeEvent</code>, <code>ChangeEventType</code>, <code>AttributeMetadata</code>, <code>BoundCameraPose</code>, <code>GpuFrame</code>, <code>Command</code>, and <code>ZeroCopyState</code>.</li>
+        <li>Mock adapters provide in-memory stage trees, property values, transforms, and frames so widget tests can run without OpenUSD or a GPU.</li>
+      </ul>
+      <p>For another data source, implement these adapter classes and let the same widgets read from that data.</p>
+    </section>
+
+    <section>
+      <h2>OpenUSD data adapters</h2>
+      <p>The concrete OpenUSD code lives in <code>ovui_data_adapters.openusd</code>. It connects USD stages, USD attributes, transforms, camera data, and renderer frames to the common data adapters.</p>
+      <ul>
+        <li>Main classes include <code>UsdStageAdapter</code>, <code>UsdPropertyAdapter</code>, <code>UsdTransformAdapter</code>, and the renderer adapter.</li>
+        <li>Command classes such as <code>SetVisibilityCommand</code>, <code>DeletePrimCommand</code>, and <code>NamespaceEditCommand</code> make USD edits work with <code>UndoManager</code>.</li>
+        <li>Camera, picking, renderer, and session helpers support the viewport when the app is working with USD data.</li>
+      </ul>
+      <p>Read this area when a change needs real USD reads or writes, renderer-backed frames, camera values, picking, or undoable USD edits.</p>
+    </section>
+
+    <section>
+      <h2>Tests, examples, and entry points</h2>
+      <p>Tests and examples cover the code at several sizes: base UI samples build widgets and scene views, ovwidgets tests drive widgets with mock data adapters, and OpenUSD tests use real USD stages when <code>pxr</code> is available.</p>
+      <ul>
+        <li><code>ovui/examples</code> creates demo windows, markdown widgets, scene manipulators, and image demos.</li>
+        <li><code>ovui/tests</code> and <code>ovui/standalone/tests</code> cover widgets, scene gestures, frame output, and offscreen runs.</li>
+        <li><code>ovwidgets/tests</code> covers app startup, widget behavior, mock data adapters, selection, transforms, renderer frames, and OpenUSD adapters.</li>
+        <li>Desktop app start: <code>python -m ovwidgets.app</code> or <code>ovwidgets</code>, optionally followed by a USD file path.</li>
+        <li>Headless app start: <code>python -m ovwidgets.app.headless</code> or <code>ovwidgets-headless</code>, with width, height, or a USD file path.</li>
+      </ul>
+      <p>When looking for a change, start from the entry point or test that matches the user-visible behavior, follow it into the widget, then follow the adapter that supplies its values.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="section-02.html">Previous: What You Can Build With ovui</a>
+      <a href="../architecture.html#section-03" target="_top">Index</a>
+    </nav>
+  </main>
+</body>
+</html>

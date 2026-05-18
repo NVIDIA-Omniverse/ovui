@@ -1,0 +1,38 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def Cube "MatrixCube" (
+        kind = "component"
+    )
+    {
+        double size = 2.0
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        # Step 3.5: exercise matrix attributes. A ``matrix2d`` (2×2, 4
+        # cells), a ``matrix3d`` (3×3, 9 cells), and a ``matrix4d`` (4×4,
+        # 16 cells) each render as an N×N grid of ``ui.FloatDrag`` cells.
+        # Values are authored row-major — the first N floats fill row 0,
+        # the next N fill row 1, and so on — matching USD's
+        # ``Gf.Matrix*d(*flat)`` constructor shape (which the adapter's
+        # ``_matrix_to_usd`` helper relies on).
+        custom matrix2d scale2d = ( (1.5, 0.0), (0.0, 2.5) )
+        custom matrix3d rotation3d = (
+            (1.0, 0.0, 0.0),
+            (0.0, 0.7071, -0.7071),
+            (0.0, 0.7071, 0.7071)
+        )
+        custom matrix4d transform4d = (
+            (1.0, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0, 0.0),
+            (5.0, 10.0, 15.0, 1.0)
+        )
+    }
+}

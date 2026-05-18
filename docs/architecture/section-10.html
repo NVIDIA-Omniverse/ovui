@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Startup, Data Flow, and Verification</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .run-diagram {
+      padding: 18px;
+    }
+
+    .entry-pair {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .run-chain {
+      display: grid;
+      grid-template-columns: minmax(146px, 1fr) auto minmax(150px, 1fr) auto minmax(176px, 1.15fr) auto minmax(150px, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .run-card,
+    .verify-row {
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+    }
+
+    .run-card {
+      min-height: 132px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+      padding: 14px;
+    }
+
+    .run-card.is-start {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .run-name,
+    .verify-title {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .run-text {
+      color: #44554b;
+      font-size: 0.94rem;
+      line-height: 1.45;
+    }
+
+    .run-pill {
+      display: inline-block;
+      width: fit-content;
+      max-width: 100%;
+      padding: 3px 8px;
+      border: 1px solid #dce3ea;
+      border-radius: 999px;
+      background: #f7f9fa;
+      color: #24384a;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 0.82rem;
+      overflow-wrap: anywhere;
+    }
+
+    .run-arrow,
+    .down-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .down-arrow {
+      padding: 8px 0;
+    }
+
+    .verify-row {
+      margin-top: 12px;
+      padding: 14px;
+    }
+
+    .verify-title {
+      margin-bottom: 8px;
+      color: #33463b;
+    }
+
+    .verify-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 900px) {
+      .run-chain {
+        grid-template-columns: 1fr;
+      }
+
+      .run-arrow {
+        transform: rotate(90deg);
+      }
+
+      .run-card {
+        min-height: auto;
+      }
+    }
+
+    @media (max-width: 620px) {
+      .entry-pair {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="section-09.html">Previous</a>
+      <a href="../architecture.html#section-10" target="_top">Index</a>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Section 10</p>
+      <h1>Startup, Data Flow, and Verification</h1>
+      <p class="lead">After the widgets and adapters are in place, an ovwidgets run starts the app, creates instances of common Python classes, opens or creates a stage, gives adapters to widgets, advances frames, and checks those behaviors with tests and examples.</p>
+    </header>
+
+    <div class="diagram run-diagram" role="img" aria-label="Startup and data flow from desktop or headless entry through app startup, stage open, adapters, widgets, frames, tests and examples">
+      <div class="entry-pair">
+        <div class="run-card is-start">
+          <div class="run-name">Desktop entry</div>
+          <span class="run-pill">python -m ovwidgets.app</span>
+          <div class="run-text">Starts a normal app window and accepts an optional USD file path.</div>
+        </div>
+        <div class="run-card is-start">
+          <div class="run-name">Headless entry</div>
+          <span class="run-pill">python -m ovwidgets.app.headless</span>
+          <div class="run-text">Starts the same app without a local desktop window.</div>
+        </div>
+      </div>
+      <div class="down-arrow" aria-hidden="true">&darr;</div>
+      <div class="run-chain">
+        <div class="run-card">
+          <div class="run-name">Application startup</div>
+          <span class="run-pill">Application.run()</span>
+          <span class="run-pill">run_async()</span>
+          <div class="run-text">Initializes ovui, creates instances of common Python classes, opens widget windows, and restores placement.</div>
+        </div>
+        <div class="run-arrow" aria-hidden="true">&rarr;</div>
+        <div class="run-card">
+          <div class="run-name">Stage open</div>
+          <span class="run-pill">open_file()</span>
+          <span class="run-pill">open_stage()</span>
+          <div class="run-text">Loads a file or accepts an existing stage, then rebuilds the active adapters.</div>
+        </div>
+        <div class="run-arrow" aria-hidden="true">&rarr;</div>
+        <div class="run-card">
+          <div class="run-name">Adapters and app state</div>
+          <span class="run-pill">StageAdapter</span>
+          <span class="run-pill">PropertyAdapter</span>
+          <span class="run-pill">TransformAdapter</span>
+          <span class="run-pill">RendererAdapter</span>
+          <div class="run-text">Selection, undo, settings, delayed callbacks, and renderer state keep the app coherent.</div>
+        </div>
+        <div class="run-arrow" aria-hidden="true">&rarr;</div>
+        <div class="run-card">
+          <div class="run-name">Widgets and frames</div>
+          <div class="run-text">Stage browser, property inspector, content browser, composition stack, and viewport show current state each frame.</div>
+        </div>
+      </div>
+      <div class="verify-row">
+        <div class="verify-title">Tests and examples cover startup, adapters, widgets, and frames</div>
+        <div class="verify-pills">
+          <span class="run-pill">ovwidgets/tests</span>
+          <span class="run-pill">ovui/examples</span>
+          <span class="run-pill">ovui/tests</span>
+          <span class="run-pill">ovui/standalone/tests</span>
+        </div>
+      </div>
+      <p class="diagram-note">The two starts converge on the same <code>Application</code> code. From there, file opening, shared state, widget updates, viewport frames, and checks run through named modules and tests.</p>
+    </div>
+
+    <section>
+      <h2>Desktop startup</h2>
+      <p>The desktop entry point is <code>python -m ovwidgets.app</code>, with the <code>ovwidgets</code> console command doing the same startup work. The entry code parses one optional USD file path, creates <code>Application</code>, and calls <code>Application.run()</code>.</p>
+      <ul>
+        <li><code>run()</code> initializes ovui, applies global styles, applies the saved theme, records the startup file path, and hands <code>run_async()</code> to <code>ui.run()</code>.</li>
+        <li><code>run_async()</code> creates the docked work area, menu row, status row, stage browser, property inspector, content browser, composition stack, and viewport.</li>
+        <li>The first frame gives the windows time to exist before saved placement is restored.</li>
+        <li>If a startup file was passed, <code>open_file()</code> runs after the UI exists; otherwise the app creates a new empty stage and loads it through the same handoff.</li>
+      </ul>
+      <p>The important point is that startup does not special-case the real widgets. It builds the same visible app first, then swaps mock startup data for real stage-backed data when a file or default stage is ready.</p>
+    </section>
+
+    <section>
+      <h2>Headless startup</h2>
+      <p>The headless entry point is <code>python -m ovwidgets.app.headless</code>, with <code>ovwidgets-headless</code> as the console command. It chooses the offscreen frame size before importing the application, then creates <code>Application</code> and calls <code>run()</code> with the optional USD path.</p>
+      <ul>
+        <li><code>--width</code> and <code>--height</code> choose the frame size for automation, render capture, or streaming jobs.</li>
+        <li>The same <code>run_async()</code> body creates widgets, instances of common Python classes, startup data, shortcuts, file drops, and the frame loop.</li>
+        <li>Optional streaming and remote input setup happens only after the first drawn frame, so a plain headless run can stay focused on rendering or automation.</li>
+      </ul>
+      <p>Headless startup changes where the app draws, not how the app is assembled. Stage opening, adapter handoff, viewport update, and tests keep using the same app code.</p>
+    </section>
+
+    <section>
+      <h2>Runtime frames</h2>
+      <p>Once the app is running, <code>run_async()</code> advances one frame at a time. Each pass drains queued remote input and queued app messages, waits for <code>ui.next_frame()</code>, then lets the application update callbacks and viewport work.</p>
+      <ul>
+        <li><code>call_later()</code> stores callbacks as <code>CallbackHandle</code> objects; <code>_on_frame_update()</code> fires due callbacks and removes completed ones.</li>
+        <li>The viewport update runs every tick, so camera flight and inertia keep moving even when rendering is throttled.</li>
+        <li><code>FrameClock</code> decides when rendering is due; it commits only after <code>ViewportWidget.render()</code> returns <code>True</code>.</li>
+        <li>A successful render asks the active <code>RendererAdapter</code> for a frame, sends it through <code>ImageBridge</code>, updates HUD values, and keeps scene drawing aligned with the camera.</li>
+        <li>Exit requests flip the running flag, and the <code>run_async()</code> cleanup code releases windows, subscriptions, adapters, callbacks, and shared singletons.</li>
+      </ul>
+      <p>This keeps frame work predictable. User input and queued messages land before the next draw, rendered pixels land after the render gate allows them, and cleanup runs from the same application owner that created the objects.</p>
+    </section>
+
+    <section>
+      <h2>Stage loading</h2>
+      <p>A stage can enter through <code>open_file()</code> or <code>open_stage()</code>. File startup uses <code>open_file()</code>: it prepares the renderer adapter, opens the USD file, then calls <code>_load_stage()</code>. In-memory and automation runs can pass an existing stage to <code>open_stage()</code>, which also lands in <code>_load_stage()</code>.</p>
+      <ul>
+        <li><code>_load_stage()</code> cancels the old stage subscription, clears selection, and detaches prior composition state before the new stage becomes active.</li>
+        <li><code>UsdStageAdapter</code> becomes the app's active stage adapter and is handed to the stage browser.</li>
+        <li>The property inspector receives a factory that creates <code>UsdPropertyAdapter</code> objects for the current selection.</li>
+        <li>The viewport receives <code>UsdTransformAdapter</code>, the active stage adapter, undo, snapping, the scene name, and a renderer adapter loaded with the stage.</li>
+        <li>The composition stack receives its composition data object, and the viewport clock resets so the next eligible tick paints the newly loaded stage.</li>
+      </ul>
+      <p>The same handoff also updates recent files, stage-change subscriptions, renderer selection highlight, prim counts, and initial camera placement. Opening a file therefore changes the active data objects while the visible widgets keep their jobs.</p>
+    </section>
+
+    <section>
+      <h2>Data flow</h2>
+      <p>Data moves in both directions. A read flow brings scene hierarchy, attributes, transforms, files, and rendered pixels into widgets. A write flow sends user edits back through adapters and instances of common Python classes so undo, selection, notices, and redraws stay together.</p>
+      <ul>
+        <li>A stage-browser selection publishes through <code>SelectionBus</code>; the property inspector rebuilds for the selected paths, and the viewport reapplies selection highlight.</li>
+        <li>A property edit goes through adapter edit calls and <code>UndoManager</code>; stage-change notices then refresh affected widgets and notify the viewport renderer.</li>
+        <li>A viewport transform drag uses <code>PrimTransformModel</code>, <code>TransformAdapter</code>, snapping, and undo to write object transforms as one user action.</li>
+        <li>A rendered frame comes from <code>RendererAdapter.render_frame()</code>, enters <code>ImageBridge.update()</code>, and reaches the viewport image provider.</li>
+        <li>A content-browser open action calls the explicit <code>open_file</code> callback, so file browsing can stay separate from scene selection.</li>
+      </ul>
+      <p>The application is the meeting point for that data movement. Widgets own their visible rows and gestures, adapters own data access, and instances of common Python classes carry the state that must be seen by more than one widget.</p>
+    </section>
+
+    <section>
+      <h2>Tests and examples</h2>
+      <p>The repo checks the behavior at several sizes. ovui tests and examples prove base widgets, scene drawing, images, and standalone frames. ovwidgets tests then cover application startup, stage opening, adapter swaps, widget behavior, frame cadence, headless startup, streaming hooks, and user-like screenshot flows.</p>
+      <ul>
+        <li><code>ovwidgets/tests/test_application.py</code> checks singleton state, common Python classes, <code>call_later()</code>, frame callbacks, settings, and shutdown.</li>
+        <li><code>ovwidgets/tests/test_step26_open_file.py</code> checks <code>open_stage()</code>, <code>open_file()</code>, stage adapter creation, invalid-file handling, and subscription cleanup.</li>
+        <li><code>ovwidgets/tests/test_application_frame_cadence.py</code> and <code>ovwidgets/tests/test_viewport_throttle.py</code> check the update/render split and <code>FrameClock</code> behavior.</li>
+        <li><code>ovwidgets/tests/test_headless_entrypoint.py</code>, <code>test_application_headless_export.py</code>, <code>test_input_drain.py</code>, and <code>test_application_message_drain.py</code> check headless entry, per-frame export, input ordering, and queued app messages.</li>
+        <li><code>ovui/examples</code>, <code>ovui/tests</code>, and <code>ovui/standalone/tests</code> cover the base UI, scene package, image paths, screenshots, and standalone frame behavior.</li>
+      </ul>
+      <p>Those checks prove the run: the same code can start with a desktop window or a headless frame, load data, update widgets, render output, and verify the behavior with focused tests and visible examples.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="section-09.html">Previous: Renderer Frames and Selection Outline</a>
+      <a href="section-11.html">Next: Inspector Pipeline</a>
+    </nav>
+  </main>
+</body>
+</html>

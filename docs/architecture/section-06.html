@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Application</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .application-diagram {
+      padding: 18px;
+    }
+
+    .application-grid {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) auto minmax(190px, 1.15fr) auto minmax(150px, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .application-card,
+    .application-center,
+    .source-card,
+    .source-note {
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+    }
+
+    .application-card,
+    .application-center {
+      min-height: 132px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+      padding: 14px;
+    }
+
+    .application-center {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .application-name,
+    .source-name,
+    .source-note-title {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .application-text,
+    .source-text {
+      color: #44554b;
+      font-size: 0.94rem;
+      line-height: 1.45;
+    }
+
+    .application-arrow,
+    .source-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .source-chain {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) auto minmax(150px, 1fr) auto minmax(150px, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .source-card {
+      min-height: 142px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 14px;
+    }
+
+    .source-card.is-start {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .source-pill {
+      display: inline-block;
+      width: fit-content;
+      max-width: 100%;
+      padding: 3px 8px;
+      border: 1px solid #dce3ea;
+      border-radius: 999px;
+      background: #f7f9fa;
+      color: #24384a;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 0.82rem;
+      overflow-wrap: anywhere;
+    }
+
+    .source-note {
+      margin-top: 12px;
+      padding: 14px;
+    }
+
+    .source-note-title {
+      margin-bottom: 7px;
+    }
+
+    .source-note-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 900px) {
+      .application-grid,
+      .source-chain {
+        grid-template-columns: 1fr;
+      }
+
+      .application-arrow,
+      .source-arrow {
+        transform: rotate(90deg);
+      }
+
+      .application-card,
+      .application-center,
+      .source-card {
+        min-height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="section-05.html">Previous</a>
+      <a href="../architecture.html#section-06" target="_top">Index</a>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Section 6</p>
+      <h1>Application</h1>
+      <p class="lead">Sections 4 and 5 covered ovui widgets and scene drawing pieces. The ovwidgets application is where those parts become a complete tool, with widgets, menus, status text, settings, selection, undo, themes, startup, and frame timing kept together.</p>
+    </header>
+
+    <section>
+      <h2>Purpose</h2>
+      <p>The application contains widgets and holds the app state they share. <code>Application</code> starts ovui, creates the docked work area, opens the stage browser, property inspector, content browser, viewport, and related widgets, then keeps selection, settings, undo, recent files, snapping, and deferred callbacks available while the frame loop runs.</p>
+      <ul>
+        <li>Startup enters through <code>python -m ovwidgets.app</code>, the <code>ovwidgets</code> console command, or the headless entry point.</li>
+        <li><code>Application.run()</code> initializes ovui, applies global styles, writes the saved widget placement, applies the chosen theme, and starts <code>run_async()</code>.</li>
+        <li>For a headless USD launch, <code>Application.run()</code> preconstructs <code>OvRtxRendererAdapter</code> before <code>ui.init</code>; <code>open_file()</code> reuses that renderer before <code>Usd.Stage.Open</code> so ovrtx owns its loader setup before USD opens the stage.</li>
+        <li><code>run_async()</code> creates the menu row, status row, widget windows, default mock adapters, shortcut routing, file-drop handling, and the frame loop.</li>
+        <li>When a stage opens, <code>_load_stage()</code> clears old selection, creates data adapters, hands them to widgets, swaps the viewport renderer, and resets render timing.</li>
+      </ul>
+      <div class="diagram application-diagram" role="img" aria-label="Application connects widgets, common Python classes, data adapters, settings and commands, menu and status, and the frame loop">
+        <div class="application-grid">
+          <div class="application-card">
+            <div class="application-name">Widgets</div>
+            <div class="application-text">Stage browser, property inspector, content browser, viewport, and related tool windows.</div>
+          </div>
+          <div class="application-arrow" aria-hidden="true">&harr;</div>
+          <div class="application-center">
+            <div class="application-name">Application</div>
+            <div class="application-text">Starts the app, creates widgets, routes shared state, and advances each frame.</div>
+          </div>
+          <div class="application-arrow" aria-hidden="true">&harr;</div>
+          <div class="application-card">
+            <div class="application-name">Data adapters</div>
+            <div class="application-text">Stage, property, transform, and renderer adapters feed widget models.</div>
+          </div>
+          <div class="application-card">
+            <div class="application-name">Menu and status</div>
+            <div class="application-text">File actions, edit actions, view choices, status messages, and errors.</div>
+          </div>
+          <div class="application-arrow" aria-hidden="true">&harr;</div>
+          <div class="application-card">
+            <div class="application-name">App state classes</div>
+            <div class="application-text">Selection, settings, undo, recent files, snapping, deferred callbacks, themes, and status messages.</div>
+          </div>
+          <div class="application-arrow" aria-hidden="true">&harr;</div>
+          <div class="application-card">
+            <div class="application-name">Frame loop</div>
+            <div class="application-text">Delayed callbacks fire, viewport updates advance, and rendering happens at the target cadence.</div>
+          </div>
+        </div>
+        <p class="diagram-note">The application connects visible widgets to data adapters and app state. Widgets render their own views while the app routes selection, settings, undo, status messages, and frame work.</p>
+      </div>
+      <p>Changes that affect several widgets at once usually start here: startup, shortcuts, file opening, status messages, settings, theme changes, selection, undo, or viewport cadence.</p>
+    </section>
+
+    <section>
+      <h2>App state classes</h2>
+      <p><code>Application</code> creates the app-owned Python objects before widget windows are opened. These objects are the handoff points for state that outlives one widget: selection, undo history, settings, recent files, delayed callbacks, snap state, status messages, modal helpers, and frame cadence.</p>
+      <ul>
+        <li><code>SelectionBus</code> owns the selected path snapshot. <code>publish()</code> replaces the snapshot, <code>subscribe()</code> notifies the stage browser, property inspector, viewport, and Layers code, and the event source lets subscribers ignore changes they originated.</li>
+        <li><code>UndoManager</code> executes <code>Command.do()</code>, keeps undo and redo stacks, exposes <code>undo()</code> and <code>redo()</code>, and can group several commands into one history entry.</li>
+        <li><code>Settings</code> stores persisted keys such as <code>ui.theme</code>, <code>ui.recent_files</code>, viewport camera defaults, and Layers options. <code>set()</code> notifies subscribers, so menu actions and the settings dialog change live app behavior through the same store.</li>
+        <li><code>RecentFileList</code> keeps a capped most-recently-used list. Successful open and save paths call <code>add()</code>, then <code>Application</code> writes <code>get_ordered()</code> back to settings for the menu and content browser.</li>
+        <li><code>call_later()</code> and <code>CallbackHandle</code> route delayed work through the frame loop. The application runs due callbacks before viewport update and render work; widgets use that path for debounced filters, deferred rebuilds, and status clearing.</li>
+        <li><code>SnapSystem</code> chains snap providers, <code>ManagedWindow</code> wraps widget-window lifetime and themed frame rebuilds, <code>FrameClock</code> gates viewport rendering, <code>StatusBar</code> and <code>ErrorReporter</code> write visible status text, and dialog helpers such as <code>confirm_dialog()</code> and <code>save_file_dialog()</code> keep modal callback handling in one place.</li>
+      </ul>
+      <p>Widgets receive the object or callback they need, update it through its public method, and let subscribers or the next frame carry the visible result. That keeps selection, settings, commands, and status text consistent without requiring widget-to-widget imports.</p>
+    </section>
+
+    <section>
+      <h2>Sources</h2>
+      <p>The application source is split by job. Start with <code>application.py</code> when the behavior involves startup or several widgets, then move to the smaller file that owns the visible feature or common class.</p>
+      <div class="diagram application-diagram" role="img" aria-label="Application sources from entry points through application files and common classes">
+        <div class="source-chain">
+          <div class="source-card is-start">
+            <div class="source-name">Entry points</div>
+            <span class="source-pill">app/__main__.py</span>
+            <span class="source-pill">app/headless.py</span>
+            <div class="source-text">Parse startup arguments, create <code>Application</code>, and launch the app.</div>
+          </div>
+          <div class="source-arrow" aria-hidden="true">&rarr;</div>
+          <div class="source-card">
+            <div class="source-name">App files</div>
+            <span class="source-pill">application.py</span>
+            <span class="source-pill">menu_bar.py</span>
+            <span class="source-pill">status_bar.py</span>
+            <span class="source-pill">settings_dialog.py</span>
+            <span class="source-pill">frame_clock.py</span>
+            <div class="source-text">Build the running app, menu row, status row, settings UI, and viewport timing.</div>
+          </div>
+          <div class="source-arrow" aria-hidden="true">&harr;</div>
+          <div class="source-card">
+            <div class="source-name">Common classes</div>
+            <span class="source-pill">selection.py</span>
+            <span class="source-pill">settings.py</span>
+            <span class="source-pill">undo.py</span>
+            <span class="source-pill">scheduler.py</span>
+            <span class="source-pill">managed_window.py</span>
+            <div class="source-text">Provide shared state, delayed callbacks, command history, and widget window behavior.</div>
+          </div>
+        </div>
+        <div class="source-note">
+          <div class="source-note-title">Tests pin the shared behavior</div>
+          <div class="source-note-list">
+            <span class="source-pill">test_application.py</span>
+            <span class="source-pill">test_selection.py</span>
+            <span class="source-pill">test_undo.py</span>
+            <span class="source-pill">test_settings.py</span>
+            <span class="source-pill">test_theme_switching.py</span>
+            <span class="source-pill">test_application_frame_cadence.py</span>
+          </div>
+        </div>
+        <p class="diagram-note">Read the entry point for launch behavior, <code>Application</code> for shared wiring, and <code>ovwidgets.common</code> for reusable classes.</p>
+      </div>
+      <ul>
+        <li><code>ovwidgets/ovwidgets/app</code> contains <code>application.py</code>, the main source for startup, widget creation, file opening, adapter handoff, frame updates, and shutdown.</li>
+        <li>The same app package contains <code>menu_bar.py</code>, <code>status_bar.py</code>, and <code>settings_dialog.py</code>, which own the visible app chrome around widgets.</li>
+        <li><code>ovwidgets/ovwidgets/common</code> owns common Python classes, widget-window helpers, mock adapters, style resources, and test-friendly stand-ins.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>How app state reaches widgets</h2>
+      <p>App state reaches widgets through ordinary Python objects. <code>Application</code> creates instances of common Python classes first, then passes explicit objects such as selection, undo, settings, recent files, or an open-file callback when a widget needs them.</p>
+      <ul>
+        <li>Selection travels through <code>SelectionBus.publish()</code> and <code>subscribe()</code>; widgets compare the event source when they need to avoid echoing their own change.</li>
+        <li>Settings travel through <code>Settings.get()</code>, <code>set()</code>, and <code>subscribe()</code>; theme changes call <code>set_theme()</code> and rebuild widget backgrounds.</li>
+        <li>Commands travel through <code>UndoManager.push()</code>, <code>undo()</code>, and <code>redo()</code>; menus and shortcuts read the same undo state.</li>
+        <li>Data reaches widgets when <code>Application._load_stage()</code> calls widget setters such as <code>set_adapter()</code>, <code>set_property_adapter_factory()</code>, <code>attach_stage()</code>, and <code>set_renderer()</code>.</li>
+        <li>Delayed work reaches widgets when <code>call_later()</code> adds a callback and <code>_on_frame_update()</code> runs due callbacks before viewport update and render work.</li>
+      </ul>
+      <p>The result is readable: instances of common Python classes keep selection, settings, commands, and current data; widgets read from or update those objects; adapters feed widget models; and ovui redraws the visible result on the next frames.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="section-05.html">Previous: Scene Tools</a>
+      <a href="../architecture.html#section-06" target="_top">Index</a>
+    </nav>
+  </main>
+</body>
+</html>

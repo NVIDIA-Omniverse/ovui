@@ -1,0 +1,45 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    # Step 4.2: exercise is_time_sampled / is_locked / is_authored wiring.
+    #
+    # ``GeoSphere`` authors two explicit state attributes and inherits a
+    # handful of UsdGeomImageable schema attributes that remain unauthored —
+    # the Property Inspector shows all three flag states side-by-side:
+    #
+    #   * ``radius`` — time-sampled (two keys); the adapter's
+    #     ``GetNumTimeSamples() > 0`` check surfaces ``is_time_sampled=True``
+    #     and the row's FloatDrag becomes ``enabled=False`` (greyed out).
+    #   * ``someLocked`` — a custom ``float`` attribute with
+    #     ``customData["locked"] = True``; the row is disabled via
+    #     ``is_locked=True``.
+    #   * ``visibility`` / ``purpose`` / ``doubleSided`` — UsdGeomImageable
+    #     schema attributes with no authored opinion; ``IsAuthored()`` is
+    #     False so the labels render with the muted ``::not_authored``
+    #     colour.
+    #
+    # This covers all three Step 4.2 code paths in a single scene so the
+    # qa screenshot proves the full feature at once.
+    def Sphere "GeoSphere" (
+        kind = "component"
+    )
+    {
+        double radius.timeSamples = {
+            0: 1.0,
+            24: 2.0,
+        }
+        custom float someLocked = 0.5 (
+            customData = {
+                bool locked = 1
+            }
+        )
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

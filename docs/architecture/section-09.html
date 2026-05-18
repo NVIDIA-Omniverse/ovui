@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Renderer Frames and Selection Outline</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .render-diagram {
+      padding: 18px;
+    }
+
+    .render-flow {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .render-card {
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+      padding: 14px;
+    }
+
+    .render-card.is-start {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .render-number {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 999px;
+      background: var(--accent);
+      color: #ffffff;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .render-card.is-start .render-number {
+      background: #1f3f33;
+    }
+
+    .render-body {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .render-name {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .render-text {
+      color: #44554b;
+      font-size: 0.94rem;
+      line-height: 1.45;
+    }
+
+    .render-pill {
+      display: inline-block;
+      width: fit-content;
+      max-width: 100%;
+      padding: 3px 7px;
+      border: 1px solid #dce3ea;
+      border-radius: 999px;
+      background: #f7f9fa;
+      color: #24384a;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 0.75rem;
+      overflow-wrap: anywhere;
+    }
+
+    .render-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .selection-row {
+      margin-top: 14px;
+      padding: 14px;
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+    }
+
+    .selection-title {
+      font-weight: 700;
+      line-height: 1.2;
+      margin-bottom: 8px;
+      color: #33463b;
+    }
+
+    .selection-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .selection-cell {
+      padding: 10px 12px;
+      border-radius: 6px;
+      border: 1px solid #d7e1da;
+      background: #f7faf8;
+      color: #233429;
+      font-size: 0.92rem;
+      line-height: 1.4;
+    }
+
+    .selection-cell .render-pill {
+      margin-top: 6px;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 640px) {
+      .render-card {
+        gap: 10px;
+        padding: 12px;
+      }
+
+      .render-number {
+        width: 26px;
+        height: 26px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="section-08.html">Previous</a>
+      <a href="../architecture.html#section-09" target="_top">Index</a>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Section 9</p>
+      <h1>Renderer Frames and Selection Outline</h1>
+      <p class="lead">After the adapters are in place, two flows keep the viewport coherent: rendered pixels travel from the ovrtx renderer to the viewport image each frame, and selection travels between the stage browser, the viewport, and the property inspector through one shared object.</p>
+    </header>
+
+    <section>
+      <h2>From ovrtx to the viewport image</h2>
+      <p>The viewport is a handoff point, not a second renderer. ovrtx renders the current stage from the current camera view, then <code>ViewportWidget</code> asks the renderer adapter for the next image that matches that view. <code>ImageBridge</code> hands the result to ovui in the form the image widget can display, and the viewport keeps camera input, picking, and selection feedback attached to the image the user sees.</p>
+      <ul>
+        <li>ovrtx owns the render work: it receives the stage and camera state and produces the frame image.</li>
+        <li>The OpenUSD adapter authors the viewport session <code>RenderProduct</code>, including <code>uniform uint[] deviceIds = [0]</code>, so ovrtx 0.3 uses the expected device for render and pick work.</li>
+        <li><code>OvRtxRendererAdapter</code> is the app-facing renderer object, so the viewport can request frames without carrying ovrtx setup details.</li>
+        <li><code>ImageBridge</code> accepts either a GPU-backed <code>GpuFrame</code> or a CPU RGBA image and gives it to <code>ByteImageProvider</code>.</li>
+        <li><code>ui.ImageWithProvider</code> shows that provider inside the viewport while <code>SceneView</code> keeps camera gestures and picking aligned with the visible image.</li>
+      </ul>
+      <div class="diagram render-diagram" role="img" aria-label="Frame flow from ovrtx renderer to frame handoff, image provider, visible viewport, and input and selection feedback">
+        <div class="render-flow">
+          <div class="render-card is-start">
+            <div class="render-number">1</div>
+            <div class="render-body">
+              <div class="render-name">ovrtx renderer</div>
+              <div class="render-text">Renders the active stage from the viewport camera into a frame image.</div>
+            </div>
+          </div>
+          <div class="render-arrow" aria-hidden="true">&darr;</div>
+          <div class="render-card">
+            <div class="render-number">2</div>
+            <div class="render-body">
+              <div class="render-name">Frame handoff</div>
+              <span class="render-pill">OvRtxRendererAdapter</span>
+              <div class="render-text">Gives the viewport the frame while hiding ovrtx details from the widget.</div>
+            </div>
+          </div>
+          <div class="render-arrow" aria-hidden="true">&darr;</div>
+          <div class="render-card">
+            <div class="render-number">3</div>
+            <div class="render-body">
+              <div class="render-name">Image provider</div>
+              <span class="render-pill">ImageBridge</span>
+              <span class="render-pill">ByteImageProvider</span>
+              <div class="render-text">Places the frame into the ovui provider that the image widget knows how to draw.</div>
+            </div>
+          </div>
+          <div class="render-arrow" aria-hidden="true">&darr;</div>
+          <div class="render-card">
+            <div class="render-number">4</div>
+            <div class="render-body">
+              <div class="render-name">Visible viewport</div>
+              <span class="render-pill">ui.ImageWithProvider</span>
+              <div class="render-text">Presents the latest image with the viewport's aspect-preserving layout.</div>
+            </div>
+          </div>
+          <div class="render-arrow" aria-hidden="true">&darr;</div>
+          <div class="render-card">
+            <div class="render-number">5</div>
+            <div class="render-body">
+              <div class="render-name">Input and selection feedback</div>
+              <span class="render-pill">SceneView</span>
+              <span class="render-pill">SelectionBus</span>
+              <div class="render-text">Keeps clicks, camera movement, and highlights tied to the same view that produced the image.</div>
+            </div>
+          </div>
+        </div>
+        <p class="diagram-note">The renderer produces the image, the bridge makes it drawable by ovui, and the viewport keeps interaction attached to that displayed image.</p>
+      </div>
+      <p>That split keeps responsibilities clear. The renderer adapter knows how to speak to ovrtx, the bridge knows how to feed ovui image data, and the viewport knows what the user is looking at and interacting with.</p>
+    </section>
+
+    <section>
+      <h2>Zero-copy and CPU fallback</h2>
+      <p>The image handoff has a fast route and a fallback route. When zero-copy is enabled and ovui accepts GPU-backed image data, the bridge can display a renderer frame without first copying it through CPU memory. When that is not available, the renderer returns a normal RGBA image that the same provider can display.</p>
+      <ul>
+        <li><code>ZeroCopyState</code> records whether GPU presentation is disabled, being probed, enabled, or in fallback.</li>
+        <li><code>GpuFrame</code> represents the GPU-backed frame long enough for <code>ImageBridge</code> to give it to ovui.</li>
+        <li>If ovui accepts the GPU-backed frame, later frames stay on that route. If not, the state switches to CPU fallback.</li>
+        <li>The CPU route gives the provider a compact uint8 RGBA image, so the viewport still displays the same frame content.</li>
+      </ul>
+      <p>The viewport does not need a separate drawing path for these cases. It asks for a frame, hands the result to the bridge, and lets the bridge choose the form the image provider receives.</p>
+    </section>
+
+    <section>
+      <h2>Selection across widgets</h2>
+      <p>Selection is the second shared flow. The stage browser, the viewport, and the property inspector each show selection in a different way, but none of them has to call the others directly. A change goes to <code>SelectionBus</code>, and each widget updates its own display from the same selection state.</p>
+      <ul>
+        <li>The stage browser publishes selection when the tree changes, and it listens for selection that starts in the viewport.</li>
+        <li>The viewport listens for selection so its renderer-owned highlight and native ovrtx outline match the current item set.</li>
+        <li>The property inspector listens for the same selection and rebuilds around the selected scene items.</li>
+        <li><code>SelectionBus</code> is the meeting point, which keeps sibling widgets independent while still making them move together.</li>
+      </ul>
+      <div class="diagram render-diagram" role="img" aria-label="Selection flow between stage browser, SelectionBus, viewport, and property inspector with picking returning through the bus">
+        <div class="selection-row">
+          <div class="selection-title">Stage browser, viewport, and property inspector meet at SelectionBus</div>
+          <div class="selection-grid">
+            <div class="selection-cell">
+              <strong>Stage browser</strong>
+              <div>Changes tree selection and follows selection from elsewhere.</div>
+              <span class="render-pill">StageWidget</span>
+            </div>
+            <div class="render-arrow" aria-hidden="true">&darr;</div>
+            <div class="selection-cell">
+              <strong>SelectionBus</strong>
+              <div>Holds the current selection state and notifies the widgets that care.</div>
+              <span class="render-pill">SelectionBus</span>
+            </div>
+            <div class="render-arrow" aria-hidden="true">&darr;</div>
+            <div class="selection-cell">
+              <strong>Viewport</strong>
+              <div>Updates the renderer highlight, outline, and pick results.</div>
+              <span class="render-pill">ViewportWidget</span>
+            </div>
+            <div class="render-arrow" aria-hidden="true">&darr;</div>
+            <div class="selection-cell">
+              <strong>Property inspector</strong>
+              <div>Shows the editable information for the selected scene items.</div>
+              <span class="render-pill">PropertyWindow</span>
+            </div>
+          </div>
+        </div>
+        <p class="diagram-note">A pick in the viewport uses the same bus, so the stage browser and property inspector update from one shared selection change.</p>
+      </div>
+      <p>The important architectural point is the direction of communication. A widget changes selection once, the bus records it once, and the other widgets react to that one change instead of forming direct links to each other.</p>
+    </section>
+
+    <section>
+      <h2>Selection outline and picking</h2>
+      <p>Picking starts from the image the user is looking at. A click or drag in the viewport asks the renderer what scene item is under the current pixel or rectangle for the current view and RenderProduct. The result becomes the app selection through <code>SelectionBus</code>, and the viewport sends that selection back to the renderer-owned outline and highlight path.</p>
+      <ul>
+        <li><code>PickGesture</code> handles a point click, while <code>PickRectGesture</code> handles drag selection.</li>
+        <li><code>OvRtxRendererAdapter</code> enqueues point and rectangle pick queries, tracks in-flight queries in FIFO order, drains canceled callbacks, and preserves the latest hit when ovrtx collapses rapid same-RenderProduct replacement queries.</li>
+        <li><code>RendererAdapter</code> answers the pick using the same stage, camera view, and RenderProduct that produced the rendered frame.</li>
+        <li>The viewport publishes the renderer's answer to <code>SelectionBus</code>, so the stage browser and property inspector follow the pick.</li>
+        <li>Selection feedback is renderer-owned: <code>set_selection_highlight()</code> configures native ovrtx selection group styling and writes selection-outline group deltas only for paths whose state changed.</li>
+      </ul>
+      <p>The loop stays readable because each part owns one visible result. The bus owns what is selected, the renderer owns the image, pick answers, highlight, and native selection outline, and the viewport owns the user gesture that starts the change. New selection tools can join by publishing a selection change through the same path.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="section-08.html">Previous: Data Adapters</a>
+      <a href="section-10.html">Next: Startup, Data Flow, and Verification</a>
+    </nav>
+  </main>
+</body>
+</html>

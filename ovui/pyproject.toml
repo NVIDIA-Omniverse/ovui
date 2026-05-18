@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel", "cmake>=3.22", "pybind11>=2.11"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovui"
+dynamic = ["version"]
+description = "ovui — GPU-accelerated Python UI toolkit"
+requires-python = ">=3.8"
+license = {text = "NVIDIA Proprietary"}
+authors = [
+    {name = "NVIDIA Corporation"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Software Development :: User Interfaces",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/NVIDIA-Omniverse/ovui"
+
+[project.optional-dependencies]
+examples = [
+    "numpy>=1.21",
+    "cuda-python",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+markers = [
+    "requires_gl: test needs an OpenGL context (CUDA-GL interop, FBO) — auto-skipped under headless Vulkan",
+    "requires_glfw: test needs the GLFW windowing platform (streaming pipeline) — auto-skipped under any OMNIUI_HEADLESS=1 mode (Vulkan or EGL surfaceless)",
+    "requires_cuda: test needs a CUDA runtime (libcudart) loadable in-process — auto-skipped when libcudart.so is unavailable",
+]
+
+[tool.setuptools]
+# Package discovery is handled by setup.py
+py-modules = []

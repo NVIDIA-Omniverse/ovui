@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ovui Project Overview</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .overview-diagram {
+      padding: 18px;
+    }
+
+    .overview-grid {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) auto minmax(190px, 1.05fr) auto minmax(190px, 1.05fr);
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .overview-card {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 14px;
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+    }
+
+    .overview-card {
+      min-height: 168px;
+      justify-content: center;
+    }
+
+    .overview-card.is-primary {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .overview-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .entry-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .entry-card {
+      min-height: 88px;
+      padding: 12px;
+      border: 1px solid #dce3ea;
+      border-radius: 8px;
+      background: #f9fbfa;
+      color: #223128;
+    }
+
+    .overview-name {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .overview-text,
+    .entry-text {
+      color: #44554b;
+      font-size: 0.94rem;
+      line-height: 1.45;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 900px) {
+      .overview-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .overview-arrow {
+        transform: rotate(90deg);
+      }
+
+      .overview-card {
+        min-height: auto;
+      }
+
+      .entry-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 560px) {
+      .entry-strip {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="../architecture.html#section-01" target="_top">Index</a>
+      <span>Section 1</span>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Section 1</p>
+      <h1>ovui Project Overview</h1>
+      <p class="lead">ovui is a Python UI framework, a library of ready-made app widgets, and a runnable reference application for building scene, viewport, and data tools that look polished and behave consistently. The Python-facing UI layer (<code>ovui</code>) supplies the primitives; ovwidgets supplies the app widgets (stage browser, property inspector, content browser, viewport, composition view); data adapters connect those widgets to OpenUSD or custom backends; the supplied application wires everything together; and an inspector pipeline lets people and AI coding agents drive the running UI through the same screenshot-action loop.</p>
+    </header>
+
+    <section>
+      <h2>What ovui is</h2>
+      <p>ovui gives Python code a UI layer for windows, rows, columns, labels, buttons, menus, inspectors, browser views, viewports, and related app UI. It includes lower-level primitives for focused controls and higher-level app widgets for complete views, so the same toolkit can support a single control area or a larger application view.</p>
+      <ul>
+        <li><strong>Python-facing UI layer:</strong> windows, layout containers, controls, styling, value models, menus, images, markdown, screenshots, and frame-driven updates.</li>
+        <li><strong>App widgets, examples, and supplied app code:</strong> stage browsing, property inspection, content browser workflows, composition views, viewport interaction, menus, status feedback, settings, recent files, selection, undo, and shortcuts.</li>
+        <li><strong>Scene and viewport pieces:</strong> scene drawing, camera gestures, picking, selection outlines, transform manipulators, rendered frames, and viewport status feedback.</li>
+        <li><strong>Data and state adapters:</strong> adapters connect widgets to OpenUSD stages, local files, ovrtx rendering, in-memory test data, and project-specific data sources without forcing each widget to know every backend detail.</li>
+        <li><strong>Fast iteration:</strong> views are ordinary Python code, so a tool can be run and inspected while the view code is still changing.</li>
+      </ul>
+      <p>The result is a toolkit with both UI vocabulary and application structure. Python describes the visible view; models and adapters carry values, hierarchy, files, transforms, rendered frames, and selection between the view and the data behind it.</p>
+    </section>
+
+    <section>
+      <h2>The project in three parts</h2>
+      <p>The repository is easiest to understand by following the path from UI primitives to app workflows and then to data. The base layer supplies the Python UI vocabulary. ovwidgets adds application views and app state. Scene, viewport, and adapter code decide where hierarchy data, attributes, files, transforms, and rendered frames come from.</p>
+      <div class="diagram overview-diagram" role="img" aria-label="ovui project parts: Python UI layer, app widgets and application views, and scene, viewport, and data adapters">
+        <div class="overview-grid">
+          <div class="overview-card is-primary">
+            <div class="overview-name">Python UI layer</div>
+            <div class="overview-text">The base runtime gives Python tools windows, frames, stacks, controls, styling, value models, menus, images, markdown, screenshots, input handling, and frame updates.</div>
+          </div>
+          <div class="overview-arrow" aria-hidden="true">&rarr;</div>
+          <div class="overview-card">
+            <div class="overview-name">App widgets and application views</div>
+            <div class="overview-text">The application contains app widgets for scene hierarchy, properties, the content browser, composition views, and viewport work, with common Python classes for selection, undo, settings, recent files, and frame timing.</div>
+          </div>
+          <div class="overview-arrow" aria-hidden="true">&harr;</div>
+          <div class="overview-card">
+            <div class="overview-name">Scene, viewport, and data adapters</div>
+            <div class="overview-text">Scene helpers add 3D drawing, camera motion, picking, and manipulators. Adapters let widgets read and edit OpenUSD stages, local files, renderer output, in-memory tests, or a custom data source.</div>
+          </div>
+        </div>
+        <div class="entry-strip" aria-label="Entry paths">
+          <div class="entry-card">
+            <div class="overview-name">Run the application</div>
+            <div class="entry-text">See the complete experience working together.</div>
+          </div>
+          <div class="entry-card">
+            <div class="overview-name">Use app widgets</div>
+            <div class="entry-text">Place a supplied workflow in a larger tool.</div>
+          </div>
+          <div class="entry-card">
+            <div class="overview-name">Replace data</div>
+            <div class="entry-text">Keep the UI while changing the backend connection.</div>
+          </div>
+          <div class="entry-card">
+            <div class="overview-name">Use UI primitives</div>
+            <div class="entry-text">Create focused controls directly from the Python UI layer.</div>
+          </div>
+        </div>
+        <p class="diagram-note">ovui supports several adoption depths: keep the full application, use selected widgets, write a new adapter behind an existing widget, or build directly from the Python UI layer.</p>
+      </div>
+      <ul>
+        <li><strong>Python UI layer:</strong> use this when a tool needs custom controls, layouts, styling, markdown, image display, screenshots, scene drawing, or a focused Python view without the supplied application.</li>
+        <li><strong>App widgets and application views:</strong> use these when a tool needs stage browsing, property inspection, content browsing, composition views, viewport work, menus, status feedback, undo, settings, recent files, and shared selection.</li>
+        <li><strong>Scene, viewport, and data adapters:</strong> use these when the visible workflow should read or edit OpenUSD, local files, rendered frames, mock data, or another backend.</li>
+      </ul>
+      <p>These parts explain why the repository contains UI primitives, app widgets, a runnable application, scene tools, and adapters in one place. They are different entry points into the same tool-building system, not separate demos competing with each other.</p>
+    </section>
+
+    <section>
+      <h2>Ways to use ovui</h2>
+      <p>A project can adopt ovui from the supplied application, from one app widget, from an adapter boundary, from the Python UI layer, or as a set of reference patterns for an AI coding agent. Those paths can be mixed when the tool grows.</p>
+      <ul>
+        <li><strong>Run the complete application.</strong> Use it as a working reference for how menus, status feedback, settings, recent files, shortcuts, file opening, drag and drop, shared selection, undo, widgets, viewport cadence, and backend wiring fit together.</li>
+        <li><strong>Add or extend an app widget.</strong> Place a stage browser, property inspector, content browser, viewport, or composition view into a product workflow, then adjust filtering, display, editing behavior, toolbar actions, or viewport tool behavior as needed.</li>
+        <li><strong>Keep widgets and replace the data.</strong> Connect a stage browser, property inspector, viewport, content browser, or composition view to proprietary data, a remote backend, local storage, generated data, or a test backend.</li>
+        <li><strong>Write new data adapters.</strong> Use adapters as the connection point for hierarchy data, attributes, transforms, rendered frames, content browsing, and composition data.</li>
+        <li><strong>Use the <code>ovui</code> API directly.</strong> Build focused controls from windows, stacks, fields, tree views, menus, markdown, image providers, styles, screenshots, scene views, gestures, and manipulators; app widgets can still be mixed in later.</li>
+        <li><strong>Use ovwidgets as skills for Claude Code, Codex, or Cursor.</strong> The repository ships Claude Code-compatible skills in <code>skills/</code>: <code>skills/omniverse-ui-apis</code> for atomic <code>ovui</code> construction, <code>skills/omniverse-ui-widgets</code> for composing standalone apps from the existing widget set, and <code>skills/omniverse-ui-inspector</code> for driving a running app through a screenshot-first inspector. Pointing an AI coding agent at these skills hands it the proven layout, model-view, styling, adapter, and inspector patterns the supplied application already uses, so the generated tool starts from real ovwidgets components and patterns rather than generic UI code, and looks and behaves like the rest of the toolkit.</li>
+      </ul>
+      <p>These choices can be combined: begin with the full application, replace one backend, add one widget, reuse the content browser, build a custom tool area from UI primitives, and let an AI coding agent generate the next tool by reusing ovwidgets through the skills above. ovui is organized so a project can take the amount that matches the tool's goal without rewriting every piece at once.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="../architecture.html#section-01" target="_top">Index</a>
+      <a href="section-02.html">Next: Build Choices</a>
+    </nav>
+  </main>
+</body>
+</html>

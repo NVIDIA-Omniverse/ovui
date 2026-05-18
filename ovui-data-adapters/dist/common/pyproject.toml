@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovui-data-adapters-common"
+dynamic = ["version"]
+description = "Abstract UI data-adapter contracts (no runtime dependencies)."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["ovui_data_adapters.common*"]
+# Source lives two levels up at ``ovui-data-adapters/ovui_data_adapters/common/`` —
+# same ``dist/<sub>/pyproject.toml`` + ``where = "../.."`` pattern as
+# ``ovwidgets/dist/``. This pattern supports editable installs
+# (``pip install -e``) and wheel builds run in-tree; **sdist builds from
+# the ``dist/<sub>/`` stub are NOT supported** because setuptools cannot
+# include source two levels above the project root in a self-contained
+# release tarball. If sdist publishing of adapters is ever needed,
+# restructure to co-located pyprojects
+# (``ovui-data-adapters/<sub>/pyproject.toml`` next to source with
+# ``where = ["."]``).
+where = ["../.."]

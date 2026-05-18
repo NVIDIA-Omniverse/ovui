@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovwidgets-app"
+dynamic = ["version"]
+description = "OvWidgets core: Application, ABCs, style, settings, dialogs, undo, selection"
+requires-python = ">=3.10"
+dependencies = [
+    "ovui>=0.1.0",
+    "ovwidgets-common[testing]>=0.1.0",
+    "ovwidgets-stage>=0.1.0",
+    "ovwidgets-layers>=0.1.0",
+    "ovwidgets-content>=0.1.0",
+    "ovwidgets-property>=0.1.0",
+    "ovwidgets-viewport>=0.1.0",
+    "ovui-data-adapters-common>=0.1.0",
+    "ovui-data-adapters-openusd>=0.1.0",
+]
+
+[project.optional-dependencies]
+# dev: ovwidgets.app.testing/mock_backend.py has a hard import from
+# ovwidgets.content.backends — install ovwidgets-content before running tests
+# that use MockBackend.
+dev = ["pytest", "libcst", "tomli", "ovwidgets-content>=0.1.0"]
+
+[project.scripts]
+ovwidgets = "ovwidgets.app.__main__:main_sync"
+ovgear = "ovwidgets.app.__main__:main_sync"
+ovwidgets-headless = "ovwidgets.app.headless:main"
+ovgear-headless = "ovwidgets.app.headless:main"
+
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["ovwidgets.app*"]   # scoped to ovwidgets.app and sub-packages
+where = ["../.."]              # two levels up from dist/app/ → repo root
+
+# Icon package data moved to ``ovwidgets-common`` in Step 8/13 (icons/,
+# resources/icons/, style/icons/ are git-mv'd to common). Consumers
+# import via ``ovwidgets.common.style.urls`` (re-exported as
+# ``ovwidgets.app.style.urls`` for backward compatibility), and chevron
+# path computations resolve through ``importlib.resources.files(
+# "ovwidgets.common")`` so wheel-built consumers find the icons under
+# the common distribution rather than this app distribution.

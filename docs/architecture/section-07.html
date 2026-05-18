@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Widgets and Data Adapters</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .widget-diagram {
+      padding: 18px;
+    }
+
+    .widget-flow {
+      display: grid;
+      grid-template-columns: minmax(190px, 1fr) minmax(160px, 0.8fr) minmax(190px, 1fr);
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .widget-column,
+    .adapter-column,
+    .application-card,
+    .independence-card {
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+    }
+
+    .widget-column,
+    .adapter-column {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+    }
+
+    .application-card {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 10px;
+      padding: 14px;
+      background: #dbe9e2;
+      color: #1f3f33;
+      text-align: center;
+    }
+
+    .diagram-title,
+    .application-title,
+    .widget-name,
+    .independence-title {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .diagram-title {
+      margin-bottom: 2px;
+      color: #33463b;
+    }
+
+    .widget-card,
+    .data-card {
+      min-height: 74px;
+      padding: 10px;
+      border: 1px solid #dce3ea;
+      border-radius: 8px;
+      background: #f9fbfa;
+    }
+
+    .widget-card.is-primary {
+      background: #eef6f2;
+      border-color: #bfd1c8;
+    }
+
+    .widget-text,
+    .application-text,
+    .independence-text {
+      color: #44554b;
+      font-size: 0.94rem;
+      line-height: 1.45;
+    }
+
+    .widget-rails {
+      display: grid;
+      gap: 8px;
+      align-content: center;
+    }
+
+    .rail {
+      height: 2px;
+      background: var(--accent);
+      opacity: 0.8;
+    }
+
+    .rail:nth-child(2),
+    .rail:nth-child(4) {
+      opacity: 0.45;
+    }
+
+    .independence-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .independence-card {
+      min-height: 132px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 14px;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 820px) {
+      .widget-flow,
+      .independence-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .widget-rails {
+        grid-template-columns: repeat(5, 1fr);
+      }
+
+      .rail {
+        height: 2px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="section-06.html">Previous</a>
+      <a href="../architecture.html#section-07" target="_top">Index</a>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Section 7</p>
+      <h1>Widgets and Data Adapters</h1>
+      <p class="lead">After the ovui widgets, scene drawing tools, and application are in place, ovwidgets has enough structure for app widgets that can be kept, derived from, copied, or replaced when building a scene tool.</p>
+    </header>
+
+    <section>
+      <h2>Purpose</h2>
+      <p>The app widgets are ordinary Python widgets, but each one reads through an adapter instead of hard-coding a single backend. That keeps the visible workflow stable while the app decides whether the data comes from startup mocks, an opened USD stage, local files, or a renderer.</p>
+      <ul>
+        <li>Widgets own their docked window, inner widget, model objects, delegates, filters, and local gestures.</li>
+        <li>Adapters supply hierarchy, attributes, files, rendered frames, transforms, and composition state.</li>
+        <li>The application creates or swaps adapters when a stage opens, then calls widget methods such as <code>set_adapter()</code>, <code>set_property_adapter_factory()</code>, <code>attach_stage()</code>, and <code>set_renderer()</code>.</li>
+        <li>App state classes such as <code>SelectionBus</code> and <code>UndoManager</code>, plus settings, status text, and deferred callbacks, keep selection, command history, and visible messages consistent.</li>
+      </ul>
+      <div class="diagram widget-diagram" role="img" aria-label="App widgets receive scene, object, file, render, and composition data from adapters while the application shares selection and settings">
+        <div class="widget-flow">
+          <div class="widget-column">
+            <div class="diagram-title">App widgets</div>
+            <div class="widget-card is-primary">
+              <div class="widget-name">Stage browser</div>
+              <div class="widget-text">Scene hierarchy and selection rows.</div>
+            </div>
+            <div class="widget-card">
+              <div class="widget-name">Property inspector</div>
+              <div class="widget-text">Grouped object attributes and edit rows.</div>
+            </div>
+            <div class="widget-card">
+              <div class="widget-name">Content browser</div>
+              <div class="widget-text">Files, folders, bookmarks, and open actions.</div>
+            </div>
+            <div class="widget-card">
+              <div class="widget-name">Viewport</div>
+              <div class="widget-text">Rendered image, camera motion, picks, and gizmos.</div>
+            </div>
+            <div class="widget-card">
+              <div class="widget-name">Composition stack</div>
+              <div class="widget-text">Composition order, save state, and authoring target.</div>
+            </div>
+          </div>
+          <div class="application-card">
+            <div class="application-title">Application</div>
+            <div class="widget-rails" aria-hidden="true">
+              <div class="rail"></div>
+              <div class="rail"></div>
+              <div class="rail"></div>
+              <div class="rail"></div>
+              <div class="rail"></div>
+            </div>
+            <div class="application-text">Creates widgets, owns instances of common Python classes, and hands each widget the adapter it needs.</div>
+          </div>
+          <div class="adapter-column">
+            <div class="diagram-title">Data adapters</div>
+            <div class="data-card">
+              <div class="widget-name"><code>StageAdapter</code></div>
+              <div class="widget-text">Hierarchy, item names, type data, visibility, rename, and reparent.</div>
+            </div>
+            <div class="data-card">
+              <div class="widget-name"><code>PropertyAdapter</code></div>
+              <div class="widget-text">Selected paths, attribute metadata, values, edit flow, and change notices.</div>
+            </div>
+            <div class="data-card">
+              <div class="widget-name"><code>BackendAdapter</code></div>
+              <div class="widget-text">URL cleanup, stat, listing, copy, move, delete, folders, and file changes.</div>
+            </div>
+            <div class="data-card">
+              <div class="widget-name"><code>RendererAdapter</code> and <code>TransformAdapter</code></div>
+              <div class="widget-text">Frames, picks, highlights, local transforms, and world transforms.</div>
+            </div>
+            <div class="data-card">
+              <div class="widget-name">Composition stack data</div>
+              <div class="widget-text">Ordered stack data, authoring target, dirty state, mute state, lock state, and prim specs.</div>
+            </div>
+          </div>
+        </div>
+        <p class="diagram-note">The application is the meeting point. Widgets stay focused on their own UI, while adapters provide the data each widget needs to draw and edit.</p>
+      </div>
+      <p>This organization is the practical reuse point for ovwidgets. The viewport can stay in place while the renderer is replaced, the content browser can stay in place while storage is replaced, or the property inspector can stay in place while new property sections are added, all without rewriting the rest of the app.</p>
+    </section>
+
+    <section>
+      <h2>Stage browser and scene data</h2>
+      <p>The stage browser turns scene hierarchy into a tree the user can search, expand, select, rename, and reorganize. <code>StageWindow</code> owns the docked window; <code>StageWidget</code> owns the search bar, tree, footer counts, selection wiring, rename controller, and drag target feedback.</p>
+      <ul>
+        <li><code>HierarchyModel</code> wraps <code>StageAdapter</code> for <code>ui.TreeView</code> and lazy-loads children as rows are expanded.</li>
+        <li><code>StageDelegate</code> draws type labels, visibility state, badges, branch icons, and row styling.</li>
+        <li><code>StageAdapter</code> supplies roots, children, display names, type names, item flags, badge flags, visibility, rename, reparent, filter support, and change notices.</li>
+        <li>Selection travels through <code>SelectionBus</code>, so a tree click can update the property inspector and viewport without direct imports between widgets.</li>
+      </ul>
+      <p>The browser is therefore useful beyond the default app. A new scene backend can provide the same adapter behavior and still reuse the tree, filtering, visibility column, rename flow, and selection sync.</p>
+    </section>
+
+    <section>
+      <h2>Property inspector and object data</h2>
+      <p>The property inspector follows selection. When selected paths change, <code>PropertyWindow</code> asks its factory for a fresh <code>PropertyAdapter</code>, then rebuilds the visible sections for those objects. The widget does not need to know how the backend stores attributes.</p>
+      <ul>
+        <li><code>AttributesWidget</code> is the default catch-all property section; it groups attributes from metadata and builds rows for supported value types.</li>
+        <li><code>AttributeModelBase</code> handles value reads, buffered edits, write-through edits, ambiguity checks, and change subscriptions for individual rows.</li>
+        <li><code>PropertySchemeRegistry</code> lets additional property sections opt into a selected payload while the default attribute section remains available.</li>
+        <li>The adapter supplies selected paths, attribute names, metadata, current values, per-component ambiguity, reset support, and edit begin/set/end calls.</li>
+      </ul>
+      <p>That matters when richer inspectors are added. A specialized property section can sit beside the default attribute list, use the same selection payload, and leave the backend handoff in the application.</p>
+    </section>
+
+    <section>
+      <h2>Content browser and files</h2>
+      <p>The content browser is about files, not scene selection. <code>ContentBrowserWindow</code> creates a <code>FileBrowserWidget</code> with a backend, a start URL, bookmark and recent-file state, settings, and an explicit open-file callback.</p>
+      <ul>
+        <li><code>BackendAdapter</code> supplies URL cleanup, stat, directory listing, folder creation, copy, move, delete, parent lookup, basename lookup, and optional change watches.</li>
+        <li><code>LocalFSBackend</code> is the default local-file implementation, while the widget code remains written against the backend adapter.</li>
+        <li><code>FileBrowserWidget</code> owns navigation, search, file detail rows, grid view, renaming, drag and drop, delete confirmation, bookmarks, and recent files.</li>
+        <li>File selection intentionally does not publish to <code>SelectionBus</code>, because file URLs are not scene paths.</li>
+      </ul>
+      <p>The separation is small but important. The browser chrome can stay in place while storage is replaced, and local storage can stay in place while the open-file handler changes.</p>
+    </section>
+
+    <section>
+      <h2>Viewport and rendered output</h2>
+      <p>The viewport combines rendered pixels with scene interaction. <code>ViewportWidget</code> owns the toolbar, rendered image, <code>SceneView</code> gestures, HUD values, selection outline, camera controller, and transform manipulator.</p>
+      <ul>
+        <li><code>RendererAdapter</code> loads the stage into the renderer, renders RGBA frames, supports picking, rectangle picking, selection highlights, and shutdown.</li>
+        <li><code>ImageBridge</code> pushes the returned frame into an ovui image provider so the viewport can show renderer output.</li>
+        <li><code>CameraController</code> handles orbit, pan, zoom, look, focus, view matrices, and projection matrices.</li>
+        <li><code>PrimTransformModel</code> uses <code>TransformAdapter</code>, <code>StageAdapter</code>, <code>UndoManager</code>, and snapping to drive drag edits on selected prims.</li>
+      </ul>
+      <p>The viewport is reusable because rendering, transforms, selection, and camera motion meet through explicit objects. A renderer swap changes where frames come from; the toolbar, camera gestures, HUD, and manipulator can remain the same.</p>
+    </section>
+
+    <section>
+      <h2>Composition stack data</h2>
+      <p>The composition stack answers a different question from the stage browser: not which prims are visible in the hierarchy, but where scene opinions come from and which entry receives new authoring. It shows an ordered composition stack, dirty state, save actions, mute and lock controls, missing-file signals, authoring target state, and optional prim-spec rows.</p>
+      <ul>
+        <li>The app creates the object that supplies composition data when a USD stage opens, attaches its notices through <code>call_later()</code>, and hands it to the widget with <code>set_adapter()</code>.</li>
+        <li>The widget keeps its own tree model, cell delegate, options menu, context menu, footer actions, selection watcher, and save-all model.</li>
+        <li>The adapter supplies root and session entries, ordered child identifiers, display names, save state, mute state, lock state, authoring target, file permissions, and prim-spec descriptors.</li>
+        <li>Commands wrap save, reload, authoring target, mute, lock, insert, create, remove, move, merge, and flatten actions so undo and redo stay with the rest of the app.</li>
+      </ul>
+      <p>This widget can stay in place when composition inspection is needed, or be removed when a simpler tool only needs a stage browser and viewport. Its composition data stays separate from the other widgets, so either choice leaves those widgets intact.</p>
+    </section>
+
+    <section>
+      <h2>How widgets stay independent</h2>
+      <p>ovwidgets keeps the widgets independent by making the application responsible for shared state. A widget can be tested with mocks, used inside the full app, or swapped for a custom widget because it receives the objects it needs instead of reaching across to sibling widgets.</p>
+      <div class="diagram widget-diagram" role="img" aria-label="Widget independence comes from injected adapters, app state classes, and focused widget ownership">
+        <div class="independence-grid">
+          <div class="independence-card">
+            <div class="independence-title">Injected adapters</div>
+            <div class="independence-text">Widgets receive the data reader or writer they need. Tests pass mocks; the running app passes USD-backed or renderer-backed objects.</div>
+          </div>
+          <div class="independence-card">
+            <div class="independence-title">App state classes</div>
+            <div class="independence-text"><code>SelectionBus</code>, <code>UndoManager</code>, settings, status text, and <code>call_later()</code> route selection, command history, visible messages, and delayed work.</div>
+          </div>
+          <div class="independence-card">
+            <div class="independence-title">Focused ownership</div>
+            <div class="independence-text">Each widget owns its own UI model, delegate, local filters, gestures, and cleanup without importing sibling widgets.</div>
+          </div>
+        </div>
+        <p class="diagram-note">The result is predictable composition: replace one widget or one data source, then keep the same selection, undo, settings, and frame timing rules.</p>
+      </div>
+      <ul>
+        <li>Stage browser, property inspector, viewport, composition stack, and content browser are created by the application, not by each other.</li>
+        <li>Stage browser, property inspector, viewport, and composition stack react to scene state; content browser stays file-oriented and opens files through a callback.</li>
+        <li>Adapters isolate backend work from UI behavior, so tests can cover widget behavior without requiring a GPU or a real USD file.</li>
+        <li>When a new app widget is needed, the common pattern is to own the visible rows locally, receive data through an adapter, and use instances of common Python classes for app-wide state.</li>
+      </ul>
+      <p>The same idea carries into the adapter packages themselves. Shared data records and concrete USD-backed implementations keep backend behavior separate from the widgets that read and edit it.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="section-06.html">Previous: Application</a>
+      <a href="../architecture.html#section-07" target="_top">Index</a>
+    </nav>
+  </main>
+</body>
+</html>

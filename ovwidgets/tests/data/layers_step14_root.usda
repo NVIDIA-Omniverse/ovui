@@ -1,0 +1,19 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+    subLayers = [
+        @./layers_step14_sub1.usda@
+    ]
+)
+
+def Xform "World"
+{
+    def Sphere "RootSphere"
+    {
+        double radius = 0.5
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

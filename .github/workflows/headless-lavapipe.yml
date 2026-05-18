@@ -1,0 +1,114 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# CI lane for Vulkan Lavapipe no-GPU headless path (issue #24, step V6).
+# Runs on ubuntu-22.04 with no GPU; uses Mesa Lavapipe software renderer.
+# Job name "vulkan-lavapipe" is referenced by the C3 validation matrix.
+
+name: Vulkan Lavapipe (no-GPU)
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/issue-24-**'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: vulkan-lavapipe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vulkan-lavapipe:
+    name: Vulkan Lavapipe (ubuntu-22.04, no GPU)
+    runs-on: ubuntu-22.04
+
+    defaults:
+      run:
+        working-directory: ovui
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Vulkan and Mesa Lavapipe dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers \
+            libglfw3-dev libfreetype-dev
+
+      - name: Configure (OMNIUI_HEADLESS_ONLY=ON)
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOMNIUI_HEADLESS_ONLY=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Guard — verify headless_test is registered
+        run: |
+          if ctest --test-dir build -N \
+              -R headless \
+            | grep -q "Total Tests: 0"; then
+            echo "ERROR: headless_test not registered in CTest"
+            exit 1
+          fi
+
+      - name: Run headless_test (Lavapipe, no GPU)
+        # OMNIUI_LAVAPIPE=1 causes StandaloneInit to inject VK_DRIVER_FILES.
+        # No VK_ICD_FILENAMES pre-set: injection must come from the library.
+        shell: bash
+        run: |
+          set -o pipefail
+          OMNIUI_LAVAPIPE=1 \
+            ctest --test-dir build \
+              -R headless \
+              --output-on-failure 2>&1 | tee /tmp/lavapipe_test.log
+
+      - name: Verify Lavapipe injection logged
+        # Re-runs headless_test with --verbose so test stdout is visible even on
+        # pass; greps for the VK_DRIVER_FILES injection line emitted by StandaloneInit.
+        # Failure here means the library did not inject VK_DRIVER_FILES.
+        run: |
+          OMNIUI_LAVAPIPE=1 \
+            ctest --test-dir build -R headless --verbose 2>&1 \
+            | tee /tmp/lavapipe_verify.log \
+            | grep -q "injecting VK_DRIVER_FILES" || {
+                echo "FAIL: 'injecting VK_DRIVER_FILES' not found in headless_test output"
+                echo "--- verify log ---"
+                cat /tmp/lavapipe_verify.log
+                exit 1
+              }
+
+      - name: Verify software device type logged
+        # Greps for the full device-type string confirming Lavapipe was selected
+        # as the Vulkan physical device (CPU software renderer).
+        run: |
+          OMNIUI_LAVAPIPE=1 \
+            ctest --test-dir build -R headless --verbose 2>&1 \
+            | tee /tmp/lavapipe_type_verify.log \
+            | grep -q "CPU (software renderer)" || {
+                echo "FAIL: 'CPU (software renderer)' not found in headless_test output"
+                echo "--- verify log ---"
+                cat /tmp/lavapipe_type_verify.log
+                exit 1
+              }
+
+      - name: Upload test log artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lavapipe-test-log
+          path: /tmp/lavapipe_test.log
+          if-no-files-found: warn
+
+      - name: Upload screenshot artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lavapipe-screenshot
+          path: ovui/build/standalone/headless_output.png
+          if-no-files-found: warn

@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>What You Can Build With ovui</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .choice-diagram {
+      padding: 18px;
+    }
+
+    .choice-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .choice-item {
+      min-height: 126px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+      padding: 14px;
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+    }
+
+    .choice-name {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .choice-text {
+      color: #44554b;
+      font-size: 0.94rem;
+      line-height: 1.45;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 780px) {
+      .choice-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 520px) {
+      .choice-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .choice-item {
+        min-height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="section-01.html">Previous</a>
+      <a href="../architecture.html#section-02" target="_top">Index</a>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Build choices</p>
+      <h1>What You Can Build With ovui</h1>
+      <p class="lead">ovui starts from the same Python idea as Section 1: the kind of tool is chosen before every class name. It can be a small desktop app, a scene workflow, a headless run, or a stream that lets people watch UI output somewhere else.</p>
+    </header>
+
+    <div class="diagram choice-diagram" role="img" aria-label="Build choices: Standalone Python UI apps, Scene tools built from ovwidgets, Headless rendering and automation runs, Live streaming">
+      <div class="choice-grid">
+        <div class="choice-item">
+          <div class="choice-name">Standalone Python UI apps</div>
+          <div class="choice-text">Python opens windows, shows controls, stores values, and reacts to user actions.</div>
+        </div>
+        <div class="choice-item">
+          <div class="choice-name">Scene tools built from ovwidgets</div>
+          <div class="choice-text">A tool opens scene data, shows it, edits properties, and keeps larger workflows organized.</div>
+        </div>
+        <div class="choice-item">
+          <div class="choice-name">Headless rendering and automation runs</div>
+          <div class="choice-text">Jobs render, capture, and exercise UI flows without a visible desktop.</div>
+        </div>
+        <div class="choice-item">
+          <div class="choice-name">Live streaming</div>
+          <div class="choice-text">Rendered output or the app view can be watched from another session when streaming is enabled.</div>
+        </div>
+      </div>
+      <p class="diagram-note">The same Python work can grow from one window into a larger tool, then run or stream where a local desktop is not the only audience.</p>
+    </div>
+
+    <section>
+      <h2>Standalone Python UI apps</h2>
+      <p>A standalone Python UI app is the smallest useful ovui build. Python opens one or more windows, places controls on screen, keeps values current, and runs user actions when someone clicks, types, drags, or changes a value.</p>
+      <ul>
+        <li>Build small tools that collect input, show state, and trigger Python work.</li>
+        <li>Keep app logic in Python while the UI responds to normal user actions.</li>
+        <li>Grow from one window to several widgets when the task needs more room.</li>
+      </ul>
+      <p>This continues the Section 1 starting point without forcing a large app. The first useful result can be a focused Python tool with clear controls and immediate feedback.</p>
+    </section>
+
+    <section>
+      <h2>Scene tools built from ovwidgets</h2>
+      <p>ovwidgets is the larger build for tools that work with scene data. To start, use widgets that already know how to open scene data, show it, browse it, edit properties, and keep related views moving together.</p>
+      <ul>
+        <li>Build tools for opening scenes, inspecting objects, changing properties, and seeing the result.</li>
+        <li>Use data adapters when scene data should come from OpenUSD, mock data, or another Python source.</li>
+        <li>Keep a larger workflow readable by grouping browsing, property editing, content access, and viewport work into widgets.</li>
+      </ul>
+      <p>This is still the same idea as the small Python app, just scaled around a scene task. The workflow is chosen first, then made concrete with widgets and data adapters.</p>
+    </section>
+
+    <section>
+      <h2>Headless rendering and automation runs</h2>
+      <p>Some tools need the same rendering and UI behavior without showing a desktop window. A headless run lets the app draw, render, capture output, or exercise UI flows on a machine where nobody is using the local screen.</p>
+      <ul>
+        <li>Run rendering jobs that need images or screenshots from the tool.</li>
+        <li>Exercise UI flows repeatedly so automation can check what the app drew.</li>
+        <li>Keep scene tools useful in server jobs, batch runs, and remote machines.</li>
+      </ul>
+      <p>The important point is that the build changes, not the product idea. The app can still render widgets, open scene tools, and produce visible output for checks or jobs.</p>
+    </section>
+
+    <section>
+      <h2>Live streaming</h2>
+      <p>Live streaming extends the same build when the output needs to be seen from another session, browser, or viewer. When configured, a tool can stream rendered output or the full app view while the Python app continues to run in its normal job.</p>
+      <ul>
+        <li>Let a remote feedback session watch the viewport or app view without sitting at the GPU machine.</li>
+        <li>Show demos from a browser while the tool keeps running in Python.</li>
+        <li>Make automation output observable elsewhere when a headless job needs a visible result.</li>
+      </ul>
+      <p>ovwidgets and the OpenUSD data adapters support both rendered viewport frames and full-app headless output. The viewport can show whether streaming is off, listening, active, or in error, making the configured app's state visible without assuming every deployment is automatically stream-ready.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="section-01.html">Previous: ovui Project Overview</a>
+      <a href="../architecture.html#section-02" target="_top">Index</a>
+    </nav>
+  </main>
+</body>
+</html>

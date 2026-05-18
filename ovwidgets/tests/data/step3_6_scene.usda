@@ -1,0 +1,29 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def Cube "AssetCube" (
+        kind = "component"
+    )
+    {
+        double size = 2.0
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        # Step 3.6: exercise asset-path attributes. ``textureRef`` uses a
+        # relative path so the ``is_relative_path`` helper registers True
+        # against it; ``modelRef`` uses an absolute filesystem path so
+        # the helper registers False. Both render as a StringField with
+        # a trailing folder button. The resolved path (via the
+        # ArResolver) shows up as a tooltip on the StringField when
+        # USD can locate the asset; for paths that don't exist on disk
+        # the tooltip is omitted.
+        custom asset textureRef = @./textures/placeholder.png@
+        custom asset modelRef = @/tmp/nonexistent_model.usd@
+    }
+}

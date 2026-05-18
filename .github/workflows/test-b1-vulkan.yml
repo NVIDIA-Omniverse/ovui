@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# B1 — pytest under headless Vulkan + Mesa Lavapipe (no GPU).
+# Runs the Python test suite against the standalone Vulkan backend on
+# stock ubuntu-22.04 with the Lavapipe software ICD.
+#
+# Golden image comparison is DISABLED here (OMNI_UI_SKIP_GOLDEN_TESTS=1)
+# until Lavapipe-specific baselines are generated. Both knobs matter:
+#
+#   * OMNI_UI_GOLDEN_STRICT controls what to do when a golden is MISSING
+#     (strict=fail, non-strict=auto-generate on first run). Leaving it
+#     unset would let CI silently promote drifted output to "the truth".
+#   * OMNI_UI_SKIP_GOLDEN_TESTS controls what to do when a golden EXISTS
+#     and the comparison would otherwise run. The goldens checked into
+#     tests/golden/vulkan/ were captured on a DGXC runner with a real
+#     GPU; Lavapipe (software ICD) disagrees by 1-9% on anti-aliased
+#     glyph edges, which always-strict comparison treats as a
+#     regression. Skipping the comparison keeps the render path
+#     covered (finalize_test_no_image still runs) without flagging
+#     ICD-driven sub-pixel drift.
+#
+# Plan to re-enable: run .github/workflows/generate-goldens.yml
+# (workflow_dispatch, backend: vulkan) on the same Lavapipe runner this
+# workflow uses, commit the regenerated tests/golden/vulkan/ baselines,
+# then drop OMNI_UI_SKIP_GOLDEN_TESTS and add OMNI_UI_GOLDEN_STRICT=1
+# here so future drift is enforced.
+#
+# Refs: ovui issue #36 (Phase 6, B1 leg).
+
+name: B1 Vulkan-lavapipe (pytest)
+
+on:
+  push:
+    branches:
+      - main
+      - 'test/**'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: test-b1-vulkan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest-vulkan-lavapipe:
+    name: pytest (B1 Vulkan-lavapipe)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    env:
+      OMNIUI_HEADLESS: "1"
+      OMNIUI_BACKEND: "vulkan"
+      OMNIUI_LAVAPIPE: "1"
+      # Skip image-comparison: the GPU-baselined goldens drift on
+      # Lavapipe. Render path still exercised. See header comment for
+      # the rebaseline plan.
+      OMNI_UI_SKIP_GOLDEN_TESTS: "1"
+      DEBIAN_FRONTEND: noninteractive
+
+    defaults:
+      run:
+        working-directory: ovui
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Vulkan + Lavapipe + build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev \
+            mesa-vulkan-drivers \
+            libglfw3-dev \
+            libfreetype-dev \
+            libfontconfig1-dev \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3-dev
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip toolchain
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+
+      - name: Build and install ovui (headless Vulkan)
+        run: |
+          pip install -e . -v
+
+      - name: Install test requirements
+        run: |
+          pip install -r requirements-test.txt
+
+      - name: Run pytest (Vulkan-lavapipe headless)
+        shell: bash
+        run: |
+          set -o pipefail
+          ulimit -c 0
+          pytest tests/ \
+            --forked \
+            -m "not requires_gl and not requires_cuda" \
+            -q \
+            --color=yes 2>&1 | tee /tmp/pytest-b1.log
+
+      - name: Upload pytest log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-b1-log
+          path: /tmp/pytest-b1.log
+          if-no-files-found: warn
+
+      - name: Upload captured diffs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-b1-captured
+          path: ovui/tests/captured/
+          if-no-files-found: ignore

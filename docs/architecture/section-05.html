@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Scene Tools</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .scene-diagram {
+      padding: 18px;
+    }
+
+    .draw-flow {
+      display: grid;
+      grid-template-columns: minmax(128px, 1fr) auto minmax(148px, 1fr) auto minmax(158px, 1fr) auto minmax(190px, 1.25fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .draw-card,
+    .view-card,
+    .source-card,
+    .source-note {
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+    }
+
+    .draw-card {
+      min-height: 154px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+      padding: 14px;
+    }
+
+    .draw-card.is-start {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .draw-name,
+    .view-title,
+    .source-name,
+    .source-note-title {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .draw-text,
+    .source-text {
+      color: #44554b;
+      font-size: 0.94rem;
+      line-height: 1.45;
+    }
+
+    .draw-arrow,
+    .source-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .view-card {
+      min-height: 154px;
+      padding: 12px;
+    }
+
+    .view-title {
+      margin-bottom: 10px;
+    }
+
+    .view-frame {
+      overflow: hidden;
+      border: 1px solid #b8c8c0;
+      border-radius: 8px;
+      background: #eef4f1;
+    }
+
+    .view-top {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      height: 26px;
+      padding: 0 8px;
+      border-bottom: 1px solid #c9d7d0;
+      background: #f8faf9;
+    }
+
+    .view-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #6b897c;
+    }
+
+    .view-body {
+      position: relative;
+      min-height: 92px;
+      background:
+        linear-gradient(140deg, rgba(53, 107, 87, 0.16), rgba(36, 56, 74, 0.04)),
+        repeating-linear-gradient(0deg, rgba(53, 107, 87, 0.13), rgba(53, 107, 87, 0.13) 1px, transparent 1px, transparent 22px),
+        repeating-linear-gradient(90deg, rgba(53, 107, 87, 0.13), rgba(53, 107, 87, 0.13) 1px, transparent 1px, transparent 22px);
+    }
+
+    .shape-line {
+      position: absolute;
+      left: 18%;
+      top: 58%;
+      width: 58%;
+      height: 3px;
+      border-radius: 999px;
+      background: #356b57;
+      transform: rotate(-20deg);
+      transform-origin: left center;
+    }
+
+    .shape-box {
+      position: absolute;
+      right: 20%;
+      top: 26%;
+      width: 46px;
+      height: 34px;
+      border: 2px solid #356b57;
+      background: rgba(255, 255, 255, 0.62);
+      transform: skewY(-10deg);
+    }
+
+    .shape-point {
+      position: absolute;
+      left: 39%;
+      top: 36%;
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: #24384a;
+      box-shadow: 46px 20px 0 #24384a, 88px -10px 0 #24384a;
+    }
+
+    .view-bottom {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px;
+      color: #44554b;
+      font-size: 0.82rem;
+    }
+
+    .source-chain {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) auto minmax(150px, 1fr) auto minmax(150px, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .source-card {
+      min-height: 142px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 14px;
+    }
+
+    .source-card.is-start {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .source-pill {
+      display: inline-block;
+      width: fit-content;
+      max-width: 100%;
+      padding: 3px 8px;
+      border: 1px solid #dce3ea;
+      border-radius: 999px;
+      background: #f7f9fa;
+      color: #24384a;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 0.82rem;
+      overflow-wrap: anywhere;
+    }
+
+    .source-note {
+      margin-top: 12px;
+      padding: 14px;
+    }
+
+    .source-note-title {
+      margin-bottom: 7px;
+    }
+
+    .source-note-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 940px) {
+      .draw-flow,
+      .source-chain {
+        grid-template-columns: 1fr;
+      }
+
+      .draw-arrow,
+      .source-arrow {
+        transform: rotate(90deg);
+      }
+
+      .draw-card,
+      .view-card,
+      .source-card {
+        min-height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="section-04.html">Previous</a>
+      <a href="../architecture.html#section-05" target="_top">Index</a>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Section 5</p>
+      <h1>Scene Tools</h1>
+      <p class="lead">After the atomic widgets in Section 4, ovui adds a scene package for Python code that needs camera-aware drawing, transforms, gestures, and manipulators inside the same windows and widgets as regular controls.</p>
+    </header>
+
+    <section>
+      <h2>Purpose</h2>
+      <p><code>omni.ui.scene</code> gives a Python tool a way to draw scene content inside an ovui window. It does not open USD files or decide what is selected. It supplies the drawn objects, camera values, and input gestures that app code can combine with normal <code>ovui</code> widgets.</p>
+      <ul>
+        <li><code>SceneView</code> is the visible scene area that can sit in a <code>ui.Window</code>, <code>ui.ZStack</code>, or viewport.</li>
+        <li><code>Scene</code> is the container reached through <code>scene_view.scene</code>; Python adds transforms, shapes, gestures, and manipulators there.</li>
+        <li><code>CameraModel</code> supplies view and projection matrices so 3D shapes line up with the current camera.</li>
+        <li>Gestures attach to shapes or to <code>Screen</code> and call Python when the user clicks, drags, hovers, or scrolls.</li>
+        <li>ovwidgets uses these pieces in the viewport for camera motion, picking, transform gizmos, and selection outlines over the rendered image.</li>
+      </ul>
+      <div class="diagram scene-diagram" role="img" aria-label="Python scene code uses app data to build scene objects inside a rendered viewport area">
+        <div class="draw-flow">
+          <div class="draw-card is-start">
+            <div class="draw-name">App data and choices</div>
+            <div class="draw-text">Selection, camera state, renderer frames, and tool mode decide what should be shown.</div>
+          </div>
+          <div class="draw-arrow" aria-hidden="true">&rarr;</div>
+          <div class="draw-card">
+            <div class="draw-name">Python scene code</div>
+            <div class="draw-text">Code opens <code>scene_view.scene</code> and creates the objects for the current frame.</div>
+          </div>
+          <div class="draw-arrow" aria-hidden="true">&rarr;</div>
+          <div class="draw-card">
+            <div class="draw-name">Scene objects</div>
+            <div class="draw-text"><code>Transform</code>, shapes, gestures, <code>Screen</code>, and manipulators describe what appears and how input behaves.</div>
+          </div>
+          <div class="draw-arrow" aria-hidden="true">&rarr;</div>
+          <div class="view-card">
+            <div class="view-title">Rendered viewport area</div>
+            <div class="view-frame" aria-hidden="true">
+              <div class="view-top">
+                <span class="view-dot"></span>
+                <span class="view-dot"></span>
+                <span class="view-dot"></span>
+              </div>
+              <div class="view-body">
+                <span class="shape-line"></span>
+                <span class="shape-box"></span>
+                <span class="shape-point"></span>
+              </div>
+              <div class="view-bottom">
+                <span>toolbar</span>
+                <span>status</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p class="diagram-note">The scene area is not a separate app. It is one part of a normal UI window, so toolbars, fields, status text, and scene drawing can live together.</p>
+      </div>
+      <p>This keeps scene tools practical: a focused viewport can sit next to a few controls, and Python decides which shapes and gestures are present as the app state changes.</p>
+    </section>
+
+    <section>
+      <h2>Python classes</h2>
+      <p>The Python names divide into a small set of jobs: a view that hosts drawing, models that carry camera or manipulator values, objects that draw, and gestures that turn input into callbacks.</p>
+      <ul>
+        <li><code>SceneView</code> hosts the scene area; its <code>scene</code> property is where content is built.</li>
+        <li><code>Scene</code>, <code>Transform</code>, and <code>Screen</code> organize objects, place them, and capture input across the whole scene area when needed.</li>
+        <li><code>CameraModel</code> and <code>AbstractManipulatorModel</code> carry view, projection, and manipulator values as float or int arrays.</li>
+        <li><code>Manipulator</code> rebuilds drawn content when its state changes; <code>GestureBindingManipulator</code> adds reusable gesture binding setup.</li>
+        <li><code>ClickGesture</code>, <code>DoubleClickGesture</code>, <code>DragGesture</code>, <code>HoverGesture</code>, <code>ScrollGesture</code>, <code>GestureManager</code>, and <code>GestureBinding</code> cover common input behavior.</li>
+      </ul>
+      <p>The names stay close to the job they perform. A viewport tool usually reads as: create a <code>SceneView</code>, keep camera values current, draw shapes in transforms, and attach gestures where user input should run Python code.</p>
+    </section>
+
+    <section>
+      <h2>Common scene objects</h2>
+      <p>Most scene code builds with a short vocabulary. The example <code>ovui/examples/scene_manipulator.py</code> creates a window, places a <code>SceneView</code> between a header and status row, draws a grid and cube with lines, and attaches drag or hover gestures to axis handles.</p>
+      <ul>
+        <li>Shapes and display items include <code>Line</code>, <code>Arc</code>, <code>Curve</code>, <code>Points</code>, <code>Rectangle</code>, <code>PolygonMesh</code>, <code>TexturedMesh</code>, <code>Image</code>, and <code>Label</code>.</li>
+        <li><code>Transform</code> moves, scales, or turns child items, so a gizmo can follow a selected object while each axis handle remains its own shape.</li>
+        <li><code>Screen</code> is useful for camera gestures because it can receive input anywhere in the scene area.</li>
+        <li><code>Widget</code> can place normal <code>ovui</code> widgets as a scene item, while regular <code>ui.HStack</code>, <code>ui.VStack</code>, labels, fields, and menus can still sit around the <code>SceneView</code>.</li>
+        <li>ovwidgets adds higher-level viewport objects such as <code>CameraManipulator</code>, <code>TransformManipulator</code>, <code>PickGesture</code>, and <code>PickRectGesture</code>; selection outlines are driven through the renderer adapter instead of a local scene manipulator.</li>
+      </ul>
+      <p>Those pieces let a tool show more than a flat rendered image. The same window can contain the rendered frame, a camera gesture area, renderer-owned selection outline and highlight state, transform handles, and ordinary UI controls that change what the scene code draws.</p>
+    </section>
+
+    <section>
+      <h2>Sources</h2>
+      <p>The scene source is split by job: start at the Python package, then move to bindings or C++ scene code when the behavior comes from the native side.</p>
+      <div class="diagram scene-diagram" role="img" aria-label="Scene sources from Python package through bindings and C++ scene code">
+        <div class="source-chain">
+          <div class="source-card is-start">
+            <div class="source-name">Python package</div>
+            <span class="source-pill">omni.ui.scene</span>
+            <div class="source-text">Exports <code>_scene</code> classes and adds <code>GestureBinding</code>, <code>GestureBindings</code>, and <code>GestureBindingManipulator</code>.</div>
+          </div>
+          <div class="source-arrow" aria-hidden="true">&harr;</div>
+          <div class="source-card">
+            <div class="source-name">Python bindings</div>
+            <span class="source-pill">ovui/bindings/scene</span>
+            <div class="source-text">Makes scene classes available to Python code as <code>SceneView</code>, shapes, gestures, models, and manipulators.</div>
+          </div>
+          <div class="source-arrow" aria-hidden="true">&harr;</div>
+          <div class="source-card">
+            <div class="source-name">C++ scene code</div>
+            <span class="source-pill">ovui/core/src/scene</span>
+            <span class="source-pill">ovui/core/include/omni/ui/scene</span>
+            <div class="source-text">Defines drawing, camera use, gesture dispatch, shape hit testing, and draw buffer behavior.</div>
+          </div>
+        </div>
+        <div class="source-note">
+          <div class="source-note-title">Real use appears in examples, tests, and ovwidgets viewport code</div>
+          <div class="source-note-list">
+            <span class="source-pill">ovui/examples/scene_manipulator.py</span>
+            <span class="source-pill">ovui/tests/scene</span>
+            <span class="source-pill">ovwidgets/ovwidgets/viewport</span>
+          </div>
+        </div>
+        <p class="diagram-note">Read examples first for Python usage, tests for edge cases, and the viewport package for a full app use of camera, pick, gizmo, and outline behavior.</p>
+      </div>
+      <ul>
+        <li><code>gesture_bindings.py</code> parses mouse and modifier bindings and adapts to standalone runs when Kit settings are not present.</li>
+        <li><code>SceneView.cpp</code>, gesture sources, shape sources, and <code>Manipulator.cpp</code> own the native drawing and input behavior.</li>
+        <li>Scene tests cover containers, cameras, shapes, gestures, manipulators, interaction, caching, and texture loading.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>How scene data reaches views</h2>
+      <p>Scene data reaches a view through Python code that already knows the app state. The scene package draws what it is told to draw; app code, widget code, or adapter-backed state decides which objects exist, where they are, and what should happen when the user acts.</p>
+      <ul>
+        <li>The ovwidgets viewport receives frames from <code>RendererAdapter</code>, shows them with <code>ImageWithProvider</code>, and places a <code>SceneView</code> in the same <code>ui.ZStack</code>.</li>
+        <li><code>CameraController</code> supplies view and projection matrices to both the renderer and <code>SceneView</code>, keeping gizmos and renderer-owned outlines aligned with the rendered frame.</li>
+        <li><code>TransformManipulator</code> reads selection and transform state through <code>PrimTransformModel</code>, then draws translate, rotate, or scale handles.</li>
+        <li>The viewport sends selection changes to <code>RendererAdapter.set_selection_highlight()</code>; the ovrtx adapter updates native selection-outline group state for the paths that changed.</li>
+        <li><code>PickGesture</code> and <code>PickRectGesture</code> turn pointer input into viewport pick requests, and the pick result is published back to shared selection state.</li>
+      </ul>
+      <p>For a custom scene tool, keep source data in Python objects or adapters, choose the visible shapes from that data, and call <code>invalidate()</code> when a manipulator should rebuild. The application then gives those scene pieces shared selection, settings, undo, and widget coordination.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="section-04.html">Previous: UI Framework</a>
+      <a href="../architecture.html#section-05" target="_top">Index</a>
+    </nav>
+  </main>
+</body>
+</html>

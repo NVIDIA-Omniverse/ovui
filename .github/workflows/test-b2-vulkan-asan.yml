@@ -1,0 +1,142 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# B2 — native C++ tests under AddressSanitizer (no pytest, no Python).
+#
+# Why this leg dropped pytest:
+#   The hosted-tooling CPython on ubuntu-22.04 is NOT ASan-instrumented.
+#   Loading an ASan-built shared library into a non-instrumented
+#   interpreter aborts during the first dlopen of the binding, even
+#   with verify_asan_link_order=0 (the abort happens inside glibc
+#   sanity checks before ASan can print a report — verified by the
+#   `Fatal Python error: Aborted` import of omni.ui_scene with no ASan
+#   stack trace; see ovui issue #36 history). Building a custom
+#   ASan-instrumented CPython just to run pytest under ASan is far more
+#   surface than the bug class is worth on this leg.
+#
+# What this leg does instead:
+#   * Configures the project with -fsanitize=address via CMake directly
+#     (NOT via pip install — no Python interpreter is involved).
+#   * Builds the native test binaries (markdown_model_tests,
+#     markdown_fuzz_tests). These are pure-CPU C++ executables that
+#     exercise the markdown parser/renderer/syntax-highlighter — the
+#     class of code where ASan-class bugs (UAF, OOB, double-free)
+#     actually live in this repo.
+#   * Runs them via ctest. libasan initializes cleanly because the
+#     process *is* the ASan-built binary; nothing about the loader
+#     needs to be tolerated.
+#
+# B1 owns Python-level coverage; B2 owns memory-safety coverage on the
+# C++ core. Splitting the two is the only configuration we have found
+# that is both useful and stable on stock GitHub-hosted runners.
+#
+# Refs: ovui issue #36 (Phase 6, B2 leg).
+
+name: B2 ASan (native C++ ctest)
+
+on:
+  push:
+    branches:
+      - main
+      - 'test/**'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: test-b2-vulkan-asan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ctest-asan:
+    name: ctest (B2 native C++ + ASan)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    defaults:
+      run:
+        working-directory: ovui
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        # libvulkan-dev + freetype/fontconfig are pulled in because
+        # the ovui core library transitively needs them at link time
+        # even though the markdown tests themselves do not touch
+        # Vulkan. Mesa drivers are not installed — these tests do not
+        # initialise an ICD.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev \
+            libgl-dev \
+            libfreetype-dev \
+            libfontconfig1-dev \
+            cmake \
+            ninja-build \
+            pkg-config
+
+      - name: Configure (CMake, ASan, headless-only)
+        # Single-config Ninja so ctest finds binaries without a config
+        # subdir. -DOMNIUI_HEADLESS_ONLY=ON avoids the GLFW dep — the
+        # markdown tests do not need the GL standalone backend.
+        run: |
+          cmake -S . -B build/asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DOMNIUI_HEADLESS_ONLY=ON \
+            -DOMNI_UI_BUILD_MARKDOWN_TESTS=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-fsanitize=address"
+
+      - name: Build native test targets
+        run: |
+          cmake --build build/asan \
+            --target markdown_model_tests markdown_fuzz_tests \
+            --parallel $(nproc)
+
+      - name: Verify ASan is linked into the test binaries
+        # If -fsanitize=address did not propagate, libasan won't be
+        # listed in DT_NEEDED. Failing here surfaces a build
+        # misconfiguration before we silently run un-instrumented tests.
+        run: |
+          set -e
+          for bin in build/asan/markdown_model_tests build/asan/markdown_fuzz_tests; do
+            echo "=== ldd $bin ==="
+            ldd "$bin"
+            if ! ldd "$bin" | grep -qi "libasan"; then
+              echo "FAIL: $bin is not linked against libasan"
+              exit 1
+            fi
+          done
+
+      - name: Run ctest with ASan
+        shell: bash
+        env:
+          # detect_leaks=0 — interpreter teardown / static destructor
+          #   leaks are noisy and out of scope for this leg.
+          # abort_on_error=1 + halt_on_error=1 — make the first error
+          #   hard-fail so ctest surfaces it.
+          # symbolize=1 + print_stacktrace=1 — readable stacks.
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:halt_on_error=1:symbolize=1:print_stacktrace=1"
+        run: |
+          set -o pipefail
+          ulimit -c 0
+          ctest --test-dir build/asan \
+            -R "^(markdown_model_tests|markdown_fuzz_tests)$" \
+            --output-on-failure 2>&1 | tee /tmp/ctest-b2.log
+
+      - name: Upload ctest log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-b2-log
+          path: /tmp/ctest-b2.log
+          if-no-files-found: warn

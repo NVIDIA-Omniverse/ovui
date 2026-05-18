@@ -1,0 +1,31 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
+#pragma once
+
+#define OMNIUI_PYBIND_DOC_Pixel                                                                                        \
+    "Pixel length is exact length in pixels.\n"                                                                        \
+    "\n"
+
+
+#define OMNIUI_PYBIND_DOC_Pixel_Pixel "Construct Pixel.\n"
+
+
+#define OMNIUI_PYBIND_DOC_Pixel_resolve                                                                                \
+    "Resolves the length value to a absolute value\n"                                                                  \
+    "\n"                                                                                                               \
+    "\n"                                                                                                               \
+    "### Arguments:\n"                                                                                                 \
+    "\n"                                                                                                               \
+    "    `absoluteFactor :`\n"                                                                                         \
+    "        the unit multiplier\n"                                                                                    \
+    "the computed absolute value\n"

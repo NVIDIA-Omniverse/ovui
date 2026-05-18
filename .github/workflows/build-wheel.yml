@@ -1,0 +1,374 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# Wheel build — produces native binary wheels for ovui.
+#
+# The Linux wheels are built against the headless Vulkan + Lavapipe toolchain
+# (the same recipe B1 uses) so they work on machines with no GPU. The Windows
+# wheel uses the GitHub-hosted Windows Server 2022 image, its preinstalled
+# Visual Studio 2022 toolchain, and Vulkan headers/loader installed with the
+# image's preinstalled vcpkg. setup.py bundles the compiled native libraries
+# into each wheel:
+#
+#   omni/ui/_ui*.so|*.pyd
+#   omni/ui/libovui.so* or ovui.dll
+#   omni/ui/libomniui_standalone.so* or omniui_standalone.dll
+#   omni/ui/resources/{fonts,glyphs,twemoji-atlas.{png,json}}
+#   omni/ui_scene/_scene*.so|*.pyd
+#   omni/ui_scene/libovuiscene.so* or ovuiscene.dll
+#
+# RPATH is set to $ORIGIN on Linux by setup.py so the libraries find each other
+# at runtime without LD_LIBRARY_PATH manipulation. Windows package imports add
+# the package DLL directories at import time.
+#
+# Triggers:
+#   * workflow_dispatch — build on demand; optionally attach to an existing release_tag
+#   * release: [published] — build and attach all wheels to the published release
+#
+# Outputs:
+#   * Workflow artifacts for Linux x64, Linux ARM64, and Windows x64 wheels
+#   * Release assets on published release events and manual release_tag runs
+
+name: Build Wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional existing release tag to attach wheels to"
+        required: false
+        type: string
+        default: ""
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-wheel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-wheel-linux:
+    name: Build wheel (${{ matrix.label }}, Vulkan headless)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x64
+            runner: ubuntu-22.04
+            artifact: ovui-wheel-linux-x64
+          - label: Linux ARM64
+            runner: ubuntu-22.04-arm
+            artifact: ovui-wheel-linux-arm64
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    defaults:
+      run:
+        working-directory: ovui
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+
+      - name: Resolve checked-out commit
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "OVUI_BUILD_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
+          echo "EXPECTED_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: Install Vulkan + Lavapipe + build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev \
+            mesa-vulkan-drivers \
+            libglfw3-dev \
+            libfreetype-dev \
+            libfontconfig1-dev \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3-dev
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip toolchain
+        run: |
+          python -m pip install --upgrade pip wheel setuptools build
+
+      - name: Build wheel
+        run: |
+          python -m pip wheel . --no-deps -w dist/ -v
+
+      - name: Show wheel contents
+        run: |
+          ls -la dist/
+          for whl in dist/*.whl; do
+            echo "=== $whl ==="
+            python -m zipfile -l "$whl"
+          done
+
+      - name: Smoke test — verify filename, install wheel, import omni.ui
+        env:
+          OMNIUI_HEADLESS: "1"
+          OMNIUI_BACKEND: "vulkan"
+          OMNIUI_LAVAPIPE: "1"
+        run: |
+          short_sha="${EXPECTED_COMMIT_SHA:0:7}"
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -eq 0 ]; then
+            echo "no wheels found in dist/"; exit 1
+          fi
+          for whl in "${wheels[@]}"; do
+            echo "checking wheel filename: $whl"
+            case "$(basename "$whl")" in
+              *"+g${short_sha}"*) echo "  short SHA +g${short_sha} present in filename: OK" ;;
+              *) echo "  FAIL: wheel filename does not contain +g${short_sha}"; exit 1 ;;
+            esac
+          done
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install --upgrade pip
+          /tmp/wheel-venv/bin/pip install "${wheels[0]}"
+          /tmp/wheel-venv/bin/python - <<'PY'
+          import os
+          import omni.ui
+          import omni.ui_scene
+          version = getattr(omni.ui, "__version__", None)
+          commit = getattr(omni.ui, "__commit__", None)
+          expected = os.environ["EXPECTED_COMMIT_SHA"]
+          short = expected[:7]
+          print(f"omni.ui ok — version={version!r} commit={commit!r}")
+          print("omni.ui_scene ok")
+          assert version and version.endswith(f"+g{short}"), (
+              f"omni.ui.__version__ {version!r} does not end with +g{short}"
+          )
+          assert commit == expected, (
+              f"omni.ui.__commit__ {commit!r} does not match GITHUB_SHA {expected!r}"
+          )
+          PY
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ovui/dist/*.whl
+          if-no-files-found: error
+
+  build-wheel-windows:
+    name: Build wheel (Windows x64)
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    env:
+      CMAKE_GENERATOR: Visual Studio 17 2022
+      CMAKE_GENERATOR_PLATFORM: x64
+      OMNIUI_BUILD_JOBS: "2"
+
+    defaults:
+      run:
+        working-directory: ovui
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+
+      - name: Resolve checked-out commit
+        shell: pwsh
+        run: |
+          $sha = git rev-parse HEAD
+          "OVUI_BUILD_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EXPECTED_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Install Vulkan headers and loader
+        shell: pwsh
+        run: |
+          if (-not $env:VCPKG_INSTALLATION_ROOT) {
+            throw "VCPKG_INSTALLATION_ROOT is not set on this runner"
+          }
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe"
+          if (-not (Test-Path $vcpkg)) {
+            throw "vcpkg.exe was not found at $vcpkg"
+          }
+          & $vcpkg install vulkan-headers:x64-windows vulkan-loader:x64-windows
+          $installed = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows"
+          $includeDir = Join-Path $installed "include"
+          $header = Join-Path $includeDir "vulkan\vulkan.h"
+          if (-not (Test-Path $header)) {
+            throw "Expected Vulkan header was not created: $header"
+          }
+          $releaseLibrary = Join-Path $installed "lib\vulkan-1.lib"
+          $debugLibrary = Join-Path $installed "debug\lib\vulkan-1.lib"
+          if (Test-Path $releaseLibrary) {
+            $library = Get-Item $releaseLibrary
+          } elseif (Test-Path $debugLibrary) {
+            $library = Get-Item $debugLibrary
+          } else {
+            throw "Expected Vulkan import library was not found under $installed"
+          }
+          $releaseLoaderDll = Join-Path $installed "bin\vulkan-1.dll"
+          $debugLoaderDll = Join-Path $installed "debug\bin\vulkan-1.dll"
+          if (Test-Path $releaseLoaderDll) {
+            $loaderDll = Get-Item $releaseLoaderDll
+          } elseif (Test-Path $debugLoaderDll) {
+            $loaderDll = Get-Item $debugLoaderDll
+          } else {
+            throw "Expected Vulkan loader DLL was not found under $installed"
+          }
+          "Vulkan_INCLUDE_DIR=$includeDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Vulkan_LIBRARY=$($library.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Vulkan_DLL_DIR=$($loaderDll.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $loaderDll.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Upgrade pip toolchain
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip wheel setuptools build cmake pybind11
+
+      - name: Build wheel
+        shell: pwsh
+        run: |
+          python -m pip wheel . --no-deps -w dist/ -v
+
+      - name: Show wheel contents
+        shell: pwsh
+        run: |
+          Get-ChildItem dist
+          foreach ($wheel in Get-ChildItem dist/*.whl) {
+            Write-Host "=== $($wheel.FullName) ==="
+            python -m zipfile -l $wheel.FullName
+          }
+
+      - name: Smoke test — verify filename, install wheel, import omni.ui
+        shell: pwsh
+        run: |
+          $shortSha = $env:EXPECTED_COMMIT_SHA.Substring(0, 7)
+          $wheels = Get-ChildItem dist/*.whl
+          if ($wheels.Count -eq 0) { throw "no wheels found in dist/" }
+          foreach ($w in $wheels) {
+            Write-Host "checking wheel filename: $($w.Name)"
+            if ($w.Name -notlike "*+g$shortSha*") {
+              throw "wheel filename $($w.Name) does not contain +g$shortSha"
+            }
+            Write-Host "  short SHA +g$shortSha present in filename: OK"
+          }
+          python -m venv "$env:RUNNER_TEMP\wheel-venv"
+          $python = "$env:RUNNER_TEMP\wheel-venv\Scripts\python.exe"
+          & $python -m pip install --upgrade pip
+          & $python -m pip install $wheels[0].FullName
+          $checkScript = @'
+          import os
+          p = os.environ.get("Vulkan_DLL_DIR")
+          if p and hasattr(os, "add_dll_directory"):
+              os.add_dll_directory(p)
+          import omni.ui
+          import omni.ui_scene
+          version = getattr(omni.ui, "__version__", None)
+          commit = getattr(omni.ui, "__commit__", None)
+          expected = os.environ["EXPECTED_COMMIT_SHA"]
+          short = expected[:7]
+          print(f"omni.ui ok - version={version!r} commit={commit!r}")
+          print("omni.ui_scene ok")
+          assert version and version.endswith(f"+g{short}"), (
+              f"omni.ui.__version__ {version!r} does not end with +g{short}"
+          )
+          assert commit == expected, f"omni.ui.__commit__ {commit!r} does not match GITHUB_SHA {expected!r}"
+          '@
+          $scriptPath = Join-Path $env:RUNNER_TEMP "wheel_smoke.py"
+          Set-Content -Path $scriptPath -Value $checkScript -Encoding utf8
+          & $python $scriptPath
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ovui-wheel-windows-x64
+          path: ovui/dist/*.whl
+          if-no-files-found: error
+
+  attach-release-wheels:
+    name: Attach wheels to GitHub release
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: ubuntu-22.04
+    needs:
+      - build-wheel-linux
+      - build-wheel-windows
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+
+      - name: Resolve release commit
+        run: |
+          echo "EXPECTED_COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ovui-wheel-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Show release wheel set
+        run: |
+          ls -la wheelhouse/
+
+      - name: Validate release wheel set
+        run: |
+          set -euo pipefail
+          short_sha="${EXPECTED_COMMIT_SHA:0:7}"
+          shopt -s nullglob
+          wheels=(wheelhouse/*.whl)
+          if [ "${#wheels[@]}" -ne 3 ]; then
+            echo "Expected exactly 3 ovui wheels, found ${#wheels[@]}"
+            printf '  %s\n' "${wheels[@]}"
+            exit 1
+          fi
+
+          require_one() {
+            local pattern="$1"
+            local label="$2"
+            local matches=(wheelhouse/$pattern)
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "Expected exactly one ${label} wheel matching ${pattern}, found ${#matches[@]}"
+              printf '  %s\n' "${matches[@]}"
+              exit 1
+            fi
+            echo "${label}: $(basename "${matches[0]}")"
+          }
+
+          require_one "ovui-*+g${short_sha}-cp312-cp312-linux_x86_64.whl" "Linux x64"
+          require_one "ovui-*+g${short_sha}-cp312-cp312-linux_aarch64.whl" "Linux ARM64"
+          require_one "ovui-*+g${short_sha}-cp312-cp312-win_amd64.whl" "Windows x64"
+
+      - name: Attach wheels to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null
+          gh release upload "$RELEASE_TAG" wheelhouse/*.whl --clobber

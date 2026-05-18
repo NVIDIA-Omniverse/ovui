@@ -1,0 +1,62 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+# Property Window Step 5.2 QA scene.
+#
+# ``NestedScope`` is intentionally a :class:`UsdGeom.Scope` (not a
+# :class:`UsdGeomSphere`) so the Property Inspector is not flooded with
+# the 8-plus unauthored schema attributes a Sphere / Xform brings in.
+# Scope provides only ``purpose`` and ``visibility``, which keeps the
+# ``Attributes`` frame short and leaves vertical room for the nested
+# ``Transform`` / ``Geometry`` frames that this step is all about.
+#
+# Each custom attribute authors ``displayGroup`` metadata that the USD
+# adapter rewrites from colon-separated (``"Transform:Translate"``) to
+# dot-separated (``"Transform.Translate"``). The Property Inspector
+# splits the dotted string to build a nested :class:`UiDisplayGroup`
+# tree — this scene is the end-to-end proof: authored USD metadata →
+# dotted path in :class:`AttributeMetadata` → nested
+# ``ui.CollapsableFrame`` hierarchy in the Property Inspector.
+#
+# Expected tree with ``/World/NestedScope`` selected:
+#
+#   Attributes
+#   ├── Proxy Prim
+#   ├── Purpose
+#   └── Visibility
+#   Transform
+#   ├── Translate
+#   │   ├── Offset X
+#   │   └── Offset Y
+#   └── Rotate
+#       └── Spin Z
+#   Geometry
+#   └── Mesh
+#       └── Subdivision
+
+def Xform "World"
+{
+    def Scope "NestedScope"
+    {
+        custom float nested:translate:x = 2.5 (
+            displayName = "Offset X"
+            displayGroup = "Transform:Translate"
+        )
+        custom float nested:translate:y = 1.25 (
+            displayName = "Offset Y"
+            displayGroup = "Transform:Translate"
+        )
+        custom float nested:rotate:z = 0.0 (
+            displayName = "Spin Z"
+            displayGroup = "Transform:Rotate"
+        )
+        custom token nested:mesh:subdivision = "catmullClark" (
+            displayName = "Subdivision"
+            displayGroup = "Geometry:Mesh"
+        )
+    }
+}

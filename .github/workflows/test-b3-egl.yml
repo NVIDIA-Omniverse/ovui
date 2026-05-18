@@ -1,0 +1,118 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# B3 — pytest under headless EGL surfaceless (no GPU, no display server).
+# Runs the Python test suite against the EGL-backed standalone build using
+# EGL_MESA_platform_surfaceless on stock ubuntu-22.04. Unlike B1/B2,
+# requires_gl tests CAN run on this leg because EGL provides a real GL
+# context (without a window).
+#
+# Strict-mode golden enforcement is intentionally OFF on B3 right now:
+# tests/golden/egl/ is empty, so OMNI_UI_GOLDEN_STRICT=1 would turn every
+# image-comparison test into a "Golden reference missing in strict mode"
+# failure. Step 31 of issue #36 populates tests/golden/egl/ via the
+# generate-goldens.yml workflow_dispatch, after which strict mode can be
+# re-enabled here.
+#
+# Refs: ovui issue #36 (Phase 6, B3 leg).
+
+name: B3 EGL-surfaceless (pytest)
+
+on:
+  push:
+    branches:
+      - main
+      - 'test/**'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: test-b3-egl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest-egl-surfaceless:
+    name: pytest (B3 EGL-surfaceless)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    env:
+      OMNIUI_HEADLESS: "1"
+      OMNIUI_HEADLESS_GL: "1"
+      OMNIUI_EGL_FORCE_SURFACELESS: "1"
+      MESA_GL_VERSION_OVERRIDE: "3.3"
+      # OMNI_UI_GOLDEN_STRICT intentionally NOT set: tests/golden/egl/ is
+      # empty until Step 31 generates EGL baselines. Re-enable strict here
+      # after that step lands.
+      DEBIAN_FRONTEND: noninteractive
+
+    defaults:
+      run:
+        working-directory: ovui
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install EGL + Mesa + build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libegl-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            mesa-utils \
+            libglfw3-dev \
+            libfreetype-dev \
+            libfontconfig1-dev \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3-dev
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip toolchain
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+
+      - name: Build and install ovui (headless EGL)
+        env:
+          OMNIUI_CMAKE_ARGS: "-DOMNIUI_HEADLESS_GL=ON"
+        run: |
+          pip install -e . -v
+
+      - name: Install test requirements
+        run: |
+          pip install -r requirements-test.txt
+
+      - name: Run pytest (EGL-surfaceless headless)
+        shell: bash
+        run: |
+          set -o pipefail
+          ulimit -c 0
+          pytest tests/ \
+            --forked \
+            -m "not requires_cuda" \
+            -q \
+            --color=yes 2>&1 | tee /tmp/pytest-b3.log
+
+      - name: Upload pytest log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-b3-log
+          path: /tmp/pytest-b3.log
+          if-no-files-found: warn
+
+      - name: Upload captured diffs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-b3-captured
+          path: ovui/tests/captured/
+          if-no-files-found: ignore

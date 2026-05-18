@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inspector Pipeline</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .inspector-diagram {
+      padding: 18px;
+    }
+
+    .inspector-loop {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) auto minmax(180px, 1.05fr) auto minmax(170px, 1fr) auto minmax(150px, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .inspector-card {
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #223128;
+      min-height: 138px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+      padding: 14px;
+    }
+
+    .inspector-card.is-start {
+      background: #dbe9e2;
+      color: #1f3f33;
+    }
+
+    .inspector-name {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .inspector-text {
+      color: #44554b;
+      font-size: 0.94rem;
+      line-height: 1.45;
+    }
+
+    .inspector-pill {
+      display: inline-block;
+      width: fit-content;
+      max-width: 100%;
+      padding: 3px 7px;
+      border: 1px solid #dce3ea;
+      border-radius: 999px;
+      background: #f7f9fa;
+      color: #24384a;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 0.75rem;
+      overflow-wrap: anywhere;
+    }
+
+    .inspector-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .api-row {
+      margin-top: 14px;
+      padding: 14px;
+      border: 1px solid #bfd1c8;
+      border-radius: 8px;
+      background: #ffffff;
+    }
+
+    .api-title {
+      font-weight: 700;
+      color: #33463b;
+      margin-bottom: 8px;
+    }
+
+    .api-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .diagram-note {
+      margin: 14px 0 0;
+      color: #33463b;
+      font-size: 0.95rem;
+    }
+
+    @media (max-width: 960px) {
+      .inspector-loop {
+        grid-template-columns: 1fr;
+      }
+
+      .inspector-arrow {
+        transform: rotate(90deg);
+      }
+
+      .inspector-card {
+        min-height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <nav class="top-nav" aria-label="Section navigation">
+      <a href="section-10.html">Previous</a>
+      <a href="../architecture.html#section-11" target="_top">Index</a>
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Section 11</p>
+      <h1>Inspector Pipeline</h1>
+      <p class="lead">ovui ships a first-class inspector pipeline for an AI agent to drive the running application the same way a person would: by looking at the screen, moving the mouse, clicking, and typing on the keyboard. The pipeline is part of ovui itself, not an external tool wired on top.</p>
+    </header>
+
+    <section>
+      <h2>How the agent works</h2>
+      <p>The pipeline follows a single loop. The agent captures the current screen, decides what to do based on what it sees, performs one input action, captures the screen again, and verifies that the new picture reflects what it just did. Every interaction follows that cycle: screenshot, analyze, act, screenshot, verify. There is no internal API access and no programmatic shortcut; the agent uses only what is visible and reachable through the same input path a person would use.</p>
+      <ul>
+        <li>The agent reads the screen from a screenshot only, never from internal state inspection or debug consoles.</li>
+        <li>Targets are chosen from pixels in the most recent screenshot, not from saved guesses.</li>
+        <li>One action runs between screenshots, so the next picture proves whether the action worked.</li>
+        <li>Failures are reported with the screenshot that shows them, not patched silently in code.</li>
+      </ul>
+      <p>That style is what makes the pipeline a usable QA path. Tests that take shortcuts often pass when the visible product is broken; tests that follow the see-act-see loop fail when the user would also fail, and pass when the user would succeed.</p>
+    </section>
+
+    <section>
+      <h2>What the agent can do</h2>
+      <p>The pipeline groups its work into capture, mouse input, keyboard input, and frame timing. Each capability is provided by ovui through the same running application that draws the UI, so the agent does not need a separate route for a tree row, a menu item, a filter field, a viewport gizmo, or a dialog.</p>
+      <ul>
+        <li><strong>Screenshot capture.</strong> A programmatic call returns the current contents of the application window. This is how the agent sees. Every action is preceded and followed by a screenshot so the result of the action is recorded as an image.</li>
+        <li><strong>Mouse control.</strong> Calls move the cursor to a target, click left, right, or middle, double-click, drag with mouse-down and mouse-up steps, and scroll. The target is always a pixel taken from a recent screenshot.</li>
+        <li><strong>Keyboard control.</strong> Calls type plain text, press keys, and perform modifier-key flows when a workflow requires them.</li>
+        <li><strong>Frame timing.</strong> Calls let the agent wait for layout, rendering, hover, focus, callbacks, and animation to settle before it compares the next screenshot.</li>
+      </ul>
+      <div class="diagram inspector-diagram" role="img" aria-label="Inspector pipeline loop showing screenshot, analyze, act, screenshot again, and verify">
+        <div class="inspector-loop">
+          <div class="inspector-card is-start">
+            <div class="inspector-name">Screenshot</div>
+            <span class="inspector-pill">capture API</span>
+            <div class="inspector-text">Records the current application window as an image.</div>
+          </div>
+          <div class="inspector-arrow" aria-hidden="true">&rarr;</div>
+          <div class="inspector-card">
+            <div class="inspector-name">Analyze and decide</div>
+            <div class="inspector-text">Reads the screenshot, identifies the target widget, and picks the pixel to act on.</div>
+          </div>
+          <div class="inspector-arrow" aria-hidden="true">&rarr;</div>
+          <div class="inspector-card">
+            <div class="inspector-name">Act</div>
+            <span class="inspector-pill">mouse API</span>
+            <span class="inspector-pill">keyboard API</span>
+            <div class="inspector-text">Performs one atomic input action: a move, a click, a key press, or a typed string.</div>
+          </div>
+          <div class="inspector-arrow" aria-hidden="true">&rarr;</div>
+          <div class="inspector-card">
+            <div class="inspector-name">Screenshot and verify</div>
+            <span class="inspector-pill">capture API</span>
+            <div class="inspector-text">Captures again, compares to the prior image, and confirms the expected change.</div>
+          </div>
+        </div>
+        <div class="api-row">
+          <div class="api-title">Capability categories provided by ovui</div>
+          <div class="api-pills">
+            <span class="inspector-pill">screenshot capture</span>
+            <span class="inspector-pill">mouse move / click / drag / scroll</span>
+            <span class="inspector-pill">keyboard keys / text</span>
+            <span class="inspector-pill">frame waits</span>
+          </div>
+        </div>
+        <p class="diagram-note">One loop, four control categories. The agent never skips a screenshot and never batches two actions between captures.</p>
+      </div>
+      <p>Those categories are enough to drive any visible widget. The agent reaches each target by where it appears on screen, then waits for the next frame before deciding whether the visible state changed as expected.</p>
+    </section>
+
+    <section>
+      <h2>Available control APIs</h2>
+      <p>The public control API lives in <code>omni.ui.testing</code>. It is intentionally small: one helper captures the window, a group of helpers injects mouse input, another group injects keyboard and text input, and the frame helpers keep the agent aligned with the application loop.</p>
+      <ul>
+        <li><strong>Capture.</strong> <code>capture_screenshot</code> records the rendered application window. The helper uses ovui's scheduled pre-swap capture path when it is available, with a direct capture fallback.</li>
+        <li><strong>Mouse.</strong> <code>mouse_move</code>, <code>mouse_click</code>, <code>mouse_double_click</code>, <code>mouse_drag</code>, and <code>mouse_scroll</code> cover hover, press, release, drag, and wheel-style input.</li>
+        <li><strong>Keyboard and text.</strong> <code>type_text</code> writes text into the focused widget, and <code>press_key</code> presses and releases an ImGui key. Modifier-key flows can drop to the lower <code>_ui._inject_key_event</code> hook when the public helper is not enough.</li>
+        <li><strong>Frame timing and run loop.</strong> <code>wait_frames</code> and <code>next_frame</code> advance the UI before the next screenshot. <code>ui.run</code> and <code>ui.run_async</code> are the run-loop entries that keep the app and the agent's coroutine moving together.</li>
+      </ul>
+      <p>Below those helpers, <code>omni.ui._ui</code> is the pybind layer that reaches the standalone backend. The public helpers are the normal agent-facing API; the lower hooks exist so tests can cover input cases that need exact event timing without mutating widget models or scene data directly.</p>
+    </section>
+
+    <section>
+      <h2>How the agent connects and runs</h2>
+      <p>The connection is an in-process Python bridge, not a network session or an external debugger. A standalone ovui app starts its normal run loop with <code>ui.run</code> or <code>ui.run_async</code>. The QA client runs beside the app code as an async routine, imports <code>omni.ui.testing</code>, and calls the helpers that are already bound to the live ovui backend.</p>
+      <ul>
+        <li>The app starts with the ovui standalone backend initialized. In headless runs, the backend renders offscreen, but the same testing helpers still capture the rendered frame.</li>
+        <li>The agent attaches by importing <code>omni.ui.testing</code> in that same Python run. The helpers call through <code>omni.ui._ui</code>, which is the pybind layer connected to the active backend.</li>
+        <li>Screenshot capture schedules a readback from the frame that ovui just rendered. Mouse and keyboard helpers enqueue input into the backend, which then feeds ImGui and the ovui widgets during the next frame.</li>
+        <li>The run loop is therefore concrete: start the app with ovui testing available, wait for the first stable frame, capture, choose the visible target, perform one input action, wait, capture again, and validate the new image.</li>
+        <li>When a particular input style needs the operating system level path rather than the application-level path, that distinction is reported as part of the run, not worked around silently.</li>
+      </ul>
+      <p>This keeps the inspector pipeline honest. The agent runs close enough to the app to use ovui's capture and input APIs, but it still judges success from screenshots instead of internal state. That is the same loop a person performs when sitting in front of the application.</p>
+    </section>
+
+    <section>
+      <h2>Using the pipeline from Claude or Codex</h2>
+      <p>The same pipeline drives the running app from an AI coding agent such as Claude Code, Codex, or Cursor. The repository ships a Claude Code-compatible skill, <code>skills/omniverse-ui-inspector</code>, that wraps the <code>omni.ui.testing</code> helpers in a localhost HTTP server and exposes a small CLI so the agent does not call internal APIs.</p>
+      <ul>
+        <li><strong>Launch the app with the skill on <code>PYTHONPATH</code>.</strong> Run <code>PYTHONPATH="${OVUI_REPO}/skills/omniverse-ui-inspector:${PYTHONPATH:-}" python -m ovwidgets.app</code> (or <code>python -m ovwidgets.app.headless</code> for offscreen runs). Importing the <code>ovuiinspect</code> module starts a localhost FastAPI server on <code>127.0.0.1:9910</code> in a background thread; ovui then drains queued mouse, keyboard, and screenshot actions on the normal frame loop. Defaults can be overridden with <code>OVUIINSPECT_HOST</code>, <code>OVUIINSPECT_PORT</code>, and <code>OVUIINSPECT_ENABLE_EXECUTE</code>.</li>
+        <li><strong>Drive the app through the <code>ovui-inspect</code> CLI.</strong> The agent issues <code>skills/omniverse-ui-inspector/scripts/ovui-inspect wait --timeout 60</code> once the app starts, then <code>screenshot --out file.png</code>, <code>move X Y</code>, <code>click X Y</code>, <code>type "text"</code>, <code>press KEY</code>, <code>combo "CTRL+A"</code>, <code>drag X1 Y1 X2 Y2</code>, and <code>scroll</code>. Coordinates always come from the previous screenshot, never from guesses.</li>
+        <li><strong>Follow the screenshot-action-screenshot loop.</strong> The agent prompt must require: take a screenshot, identify the target pixel from that image, perform one atomic action, take another screenshot, and compare. One action per screenshot pair. No batching, no Python execution shortcuts, no <code>/execute</code> unless the app was explicitly relaunched with <code>OVUIINSPECT_ENABLE_EXECUTE=1</code> for a setup step that has no visible UI path.</li>
+        <li><strong>Pair the inspector with the code-generation skills.</strong> Point the agent at <code>skills/omniverse-ui-apis</code> (atomic <code>ovui</code> primitives and TreeView/Window/Scene patterns) and <code>skills/omniverse-ui-widgets</code> (composing standalone apps from existing widgets) when asking it to generate or modify ovui code. The inspector skill captures what the running UI actually looks like; the code skills supply the proven layout, model, styling, and adapter patterns. Used together, the agent sees the live state, reads the right patterns, edits code, then re-screenshots to verify the change.</li>
+      </ul>
+      <p>A useful agent prompt names all three pieces explicitly: which app to launch, which inspector commands to run between edits, and which skill to consult for code patterns. Example: <em>"Launch <code>python -m ovwidgets.app</code> with <code>skills/omniverse-ui-inspector</code> on <code>PYTHONPATH</code>, wait for health, screenshot the current viewport, add a new toolbar button to <code>ViewportWidget</code> using the patterns in <code>skills/omniverse-ui-widgets/SKILL.md</code>, then re-screenshot and confirm the new button appears."</em></p>
+      <p>Grounding the agent in screenshots from the running app and in the skills above is what makes the generated UI look and behave like the rest of ovui instead of generic code: the agent reuses real ovwidgets components, follows the styling and selection conventions the application already enforces, and proves the change with a screenshot the user can read.</p>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Section navigation">
+      <a href="section-10.html">Previous: Startup, Data Flow, and Verification</a>
+      <a href="../architecture.html#section-11" target="_top">Index</a>
+    </nav>
+  </main>
+</body>
+</html>

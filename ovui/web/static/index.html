@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ovui playground</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"></span>
+          <span class="brand-title">ovui playground</span>
+        </div>
+        <div id="status" class="status">Loading</div>
+      </header>
+
+      <section class="canvas-pane" aria-label="compiled ovui ImGui output">
+        <div class="canvas-frame">
+          <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="0"></canvas>
+        </div>
+      </section>
+
+      <section class="editor-pane" aria-label="browser Python editor">
+        <div class="editor-toolbar">
+          <span>Python</span>
+          <button id="run-button" type="button" disabled>Run</button>
+        </div>
+        <div class="editor-grid">
+          <textarea id="python-editor" spellcheck="false" aria-label="Python script"></textarea>
+          <pre id="console" aria-label="Console output"></pre>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

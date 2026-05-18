@@ -1,0 +1,32 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def Cube "EnumCube" (
+        kind = "component"
+    )
+    {
+        double size = 2.0
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        # Step 3.3: exercise token attributes with allowedTokens metadata
+        # so the Property Inspector renders them as ui.ComboBox rows via
+        # TokenAttributeRow instead of plain StringField via
+        # StringAttributeRow.
+        #
+        # ``visibility`` is declared on UsdGeomImageable with
+        # ``allowedTokens = ["inherited", "invisible"]`` — authoring the
+        # value here ensures it appears in the enumerated attribute list.
+        token visibility = "invisible"
+
+        # ``purpose`` — also UsdGeomImageable — carries
+        # ``allowedTokens = ["default", "render", "proxy", "guide"]``.
+        token purpose = "render"
+    }
+}

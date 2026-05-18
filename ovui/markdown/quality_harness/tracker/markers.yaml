@@ -1,0 +1,53 @@
+# Per-marker progress tracker.
+#
+# Each entry describes one atomic feature the SUT must render indistinguishably
+# from the oracle. Fields:
+#   file:       corpus/ path to the MD that isolates the marker
+#   category:   inline | block | composite | document
+#   status:     red (not attempted) | yellow (close) | green (matched)
+#   ssim_gate:  minimum SSIM required to flip status to "green" (tuned per
+#               marker class; text-heavy atoms should demand higher than
+#               image-heavy atoms)
+#   notes:     human-readable observations, last diff highlights
+#
+# Status is set by diff/compare.py and manually promoted after review.
+
+atoms:
+  - { file: atoms/01_paragraph.md,   category: block,  status: red, ssim_gate: 0.98 }
+  - { file: atoms/02_headings.md,    category: block,  status: red, ssim_gate: 0.97 }
+  - { file: atoms/03_bold.md,        category: inline, status: red, ssim_gate: 0.98 }
+  - { file: atoms/04_italic.md,      category: inline, status: red, ssim_gate: 0.98 }
+  - { file: atoms/05_bold_italic.md, category: inline, status: red, ssim_gate: 0.98 }
+  - { file: atoms/06_strikethrough.md, category: inline, status: red, ssim_gate: 0.98 }
+  - { file: atoms/07_inline_code.md, category: inline, status: red, ssim_gate: 0.97 }
+  - { file: atoms/08_link.md,        category: inline, status: red, ssim_gate: 0.98 }
+  - { file: atoms/09_image.md,       category: block,  status: red, ssim_gate: 0.90 }
+  - { file: atoms/10_blockquote.md,  category: block,  status: red, ssim_gate: 0.97 }
+  - { file: atoms/11_ul_tight.md,    category: block,  status: red, ssim_gate: 0.97 }
+  - { file: atoms/12_ul_loose.md,    category: block,  status: red, ssim_gate: 0.97 }
+  - { file: atoms/13_ol.md,          category: block,  status: red, ssim_gate: 0.97 }
+  - { file: atoms/14_nested_list.md, category: block,  status: red, ssim_gate: 0.96 }
+  - { file: atoms/15_task_list.md,   category: block,  status: red, ssim_gate: 0.96 }
+  - { file: atoms/16_hr.md,          category: block,  status: red, ssim_gate: 0.98 }
+  - { file: atoms/17_fenced_code.md, category: block,  status: red, ssim_gate: 0.95 }
+  - { file: atoms/18_indented_code.md, category: block, status: red, ssim_gate: 0.95 }
+  - { file: atoms/19_table.md,       category: block,  status: red, ssim_gate: 0.96 }
+  - { file: atoms/20_table_aligned.md, category: block, status: red, ssim_gate: 0.96 }
+  - { file: atoms/21_alert_note.md,  category: block,  status: red, ssim_gate: 0.95 }
+  - { file: atoms/22_alert_all.md,   category: block,  status: red, ssim_gate: 0.95 }
+  - { file: atoms/23_emoji.md,       category: inline, status: red, ssim_gate: 0.92 }
+  - { file: atoms/24_autolink.md,    category: inline, status: red, ssim_gate: 0.97 }
+  - { file: atoms/25_hard_break.md,  category: inline, status: red, ssim_gate: 0.98 }
+  - { file: atoms/26_math_inline.md, category: inline, status: red, ssim_gate: 0.93 }
+  - { file: atoms/27_math_block.md,  category: block,  status: red, ssim_gate: 0.93 }
+
+composites:
+  - { file: composites/C01_list_with_code.md,     category: composite, status: red, ssim_gate: 0.94 }
+  - { file: composites/C02_blockquote_with_list.md, category: composite, status: red, ssim_gate: 0.95 }
+  - { file: composites/C03_table_with_inline.md,  category: composite, status: red, ssim_gate: 0.94 }
+  - { file: composites/C04_alert_with_code.md,    category: composite, status: red, ssim_gate: 0.94 }
+
+documents:
+  - { file: documents/D01_ai_short_answer.md, category: document, status: red, ssim_gate: 0.93 }
+  - { file: documents/D02_ai_technical.md,    category: document, status: red, ssim_gate: 0.93 }
+  - { file: documents/D03_ai_mixed_chat.md,   category: document, status: red, ssim_gate: 0.93 }

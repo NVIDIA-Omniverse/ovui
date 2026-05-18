@@ -1,0 +1,46 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def Xform "ProxyCube" (
+        kind = "component"
+    )
+    {
+        double3 xformOp:translate = (2, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "ProxyCone" (
+        kind = "component"
+    )
+    {
+        double3 xformOp:translate = (-2, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    # Step 3.7: exercise relationship rendering. ``proxyPrim`` is a
+    # UsdGeomImageable-inherited relationship on every UsdGeom prim; we
+    # author one target here and a second relationship (``singleProxy``
+    # pointing at one target, ``multiProxies`` pointing at two) so the
+    # screenshot shows the read-only StringField displaying both the
+    # single-target and multi-target shapes back-to-back. All target
+    # paths are live prims in this scene so the relationship is not
+    # dangling.
+    def Sphere "GeoSphere" (
+        kind = "component"
+    )
+    {
+        double radius = 1.0
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        rel proxyPrim = </World/ProxyCube>
+        rel singleProxy = </World/ProxyCone>
+        rel multiProxies = [</World/ProxyCube>, </World/ProxyCone>]
+    }
+}

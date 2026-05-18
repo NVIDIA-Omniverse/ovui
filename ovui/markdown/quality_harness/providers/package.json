@@ -1,0 +1,10 @@
+{
+  "name": "ovui-markdown-provider-plugins",
+  "private": true,
+  "description": "Optional local Node providers for MarkdownWidget Mermaid and MathJax showcases.",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@mathjax/src": "^4.0.0",
+    "@mermaid-js/mermaid-cli": "^11.12.0"
+  }
+}

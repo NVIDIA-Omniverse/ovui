@@ -1,0 +1,16 @@
+#usda 1.0
+(
+    subLayers = [
+        @./layers_step14_sub2.usda@
+    ]
+)
+
+over "World"
+{
+    def Cube "MidCube"
+    {
+        double size = 1.0
+        double3 xformOp:translate = (2.0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

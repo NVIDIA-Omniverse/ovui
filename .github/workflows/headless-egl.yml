@@ -1,0 +1,99 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# CI lane for EGL no-GPU headless path (issue #24, step C2).
+# Runs on ubuntu-22.04 with no GPU; uses EGL_MESA_platform_surfaceless.
+# Job name "egl-surfaceless" is referenced by the C3 validation matrix.
+
+name: EGL Headless (no-GPU)
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/issue-24-**'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: egl-headless-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  egl-surfaceless:
+    name: EGL surfaceless (ubuntu-22.04, no GPU)
+    runs-on: ubuntu-22.04
+
+    defaults:
+      run:
+        working-directory: ovui
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install EGL and Mesa dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libegl1-mesa-dev libgles2-mesa-dev \
+            libglfw3-dev libfreetype-dev
+
+      - name: Configure (OMNIUI_HEADLESS_GL=ON)
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOMNIUI_HEADLESS_GL=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Guard — verify EGL tests are registered
+        run: |
+          if ctest --test-dir build -N \
+              -R "headless_egl|egl_platform_unit|egl_texture_upload|egl_screenshot_error" \
+            | grep -q "Total Tests: 0"; then
+            echo "ERROR: no EGL tests registered in CTest"
+            exit 1
+          fi
+
+      - name: Run EGL tests (surfaceless, no GPU)
+        shell: bash
+        run: |
+          set -o pipefail
+          OMNIUI_EGL_FORCE_SURFACELESS=1 \
+          MESA_GL_VERSION_OVERRIDE=3.3 \
+            ctest --test-dir build \
+              -R "headless_egl|egl_platform_unit|egl_texture_upload|egl_screenshot_error" \
+              --output-on-failure 2>&1 | tee /tmp/egl_test.log
+
+      - name: Verify surfaceless strategy logged
+        # Re-runs headless_egl with --verbose so test stdout is visible even on
+        # pass; greps for the EGL_MESA_platform_surfaceless confirmation line.
+        # Failure here means the wrong EGL strategy was selected.
+        run: |
+          OMNIUI_EGL_FORCE_SURFACELESS=1 MESA_GL_VERSION_OVERRIDE=3.3 \
+            ctest --test-dir build -R "headless_egl" --verbose 2>&1 \
+            | tee /tmp/egl_surfaceless_verify.log \
+            | grep -q "EGL_MESA_platform_surfaceless active" || {
+              echo "FAIL: 'EGL_MESA_platform_surfaceless active' not found"
+              echo "--- verify log ---"
+              cat /tmp/egl_surfaceless_verify.log
+              exit 1
+            }
+
+      - name: Upload screenshot artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: egl-headless-screenshot
+          path: /tmp/egl_ctest.png
+          if-no-files-found: warn
+
+      - name: Upload test log artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: egl-headless-test-log
+          path: /tmp/egl_test.log
+          if-no-files-found: warn

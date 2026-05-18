@@ -1,0 +1,11 @@
+# ovui test-only dependencies — kept separate from build deps in pyproject.toml
+# so CI test legs install nothing more than they need. Pin minima only; the
+# CI image is allowed to provide newer versions of the same package.
+#
+# Refs: #36 (Phase 6 step 9)
+
+pytest>=7.0
+pytest-forked>=1.4
+pytest-asyncio>=0.21
+Pillow>=9.0
+numpy>=1.21
