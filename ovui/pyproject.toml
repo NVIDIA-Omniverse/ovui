@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ovui"
 dynamic = ["version"]
 description = "ovui — GPU-accelerated Python UI toolkit"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 license = {text = "NVIDIA Proprietary"}
 authors = [
     {name = "NVIDIA Corporation"},

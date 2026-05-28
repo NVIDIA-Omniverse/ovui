@@ -79,18 +79,16 @@ def _read_commit_sha() -> str:
 
 
 def _qualified_version(base_version: str, commit: str) -> str:
-    """Build a PEP 440-compliant version that bakes the short commit SHA into
-    the wheel filename.
+    """Return the wheel's PEP 440 version — always the plain base version.
 
-    PEP 427 wheel filenames are `{name}-{version}(-{build})?-{py}-{abi}-{plat}`,
-    so the SHA has to ride along inside the version field. PEP 440 local-version
-    identifiers (the `+local` suffix) are the right slot: they survive into the
-    wheel filename verbatim and `pip` installs them like any other version.
-    The `g` prefix mirrors the `setuptools-scm` / `git describe` convention.
+    Public package indexes (PyPI, NVIDIA Kitmaker) reject PEP 440
+    local-version identifiers (``+local``), so wheels never carry a
+    ``+g<hash>`` suffix. The full commit SHA is still recorded in
+    ``_build_info.py`` (via the separate ``__commit__`` field) for
+    provenance.
     """
-    if not commit or commit == "unknown" or len(commit) < 7:
-        return base_version
-    return f"{base_version}+g{commit[:7]}"
+    del commit  # unused; kept in signature for call-site stability
+    return base_version
 
 
 def _write_build_info(version: str, commit: str) -> None:
@@ -476,6 +474,6 @@ setup(
             "*.pyd",
         ],
     },
-    python_requires=">=3.8",
+    python_requires=">=3.12",
     zip_safe=False,
 )

@@ -91,11 +91,21 @@ if(NOT WIN32 AND NOT EMSCRIPTEN)
 endif()
 if(APPLE)
     set_target_properties(ovui PROPERTIES
-        INSTALL_RPATH "@loader_path"
+        # Cover both the wheel layout (omni/ui, omni/ui_scene) and the build
+        # tree (build/pip/core, build/pip/standalone). Non-existent entries
+        # are silently skipped by the loader. BUILD_WITH_INSTALL_RPATH bakes
+        # this in at build time so wheels don't carry leaked build-dir paths.
+        INSTALL_RPATH "@loader_path;@loader_path/../core;@loader_path/../standalone;@loader_path/../ui;@loader_path/../ui_scene"
+        BUILD_WITH_INSTALL_RPATH ON
     )
 elseif(NOT WIN32 AND NOT EMSCRIPTEN)
     set_target_properties(ovui PROPERTIES
-        INSTALL_RPATH "$ORIGIN"
+        # Cover both the wheel layout (omni/ui, omni/ui_scene) and the build
+        # tree (build/pip/core, build/pip/standalone). Non-existent entries
+        # are silently skipped by the loader. BUILD_WITH_INSTALL_RPATH bakes
+        # this in at build time so wheels don't carry leaked build-dir paths.
+        INSTALL_RPATH "$ORIGIN:$ORIGIN/../core:$ORIGIN/../standalone:$ORIGIN/../ui:$ORIGIN/../ui_scene"
+        BUILD_WITH_INSTALL_RPATH ON
     )
 endif()
 if(WIN32)
@@ -154,8 +164,10 @@ if(NOT (EMSCRIPTEN AND (OMNI_UI_BUILD_PYODIDE_BINDINGS OR OMNI_UI_BUILD_WEB_RUNT
         set_target_properties(ovuiscene PROPERTIES
             VERSION ${PROJECT_VERSION}
             SOVERSION 3
-            BUILD_RPATH "$ORIGIN"
-            INSTALL_RPATH "$ORIGIN"
+            # See ovui target above for rationale on this multi-entry RPATH
+            # and BUILD_WITH_INSTALL_RPATH.
+            INSTALL_RPATH "$ORIGIN:$ORIGIN/../core:$ORIGIN/../standalone:$ORIGIN/../ui:$ORIGIN/../ui_scene"
+            BUILD_WITH_INSTALL_RPATH ON
         )
     endif()
     if(WIN32)

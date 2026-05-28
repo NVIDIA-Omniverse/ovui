@@ -731,7 +731,7 @@ programmatically drags the X arrow and saves before/after PNGs.
 
 ```
 ovui/
-├── CMakeLists.txt              Top-level CMake (project v0.1.0, C++17)
+├── CMakeLists.txt              Top-level CMake (project v0.1.1, C++17)
 ├── setup.py                    pip install entry point (drives CMake)
 ├── pyproject.toml              PEP 517 build config
 ├── core/

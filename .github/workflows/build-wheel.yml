@@ -26,7 +26,10 @@
 #   * release: [published] — build and attach all wheels to the published release
 #
 # Outputs:
-#   * Workflow artifacts for Linux x64, Linux ARM64, and Windows x64 wheels
+#   * Workflow artifacts for Linux x64, Linux ARM64, manylinux x64,
+#     manylinux aarch64, and Windows x64 wheels (each Linux job emits
+#     both a plain linux_<arch> wheel and a retagged
+#     manylinux_2_35_<arch> wheel into the same artifact)
 #   * Release assets on published release events and manual release_tag runs
 
 name: Build Wheel
@@ -62,9 +65,13 @@ jobs:
           - label: Linux x64
             runner: ubuntu-22.04
             artifact: ovui-wheel-linux-x64
+            linux_tag: linux_x86_64
+            manylinux_tag: manylinux_2_35_x86_64
           - label: Linux ARM64
             runner: ubuntu-22.04-arm
             artifact: ovui-wheel-linux-arm64
+            linux_tag: linux_aarch64
+            manylinux_tag: manylinux_2_35_aarch64
 
     env:
       DEBIAN_FRONTEND: noninteractive
@@ -112,6 +119,19 @@ jobs:
         run: |
           python -m pip wheel . --no-deps -w dist/ -v
 
+      - name: Retag wheel for manylinux
+        run: |
+          shopt -s nullglob
+          src_wheels=(dist/ovui-*-cp312-cp312-${{ matrix.linux_tag }}.whl)
+          if [ "${#src_wheels[@]}" -ne 1 ]; then
+            echo "Expected exactly one ${{ matrix.linux_tag }} wheel in dist/, found ${#src_wheels[@]}"
+            printf '  %s\n' "${src_wheels[@]}"
+            exit 1
+          fi
+          python -m wheel tags --platform-tag ${{ matrix.manylinux_tag }} "${src_wheels[0]}"
+          echo "dist/ after retag:"
+          ls -la dist/
+
       - name: Show wheel contents
         run: |
           ls -la dist/
@@ -126,7 +146,6 @@ jobs:
           OMNIUI_BACKEND: "vulkan"
           OMNIUI_LAVAPIPE: "1"
         run: |
-          short_sha="${EXPECTED_COMMIT_SHA:0:7}"
           shopt -s nullglob
           wheels=(dist/*.whl)
           if [ "${#wheels[@]}" -eq 0 ]; then
@@ -134,10 +153,11 @@ jobs:
           fi
           for whl in "${wheels[@]}"; do
             echo "checking wheel filename: $whl"
-            case "$(basename "$whl")" in
-              *"+g${short_sha}"*) echo "  short SHA +g${short_sha} present in filename: OK" ;;
-              *) echo "  FAIL: wheel filename does not contain +g${short_sha}"; exit 1 ;;
-            esac
+            basename_whl="$(basename "$whl")"
+            if [[ "$basename_whl" != ovui-* ]]; then
+              echo "  FAIL: unexpected wheel filename format: $basename_whl"; exit 1
+            fi
+            echo "  filename OK: $basename_whl"
           done
           python -m venv /tmp/wheel-venv
           /tmp/wheel-venv/bin/pip install --upgrade pip
@@ -149,12 +169,10 @@ jobs:
           version = getattr(omni.ui, "__version__", None)
           commit = getattr(omni.ui, "__commit__", None)
           expected = os.environ["EXPECTED_COMMIT_SHA"]
-          short = expected[:7]
           print(f"omni.ui ok — version={version!r} commit={commit!r}")
           print("omni.ui_scene ok")
-          assert version and version.endswith(f"+g{short}"), (
-              f"omni.ui.__version__ {version!r} does not end with +g{short}"
-          )
+          assert version, "omni.ui.__version__ is empty"
+          print(f"  version={version!r} — OK")
           assert commit == expected, (
               f"omni.ui.__commit__ {commit!r} does not match GITHUB_SHA {expected!r}"
           )
@@ -262,15 +280,14 @@ jobs:
       - name: Smoke test — verify filename, install wheel, import omni.ui
         shell: pwsh
         run: |
-          $shortSha = $env:EXPECTED_COMMIT_SHA.Substring(0, 7)
           $wheels = Get-ChildItem dist/*.whl
           if ($wheels.Count -eq 0) { throw "no wheels found in dist/" }
           foreach ($w in $wheels) {
             Write-Host "checking wheel filename: $($w.Name)"
-            if ($w.Name -notlike "*+g$shortSha*") {
-              throw "wheel filename $($w.Name) does not contain +g$shortSha"
+            if ($w.Name -notmatch '^ovui-') {
+              throw "unexpected wheel filename format: $($w.Name)"
             }
-            Write-Host "  short SHA +g$shortSha present in filename: OK"
+            Write-Host "  filename OK"
           }
           python -m venv "$env:RUNNER_TEMP\wheel-venv"
           $python = "$env:RUNNER_TEMP\wheel-venv\Scripts\python.exe"
@@ -286,12 +303,10 @@ jobs:
           version = getattr(omni.ui, "__version__", None)
           commit = getattr(omni.ui, "__commit__", None)
           expected = os.environ["EXPECTED_COMMIT_SHA"]
-          short = expected[:7]
           print(f"omni.ui ok - version={version!r} commit={commit!r}")
           print("omni.ui_scene ok")
-          assert version and version.endswith(f"+g{short}"), (
-              f"omni.ui.__version__ {version!r} does not end with +g{short}"
-          )
+          assert version, "omni.ui.__version__ is empty"
+          print(f"  version={version!r} - OK")
           assert commit == expected, f"omni.ui.__commit__ {commit!r} does not match GITHUB_SHA {expected!r}"
           '@
           $scriptPath = Join-Path $env:RUNNER_TEMP "wheel_smoke.py"
@@ -321,10 +336,6 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
 
-      - name: Resolve release commit
-        run: |
-          echo "EXPECTED_COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
@@ -339,11 +350,10 @@ jobs:
       - name: Validate release wheel set
         run: |
           set -euo pipefail
-          short_sha="${EXPECTED_COMMIT_SHA:0:7}"
           shopt -s nullglob
           wheels=(wheelhouse/*.whl)
-          if [ "${#wheels[@]}" -ne 3 ]; then
-            echo "Expected exactly 3 ovui wheels, found ${#wheels[@]}"
+          if [ "${#wheels[@]}" -ne 5 ]; then
+            echo "Expected exactly 5 ovui wheels, found ${#wheels[@]}"
             printf '  %s\n' "${wheels[@]}"
             exit 1
           fi
@@ -360,9 +370,11 @@ jobs:
             echo "${label}: $(basename "${matches[0]}")"
           }
 
-          require_one "ovui-*+g${short_sha}-cp312-cp312-linux_x86_64.whl" "Linux x64"
-          require_one "ovui-*+g${short_sha}-cp312-cp312-linux_aarch64.whl" "Linux ARM64"
-          require_one "ovui-*+g${short_sha}-cp312-cp312-win_amd64.whl" "Windows x64"
+          require_one "ovui-*-cp312-cp312-linux_x86_64.whl" "Linux x64"
+          require_one "ovui-*-cp312-cp312-linux_aarch64.whl" "Linux ARM64"
+          require_one "ovui-*-cp312-cp312-manylinux_2_35_x86_64.whl" "manylinux x64"
+          require_one "ovui-*-cp312-cp312-manylinux_2_35_aarch64.whl" "manylinux aarch64"
+          require_one "ovui-*-cp312-cp312-win_amd64.whl" "Windows x64"
 
       - name: Attach wheels to GitHub release
         env:

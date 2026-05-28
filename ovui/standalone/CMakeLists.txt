@@ -267,11 +267,17 @@ if(NOT WIN32)
 endif()
 if(APPLE)
     set_target_properties(omniui_standalone PROPERTIES
-        INSTALL_RPATH "@loader_path"
+        # See ovui/core/CMakeLists.txt for rationale on this multi-entry
+        # RPATH and BUILD_WITH_INSTALL_RPATH.
+        INSTALL_RPATH "@loader_path;@loader_path/../core;@loader_path/../standalone;@loader_path/../ui;@loader_path/../ui_scene"
+        BUILD_WITH_INSTALL_RPATH ON
     )
 elseif(NOT WIN32)
     set_target_properties(omniui_standalone PROPERTIES
-        INSTALL_RPATH "$ORIGIN"
+        # See ovui/core/CMakeLists.txt for rationale on this multi-entry
+        # RPATH and BUILD_WITH_INSTALL_RPATH.
+        INSTALL_RPATH "$ORIGIN:$ORIGIN/../core:$ORIGIN/../standalone:$ORIGIN/../ui:$ORIGIN/../ui_scene"
+        BUILD_WITH_INSTALL_RPATH ON
     )
 endif()
 if(WIN32)

@@ -156,7 +156,7 @@ class HttpImageProviderPlugin(AsyncProviderPlugin):
         *,
         timeout: float = DEFAULT_TIMEOUT,
         max_bytes: int = DEFAULT_MAX_BYTES,
-        user_agent: str = "ovui-markdown-widget/0.1.0",
+        user_agent: str = "ovui-markdown-widget/0.1.1",
         accept: str = "image/*, image/svg+xml;q=0.9, */*;q=0.1",
         allow_private_networks: bool = False,
         block_scheme_downgrade: bool = True,
