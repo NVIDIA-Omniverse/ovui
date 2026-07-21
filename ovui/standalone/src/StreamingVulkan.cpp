@@ -36,6 +36,9 @@
 // ---------------------------------------------------------------------------
 #ifdef OMNIUI_HAS_NVENC
 #include <nvEncodeAPI.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 // Function pointer type for NvEncodeAPICreateInstance
 using NvEncCreateInstanceFn = NVENCSTATUS(NVENCAPI*)(NV_ENCODE_API_FUNCTION_LIST*);
@@ -465,7 +468,20 @@ bool StreamingVulkan::initNvenc()
     NV_ENCODE_API_FUNCTION_LIST nvenc = {};
     nvenc.version = NV_ENCODE_API_FUNCTION_LIST_VER;
 
+#ifdef _WIN32
     NVENCSTATUS status = NvEncodeAPICreateInstance(&nvenc);
+#else
+    static void* nvencLibrary = dlopen("libnvidia-encode.so.1", RTLD_NOW | RTLD_LOCAL);
+    static NvEncCreateInstanceFn createInstance = nvencLibrary
+        ? reinterpret_cast<NvEncCreateInstanceFn>(dlsym(nvencLibrary, "NvEncodeAPICreateInstance"))
+        : nullptr;
+    if (!createInstance)
+    {
+        fprintf(stderr, "StreamingVulkan: failed to load NVENC API\n");
+        return false;
+    }
+    NVENCSTATUS status = createInstance(&nvenc);
+#endif
     if (status != NV_ENC_SUCCESS)
     {
         fprintf(stderr, "StreamingVulkan: NvEncodeAPICreateInstance failed (%d)\n", status);

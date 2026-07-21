@@ -28,7 +28,7 @@ client. The browser page should show:
 The proof screenshot produced by this runbook is:
 
 ```text
-$WORKDIR/ovui/ovwidgets-browser-proof.png
+$WORKDIR/ovui/ovui-widgets-browser-proof.png
 ```
 
 That screenshot was captured from:
@@ -54,7 +54,7 @@ $WORKDIR/ovui/
   ovui/
     README.md
     HEADLESS.md
-  ovwidgets/
+  ovui-widgets/
     README.md
     LIVESTREAM.md
     dist/common/
@@ -710,7 +710,7 @@ verbatim from `os.environ`.
 The successful venv path was:
 
 ```text
-$WORKDIR/ovui/ovwidgets/_venv312
+$WORKDIR/ovui/ovui-widgets/_venv312
 ```
 
 ### 8.0 Build order
@@ -730,7 +730,7 @@ Follow this exact order:
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
 export PY312="$WORKDIR/python-3.12.13-official/bin/python3.12"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 "$PY312" -m venv "$VENV"
@@ -744,7 +744,7 @@ Use this block for install checks and runtime:
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 export USD_INSTALL="$WORKDIR/usd-build/install"
 export ovrtx_RUNTIME="$WORKDIR/ovrtx/examples/c/_deps/ovrtx-src/bin"
 export OVSTREAM_SDK="$WORKDIR/ovstream/_build/linux-x86_64/release/sdk"
@@ -763,7 +763,7 @@ The successful OVUI install used Vulkan and CUDA discovery. It set
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 export PATH="$VENV/bin:$PATH"
 
@@ -785,7 +785,7 @@ The build output in the successful run showed:
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 "$VENV/bin/python" -m pip install -e "$WORKDIR/ovrtx/python"
@@ -807,7 +807,7 @@ from Section 8.4. Install the OpenUSD adapter without dependency resolution so
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 "$VENV/bin/python" -m pip install -e \
@@ -826,17 +826,17 @@ layers were present:
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 "$VENV/bin/python" -m pip install --no-deps \
-    -e "$WORKDIR/ovui/ovwidgets/dist/common[testing]" \
-    -e "$WORKDIR/ovui/ovwidgets/dist/stage" \
-    -e "$WORKDIR/ovui/ovwidgets/dist/layers" \
-    -e "$WORKDIR/ovui/ovwidgets/dist/content" \
-    -e "$WORKDIR/ovui/ovwidgets/dist/property" \
-    -e "$WORKDIR/ovui/ovwidgets/dist/viewport" \
-    -e "$WORKDIR/ovui/ovwidgets/dist/app"
+    -e "$WORKDIR/ovui/ovui-widgets/dist/common[testing]" \
+    -e "$WORKDIR/ovui/ovui-widgets/dist/stage" \
+    -e "$WORKDIR/ovui/ovui-widgets/dist/layers" \
+    -e "$WORKDIR/ovui/ovui-widgets/dist/content" \
+    -e "$WORKDIR/ovui/ovui-widgets/dist/property" \
+    -e "$WORKDIR/ovui/ovui-widgets/dist/viewport" \
+    -e "$WORKDIR/ovui/ovui-widgets/dist/app"
 ```
 
 ### 8.8 Install ovstream SDK Python package
@@ -849,7 +849,7 @@ Build `libovstream.so` first using Section 9, then install the Python package:
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 "$VENV/bin/python" -m pip install -e \
@@ -862,7 +862,7 @@ Run this only after Sections 6, 7, 8, and 9 are complete:
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 export USD_INSTALL="$WORKDIR/usd-build/install"
 export ovrtx_RUNTIME="$WORKDIR/ovrtx/examples/c/_deps/ovrtx-src/bin"
 export OVSTREAM_SDK="$WORKDIR/ovstream/_build/linux-x86_64/release/sdk"
@@ -877,8 +877,8 @@ import ovrtx
 import omni.ui
 from omni.ui import headless_frame
 import ovstream
-from ovwidgets.app.application import Application
-from ovwidgets.viewport._livestream_tap import LivestreamTap
+from ovui_widgets.app.application import Application
+from ovui_widgets.viewport._livestream_tap import LivestreamTap
 
 print("USD", Usd.GetVersion())
 print("ovrtx", ovrtx.__version__)
@@ -1090,7 +1090,7 @@ self-contained for loader resolution.
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 export OVSTREAM_SDK="$WORKDIR/ovstream/_build/linux-x86_64/release/sdk"
 
 OVSTREAM_LIB_PATH="$OVSTREAM_SDK/libovstream.so" \
@@ -1114,7 +1114,7 @@ Expected:
 The successful proof used a generated helper script at:
 
 ```text
-$WORKDIR/tmp/ovwidgets_livestream_server.py
+$WORKDIR/tmp/ovui_widgets_livestream_server.py
 ```
 
 It was not committed. It exists to launch the app headlessly, load the USD file,
@@ -1124,7 +1124,7 @@ This helper intentionally reaches into application internals from the current
 OVUI `main` implementation: `Application._instance`, `app._stage_window._widget`,
 `app._stage_adapter`, `app._headless_tap`, `app.call_later`, and
 `app.selection_bus`. When updating to a newer OVUI main revision, inspect the
-current `ovwidgets.app.Application` and stage widget APIs before assuming the
+current `ovui_widgets.app.Application` and stage widget APIs before assuming the
 helper still works unchanged.
 
 The helpers in Section 10.1 and Section 12.3 live under `$WORKDIR/tmp`. If that
@@ -1137,14 +1137,14 @@ Create the script:
 
 ```bash
 mkdir -p "$WORKDIR/tmp"
-cat > $WORKDIR/tmp/ovwidgets_livestream_server.py <<'PY'
+cat > $WORKDIR/tmp/ovui_widgets_livestream_server.py <<'PY'
 import os
 import sys
 import time
 
 WORKDIR = os.environ["WORKDIR"]
-READY_FLAG = os.path.join(WORKDIR, "tmp", "ovwidgets-livestream-ready")
-USD_PATH = os.path.join(WORKDIR, "ovui", "ovwidgets", "tests", "data", "simple_scene.usda")
+READY_FLAG = os.path.join(WORKDIR, "tmp", "ovui-widgets-livestream-ready")
+USD_PATH = os.path.join(WORKDIR, "ovui", "ovui-widgets", "tests", "data", "simple_scene.usda")
 SELECTED_PATH = "/World/Cube"
 
 os.environ.setdefault("OMNIUI_HEADLESS", "1")
@@ -1164,7 +1164,7 @@ os.environ.setdefault(
 )
 
 import omni.ui as ui
-from ovwidgets.app.application import Application
+from ovui_widgets.app.application import Application
 
 
 def _mark_ready_once(app: Application) -> None:
@@ -1226,7 +1226,7 @@ record the exact PID.
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 export USD_INSTALL="$WORKDIR/usd-build/install"
 export ovrtx_RUNTIME="$WORKDIR/ovrtx/examples/c/_deps/ovrtx-src/bin"
 export OVSTREAM_SDK="$WORKDIR/ovstream/_build/linux-x86_64/release/sdk"
@@ -1238,8 +1238,8 @@ PYTHONPATH="$USD_INSTALL/lib/python" \
 LD_LIBRARY_PATH="$USD_INSTALL/lib:$ovrtx_RUNTIME:$OVSTREAM_SDK" \
 OVSTREAM_LIB_PATH="$OVSTREAM_SDK/libovstream.so" \
 SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
-setsid "$VENV/bin/python" $WORKDIR/tmp/ovwidgets_livestream_server.py \
-    > $WORKDIR/tmp/ovwidgets-livestream-server.log 2>&1 &
+setsid "$VENV/bin/python" $WORKDIR/tmp/ovui_widgets_livestream_server.py \
+    > $WORKDIR/tmp/ovui-widgets-livestream-server.log 2>&1 &
 
 echo "livestream server pid: $!"
 ```
@@ -1249,8 +1249,8 @@ This process should remain running; record the PID printed by the shell.
 Watch readiness:
 
 ```bash
-tail -f $WORKDIR/tmp/ovwidgets-livestream-server.log
-cat $WORKDIR/tmp/ovwidgets-livestream-ready
+tail -f $WORKDIR/tmp/ovui-widgets-livestream-server.log
+cat $WORKDIR/tmp/ovui-widgets-livestream-ready
 ```
 
 Expected readiness line:
@@ -1272,12 +1272,12 @@ The successful browser client was served from the ovstream SDK example:
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
-export VENV="$WORKDIR/ovui/ovwidgets/_venv312"
+export VENV="$WORKDIR/ovui/ovui-widgets/_venv312"
 
 cd "$WORKDIR/ovstream/sdk/examples/webrtc_client"
 
 setsid "$VENV/bin/python" -m http.server 8080 \
-    > $WORKDIR/tmp/ovwidgets-webrtc-http.log 2>&1 &
+    > $WORKDIR/tmp/ovui-widgets-webrtc-http.log 2>&1 &
 
 echo "http server pid: $!"
 ```
@@ -1315,7 +1315,7 @@ use `pkill`, `killall`, or broad process-name matching.
 The server script loads:
 
 ```text
-$WORKDIR/ovui/ovwidgets/tests/data/simple_scene.usda
+$WORKDIR/ovui/ovui-widgets/tests/data/simple_scene.usda
 ```
 
 The script selects:
@@ -1361,23 +1361,23 @@ The successful run used `playwright-core` and the system Chrome executable. It
 did not rely on a Playwright-managed browser download.
 
 ```bash
-mkdir -p $WORKDIR/tmp/ovwidgets-browser-proof
-cd $WORKDIR/tmp/ovwidgets-browser-proof
+mkdir -p $WORKDIR/tmp/ovui-widgets-browser-proof
+cd $WORKDIR/tmp/ovui-widgets-browser-proof
 npm init -y
 npm install playwright-core@1.60.0
 ```
 
 ### 12.3 Browser capture script
 
-Create `$WORKDIR/tmp/ovwidgets-browser-proof/capture.js`:
+Create `$WORKDIR/tmp/ovui-widgets-browser-proof/capture.js`:
 
 ```bash
-cat > $WORKDIR/tmp/ovwidgets-browser-proof/capture.js <<'JS'
+cat > $WORKDIR/tmp/ovui-widgets-browser-proof/capture.js <<'JS'
 const { chromium } = require('playwright-core');
 
 (async () => {
   const workdir = process.env.WORKDIR || `${process.env.HOME}/dev/ovui-livestream-work`;
-  const out = process.env.OUT || `${workdir}/ovui/ovwidgets-browser-proof.png`;
+  const out = process.env.OUT || `${workdir}/ovui/ovui-widgets-browser-proof.png`;
   const browser = await chromium.launch({
     executablePath: '/usr/bin/google-chrome',
     headless: true,
@@ -1438,9 +1438,9 @@ JS
 ### 12.4 Capture screenshot
 
 ```bash
-cd $WORKDIR/tmp/ovwidgets-browser-proof
-OUT=$WORKDIR/ovui/ovwidgets-browser-proof.png \
-node $WORKDIR/tmp/ovwidgets-browser-proof/capture.js
+cd $WORKDIR/tmp/ovui-widgets-browser-proof
+OUT=$WORKDIR/ovui/ovui-widgets-browser-proof.png \
+node $WORKDIR/tmp/ovui-widgets-browser-proof/capture.js
 ```
 
 Successful run output:
@@ -1448,7 +1448,7 @@ Successful run output:
 ```text
 [browser:log] update {action: start, status: inProgress, info: Starting stream.}
 [browser:log] connect() returned {action: start, status: inProgress, info: Starting stream.}
-SCREENSHOT=$WORKDIR/ovui/ovwidgets-browser-proof.png
+SCREENSHOT=$WORKDIR/ovui/ovui-widgets-browser-proof.png
 VIDEO={"status":"Connected","videoWidth":1280,"videoHeight":720,"readyState":4,"currentTime":3.568634}
 ```
 
@@ -1465,11 +1465,11 @@ favicon resources. The key checks are:
 The successful screenshot size was:
 
 ```bash
-stat -c '%n %s bytes' $WORKDIR/ovui/ovwidgets-browser-proof.png
+stat -c '%n %s bytes' $WORKDIR/ovui/ovui-widgets-browser-proof.png
 ```
 
 ```text
-$WORKDIR/ovui/ovwidgets-browser-proof.png 224487 bytes
+$WORKDIR/ovui/ovui-widgets-browser-proof.png 224487 bytes
 ```
 
 ## 13. Validation checklist
@@ -1545,14 +1545,14 @@ env OVRTX_SKIP_USD_CHECK=1 \
 PYTHONPATH=$WORKDIR/usd-build/install/lib/python \
 LD_LIBRARY_PATH=$WORKDIR/usd-build/install/lib:$WORKDIR/ovrtx/examples/c/_deps/ovrtx-src/bin:$WORKDIR/ovstream/_build/linux-x86_64/release/sdk \
 OVSTREAM_LIB_PATH=$WORKDIR/ovstream/_build/linux-x86_64/release/sdk/libovstream.so \
-$WORKDIR/ovui/ovwidgets/_venv312/bin/python - <<'PY'
+$WORKDIR/ovui/ovui-widgets/_venv312/bin/python - <<'PY'
 from pxr import Usd
 import ovrtx
 import omni.ui
 from omni.ui import headless_frame
 import ovstream
-from ovwidgets.app.application import Application
-from ovwidgets.viewport._livestream_tap import LivestreamTap
+from ovui_widgets.app.application import Application
+from ovui_widgets.viewport._livestream_tap import LivestreamTap
 
 print("USD", Usd.GetVersion())
 print("ovrtx", ovrtx.__version__)
@@ -1577,7 +1577,7 @@ ovstream 0.1.2
 ```bash
 ps -p <livestream-pid>,<http-pid> -o pid,ppid,stat,etime,cmd
 curl -sS -I http://127.0.0.1:8080/ | sed -n '1,8p'
-cat $WORKDIR/tmp/ovwidgets-livestream-ready
+cat $WORKDIR/tmp/ovui-widgets-livestream-ready
 ```
 
 Expected:
@@ -1590,9 +1590,9 @@ ready selected=/World/Cube state=LISTENING clients=0 error=None
 ### Browser/WebRTC screenshot
 
 ```bash
-OUT=$WORKDIR/ovui/ovwidgets-browser-proof.png \
-node $WORKDIR/tmp/ovwidgets-browser-proof/capture.js
-stat -c '%n %s bytes' $WORKDIR/ovui/ovwidgets-browser-proof.png
+OUT=$WORKDIR/ovui/ovui-widgets-browser-proof.png \
+node $WORKDIR/tmp/ovui-widgets-browser-proof/capture.js
+stat -c '%n %s bytes' $WORKDIR/ovui/ovui-widgets-browser-proof.png
 ```
 
 Expected:
@@ -1668,7 +1668,7 @@ Check the server process:
 
 ```bash
 ps -p <LIVESTREAM_PID> -o pid,ppid,stat,etime,cmd
-tail -n 120 $WORKDIR/tmp/ovwidgets-livestream-server.log
+tail -n 120 $WORKDIR/tmp/ovui-widgets-livestream-server.log
 ```
 
 Check that the client can load:
@@ -1742,7 +1742,7 @@ Symptoms:
 Check:
 
 ```bash
-$WORKDIR/ovui/ovwidgets/_venv312/bin/python -c "import sys; print(sys.executable); print(sys.version)"
+$WORKDIR/ovui/ovui-widgets/_venv312/bin/python -c "import sys; print(sys.executable); print(sys.version)"
 ```
 
 Expected executable should be the venv created from:
@@ -1799,7 +1799,7 @@ videoWidth:  1280
 videoHeight: 720
 readyState:  4
 currentTime: 3.568634
-screenshot:  $WORKDIR/ovui/ovwidgets-browser-proof.png
+screenshot:  $WORKDIR/ovui/ovui-widgets-browser-proof.png
 size:        224487 bytes
 ```
 
@@ -1812,8 +1812,8 @@ OVUI and OV Widgets:
 - `$WORKDIR/ovui/README.md`
 - `$WORKDIR/ovui/ovui/README.md`
 - `$WORKDIR/ovui/ovui/HEADLESS.md`
-- `$WORKDIR/ovui/ovwidgets/README.md`
-- `$WORKDIR/ovui/ovwidgets/LIVESTREAM.md`
+- `$WORKDIR/ovui/ovui-widgets/README.md`
+- `$WORKDIR/ovui/ovui-widgets/LIVESTREAM.md`
 - `$WORKDIR/ovui/ovui-data-adapters/README.md`
 
 ovrtx:
@@ -1866,7 +1866,7 @@ OpenSSL:
   version OpenSSL 3.5.6
 
 OV Widgets venv:
-  $WORKDIR/ovui/ovwidgets/_venv312
+  $WORKDIR/ovui/ovui-widgets/_venv312
 
 ovrtx runtime:
   $WORKDIR/ovrtx/examples/c/_deps/ovrtx-src/bin/libovrtx-dynamic.so
@@ -1875,13 +1875,13 @@ OVSTREAM runtime:
   $WORKDIR/ovstream/_build/linux-x86_64/release/sdk/libovstream.so
 
 USD scene:
-  $WORKDIR/ovui/ovwidgets/tests/data/simple_scene.usda
+  $WORKDIR/ovui/ovui-widgets/tests/data/simple_scene.usda
 
 Selected prim:
   /World/Cube
 
 Browser proof:
-  $WORKDIR/ovui/ovwidgets-browser-proof.png
+  $WORKDIR/ovui/ovui-widgets-browser-proof.png
 ```
 
 ### 16.3 Successful runtime state
@@ -1889,8 +1889,8 @@ Browser proof:
 The successful run leaves these process roles running:
 
 ```text
-<livestream-pid>  $WORKDIR/ovui/ovwidgets/_venv312/bin/python $WORKDIR/tmp/ovwidgets_livestream_server.py
-<http-pid>        $WORKDIR/ovui/ovwidgets/_venv312/bin/python -m http.server 8080
+<livestream-pid>  $WORKDIR/ovui/ovui-widgets/_venv312/bin/python $WORKDIR/tmp/ovui_widgets_livestream_server.py
+<http-pid>        $WORKDIR/ovui/ovui-widgets/_venv312/bin/python -m http.server 8080
 ```
 
 The successful URL was:
@@ -1902,14 +1902,14 @@ http://127.0.0.1:8080/
 The ready file was:
 
 ```text
-$WORKDIR/tmp/ovwidgets-livestream-ready
+$WORKDIR/tmp/ovui-widgets-livestream-ready
 ready selected=/World/Cube state=LISTENING clients=0 error=None
 ```
 
 The browser automation reported:
 
 ```text
-SCREENSHOT=$WORKDIR/ovui/ovwidgets-browser-proof.png
+SCREENSHOT=$WORKDIR/ovui/ovui-widgets-browser-proof.png
 VIDEO={"status":"Connected","videoWidth":1280,"videoHeight":720,"readyState":4,"currentTime":3.568634}
 ```
 
@@ -1919,11 +1919,11 @@ The previous proof intentionally did not commit build outputs or screenshots.
 Generated/untracked items included:
 
 ```text
-$WORKDIR/ovui/ovwidgets-browser-proof.png
-$WORKDIR/tmp/ovwidgets_livestream_server.py
-$WORKDIR/tmp/ovwidgets-browser-proof/capture.js
-$WORKDIR/tmp/ovwidgets-livestream-server.log
-$WORKDIR/tmp/ovwidgets-webrtc-http.log
+$WORKDIR/ovui/ovui-widgets-browser-proof.png
+$WORKDIR/tmp/ovui_widgets_livestream_server.py
+$WORKDIR/tmp/ovui-widgets-browser-proof/capture.js
+$WORKDIR/tmp/ovui-widgets-livestream-server.log
+$WORKDIR/tmp/ovui-widgets-webrtc-http.log
 ```
 
 Local source-tree patches outside OVUI were also part of the build environment:

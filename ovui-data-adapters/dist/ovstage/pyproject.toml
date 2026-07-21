@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovui-data-adapters-ovstage"
+dynamic = ["version"]
+description = "ovstage data-adapter package boundary."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ovui-data-adapters-common>=0.1.0",
+]
+
+[project.entry-points."ovui_data_adapters.adapters"]
+ovstage = "ovui_data_adapters.ovstage.register:register"
+
+[project.entry-points."ovui_data_adapters.native_renderer_factories"]
+ovstage = "ovui_data_adapters.ovstage.renderer_adapter:OvstageRendererAdapter"
+
+[project.entry-points."ovui_widgets.components"]
+ovstage_physics_controls = "ovui_widgets_physx_controls:register"
+
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["ovui_data_adapters.ovstage*", "ovui_widgets_physx_controls"]
+where = ["../.."]

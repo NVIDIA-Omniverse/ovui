@@ -467,7 +467,16 @@ void Frame::_drawContent(float elapsedTime)
 
     if (doRaster)
     {
-        iterateChildren = this->_rasterHelperBegin(cursor.x, cursor.y, width, height);
+        ImVec2 rasterOrigin = cursor;
+        auto* ctx = ImGui::GetCurrentContext();
+        ImGuiWindow* window = ctx ? ctx->CurrentWindow : nullptr;
+        if (window)
+        {
+            rasterOrigin.x = std::max(rasterOrigin.x, window->ClipRect.Min.x);
+            rasterOrigin.y = std::max(rasterOrigin.y, window->ClipRect.Min.y);
+        }
+
+        iterateChildren = this->_rasterHelperBegin(rasterOrigin.x, rasterOrigin.y, width, height);
         needSeparateWindow = false;
     }
     else

@@ -206,6 +206,26 @@ void ScrollingFrame::_drawContent(float elapsedTime)
         }
     }
 
+    auto& data = _getData<ScrollingFrameData>();
+
+    // If this ScrollingFrame is rasterized, Frame::_drawContent may draw the
+    // cached draw list without iterating the child. ImGui still needs the
+    // child's full content size here so scroll bounds stay correct.
+    ImVec2 childContentSize{ 0.0f, 0.0f };
+    if (data.m_canvas && data.m_canvas->isVisible())
+    {
+        childContentSize.x = data.m_canvas->getComputedContentWidth();
+        childContentSize.y = data.m_canvas->getComputedContentHeight();
+    }
+
+    if (horizontalPolicy != ScrollBarPolicy::eScrollBarAlwaysOff ||
+        verticalPolicy != ScrollBarPolicy::eScrollBarAlwaysOff)
+    {
+        ImGui::SetNextWindowContentSize(
+            { horizontalPolicy == ScrollBarPolicy::eScrollBarAlwaysOff ? 0.0f : childContentSize.x,
+              verticalPolicy == ScrollBarPolicy::eScrollBarAlwaysOff ? 0.0f : childContentSize.y });
+    }
+
     // Create a window with the specified size.
     ImGui::BeginChild("", { this->getComputedContentWidth(), this->getComputedContentHeight() }, false, flags);
 
@@ -216,7 +236,6 @@ void ScrollingFrame::_drawContent(float elapsedTime)
     // will return to the initial value. To avoid it, we use the flag that indicates that the scroll level was changed.
     // It allows us to obtain the correct scroll from ImGui and send it back to ImGui if it was changed, so it's very
     // transparent to the user.
-    auto& data = _getData<ScrollingFrameData>();
     if (data.m_scrollXExplicitlyChanged)
     {
         ImGui::SetScrollX(this->getScrollX() * dpiScale);
@@ -224,8 +243,12 @@ void ScrollingFrame::_drawContent(float elapsedTime)
     }
     else
     {
-        this->setScrollX(ImGui::GetScrollX() / dpiScale);
-        this->setScrollXMax(ImGui::GetScrollMaxX() / dpiScale);
+        const float scrollX = ImGui::GetScrollX() / dpiScale;
+        if (scrollX != this->getScrollX() && this->getRasterPolicy() != RasterPolicy::eNever)
+        {
+            this->forceRasterDirty(BakeDirtyReason::eContentChanged);
+        }
+        this->setScrollX(scrollX);
     }
 
     if (data.m_scrollYExplicitlyChanged)
@@ -235,12 +258,18 @@ void ScrollingFrame::_drawContent(float elapsedTime)
     }
     else
     {
-        this->setScrollY(ImGui::GetScrollY() / dpiScale);
-        this->setScrollYMax(ImGui::GetScrollMaxY() / dpiScale);
+        const float scrollY = ImGui::GetScrollY() / dpiScale;
+        if (scrollY != this->getScrollY() && this->getRasterPolicy() != RasterPolicy::eNever)
+        {
+            this->forceRasterDirty(BakeDirtyReason::eContentChanged);
+        }
+        this->setScrollY(scrollY);
     }
 
     // Base _drawContent works nice. We only need to frame it to the scrolling window.
     Frame::_drawContent(elapsedTime);
+    this->setScrollXMax(ImGui::GetScrollMaxX() / dpiScale);
+    this->setScrollYMax(ImGui::GetScrollMaxY() / dpiScale);
 
     ImGui::EndChild();
     ImGui::PopID();
@@ -252,11 +281,19 @@ void ScrollingFrame::_drawContent(float elapsedTime)
 void ScrollingFrame::_scrollXExplicitlyChanged()
 {
     _getData<ScrollingFrameData>().m_scrollXExplicitlyChanged = true;
+    if (this->getRasterPolicy() != RasterPolicy::eNever)
+    {
+        this->forceRasterDirty(BakeDirtyReason::eContentChanged);
+    }
 }
 
 void ScrollingFrame::_scrollYExplicitlyChanged()
 {
     _getData<ScrollingFrameData>().m_scrollYExplicitlyChanged = true;
+    if (this->getRasterPolicy() != RasterPolicy::eNever)
+    {
+        this->forceRasterDirty(BakeDirtyReason::eContentChanged);
+    }
 }
 
 OMNIUI_NAMESPACE_CLOSE_SCOPE

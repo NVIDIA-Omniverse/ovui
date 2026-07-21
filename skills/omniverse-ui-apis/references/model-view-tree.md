@@ -275,9 +275,9 @@ Use `keep_alive=True` when filtering huge trees and item churn would otherwise d
 
 ## Stage Hierarchy Tree From Atomic Primitives
 
-Do not reuse `ovwidgets.stage.widget.StageWidget` or `StageWindow` when the user asks for atomic widgets. Inspecting them for patterns is allowed; importing them is not. Recreate the pattern from atomic widgets.
+Do not reuse `ovui_widgets.stage.widget.StageWidget` or `StageWindow` when the user asks for atomic widgets. Inspecting them for patterns is allowed; importing them is not. Recreate the pattern from atomic widgets.
 
-The pattern below is distilled from the reference `ovwidgets/stage/widget/hierarchy_model.py` and `stage_widget.py`. File:line references are provided so the agent can verify when in doubt — but the agent must reimplement, not import.
+The pattern below is distilled from the reference `ovui_widgets/stage/widget/hierarchy_model.py` and `stage_widget.py`. File:line references are provided so the agent can verify when in doubt — but the agent must reimplement, not import.
 
 Model responsibilities:
 

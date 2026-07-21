@@ -225,14 +225,14 @@ async function runInteractionScenario() {
     await page.mouse.click(canvasBox.x + 190, canvasBox.y + 155);
     await page.screenshot({ path: screenshotPath("interaction_720_canvas_field_focus") });
     await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
-    await page.keyboard.type("VictorHD");
+    await page.keyboard.type("HiDpiQA");
     await page.screenshot({ path: screenshotPath("interaction_720_canvas_field_typed") });
 
     await page.mouse.click(canvasBox.x + 106, canvasBox.y + 316);
     await page.screenshot({ path: screenshotPath("interaction_720_advanced_clicked") });
     await page.mouse.click(canvasBox.x + 236, canvasBox.y + 316);
     await page.waitForFunction(
-      () => document.querySelector("#console")?.textContent?.includes("VictorHD"),
+      () => document.querySelector("#console")?.textContent?.includes("HiDpiQA"),
       null,
       { timeout: 10000 }
     );

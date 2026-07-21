@@ -7,5 +7,8 @@
 pytest>=7.0
 pytest-forked>=1.4
 pytest-asyncio>=0.21
+pytest-timeout>=2.1
+pytest-cov>=5.0
 Pillow>=9.0
+PyOpenGL>=3.1
 numpy>=1.21

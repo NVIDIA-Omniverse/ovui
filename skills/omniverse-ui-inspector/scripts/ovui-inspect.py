@@ -105,6 +105,10 @@ def status():
     return _get("/status", timeout=5.0)
 
 
+def application_state(timeout: float = 5.0):
+    return _get("/state", {"timeout": timeout}, timeout=timeout + 5)
+
+
 def wait_for_health(timeout: float = 60.0, interval: float = 0.5) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -141,6 +145,7 @@ def click(
     *,
     button: str = "left",
     double: bool = False,
+    modifiers: list[str] | None = None,
     timeout: float = 5.0,
 ):
     data = {"button": button, "double": double, "timeout": timeout}
@@ -148,6 +153,8 @@ def click(
         data["x"] = x
     if y is not None:
         data["y"] = y
+    if modifiers is not None:
+        data["modifiers"] = modifiers
     return _post("/mouse/click", data, timeout=timeout + 5)
 
 
@@ -160,6 +167,7 @@ def drag(
     button: str = "left",
     steps: int | None = None,
     duration: float | None = None,
+    modifiers: list[str] | None = None,
     timeout: float = 10.0,
 ):
     data = {
@@ -174,6 +182,8 @@ def drag(
         data["steps"] = steps
     if duration is not None:
         data["duration"] = duration
+    if modifiers is not None:
+        data["modifiers"] = modifiers
     return _post(
         "/mouse/drag",
         data,
@@ -244,6 +254,12 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("health")
     sub.add_parser("status")
+    state_cmd = sub.add_parser(
+        "state",
+        help="Read QA application state (requires OVUIINSPECT_ENABLE_STATE=1)",
+    )
+    state_cmd.add_argument("--out", help="Optional JSON output path")
+    state_cmd.add_argument("--timeout", type=float, default=5.0)
     wait_cmd = sub.add_parser("wait")
     wait_cmd.add_argument("--timeout", type=float, default=60.0)
     shot = sub.add_parser("screenshot")
@@ -258,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
     ck.add_argument("y", type=int)
     ck.add_argument("--button", choices=["left", "right", "middle"], default="left")
     ck.add_argument("--double", action="store_true")
+    ck.add_argument("--modifiers")
     dg = sub.add_parser("drag")
     dg.add_argument("start_x", type=int)
     dg.add_argument("start_y", type=int)
@@ -274,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         help="exact drag move-step count; overrides duration when both are provided",
     )
+    dg.add_argument("--modifiers", help="Comma-separated ctrl,shift,alt,super")
     sc = sub.add_parser("scroll")
     sc.add_argument("direction", choices=["up", "down", "left", "right"])
     sc.add_argument("--amount", type=float, default=5.0)
@@ -300,6 +318,13 @@ def main(argv: list[str] | None = None) -> int:
         result = health()
     elif args.command == "status":
         result = status()
+    elif args.command == "state":
+        result = application_state(args.timeout)
+        if args.out and isinstance(result, dict) and result.get("success"):
+            with open(args.out, "w", encoding="utf-8") as handle:
+                json.dump(result, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            result = {"success": True, "out": args.out, "state": result.get("state")}
     elif args.command == "wait":
         ok = wait_for_health(args.timeout)
         print("OK" if ok else "TIMEOUT")
@@ -309,8 +334,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "move":
         result = move(args.x, args.y)
     elif args.command == "click":
-        result = click(args.x, args.y, button=args.button, double=args.double)
+        modifiers = [m.strip() for m in args.modifiers.split(",")] if args.modifiers else None
+        result = click(args.x, args.y, button=args.button, double=args.double, modifiers=modifiers)
     elif args.command == "drag":
+        modifiers = [m.strip() for m in args.modifiers.split(",")] if args.modifiers else None
         result = drag(
             args.start_x,
             args.start_y,
@@ -319,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
             button=args.button,
             steps=args.steps,
             duration=args.duration,
+            modifiers=modifiers,
         )
     elif args.command == "scroll":
         result = scroll(args.direction, amount=args.amount, x=args.x, y=args.y)

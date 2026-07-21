@@ -280,6 +280,7 @@ elif not _IN_KIT:
         get_max_frame_rate,
         init,
         next_frame,
+        request_wakeup,
         run,
         run_async,
         set_max_frame_rate,

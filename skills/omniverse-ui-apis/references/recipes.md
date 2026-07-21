@@ -517,7 +517,7 @@ with rv.map(device=Device.CPU) as mapping:
 
 `frame` is `(H, W, 4)` uint8 RGBA — feed it straight into `ImageBridge.update(frame)`.
 
-If the agent needs more than this — pick rays, selection highlight, GPU zero-copy, or session-layer reinjection on resize — stop and ask Victor to authorize the high-level adapter or extend this skill.
+If the agent needs more than this — pick rays, selection highlight, GPU zero-copy, or session-layer reinjection on resize — stop and ask the skill maintainer to authorize the high-level adapter or extend this skill.
 
 ## Recipe: Property-Inspector Row Patterns From Atomic Widgets
 

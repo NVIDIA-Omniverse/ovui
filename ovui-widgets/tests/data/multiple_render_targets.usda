@@ -1,0 +1,153 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    def Xform "Geometry"
+    {
+        def Mesh "GroundPlane"
+        {
+            float3[] extent = [(-25, -25, 0), (25, 25, 0)]
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(-25, -25, 0), (25, -25, 0), (25, 25, 0), (-25, 25, 0)]
+            color3f[] primvars:displayColor = [(0.05, 0.05, 0.05)]
+        }
+
+        def Cube "BlueCube"
+        {
+            double size = 1.6
+            double3 xformOp:translate = (-1.25, 0, 0.8)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Sphere "GoldSphere"
+        {
+            double radius = 0.85
+            double3 xformOp:translate = (1.25, 0, 0.85)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Cube "LidarTarget"
+        {
+            double size = 4
+            color3f[] primvars:displayColor = [(0.45, 0.43, 0.39)]
+            double3 xformOp:translate = (7, 0, 2)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+
+    def Xform "Cameras"
+    {
+        def Camera "Main"
+        {
+            float focalLength = 24
+            float horizontalAperture = 20.955
+            float verticalAperture = 15.2908
+            float2 clippingRange = (0.01, 10000)
+            token projection = "perspective"
+            double3 xformOp:translate = (-6, -8, 5)
+            float3 xformOp:rotateXYZ = (60, 0, -37)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
+
+        def Camera "Closeup"
+        {
+            float focalLength = 36
+            float horizontalAperture = 20.955
+            float verticalAperture = 15.2908
+            float2 clippingRange = (0.01, 10000)
+            token projection = "perspective"
+            double3 xformOp:translate = (4, -5, 3)
+            float3 xformOp:rotateXYZ = (58, 0, 38)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
+    }
+
+    def Xform "RoofLidar"
+    {
+        double3 xformOp:translate = (0, 0, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def OmniLidar "Sensor" (
+            prepend apiSchemas = ["OmniSensorGenericLidarCoreAPI"]
+        )
+        {
+            token omni:sensor:Core:elementsCoordsType = "CARTESIAN"
+            token omni:sensor:Core:outputFrameOfReference = "WORLD"
+            double2 omni:sensor:frameRate = (10, 1)
+            float3 xformOp:rotateXYZ = (90, 0, -90)
+            uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
+        }
+    }
+
+    def DistantLight "KeyLight"
+    {
+        float intensity = 700
+        float angle = 0.6
+        float3 xformOp:rotateXYZ = (315, 45, 0)
+        uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
+    }
+}
+
+def Scope "Render"
+{
+    def Scope "Vars"
+    {
+        def RenderVar "LdrColor"
+        {
+            uniform string sourceName = "LdrColor"
+        }
+
+        def RenderVar "DistanceToCamera"
+        {
+            uniform string sourceName = "DistanceToCameraSD"
+        }
+
+        def RenderVar "PointCloud"
+        {
+            uniform string sourceName = "PointCloud"
+            string[] channels = [
+                "Coordinates",
+                "Intensity",
+                "Counts",
+                "Flags",
+                "TimeOffsetNs"
+            ]
+        }
+    }
+
+    def Scope "Products"
+    {
+        def RenderProduct "MainCamera"
+        {
+            rel camera = </World/Cameras/Main>
+            rel orderedVars = [
+                </Render/Vars/LdrColor>,
+                </Render/Vars/DistanceToCamera>
+            ]
+            uniform int2 resolution = (1280, 720)
+        }
+
+        def RenderProduct "CloseupCamera"
+        {
+            rel camera = </World/Cameras/Closeup>
+            rel orderedVars = </Render/Vars/LdrColor>
+            uniform int2 resolution = (960, 540)
+        }
+
+        def RenderProduct "RoofLidar"
+        {
+            rel camera = </World/RoofLidar/Sensor>
+            rel orderedVars = </Render/Vars/PointCloud>
+            uniform int2 resolution = (1, 1)
+        }
+    }
+}

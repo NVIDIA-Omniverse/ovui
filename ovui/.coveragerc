@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+
+[run]
+branch = True
+relative_files = True
+source =
+    python/omni/ui
+    python/omni/ui_scene
+
+[report]
+precision = 2
+show_missing = True
+skip_covered = True
+
+[html]
+show_contexts = True

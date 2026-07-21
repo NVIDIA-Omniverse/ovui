@@ -1,0 +1,865 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# Pull-request and download-only app wheelhouse build.
+#
+# This workflow mirrors the platform coverage of build-wheel.yml for the native
+# ovui package, then adds the pure-Python ovui-widgets and data-adapter wheels
+# needed to run and test the reference app from downloaded artifacts. The
+# Inspector skill is embedded in the ovui application wheel; it is never a
+# standalone distribution.
+# Native ovui wheels force bundled static GLFW/FreeType and require Vulkan plus
+# CUDA 12.8; CI fails instead of silently emitting a reduced-feature wheel.
+#
+# It intentionally has no release trigger, no package publish step, no gh
+# release upload, and only read repository permissions. Pull requests build and
+# clean-install the affected packages; wheels are uploaded only as GitHub
+# Actions workflow artifacts.
+
+name: Build App Wheelhouse
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Optional branch, tag, or SHA to build"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-app-wheelhouse-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-app-wheelhouse-linux:
+    name: Build app wheelhouse (${{ matrix.label }}, Vulkan + CUDA)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x64
+            runner: ubuntu-22.04
+            artifact: ovui-app-wheelhouse-linux-x64
+            linux_tag: linux_x86_64
+            manylinux_tag: manylinux_2_35_x86_64
+            cuda_repo_arch: x86_64
+            standalone_openusd: true
+          - label: Linux ARM64
+            runner: ubuntu-22.04-arm
+            artifact: ovui-app-wheelhouse-linux-arm64
+            linux_tag: linux_aarch64
+            manylinux_tag: manylinux_2_35_aarch64
+            cuda_repo_arch: sbsa
+            # usd-core 25.11 does not publish a Linux ARM64 wheel.
+            standalone_openusd: false
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CUDAToolkit_ROOT: /usr/local/cuda-12.8
+      OMNIUI_CMAKE_ARGS: >-
+        -DOMNIUI_USE_BUNDLED_GLFW=ON
+        -DOMNIUI_USE_BUNDLED_FREETYPE=ON
+        -DOMNIUI_REQUIRE_VULKAN=ON
+        -DOMNIUI_REQUIRE_CUDA=ON
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref != '' && inputs.source_ref || github.ref }}
+
+      - name: Resolve checked-out commit
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "OVUI_BUILD_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
+          echo "EXPECTED_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: Install Vulkan, CUDA, and static dependency build prerequisites
+        # Do not install libglfw3-dev, libfreetype-dev, or libfontconfig1-dev:
+        # wheel builds force the pinned static FetchContent targets instead.
+        run: |
+          set -euo pipefail
+          keyring="$RUNNER_TEMP/cuda-keyring_1.1-1_all.deb"
+          curl -fsSL \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${{ matrix.cuda_repo_arch }}/cuda-keyring_1.1-1_all.deb" \
+            -o "$keyring"
+          sudo dpkg -i "$keyring"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-8 \
+            libvulkan-dev \
+            mesa-vulkan-drivers \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libxkbcommon-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            xvfb \
+            xauth \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3-dev
+
+          test -x "$CUDAToolkit_ROOT/bin/nvcc"
+          test -f "$CUDAToolkit_ROOT/include/cuda_runtime.h"
+          cuda_stub="$(find "$CUDAToolkit_ROOT" -path '*/stubs/libcuda.so' -print -quit)"
+          cuda_runtime="$(find "$CUDAToolkit_ROOT" -name 'libcudart.so.12' -print -quit)"
+          test -n "$cuda_stub"
+          test -n "$cuda_runtime"
+          stub_dir="$RUNNER_TEMP/cuda-driver-stub"
+          mkdir -p "$stub_dir"
+          ln -s "$cuda_stub" "$stub_dir/libcuda.so.1"
+          echo "LD_LIBRARY_PATH=$stub_dir:$(dirname "$cuda_runtime")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          "$CUDAToolkit_ROOT/bin/nvcc" --version
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip toolchain
+        run: |
+          python -m pip install --upgrade pip wheel setuptools build pybind11
+
+      - name: Build native ovui wheel
+        run: |
+          mkdir -p wheelhouse
+          python -m pip wheel ./ovui --no-deps -w wheelhouse/ -v
+
+      - name: Retag ovui wheel for manylinux
+        run: |
+          shopt -s nullglob
+          src_wheels=(wheelhouse/ovui-*-cp312-cp312-${{ matrix.linux_tag }}.whl)
+          if [ "${#src_wheels[@]}" -ne 1 ]; then
+            echo "Expected exactly one ${{ matrix.linux_tag }} ovui wheel in wheelhouse/, found ${#src_wheels[@]}"
+            printf '  %s\n' "${src_wheels[@]}"
+            exit 1
+          fi
+          python -m wheel tags --platform-tag ${{ matrix.manylinux_tag }} "${src_wheels[0]}"
+
+      - name: Build ovui-widgets and data-adapter wheels
+        run: |
+          set -euo pipefail
+          projects=(
+            ovui-data-adapters/dist/common
+            ovui-data-adapters/dist/services
+            ovui-data-adapters/dist/openusd
+            ovui-data-adapters/dist/ovstage
+            ovui-widgets/dist/common
+            ovui-widgets/dist/content
+            ovui-widgets/dist/stage
+            ovui-widgets/dist/layers
+            ovui-widgets/dist/property
+            ovui-widgets/dist/viewport
+            ovui-widgets/dist/app
+            ovui-widgets/dist/all
+          )
+          for project in "${projects[@]}"; do
+            echo "=== Building $project ==="
+            python -m pip wheel "$project" --no-deps -w wheelhouse/ -v
+          done
+
+      - name: Write wheelhouse manifest
+        run: |
+          {
+            echo "ovui app wheelhouse"
+            echo "commit: ${EXPECTED_COMMIT_SHA}"
+            echo "platform: ${{ matrix.label }}"
+            echo
+            echo "wheels:"
+            find wheelhouse -maxdepth 1 -type f -name '*.whl' -printf '  %f\n' | sort
+            echo
+            echo "external runtime dependencies are resolved by pip from package metadata unless already supplied:"
+            echo "  numpy, usd-core, and optional ovrtx/ovstage runtimes as needed by the selected provider"
+            echo
+            echo "install note:"
+            echo "  install from this directory with --find-links and package names so pip chooses the right platform wheel"
+          } > wheelhouse/MANIFEST.txt
+
+      - name: Validate wheelhouse contents
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          require_one() {
+            local pattern="$1"
+            local label="$2"
+            local matches=(wheelhouse/$pattern)
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "Expected exactly one ${label} wheel matching ${pattern}, found ${#matches[@]}"
+              printf '  %s\n' "${matches[@]}"
+              exit 1
+            fi
+            echo "${label}: $(basename "${matches[0]}")"
+          }
+
+          require_one "ovui-*-cp312-cp312-${{ matrix.linux_tag }}.whl" "ovui ${{ matrix.linux_tag }}"
+          require_one "ovui-*-cp312-cp312-${{ matrix.manylinux_tag }}.whl" "ovui ${{ matrix.manylinux_tag }}"
+          require_one "ovui_data_adapters_common-*-py3-none-any.whl" "ovui-data-adapters-common"
+          require_one "ovui_data_adapters_services-*-py3-none-any.whl" "ovui-data-adapters-services"
+          require_one "ovui_data_adapters_openusd-*-py3-none-any.whl" "ovui-data-adapters-openusd"
+          require_one "ovui_data_adapters_ovstage-*-py3-none-any.whl" "ovui-data-adapters-ovstage"
+          require_one "ovui_widgets_common-*-py3-none-any.whl" "ovui-widgets-common"
+          require_one "ovui_widgets_content-*-py3-none-any.whl" "ovui-widgets-content"
+          require_one "ovui_widgets_stage-*-py3-none-any.whl" "ovui-widgets-stage"
+          require_one "ovui_widgets_layers-*-py3-none-any.whl" "ovui-widgets-layers"
+          require_one "ovui_widgets_property-*-py3-none-any.whl" "ovui-widgets-property"
+          require_one "ovui_widgets_viewport-*-py3-none-any.whl" "ovui-widgets-viewport"
+          require_one "ovui_widgets_app-*-py3-none-any.whl" "ovui-widgets-app"
+          require_one "ovui_widgets_all-*-py3-none-any.whl" "ovui-widgets-all"
+
+          # 14 = native ovui (linux tag + manylinux retag) + the 12
+          # pure-Python distributions built above.
+          wheel_count="$(find wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)"
+          if [ "$wheel_count" -ne 14 ]; then
+            echo "Expected 14 wheels in Linux wheelhouse, found $wheel_count"
+            find wheelhouse -maxdepth 1 -type f -name '*.whl' -print | sort
+            exit 1
+          fi
+
+      - name: Show wheel contents
+        run: |
+          ls -la wheelhouse/
+          for whl in wheelhouse/*.whl; do
+            echo "=== $whl ==="
+            python -m zipfile -l "$whl"
+          done
+
+      - name: Smoke test wheelhouse install without external deps
+        env:
+          OMNIUI_HEADLESS: "1"
+          OMNIUI_BACKEND: "vulkan"
+          OMNIUI_LAVAPIPE: "1"
+          OVUIINSPECT_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          native=(wheelhouse/ovui-*-cp312-cp312-${{ matrix.linux_tag }}.whl)
+          if [ "${#native[@]}" -ne 1 ]; then
+            echo "Expected one native ovui wheel for smoke test, found ${#native[@]}"
+            exit 1
+          fi
+          repo_wheels=("${native[0]}")
+          for whl in wheelhouse/*.whl; do
+            case "$(basename "$whl")" in
+              ovui-*) ;;
+              *) repo_wheels+=("$whl") ;;
+            esac
+          done
+          python -m venv /tmp/ovui-app-wheelhouse-venv
+          /tmp/ovui-app-wheelhouse-venv/bin/pip install --upgrade pip
+          /tmp/ovui-app-wheelhouse-venv/bin/pip install --no-deps "${repo_wheels[@]}"
+          /tmp/ovui-app-wheelhouse-venv/bin/python - <<'PY'
+          import importlib.metadata as metadata
+          import os
+
+          import omni.ui
+          import omni.ui_scene
+          import ovui_widgets.app
+
+          expected_commit = os.environ["EXPECTED_COMMIT_SHA"]
+          commit = getattr(omni.ui, "__commit__", None)
+          assert commit == expected_commit, (
+              f"omni.ui.__commit__ {commit!r} does not match {expected_commit!r}"
+          )
+
+          expected_distributions = [
+              "ovui",
+              "ovui-data-adapters-common",
+              "ovui-data-adapters-services",
+              "ovui-data-adapters-openusd",
+              "ovui-data-adapters-ovstage",
+              "ovui-widgets-common",
+              "ovui-widgets-content",
+              "ovui-widgets-stage",
+              "ovui-widgets-layers",
+              "ovui-widgets-property",
+              "ovui-widgets-viewport",
+              "ovui-widgets-app",
+              "ovui-widgets-all",
+          ]
+          for dist in expected_distributions:
+              print(f"{dist} {metadata.version(dist)}")
+
+          eps = metadata.entry_points()
+          adapters = {ep.name for ep in eps.select(group="ovui_data_adapters.adapters")}
+          components = {ep.name for ep in eps.select(group="ovui_widgets.components")}
+          assert {"openusd", "ovstage"} <= adapters, adapters
+          assert {"ovstage_physics_controls"} <= components, components
+          print("wheelhouse smoke OK")
+          PY
+          /tmp/ovui-app-wheelhouse-venv/bin/python \
+            .github/scripts/validate_packaged_skills.py
+
+      - name: Download common clean-install dependencies
+        run: |
+          python -m pip download \
+            --only-binary=:all: \
+            --dest clean-install-deps \
+            "numpy>=1.20"
+
+      - name: Clean-install common livestream package
+        env:
+          PYTHONNOUSERSITE: "1"
+          PYTHONPATH: ""
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          common=(wheelhouse/ovui_data_adapters_common-*-py3-none-any.whl)
+          if [ "${#common[@]}" -ne 1 ]; then
+            echo "Expected one common wheel, found ${#common[@]}"
+            exit 1
+          fi
+          venv="$RUNNER_TEMP/ovui-common-clean-install"
+          python -m venv "$venv"
+          "$venv/bin/python" -m pip install \
+            --no-index \
+            --find-links=clean-install-deps \
+            "${common[0]}"
+          "$venv/bin/python" -m pip check
+          "$venv/bin/python" .github/scripts/validate_clean_install.py common
+
+      - name: Download standalone OpenUSD clean-install dependency
+        if: matrix.standalone_openusd
+        run: |
+          python -m pip download \
+            --only-binary=:all: \
+            --dest clean-install-deps \
+            "usd-core==25.11"
+
+      - name: Clean-install ovui-widgets-all with standalone OpenUSD
+        if: matrix.standalone_openusd
+        env:
+          PYTHONNOUSERSITE: "1"
+          PYTHONPATH: ""
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          aggregate=(wheelhouse/ovui_widgets_all-*-py3-none-any.whl)
+          if [ "${#aggregate[@]}" -ne 1 ]; then
+            echo "Expected one ovui-widgets-all wheel, found ${#aggregate[@]}"
+            exit 1
+          fi
+          venv="$RUNNER_TEMP/ovui-widgets-all-clean-install"
+          python -m venv "$venv"
+          "$venv/bin/python" -m pip install \
+            --no-index \
+            --find-links=wheelhouse \
+            --find-links=clean-install-deps \
+            "${aggregate[0]}"
+          "$venv/bin/python" -m pip check
+          "$venv/bin/python" .github/scripts/validate_clean_install.py aggregate
+
+      - name: Run hosted package tests
+        if: matrix.standalone_openusd
+        env:
+          PYTHONNOUSERSITE: "1"
+          PYTHONPATH: ""
+          OVUI_WIDGETS_REQUIRE_OVRTX: "0"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          venv="$RUNNER_TEMP/ovui-widgets-all-clean-install"
+          python="$venv/bin/python"
+          services=(wheelhouse/ovui_data_adapters_services-*-py3-none-any.whl)
+          ovstage=(wheelhouse/ovui_data_adapters_ovstage-*-py3-none-any.whl)
+          if [ "${#services[@]}" -ne 1 ] || [ "${#ovstage[@]}" -ne 1 ]; then
+            echo "Expected one services and ovstage wheel"
+            exit 1
+          fi
+          "$python" -m pip install \
+            "${services[0]}" \
+            "${ovstage[0]}" \
+            -r skills/omniverse-ui-inspector/requirements.txt \
+            "pytest>=7,<10" \
+            pytest-timeout \
+            Pillow \
+            "ovstream==0.4.5"
+          "$python" -m pip check
+
+          (
+            cd ovui-data-adapters
+            "$python" -m pytest -q -rs tests \
+              -m "not (requires_ovstage or requires_ovphysx or requires_ovrtx)"
+          )
+          (
+            cd skills/omniverse-ui-inspector
+            "$python" -m pytest -q -rs tests
+          )
+          (
+            cd ovui-widgets
+            unset OVUI_DATA_ADAPTER_PROVIDER
+            xvfb-run -a "$python" -m pytest -q -rs tests \
+              -m "not inspector_qa and not performance and not requires_cuda_vulkan_gl_interop and not (requires_ovstage or requires_ovphysx or requires_ovrtx)"
+          )
+
+      - name: Upload app wheelhouse as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: wheelhouse/*
+          if-no-files-found: error
+
+  build-app-wheelhouse-windows:
+    name: Build app wheelhouse (Windows x64, Vulkan + CUDA)
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    env:
+      CMAKE_GENERATOR: Visual Studio 17 2022
+      CMAKE_GENERATOR_PLATFORM: x64
+      OMNIUI_BUILD_JOBS: "2"
+      OMNIUI_CMAKE_ARGS: >-
+        -DOMNIUI_USE_BUNDLED_GLFW=ON
+        -DOMNIUI_USE_BUNDLED_FREETYPE=ON
+        -DOMNIUI_REQUIRE_VULKAN=ON
+        -DOMNIUI_REQUIRE_CUDA=ON
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref != '' && inputs.source_ref || github.ref }}
+
+      - name: Resolve checked-out commit
+        shell: pwsh
+        run: |
+          $sha = git rev-parse HEAD
+          "OVUI_BUILD_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EXPECTED_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Install CUDA 12.8 compiler and runtime
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "cuda_12.8.2_windows_network.exe"
+          Invoke-WebRequest -Uri "https://developer.download.nvidia.com/compute/cuda/12.8.2/network_installers/cuda_12.8.2_windows_network.exe" -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList @(
+            "-s", "-n", "cudart_12.8", "nvcc_12.8") -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "CUDA installer failed with exit code $($process.ExitCode)"
+          }
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          foreach ($required in @(
+            "bin\nvcc.exe",
+            "bin\cudart64_12.dll",
+            "include\cuda_runtime.h",
+            "include\crt\host_config.h",
+            "lib\x64\cuda.lib",
+            "lib\x64\cudart.lib")) {
+            $path = Join-Path $cudaRoot $required
+            if (-not (Test-Path $path)) { throw "CUDA component is missing: $path" }
+          }
+          "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDAToolkit_ROOT=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $cudaRoot "bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          (Join-Path $cudaRoot "bin\x64") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $cudaRoot "bin\nvcc.exe") --version
+
+      - name: Install Vulkan headers and loader
+        shell: pwsh
+        run: |
+          if (-not $env:VCPKG_INSTALLATION_ROOT) {
+            throw "VCPKG_INSTALLATION_ROOT is not set on this runner"
+          }
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe"
+          if (-not (Test-Path $vcpkg)) {
+            throw "vcpkg.exe was not found at $vcpkg"
+          }
+          & $vcpkg install vulkan-headers:x64-windows vulkan-loader:x64-windows
+          $installed = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows"
+          $includeDir = Join-Path $installed "include"
+          $header = Join-Path $includeDir "vulkan\vulkan.h"
+          if (-not (Test-Path $header)) {
+            throw "Expected Vulkan header was not created: $header"
+          }
+          $releaseLibrary = Join-Path $installed "lib\vulkan-1.lib"
+          $debugLibrary = Join-Path $installed "debug\lib\vulkan-1.lib"
+          if (Test-Path $releaseLibrary) {
+            $library = Get-Item $releaseLibrary
+          } elseif (Test-Path $debugLibrary) {
+            $library = Get-Item $debugLibrary
+          } else {
+            throw "Expected Vulkan import library was not found under $installed"
+          }
+          $releaseLoaderDll = Join-Path $installed "bin\vulkan-1.dll"
+          $debugLoaderDll = Join-Path $installed "debug\bin\vulkan-1.dll"
+          if (Test-Path $releaseLoaderDll) {
+            $loaderDll = Get-Item $releaseLoaderDll
+          } elseif (Test-Path $debugLoaderDll) {
+            $loaderDll = Get-Item $debugLoaderDll
+          } else {
+            throw "Expected Vulkan loader DLL was not found under $installed"
+          }
+          "Vulkan_INCLUDE_DIR=$includeDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Vulkan_LIBRARY=$($library.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Vulkan_DLL_DIR=$($loaderDll.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $loaderDll.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Upgrade pip toolchain
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip wheel setuptools build cmake pybind11
+
+      - name: Build native ovui wheel
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path wheelhouse | Out-Null
+          python -m pip wheel .\ovui --no-deps -w wheelhouse\ -v
+
+      - name: Build ovui-widgets and data-adapter wheels
+        shell: pwsh
+        run: |
+          $projects = @(
+            "ovui-data-adapters\dist\common",
+            "ovui-data-adapters\dist\services",
+            "ovui-data-adapters\dist\openusd",
+            "ovui-data-adapters\dist\ovstage",
+            "ovui-widgets\dist\common",
+            "ovui-widgets\dist\content",
+            "ovui-widgets\dist\stage",
+            "ovui-widgets\dist\layers",
+            "ovui-widgets\dist\property",
+            "ovui-widgets\dist\viewport",
+            "ovui-widgets\dist\app",
+            "ovui-widgets\dist\all"
+          )
+          foreach ($project in $projects) {
+            Write-Host "=== Building $project ==="
+            python -m pip wheel $project --no-deps -w wheelhouse\ -v
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Write wheelhouse manifest
+        shell: pwsh
+        run: |
+          $lines = @(
+            "ovui app wheelhouse",
+            "commit: $env:EXPECTED_COMMIT_SHA",
+            "platform: Windows x64",
+            "",
+            "wheels:"
+          )
+          $lines += Get-ChildItem wheelhouse\*.whl | Sort-Object Name | ForEach-Object { "  $($_.Name)" }
+          $lines += @(
+            "",
+            "external runtime dependencies are resolved by pip from package metadata unless already supplied:",
+            "  numpy, usd-core, and optional ovrtx/ovstage runtimes as needed by the selected provider",
+            "",
+            "install note:",
+            "  install from this directory with --find-links and package names so pip chooses the right platform wheel"
+          )
+          Set-Content -Path wheelhouse\MANIFEST.txt -Value $lines -Encoding utf8
+
+      - name: Validate wheelhouse contents
+        shell: pwsh
+        run: |
+          function Require-One($Pattern, $Label) {
+            $matches = @(Get-ChildItem "wheelhouse\$Pattern")
+            if ($matches.Count -ne 1) {
+              Write-Host "Expected exactly one $Label wheel matching $Pattern, found $($matches.Count)"
+              $matches | ForEach-Object { Write-Host "  $($_.FullName)" }
+              throw "missing or duplicate wheel: $Label"
+            }
+            Write-Host "${Label}: $($matches[0].Name)"
+          }
+
+          Require-One "ovui-*-cp312-cp312-win_amd64.whl" "ovui win_amd64"
+          Require-One "ovui_data_adapters_common-*-py3-none-any.whl" "ovui-data-adapters-common"
+          Require-One "ovui_data_adapters_services-*-py3-none-any.whl" "ovui-data-adapters-services"
+          Require-One "ovui_data_adapters_openusd-*-py3-none-any.whl" "ovui-data-adapters-openusd"
+          Require-One "ovui_data_adapters_ovstage-*-py3-none-any.whl" "ovui-data-adapters-ovstage"
+          Require-One "ovui_widgets_common-*-py3-none-any.whl" "ovui-widgets-common"
+          Require-One "ovui_widgets_content-*-py3-none-any.whl" "ovui-widgets-content"
+          Require-One "ovui_widgets_stage-*-py3-none-any.whl" "ovui-widgets-stage"
+          Require-One "ovui_widgets_layers-*-py3-none-any.whl" "ovui-widgets-layers"
+          Require-One "ovui_widgets_property-*-py3-none-any.whl" "ovui-widgets-property"
+          Require-One "ovui_widgets_viewport-*-py3-none-any.whl" "ovui-widgets-viewport"
+          Require-One "ovui_widgets_app-*-py3-none-any.whl" "ovui-widgets-app"
+          Require-One "ovui_widgets_all-*-py3-none-any.whl" "ovui-widgets-all"
+
+          # 13 = native ovui (win_amd64, no retag) + the 12 pure-Python
+          # distributions built above.
+          $wheelCount = @(Get-ChildItem wheelhouse\*.whl).Count
+          if ($wheelCount -ne 13) {
+            Get-ChildItem wheelhouse\*.whl | Sort-Object Name
+            throw "Expected 13 wheels in Windows wheelhouse, found $wheelCount"
+          }
+
+      - name: Show wheel contents
+        shell: pwsh
+        run: |
+          Get-ChildItem wheelhouse
+          foreach ($wheel in Get-ChildItem wheelhouse/*.whl) {
+            Write-Host "=== $($wheel.FullName) ==="
+            python -m zipfile -l $wheel.FullName
+          }
+
+      - name: Smoke test wheelhouse install without external deps
+        shell: pwsh
+        env:
+          OMNIUI_HEADLESS: "1"
+          OMNIUI_BACKEND: "vulkan"
+          OVUIINSPECT_ENABLED: "0"
+        run: |
+          $native = @(Get-ChildItem wheelhouse\ovui-*-cp312-cp312-win_amd64.whl)
+          if ($native.Count -ne 1) { throw "Expected one native ovui wheel for smoke test, found $($native.Count)" }
+          $repoWheels = @($native[0].FullName)
+          $repoWheels += @(Get-ChildItem wheelhouse\*.whl | Where-Object { $_.Name -notmatch '^ovui-' } | ForEach-Object { $_.FullName })
+
+          python -m venv "$env:RUNNER_TEMP\ovui-app-wheelhouse-venv"
+          $python = "$env:RUNNER_TEMP\ovui-app-wheelhouse-venv\Scripts\python.exe"
+          & $python -m pip install --upgrade pip
+          & $python -m pip install --no-deps $repoWheels
+
+          $checkScript = @'
+          import importlib.metadata as metadata
+          import os
+
+          p = os.environ.get("Vulkan_DLL_DIR")
+          if p and hasattr(os, "add_dll_directory"):
+              os.add_dll_directory(p)
+
+          import omni.ui
+          import omni.ui_scene
+          import ovui_widgets.app
+
+          expected_commit = os.environ["EXPECTED_COMMIT_SHA"]
+          commit = getattr(omni.ui, "__commit__", None)
+          assert commit == expected_commit, (
+              f"omni.ui.__commit__ {commit!r} does not match {expected_commit!r}"
+          )
+
+          expected_distributions = [
+              "ovui",
+              "ovui-data-adapters-common",
+              "ovui-data-adapters-services",
+              "ovui-data-adapters-openusd",
+              "ovui-data-adapters-ovstage",
+              "ovui-widgets-common",
+              "ovui-widgets-content",
+              "ovui-widgets-stage",
+              "ovui-widgets-layers",
+              "ovui-widgets-property",
+              "ovui-widgets-viewport",
+              "ovui-widgets-app",
+              "ovui-widgets-all",
+          ]
+          for dist in expected_distributions:
+              print(f"{dist} {metadata.version(dist)}")
+
+          eps = metadata.entry_points()
+          adapters = {ep.name for ep in eps.select(group="ovui_data_adapters.adapters")}
+          components = {ep.name for ep in eps.select(group="ovui_widgets.components")}
+          assert {"openusd", "ovstage"} <= adapters, adapters
+          assert {"ovstage_physics_controls"} <= components, components
+          print("wheelhouse smoke OK")
+          '@
+          $scriptPath = Join-Path $env:RUNNER_TEMP "wheelhouse_smoke.py"
+          Set-Content -Path $scriptPath -Value $checkScript -Encoding utf8
+          & $python $scriptPath
+          & $python .github\scripts\validate_packaged_skills.py
+
+      - name: Download clean-install dependencies
+        shell: pwsh
+        run: |
+          python -m pip download `
+            --only-binary=:all: `
+            --dest clean-install-deps `
+            "numpy>=1.20" `
+            "usd-core==25.11"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Clean-install common livestream package
+        shell: pwsh
+        env:
+          PYTHONNOUSERSITE: "1"
+          PYTHONPATH: ""
+        run: |
+          $common = @(Get-ChildItem wheelhouse\ovui_data_adapters_common-*-py3-none-any.whl)
+          if ($common.Count -ne 1) {
+            throw "Expected one common wheel, found $($common.Count)"
+          }
+          $venv = Join-Path $env:RUNNER_TEMP "ovui-common-clean-install"
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $python = Join-Path $venv "Scripts\python.exe"
+          & $python -m pip install `
+            --no-index `
+            --find-links=clean-install-deps `
+            $common[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python .github\scripts\validate_clean_install.py common
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Clean-install ovui-widgets-all with standalone OpenUSD
+        shell: pwsh
+        env:
+          PYTHONNOUSERSITE: "1"
+          PYTHONPATH: ""
+        run: |
+          $aggregate = @(Get-ChildItem wheelhouse\ovui_widgets_all-*-py3-none-any.whl)
+          if ($aggregate.Count -ne 1) {
+            throw "Expected one ovui-widgets-all wheel, found $($aggregate.Count)"
+          }
+          $venv = Join-Path $env:RUNNER_TEMP "ovui-widgets-all-clean-install"
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $python = Join-Path $venv "Scripts\python.exe"
+          & $python -m pip install `
+            --no-index `
+            --find-links=wheelhouse `
+            --find-links=clean-install-deps `
+            $aggregate[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python .github\scripts\validate_clean_install.py aggregate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run hosted package tests
+        shell: pwsh
+        env:
+          PYTHONNOUSERSITE: "1"
+          PYTHONPATH: ""
+          OVUI_WIDGETS_REQUIRE_OVRTX: "0"
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP "ovui-widgets-all-clean-install"
+          $python = Join-Path $venv "Scripts\python.exe"
+          $services = @(Get-ChildItem wheelhouse\ovui_data_adapters_services-*-py3-none-any.whl)
+          $ovstage = @(Get-ChildItem wheelhouse\ovui_data_adapters_ovstage-*-py3-none-any.whl)
+          if ($services.Count -ne 1 -or $ovstage.Count -ne 1) {
+            throw "Expected one services and ovstage wheel"
+          }
+          & $python -m pip install `
+            $services[0].FullName `
+            $ovstage[0].FullName `
+            -r skills\omniverse-ui-inspector\requirements.txt `
+            "pytest>=7,<10" `
+            pytest-timeout `
+            Pillow `
+            "ovstream==0.4.5"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $nativeTestBootstrap = Join-Path $env:RUNNER_TEMP "ovui_native_test_bootstrap.py"
+          $nativeTestBootstrapSource = @'
+          import importlib
+          import os
+          from pathlib import Path
+          import sys
+
+          import pytest
+
+
+          def fail(message):
+              print(f"[native-test-bootstrap] ERROR: {message}", file=sys.stderr, flush=True)
+              raise SystemExit(2)
+
+
+          if sys.platform != "win32":
+              fail(f"Windows is required, but sys.platform is {sys.platform!r}")
+
+          add_dll_directory = getattr(os, "add_dll_directory", None)
+          if not callable(add_dll_directory):
+              fail("callable os.add_dll_directory is required")
+
+          raw_vulkan_dir = os.environ.get("Vulkan_DLL_DIR")
+          if raw_vulkan_dir is None or not raw_vulkan_dir.strip():
+              fail("Vulkan_DLL_DIR must name the directory containing vulkan-1.dll")
+
+          try:
+              vulkan_dir = Path(raw_vulkan_dir).expanduser().resolve(strict=True)
+          except OSError as exc:
+              fail(f"Vulkan_DLL_DIR does not resolve to an existing directory: {raw_vulkan_dir!r}: {exc}")
+          if not vulkan_dir.is_dir():
+              fail(f"Vulkan_DLL_DIR is not a directory: {vulkan_dir}")
+
+          vulkan_dll = vulkan_dir / "vulkan-1.dll"
+          if not vulkan_dll.is_file():
+              fail(f"Vulkan loader DLL is missing: {vulkan_dll}")
+          vulkan_dll = vulkan_dll.resolve(strict=True)
+
+          try:
+              _DLL_DIRECTORY_HANDLES = [add_dll_directory(str(vulkan_dir))]
+          except OSError as exc:
+              fail(f"could not register Vulkan DLL directory {vulkan_dir}: {exc}")
+
+          # A script normally puts its own directory at sys.path[0]. Match
+          # `python -m pytest` by restoring the invocation's working directory.
+          if sys.path:
+              sys.path[0] = os.getcwd()
+          else:
+              sys.path.append(os.getcwd())
+
+          print(f"[native-test-bootstrap] registered Vulkan DLL directory: {vulkan_dir}", flush=True)
+          print(f"[native-test-bootstrap] verified Vulkan loader: {vulkan_dll}", flush=True)
+          print(f"[native-test-bootstrap] pytest working directory: {os.getcwd()}", flush=True)
+
+          try:
+              ui = importlib.import_module("omni.ui")
+              ui_native = importlib.import_module("omni.ui._ui")
+              ui_scene = importlib.import_module("omni.ui_scene")
+              scene_native = importlib.import_module("omni.ui_scene._scene")
+          except Exception as exc:
+              fail(
+                  "native ovui preflight failed after registering "
+                  f"{vulkan_dir}: {type(exc).__name__}: {exc}"
+              )
+
+          print(f"[native-test-bootstrap] omni.ui package: {ui.__file__}", flush=True)
+          print(f"[native-test-bootstrap] omni.ui._ui native module: {ui_native.__file__}", flush=True)
+          print(f"[native-test-bootstrap] omni.ui_scene package: {ui_scene.__file__}", flush=True)
+          print(f"[native-test-bootstrap] omni.ui_scene._scene native module: {scene_native.__file__}", flush=True)
+
+          raise SystemExit(pytest.main(sys.argv[1:]))
+          '@
+          Set-Content -LiteralPath $nativeTestBootstrap -Value $nativeTestBootstrapSource -Encoding utf8
+
+          Remove-Item Env:OVUI_DATA_ADAPTER_PROVIDER -ErrorAction SilentlyContinue
+          Push-Location ovui-data-adapters
+          & $python -m pytest -q -rs tests -m "not (requires_ovstage or requires_ovphysx or requires_ovrtx)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+          Push-Location skills\omniverse-ui-inspector
+          & $python -m pytest -q -rs tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+          Push-Location ovui-widgets
+          & $python $nativeTestBootstrap -q -rs tests `
+            -m "not inspector_qa and not performance and not requires_cuda_vulkan_gl_interop and not (requires_ovstage or requires_ovphysx or requires_ovrtx)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+      - name: Upload app wheelhouse as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ovui-app-wheelhouse-windows-x64
+          path: wheelhouse/*
+          if-no-files-found: error

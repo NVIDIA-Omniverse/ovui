@@ -19,10 +19,13 @@ can be regression-tested without spinning up the omni.ui backend.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import contextmanager
 
-from test_base import _backend_tag
+import pytest
+import test_base
+from test_base import OmniUiTest, _backend_tag
 
 
 # ---------------------------------------------------------------------------
@@ -116,3 +119,63 @@ def test_backend_tag_current_test_env_is_vulkan():
     else:
         # Sanity: helper returned something from the documented set.
         assert _backend_tag() in ("vulkan", "egl", "opengl")
+
+
+class _GoldenHarness(OmniUiTest):
+    """Minimal harness for testing golden helper branches without a backend."""
+
+    def runTest(self):
+        pass
+
+    async def wait_n_updates(self, n: int = 3) -> None:
+        return None
+
+
+def test_strict_golden_capture_failure_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("OMNI_UI_GOLDEN_STRICT", "1")
+    monkeypatch.delenv("OMNI_UI_GENERATE_GOLDEN", raising=False)
+    monkeypatch.setattr(test_base, "_is_vulkan_backend", lambda: False)
+    monkeypatch.setattr(test_base, "_try_read_pixels", lambda width, height: None)
+
+    captured_path = tmp_path / "captured" / "stale.png"
+    captured_path.parent.mkdir()
+    captured_path.write_bytes(b"stale")
+
+    with pytest.raises(AssertionError, match="Golden image capture failed"):
+        asyncio.run(
+            _GoldenHarness()._capture_and_compare_golden(
+                captured_path=captured_path,
+                golden_read_path=tmp_path / "golden" / "missing.png",
+                golden_write_path=tmp_path / "golden" / "missing.png",
+                diff_path=tmp_path / "diff.png",
+                width=1,
+                height=1,
+                threshold=0.01,
+                cmp_metric="mean_error",
+            )
+        )
+
+    assert not captured_path.exists()
+
+
+def test_generate_golden_writes_opengl_capture(monkeypatch, tmp_path):
+    monkeypatch.setenv("OMNI_UI_GENERATE_GOLDEN", "1")
+    monkeypatch.setenv("OMNI_UI_GOLDEN_STRICT", "1")
+    monkeypatch.setattr(test_base, "_is_vulkan_backend", lambda: False)
+    monkeypatch.setattr(test_base, "_try_read_pixels", lambda width, height: b"\x00\x00\x00\xff")
+
+    golden_path = tmp_path / "golden" / "generated.png"
+    asyncio.run(
+        _GoldenHarness()._capture_and_compare_golden(
+            captured_path=tmp_path / "captured" / "generated.png",
+            golden_read_path=golden_path,
+            golden_write_path=golden_path,
+            diff_path=tmp_path / "diff.png",
+            width=1,
+            height=1,
+            threshold=0.01,
+            cmp_metric="mean_error",
+        )
+    )
+
+    assert golden_path.exists()

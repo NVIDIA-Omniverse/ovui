@@ -148,7 +148,7 @@
     <header class="hero">
       <p class="eyebrow">Section 4</p>
       <h1>UI Framework</h1>
-      <p class="lead">ovui gives Python code the base UI runtime used by standalone apps and widgets in ovwidgets: windows, layout containers, widgets, value models, callbacks, and an async frame loop.</p>
+      <p class="lead">ovui gives Python code the base UI runtime used by standalone apps and widgets in ovui-widgets: windows, layout containers, widgets, value models, callbacks, and an async frame loop.</p>
     </header>
 
     <section>
@@ -205,7 +205,7 @@
 
     <section>
       <h2>Common widgets</h2>
-      <p>The common widgets cover text, commands, editable values, hierarchical views, images, markdown, progress, and menu actions. Widgets in ovwidgets reuse these widgets instead of drawing a separate widget set.</p>
+      <p>The common widgets cover text, commands, editable values, hierarchical views, images, markdown, progress, and menu actions. Widgets in ovui-widgets reuse these widgets instead of drawing a separate widget set.</p>
       <ul>
         <li>Text and display: <code>Label</code>, <code>Image</code>, <code>ImageWithProvider</code>, <code>MarkdownWidget</code>, and <code>ProgressBar</code>.</li>
         <li>Controls: <code>Button</code>, <code>ToolButton</code>, <code>CheckBox</code>, <code>ComboBox</code>, <code>RadioButton</code>, and <code>RadioCollection</code>.</li>
@@ -259,7 +259,7 @@
 
     <section>
       <h2>How data reaches widgets</h2>
-      <p>Data enters widgets through models and callback functions. The base UI framework does not know about USD; widgets in ovwidgets can ask a data adapter for values, put those values into item or value models, and let ovui widgets render them.</p>
+      <p>Data enters widgets through models and callback functions. The base UI framework does not know about USD; widgets in ovui-widgets can ask a data adapter for values, put those values into item or value models, and let ovui widgets render them.</p>
       <ul>
         <li><code>AbstractValueModel</code> stores one value and exposes bool, float, int, and string accessors, plus value-changed and edit callbacks.</li>
         <li><code>AbstractItemModel</code> exposes child items and value models per item; <code>TreeView</code> asks it for rows and values.</li>

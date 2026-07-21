@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 # The fromGpu CUDA → Vulkan path only exists on the Vulkan backend; ensure
 # we're not silently dispatched to OpenGL. Set before importing omni.ui.
@@ -43,6 +44,8 @@ import numpy as np
 import omni.ui as ui
 
 _SCREENSHOT = "--screenshot" in sys.argv
+_SCREENSHOT_FAILED = False
+_SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Synthetic RGBA8 gradient — small, visually distinctive, no external assets.
 W, H = 256, 256
@@ -61,7 +64,14 @@ if not ui.has_gpu_byte_image():
     print(
         "omni.ui.has_gpu_byte_image() is False — this build does not have the "
         "CUDA-Vulkan zero-copy path wired up. Rebuild with Vulkan + CUDA, or use "
-        "ByteImageProvider.set_data() for the host-upload path instead.",
+        "ByteImageProvider.set_data() for the host-upload path instead.\n"
+        "For zero-copy GPU byte images, install the NVIDIA CUDA Toolkit before "
+        "configuring ovui, then rebuild/reinstall ovui (for example: "
+        "pip install --force-reinstall .).\n"
+        "See ovui/README.md → Windows 11 / Windows Server 2022 → "
+        "'CUDA Toolkit for CUDA-Vulkan byte images'.\n"
+        "Verify with: python -c \"import omni.ui as ui; "
+        "print(ui.has_gpu_byte_image())\"",
         file=sys.stderr,
     )
     ui.shutdown()
@@ -117,16 +127,25 @@ def _free_cuda() -> None:
 
 async def _capture(path: str) -> None:
     from omni.ui import testing
+    global _SCREENSHOT_FAILED
+
     await testing.wait_frames(4)
-    testing.capture_screenshot(path)
-    print(f"screenshot saved: {path}")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    ok = testing.capture_screenshot(path)
+    if ok:
+        print(f"screenshot saved: {path}")
+    else:
+        print(f"ERROR: screenshot capture failed: {path}", file=sys.stderr)
+        _SCREENSHOT_FAILED = True
 
 
 if __name__ == "__main__":
     try:
         if _SCREENSHOT:
-            ui.run(_capture("byte_image_gpu_demo.png"))
+            ui.run(_capture(str(_SCRIPT_DIR / "byte_image_gpu_demo.png")))
         else:
             ui.run()
     finally:
         _free_cuda()
+    if _SCREENSHOT and _SCREENSHOT_FAILED:
+        sys.exit(1)

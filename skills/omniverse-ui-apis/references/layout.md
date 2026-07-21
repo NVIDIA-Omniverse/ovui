@@ -56,7 +56,7 @@ Important properties (canonical names from ovui bindings, `BindFrame.h`):
 - `raster_policy`: controls cached rasterization (`ui.RasterPolicy.NEVER` to disable).
 - `set_tooltip_fn`/`tooltip`.
 
-`ui.CollapsableFrame` is the related collapsible-section container used by the Property Inspector (`ovwidgets/property/group_widget.py:106-112`):
+`ui.CollapsableFrame` is the related collapsible-section container used by the Property Inspector (`ovui_widgets/property/group_widget.py:106-112`):
 
 ```python
 ui.CollapsableFrame(
@@ -181,7 +181,7 @@ Important properties:
 - `stable_size=True`: child gets the full parent size even when offset.
 - `draggable`, `drag_axis`, `frames_to_start_drag`: useful for direct manipulation.
 
-The reference code uses a `Placer` with a negative Y offset to hide the standalone-ovui `TreeView`'s internal top strip behind a clipping frame. The comment in `ovwidgets/stage/widget/stage_widget.py:215-249` documents this workaround:
+The reference code uses a `Placer` with a negative Y offset to hide the standalone-ovui `TreeView`'s internal top strip behind a clipping frame. The comment in `ovui_widgets/stage/widget/stage_widget.py:215-249` documents this workaround:
 
 > "The standalone `ovui` `TreeView` reserves a ~20-px strip at the top of its body that isn't reachable from the delegate or from any `TreeView.*` style selector. We hide it by placing the TreeView inside a clipping `ui.Frame` with a negative top margin via a `ui.Placer` — the first row slides up so it sits flush under our manual column header."
 
@@ -221,10 +221,10 @@ For complex production-style tools:
 
 ## Docked Workbench Layout Pattern
 
-The reference application (`ovwidgets/app/application.py:1044-1142`) creates:
+The reference application (`ovui_widgets/app/application.py:1044-1142`) creates:
 
 1. `self._dockspace = ui.DockSpace(None)` first.
-2. Dockable panel windows. The reference application builds these via a `ManagedWindow` base class (`ovwidgets/common/managed_window.py`) but atomic prototypes should just call `ui.Window(title, dockPreference=ui.DockPreference.MAIN, ...)` directly. Each `Window` has a `.frame` whose content is built via `set_build_fn`.
+2. Dockable panel windows. The reference application builds these via a `ManagedWindow` base class (`ovui_widgets/common/managed_window.py`) but atomic prototypes should just call `ui.Window(title, dockPreference=ui.DockPreference.MAIN, ...)` directly. Each `Window` has a `.frame` whose content is built via `set_build_fn`.
 3. A menu-bar window with flags `NO_DOCKING | NO_TITLE_BAR | NO_RESIZE | MENU_BAR | NO_BACKGROUND`.
 4. A status overlay window with `NO_DOCKING | NO_TITLE_BAR | NO_RESIZE | NO_MOUSE_INPUTS` and `fill_app_window=True`. Inside, a `ui.VStack` with `ui.Spacer()` pushes the status row to the bottom so the rest of the window stays transparent.
 5. `await ui.next_frame()` before any programmatic `dock_in()` call, because ImGui dock IDs do not exist before the first rendered frame.

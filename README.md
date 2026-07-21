@@ -1,83 +1,69 @@
-# ovui monorepo
+# NVIDIA ovui
 
-Three independently-built but co-developed Python projects in one
-repository. The merge from the standalone `ovui` and USD Viewer (`ovgear`) repos
-preserves the full history of both.
+## 1. What is ovui?
 
-## Layout
+**ovui** is a standalone Python UI toolkit for building native scene, viewport, and data applications, exposing the Omniverse UI framework through the familiar `omni.ui` (windows, layout, value models, widgets) and `omni.ui_scene` (SceneView, gestures, manipulators) Python APIs over a native C++ core. It loads and edits OpenUSD stages, presents rendered viewports from an external renderer such as ovrtx, runs headlessly for automation, and can be inspected by AI agents through a screenshot-first loop. Its defining trait is that it runs standalone — **no Omniverse Kit installation required**.
 
-```
-.
-├── ovui/                  ← UI framework: omni.ui + omni.ui_scene + native libs
-├── ovwidgets/             ← Application widgets layer (stage / layers / property /
-│                            content / viewport / app) with per-component dists
-└── ovui-data-adapters/    ← Adapter contracts (common) + OpenUSD adapters (openusd)
-```
+ovui is a disaggregated piece of the Omniverse platform: the `omni.ui` UI framework decoupled from the Kit extension system and shipped as an independently installable library, available as a peer to the other `ov` libraries (ovrtx, ovgraph, ovphysx, and more). It pairs the native runtime with **ovui-widgets** (production-shaped scene widgets) and **ovui-data-adapters** (a backend boundary for OpenUSD and custom data sources), keeping the UI layer cleanly separate from the data layer so teams can build tools against their own backends.
 
-Each top-level directory is a self-contained project root. They are
-co-located so a single PR can change framework code, widget code, and
-adapter code in lock-step, but they install and ship as independent
-distributions:
+> *ovui is pre-release software and is not enterprise-supported.*
+---
 
-- `ovui/setup.py` builds the native UI framework (cmake + ninja
-  + setuptools) and ships as the `ovui` wheel.
-- `ovwidgets/dist/{all,app,common,content,layers,property,stage,viewport}/pyproject.toml`
-  ship as `ovwidgets-<sub>` distributions; per-component install
-  uses `where = ["../.."]`.
-- `ovui-data-adapters/dist/{common,openusd}/pyproject.toml` ship
-  as `ovui-data-adapters-{common,openusd}`; same `where = ["../.."]`
-  pattern, source under the unified
-  `ovui-data-adapters/ovui_data_adapters/` import-package root.
+## 2. What functionalities are available, and who are the target users?
 
-## Per-component documentation
+**What you can do with it:**
 
-- [`ovui/README.md`](ovui/README.md) — UI framework
-- [`ovwidgets/README.md`](ovwidgets/README.md) — application widgets
-- [`ovui-data-adapters/README.md`](ovui-data-adapters/README.md) — adapter contracts and OpenUSD adapters
+- **Build standalone Python UI apps** — windows, frames, stacks, fields, sliders, tree views, menus, markdown, images, styles, and frame-driven updates via `omni.ui`.
+- **Author scene and viewport tools** — camera-aware drawing, gestures, manipulators, picking, selection outlines, and rendered-frame presentation via `omni.ui_scene`.
+- **Reuse production USD workflows** — drop-in Stage Browser, Property Inspector, Layers panel, Content Browser, and Viewport widgets, plus shared `SelectionBus`, `UndoManager`, `Settings`, and recent-files services from ovui-widgets.
+- **Stay backend-independent** — implement adapter contracts (`StageAdapter`, `PropertyAdapter`, `TransformAdapter`, `RendererAdapter`) to wire widgets to OpenUSD or your own data source; OpenUSD + ovrtx implementations are included.
+- **Run headless and prove output remotely** — Vulkan/offscreen runs, programmatic screenshots, and frame-loop draining for CI and automation.
+- **Drive it with AI coding agents** — the repo ships `AGENTS.md` and task-level skills (atomic UI APIs, widget composition, styling, screenshot-first inspection) so agents work from real patterns instead of inventing UI code.
+- **Install in pieces** — a monorepo of independently installable distributions (`ovui`, `ovui-widgets-*`, `ovui-data-adapters-*`) that share one version, so you take only what you need.
 
-## Development workflow
+**Who benefits:**
 
-For a fresh dev venv:
+- **USD tool & application developers** — build scene browsers, property editors, and viewport tools in Python without standing up a full Kit stack.
+- **Omniverse Kit developers** — reuse the same `omni.ui` / `omni.ui_scene` APIs you already know, now available standalone.
+- **Headless automation & synthetic-data engineers** — run UI-driven workflows offscreen and capture screenshots/frames in CI or on remote GPUs.
+- **AI coding agents (and the developers using them)** — scaffold, build, and inspect ovui apps through the shipped skills and screenshot-first inspector.
 
-```bash
-python3.12 -m venv ovwidgets/_venv312
-ovwidgets/_venv312/bin/pip install -U pip setuptools wheel build pytest pytest-asyncio ruff mypy
-ovwidgets/_venv312/bin/pip install -e ovui/
-ovwidgets/_venv312/bin/pip install -e /path/to/ovrtx/python      # external dep
-ovwidgets/_venv312/bin/pip install -e ovui-data-adapters/dist/common
-ovwidgets/_venv312/bin/pip install -e ovui-data-adapters/dist/openusd
-# then install ovwidgets/dist/<sub>/ packages in dependency order.
-```
+---
 
-Windows source installs need the Windows prerequisites in
-[`ovui/README.md`](ovui/README.md#windows-11--windows-server-2022) before
-`pip install -e ovui/`. Install the CUDA Toolkit before building if you need
-the CUDA-Vulkan byte-image path used by `ovui/examples/byte_image_gpu_demo.py`,
-then verify with:
+## 3. Documentation and reference links
 
-```bash
-python -c "import omni.ui as ui; print(ui.has_gpu_byte_image())"
-```
+- **Quickstart & install:** <https://github.com/NVIDIA-Omniverse/ovui#readme>
+- **Native UI framework guide:** <https://github.com/NVIDIA-Omniverse/ovui/blob/main/ovui/README.md>
+- **USD Viewer app & widgets guide:** <https://github.com/NVIDIA-Omniverse/ovui/blob/main/ovui-widgets/README.md>
+- **Data adapters guide:** <https://github.com/NVIDIA-Omniverse/ovui/blob/main/ovui-data-adapters/README.md>
+- **Architecture overview:** <https://github.com/NVIDIA-Omniverse/ovui/tree/main/docs>
+- **Source (GitHub):** <https://github.com/NVIDIA-Omniverse/ovui>
+- **Package (PyPI):** <https://pypi.org/project/ovui/>
+- **Releases (pre-built artifacts):** <https://github.com/NVIDIA-Omniverse/ovui/releases>
+- **Skills for AI coding agents:** <https://github.com/NVIDIA-Omniverse/ovui/tree/main/skills>
+- **Support:** [Issues](https://github.com/NVIDIA-Omniverse/ovui/issues)
 
-## CI
+---
 
-The active automation lives under `.github/workflows/`:
+## 4. System requirements
 
-- `build-wheel.yml` builds ovui wheels for Linux x64, Linux ARM64, and
-  Windows x64, then smoke-imports the installed wheel.
-- `headless-lavapipe.yml` and `headless-egl.yml` build and run the headless
-  CTest lanes.
-- `test-b1-vulkan.yml`, `test-b2-vulkan-asan.yml`, and `test-b3-egl.yml` run
-  the Vulkan pytest, native ASan, and EGL pytest lanes.
-- `generate-goldens.yml` regenerates golden images on demand.
+- **Python 3.12+**
+- **Linux** (Ubuntu 22.04 / Debian) and **Windows** (Windows 11 / Windows Server 2022), x86_64
+- **NVIDIA RTX-capable GPU + compatible driver** for rendered viewport output via ovrtx; a Vulkan-capable environment (including headless/Lavapipe) is supported for UI and offscreen paths
+- **Build toolchain for source installs:** CMake with Visual Studio 2022 ("Desktop development with C++") on Windows, or `build-essential` on Linux; Vulkan headers + loader for the optional Vulkan backend
+- **Current release:** ovui 0.2.0 (Early Access)
+- The rendered viewport path depends on an external renderer (ovrtx), which is not provided by this repository. The OpenUSD data-adapter provider additionally requires OpenUSD (`pxr`) Python bindings — from its `standalone` extra or the environment — while the native OVStage provider uses the external native OVStage runtime and needs no OpenUSD bindings
 
-## Merge context
+---
 
-The repository was merged from two sources:
+## 5. Licensing
 
-- `ovui` — relocated under `ovui/`.
-- USD Viewer (`ovgear`) — split into `ovwidgets/` (the import package + its dist
-  packages) and `ovui-data-adapters/` (the unified adapter package).
+- Governed by the **[NVIDIA Software License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/)** and the **[Product Specific Terms for NVIDIA Omniverse](https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-omniverse/)**.
+- Source-available for inspection; pre-release versions are provided **AS-IS** and are **not currently open to external contributions**.
+- Installs/downloads additional third-party open-source components — review their license terms (see `THIRD_PARTY_NOTICES.md`) before use.
 
-Merge history is preserved in git; the runtime and packaging docs above are the
-current source of truth.
+> **Note:** ovui is pre-release Early Access software and is not enterprise-supported. APIs may change before the 1.0 release. The rendered viewport requires a separate ovrtx renderer install; the UI framework, widgets, and headless paths work without it.
+
+---
+
+*ovui · standalone distribution of Omniverse's `omni.ui` UI framework · Copyright (c) 2025 NVIDIA Corporation.*

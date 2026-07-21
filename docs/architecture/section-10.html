@@ -140,19 +140,19 @@
     <header class="hero">
       <p class="eyebrow">Section 10</p>
       <h1>Startup, Data Flow, and Verification</h1>
-      <p class="lead">After the widgets and adapters are in place, an ovwidgets run starts the app, creates instances of common Python classes, opens or creates a stage, gives adapters to widgets, advances frames, and checks those behaviors with tests and examples.</p>
+      <p class="lead">After the widgets and adapters are in place, an ovui-widgets run starts the app, creates instances of common Python classes, opens or creates a stage, gives adapters to widgets, advances frames, and checks those behaviors with tests and examples.</p>
     </header>
 
     <div class="diagram run-diagram" role="img" aria-label="Startup and data flow from desktop or headless entry through app startup, stage open, adapters, widgets, frames, tests and examples">
       <div class="entry-pair">
         <div class="run-card is-start">
           <div class="run-name">Desktop entry</div>
-          <span class="run-pill">python -m ovwidgets.app</span>
+          <span class="run-pill">python -m ovui_widgets.app</span>
           <div class="run-text">Starts a normal app window and accepts an optional USD file path.</div>
         </div>
         <div class="run-card is-start">
           <div class="run-name">Headless entry</div>
-          <span class="run-pill">python -m ovwidgets.app.headless</span>
+          <span class="run-pill">python -m ovui_widgets.app.headless</span>
           <div class="run-text">Starts the same app without a local desktop window.</div>
         </div>
       </div>
@@ -189,7 +189,7 @@
       <div class="verify-row">
         <div class="verify-title">Tests and examples cover startup, adapters, widgets, and frames</div>
         <div class="verify-pills">
-          <span class="run-pill">ovwidgets/tests</span>
+          <span class="run-pill">ovui-widgets/tests</span>
           <span class="run-pill">ovui/examples</span>
           <span class="run-pill">ovui/tests</span>
           <span class="run-pill">ovui/standalone/tests</span>
@@ -200,7 +200,7 @@
 
     <section>
       <h2>Desktop startup</h2>
-      <p>The desktop entry point is <code>python -m ovwidgets.app</code>, with the <code>ovwidgets</code> console command doing the same startup work. The entry code parses one optional USD file path, creates <code>Application</code>, and calls <code>Application.run()</code>.</p>
+      <p>The desktop entry point is <code>python -m ovui_widgets.app</code>, with the <code>ovui-widgets</code> console command doing the same startup work. The entry code parses one optional USD file path, creates <code>Application</code>, and calls <code>Application.run()</code>.</p>
       <ul>
         <li><code>run()</code> initializes ovui, applies global styles, applies the saved theme, records the startup file path, and hands <code>run_async()</code> to <code>ui.run()</code>.</li>
         <li><code>run_async()</code> creates the docked work area, menu row, status row, stage browser, property inspector, content browser, composition stack, and viewport.</li>
@@ -212,7 +212,7 @@
 
     <section>
       <h2>Headless startup</h2>
-      <p>The headless entry point is <code>python -m ovwidgets.app.headless</code>, with <code>ovwidgets-headless</code> as the console command. It chooses the offscreen frame size before importing the application, then creates <code>Application</code> and calls <code>run()</code> with the optional USD path.</p>
+      <p>The headless entry point is <code>python -m ovui_widgets.app.headless</code>, with <code>ovui-widgets-headless</code> as the console command. It chooses the offscreen frame size before importing the application, then creates <code>Application</code> and calls <code>run()</code> with the optional USD path.</p>
       <ul>
         <li><code>--width</code> and <code>--height</code> choose the frame size for automation, render capture, or streaming jobs.</li>
         <li>The same <code>run_async()</code> body creates widgets, instances of common Python classes, startup data, shortcuts, file drops, and the frame loop.</li>
@@ -262,12 +262,12 @@
 
     <section>
       <h2>Tests and examples</h2>
-      <p>The repo checks the behavior at several sizes. ovui tests and examples prove base widgets, scene drawing, images, and standalone frames. ovwidgets tests then cover application startup, stage opening, adapter swaps, widget behavior, frame cadence, headless startup, streaming hooks, and user-like screenshot flows.</p>
+      <p>The repo checks the behavior at several sizes. ovui tests and examples prove base widgets, scene drawing, images, and standalone frames. ovui-widgets tests then cover application startup, stage opening, adapter swaps, widget behavior, frame cadence, headless startup, streaming hooks, and user-like screenshot flows.</p>
       <ul>
-        <li><code>ovwidgets/tests/test_application.py</code> checks singleton state, common Python classes, <code>call_later()</code>, frame callbacks, settings, and shutdown.</li>
-        <li><code>ovwidgets/tests/test_step26_open_file.py</code> checks <code>open_stage()</code>, <code>open_file()</code>, stage adapter creation, invalid-file handling, and subscription cleanup.</li>
-        <li><code>ovwidgets/tests/test_application_frame_cadence.py</code> and <code>ovwidgets/tests/test_viewport_throttle.py</code> check the update/render split and <code>FrameClock</code> behavior.</li>
-        <li><code>ovwidgets/tests/test_headless_entrypoint.py</code>, <code>test_application_headless_export.py</code>, <code>test_input_drain.py</code>, and <code>test_application_message_drain.py</code> check headless entry, per-frame export, input ordering, and queued app messages.</li>
+        <li><code>ovui-widgets/tests/test_application.py</code> checks singleton state, common Python classes, <code>call_later()</code>, frame callbacks, settings, and shutdown.</li>
+        <li><code>ovui-widgets/tests/test_step26_open_file.py</code> checks <code>open_stage()</code>, <code>open_file()</code>, stage adapter creation, invalid-file handling, and subscription cleanup.</li>
+        <li><code>ovui-widgets/tests/test_application_frame_cadence.py</code> and <code>ovui-widgets/tests/test_viewport_throttle.py</code> check the update/render split and <code>FrameClock</code> behavior.</li>
+        <li><code>ovui-widgets/tests/test_headless_entrypoint.py</code>, <code>test_application_headless_export.py</code>, <code>test_input_drain.py</code>, and <code>test_application_message_drain.py</code> check headless entry, per-frame export, input ordering, and queued app messages.</li>
         <li><code>ovui/examples</code>, <code>ovui/tests</code>, and <code>ovui/standalone/tests</code> cover the base UI, scene package, image paths, screenshots, and standalone frame behavior.</li>
       </ul>
       <p>Those checks prove the run: the same code can start with a desktop window or a headless frame, load data, update widgets, render output, and verify the behavior with focused tests and visible examples.</p>

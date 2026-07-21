@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovui-widgets-layers"
+dynamic = ["version"]
+description = "ovui-widgets Layers Panel"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ovui-widgets-common>=0.1.0",
+    "ovui-data-adapters-common>=0.1.0",
+]
+
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["ovui_widgets.layers*"]
+where = ["../.."]

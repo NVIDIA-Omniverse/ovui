@@ -1,0 +1,112 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    def Camera "PreviewCamera"
+    {
+        float focalLength = 35
+        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, -8, 4, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+}
+
+def Scope "Render"
+{
+    def Scope "Products"
+    {
+        def RenderProduct "PrimaryProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            uniform int2 resolution = (640, 480)
+
+            custom int omni:rtx:samples = 16 (
+                customData = {
+                    dictionary renderSettings = {
+                        int default = 4
+                        string description = "Maximum sample count."
+                        string group_id = "quality"
+                        string group_label = "Quality"
+                        double group_order = 10
+                        dictionary range = {
+                            double max = 4096
+                            double min = 1
+                        }
+                        string label = "Sample Count"
+                        double order = 10
+                        string requirement = "warmup"
+                        dictionary soft_range = {
+                            double max = 128
+                            double min = 1
+                        }
+                        string units = "samples"
+                    }
+                }
+            )
+
+            custom token omni:rtx:qualityMode = "balanced" (
+                allowedTokens = ["draft", "balanced", "final"]
+                customData = {
+                    dictionary renderSettings = {
+                        string group_id = "quality"
+                        string group_label = "Quality"
+                        string label = "Quality Mode"
+                        double order = 20
+                        string value_type = "enum"
+                    }
+                }
+            )
+
+            custom float omni:rtx:exposure (
+                customData = {
+                    dictionary renderSettings = {
+                        double default = 1.25
+                        string group_id = "tone"
+                        string group_label = "Tone"
+                        double group_order = 20
+                        string label = "Exposure"
+                        double order = 10
+                        string requirement = "renderer_restart"
+                        string units = "stops"
+                    }
+                }
+            )
+
+            custom bool omni:rtx:experimental = 1 (
+                customData = {
+                    dictionary renderSettings = {
+                        string disabled_reason = "Experimental setting is not public yet."
+                        bool enabled = false
+                        string group_id = "quality"
+                        string group_label = "Quality"
+                        string label = "Experimental"
+                        double order = 30
+                    }
+                }
+            )
+
+            custom matrix4d omni:rtx:badMatrix = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) ) (
+                customData = {
+                    dictionary renderSettings = {
+                        string group_id = "unsupported"
+                        string group_label = "Unsupported"
+                        string label = "Unsupported Matrix"
+                        double order = 10
+                    }
+                }
+            )
+
+            custom float internal:debugOnly = 9
+        }
+
+        def RenderProduct "EmptyProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            uniform int2 resolution = (640, 480)
+        }
+    }
+}

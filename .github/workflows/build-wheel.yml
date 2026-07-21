@@ -4,10 +4,13 @@
 # Wheel build — produces native binary wheels for ovui.
 #
 # The Linux wheels are built against the headless Vulkan + Lavapipe toolchain
-# (the same recipe B1 uses) so they work on machines with no GPU. The Windows
+# (the same recipe B1 uses) plus CUDA 12.8 development components. A CUDA
+# driver stub keeps hosted-runner smoke tests driver-free; real CUDA use still
+# requires a driver at runtime. The Windows
 # wheel uses the GitHub-hosted Windows Server 2022 image, its preinstalled
-# Visual Studio 2022 toolchain, and Vulkan headers/loader installed with the
-# image's preinstalled vcpkg. setup.py bundles the compiled native libraries
+# Visual Studio 2022 toolchain, Vulkan headers/loader installed with the
+# image's preinstalled vcpkg, and CUDA 12.8 compiler/runtime components from
+# NVIDIA's network installer. setup.py bundles the compiled native libraries
 # into each wheel:
 #
 #   omni/ui/_ui*.so|*.pyd
@@ -54,9 +57,9 @@ concurrency:
 
 jobs:
   build-wheel-linux:
-    name: Build wheel (${{ matrix.label }}, Vulkan headless)
+    name: Build wheel (${{ matrix.label }}, Vulkan + CUDA)
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     strategy:
       fail-fast: false
@@ -67,14 +70,22 @@ jobs:
             artifact: ovui-wheel-linux-x64
             linux_tag: linux_x86_64
             manylinux_tag: manylinux_2_35_x86_64
+            cuda_repo_arch: x86_64
           - label: Linux ARM64
             runner: ubuntu-22.04-arm
             artifact: ovui-wheel-linux-arm64
             linux_tag: linux_aarch64
             manylinux_tag: manylinux_2_35_aarch64
+            cuda_repo_arch: sbsa
 
     env:
       DEBIAN_FRONTEND: noninteractive
+      CUDAToolkit_ROOT: /usr/local/cuda-12.8
+      OMNIUI_CMAKE_ARGS: >-
+        -DOMNIUI_USE_BUNDLED_GLFW=ON
+        -DOMNIUI_USE_BUNDLED_FREETYPE=ON
+        -DOMNIUI_REQUIRE_VULKAN=ON
+        -DOMNIUI_REQUIRE_CUDA=ON
 
     defaults:
       run:
@@ -92,19 +103,47 @@ jobs:
           echo "OVUI_BUILD_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
           echo "EXPECTED_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
 
-      - name: Install Vulkan + Lavapipe + build deps
+      - name: Install Vulkan, CUDA, and static dependency build prerequisites
+        # Do not install libglfw3-dev, libfreetype-dev, or libfontconfig1-dev:
+        # wheel builds force the pinned static FetchContent targets instead.
+        # GLFW's source build still needs the Wayland and X11 headers below.
         run: |
+          set -euo pipefail
+          keyring="$RUNNER_TEMP/cuda-keyring_1.1-1_all.deb"
+          curl -fsSL \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${{ matrix.cuda_repo_arch }}/cuda-keyring_1.1-1_all.deb" \
+            -o "$keyring"
+          sudo dpkg -i "$keyring"
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-8 \
             libvulkan-dev \
             mesa-vulkan-drivers \
-            libglfw3-dev \
-            libfreetype-dev \
-            libfontconfig1-dev \
+            libgl-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libxkbcommon-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
             cmake \
             ninja-build \
             pkg-config \
             python3-dev
+
+          test -x "$CUDAToolkit_ROOT/bin/nvcc"
+          test -f "$CUDAToolkit_ROOT/include/cuda_runtime.h"
+          cuda_stub="$(find "$CUDAToolkit_ROOT" -path '*/stubs/libcuda.so' -print -quit)"
+          cuda_runtime="$(find "$CUDAToolkit_ROOT" -name 'libcudart.so.12' -print -quit)"
+          test -n "$cuda_stub"
+          test -n "$cuda_runtime"
+          stub_dir="$RUNNER_TEMP/cuda-driver-stub"
+          mkdir -p "$stub_dir"
+          ln -s "$cuda_stub" "$stub_dir/libcuda.so.1"
+          echo "LD_LIBRARY_PATH=$stub_dir:$(dirname "$cuda_runtime")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          "$CUDAToolkit_ROOT/bin/nvcc" --version
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -177,6 +216,43 @@ jobs:
               f"omni.ui.__commit__ {commit!r} does not match GITHUB_SHA {expected!r}"
           )
           PY
+          /tmp/wheel-venv/bin/python ../.github/scripts/validate_packaged_skills.py \
+            --expected omniverse-ui-apis omniverse-ui-inspector
+
+      - name: Build pure-Python project wheels
+        if: matrix.linux_tag == 'linux_x86_64'
+        run: |
+          set -euo pipefail
+          projects=(
+            ovui-data-adapters/dist/common
+            ovui-data-adapters/dist/services
+            ovui-data-adapters/dist/openusd
+            ovui-data-adapters/dist/ovstage
+            ovui-widgets/dist/common
+            ovui-widgets/dist/content
+            ovui-widgets/dist/stage
+            ovui-widgets/dist/layers
+            ovui-widgets/dist/property
+            ovui-widgets/dist/viewport
+            ovui-widgets/dist/app
+            ovui-widgets/dist/all
+          )
+          for project in "${projects[@]}"; do
+            python -m pip wheel --no-deps -w dist/ "../$project"
+          done
+
+      - name: Validate skills in release wheels
+        if: matrix.linux_tag == 'linux_x86_64'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          app=(dist/ovui_widgets_app-*-py3-none-any.whl)
+          if [ "${#app[@]}" -ne 1 ]; then
+            echo "Expected one ovui-widgets-app wheel"
+            exit 1
+          fi
+          /tmp/wheel-venv/bin/pip install --no-deps "${app[0]}"
+          /tmp/wheel-venv/bin/python ../.github/scripts/validate_packaged_skills.py
 
       - name: Upload wheel as workflow artifact
         uses: actions/upload-artifact@v4
@@ -186,14 +262,19 @@ jobs:
           if-no-files-found: error
 
   build-wheel-windows:
-    name: Build wheel (Windows x64)
+    name: Build wheel (Windows x64, Vulkan + CUDA)
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
       CMAKE_GENERATOR: Visual Studio 17 2022
       CMAKE_GENERATOR_PLATFORM: x64
       OMNIUI_BUILD_JOBS: "2"
+      OMNIUI_CMAKE_ARGS: >-
+        -DOMNIUI_USE_BUNDLED_GLFW=ON
+        -DOMNIUI_USE_BUNDLED_FREETYPE=ON
+        -DOMNIUI_REQUIRE_VULKAN=ON
+        -DOMNIUI_REQUIRE_CUDA=ON
 
     defaults:
       run:
@@ -217,6 +298,33 @@ jobs:
         with:
           python-version: "3.12"
           architecture: "x64"
+
+      - name: Install CUDA 12.8 compiler and runtime
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "cuda_12.8.2_windows_network.exe"
+          Invoke-WebRequest -Uri "https://developer.download.nvidia.com/compute/cuda/12.8.2/network_installers/cuda_12.8.2_windows_network.exe" -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList @(
+            "-s", "-n", "cudart_12.8", "nvcc_12.8") -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "CUDA installer failed with exit code $($process.ExitCode)"
+          }
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          foreach ($required in @(
+            "bin\nvcc.exe",
+            "bin\cudart64_12.dll",
+            "include\cuda_runtime.h",
+            "include\crt\host_config.h",
+            "lib\x64\cuda.lib",
+            "lib\x64\cudart.lib")) {
+            $path = Join-Path $cudaRoot $required
+            if (-not (Test-Path $path)) { throw "CUDA component is missing: $path" }
+          }
+          "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDAToolkit_ROOT=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $cudaRoot "bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          (Join-Path $cudaRoot "bin\x64") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $cudaRoot "bin\nvcc.exe") --version
 
       - name: Install Vulkan headers and loader
         shell: pwsh
@@ -312,6 +420,8 @@ jobs:
           $scriptPath = Join-Path $env:RUNNER_TEMP "wheel_smoke.py"
           Set-Content -Path $scriptPath -Value $checkScript -Encoding utf8
           & $python $scriptPath
+          & $python ..\.github\scripts\validate_packaged_skills.py `
+            --expected omniverse-ui-apis omniverse-ui-inspector
 
       - name: Upload wheel as workflow artifact
         uses: actions/upload-artifact@v4
@@ -351,9 +461,11 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+          # 17 = 5 native ovui wheels (Linux x64/ARM64, manylinux x64/aarch64,
+          # Windows x64) + the 12 universal pure-Python distributions below.
           wheels=(wheelhouse/*.whl)
-          if [ "${#wheels[@]}" -ne 5 ]; then
-            echo "Expected exactly 5 ovui wheels, found ${#wheels[@]}"
+          if [ "${#wheels[@]}" -ne 17 ]; then
+            echo "Expected exactly 17 project wheels, found ${#wheels[@]}"
             printf '  %s\n' "${wheels[@]}"
             exit 1
           fi
@@ -375,6 +487,24 @@ jobs:
           require_one "ovui-*-cp312-cp312-manylinux_2_35_x86_64.whl" "manylinux x64"
           require_one "ovui-*-cp312-cp312-manylinux_2_35_aarch64.whl" "manylinux aarch64"
           require_one "ovui-*-cp312-cp312-win_amd64.whl" "Windows x64"
+
+          universal_distributions=(
+            ovui_data_adapters_common
+            ovui_data_adapters_services
+            ovui_data_adapters_openusd
+            ovui_data_adapters_ovstage
+            ovui_widgets_common
+            ovui_widgets_content
+            ovui_widgets_stage
+            ovui_widgets_layers
+            ovui_widgets_property
+            ovui_widgets_viewport
+            ovui_widgets_app
+            ovui_widgets_all
+          )
+          for distribution in "${universal_distributions[@]}"; do
+            require_one "$distribution-*-py3-none-any.whl" "$distribution universal"
+          done
 
       - name: Attach wheels to GitHub release
         env:

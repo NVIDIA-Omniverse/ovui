@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovui-widgets-app"
+dynamic = ["version"]
+description = "ovui-widgets core: Application, ABCs, style, settings, dialogs, undo, selection"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ovui>=0.1.0",
+    "ovui-widgets-common[testing]>=0.1.0",
+    "ovui-widgets-stage>=0.1.0",
+    "ovui-widgets-layers>=0.1.0",
+    "ovui-widgets-content>=0.1.0",
+    "ovui-widgets-property>=0.1.0",
+    "ovui-widgets-viewport>=0.1.0",
+    "ovui-data-adapters-common>=0.1.0",
+]
+
+[project.optional-dependencies]
+# dev: ovui_widgets.app.testing/mock_backend.py has a hard import from
+# ovui_widgets.content.backends — install ovui-widgets-content before running tests
+# that use MockBackend.
+dev = ["pytest", "libcst", "tomli", "ovui-widgets-content>=0.1.0"]
+
+[project.scripts]
+ovui-widgets = "ovui_widgets.app.__main__:main_sync"
+ovgear = "ovui_widgets.app.__main__:main_sync"
+ovui-widgets-headless = "ovui_widgets.app.headless:main"
+ovgear-headless = "ovui_widgets.app.headless:main"
+ovui-widgets-skill = "ovui_widgets_agent_skills:main"
+
+[project.entry-points."ovui.skills"]
+omniverse-ui-widgets = "ovui_widgets_agent_skills:get_omniverse_ui_widgets_skill"
+omniverse-ui-styling = "ovui_widgets_agent_skills:get_omniverse_ui_styling_skill"
+omniverse-ui-widgets-app = "ovui_widgets_agent_skills:get_omniverse_ui_widgets_app_skill"
+
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["ovui_widgets.app*", "ovui_widgets_agent_skills*"]
+where = ["../.."]              # two levels up from dist/app/ → repo root
+
+# Icon package data moved to ``ovui-widgets-common`` in Step 8/13 (icons/,
+# resources/icons/, style/icons/ are git-mv'd to common). Consumers
+# import via ``ovui_widgets.common.style.urls`` (re-exported as
+# ``ovui_widgets.app.style.urls`` for backward compatibility), and chevron
+# path computations resolve through ``importlib.resources.files(
+# "ovui_widgets.common")`` so wheel-built consumers find the icons under
+# the common distribution rather than this app distribution.

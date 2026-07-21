@@ -5,7 +5,7 @@ ovui-inspect uses full-frame screenshot pixel coordinates.
 At the recommended launch size:
 
 ```bash
-python -m ovwidgets.app.headless --width 1280 --height 720
+python -m ovui_widgets.app.headless --width 1280 --height 720
 ```
 
 a point seen at `(200, 150)` in the screenshot should be passed to:

@@ -17,6 +17,9 @@
 #if OMNIUI_HAS_CUDA
 #  include "CudaVulkanInterop.h"
 #  include <cuda_runtime.h>
+#  if !defined(_WIN32)
+#    include <unistd.h>
+#  endif
 #endif
 
 #include <imgui/imgui.h>
@@ -47,6 +50,11 @@ struct VkTextureState
     VkDeviceSize     memorySize     = 0;
     CudaImageImport  cudaImport     = {};
     bool             cudaImportTried = false;
+    VkBuffer         cudaUploadBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory   cudaUploadMemory = VK_NULL_HANDLE;
+    VkDeviceSize     cudaUploadSize = 0;
+    cudaExternalMemory_t cudaUploadExternalMemory = nullptr;
+    void*            cudaUploadPtr = nullptr;
 #endif
 };
 
@@ -62,18 +70,39 @@ uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits, VkMemoryProper
     return UINT32_MAX;
 }
 
-void destroyTexture(VulkanBackend* backend, VkTextureState* s)
+void destroyTexture(VulkanBackend* backend, VkTextureState* s, bool keepDescriptorSet = false)
 {
     if (!backend || !s) return;
     VkDevice device = backend->getDevice();
     if (device == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(device);
-    if (s->descriptorSet != VK_NULL_HANDLE)
+    if (s->descriptorSet != VK_NULL_HANDLE && !keepDescriptorSet)
     {
         ImGui_ImplVulkan_RemoveTexture(s->descriptorSet);
         s->descriptorSet = VK_NULL_HANDLE;
     }
 #if OMNIUI_HAS_CUDA
+    if (s->cudaUploadPtr)
+    {
+        cudaFree(s->cudaUploadPtr);
+        s->cudaUploadPtr = nullptr;
+    }
+    if (s->cudaUploadExternalMemory)
+    {
+        cudaDestroyExternalMemory(s->cudaUploadExternalMemory);
+        s->cudaUploadExternalMemory = nullptr;
+    }
+    if (s->cudaUploadBuffer)
+    {
+        vkDestroyBuffer(device, s->cudaUploadBuffer, nullptr);
+        s->cudaUploadBuffer = VK_NULL_HANDLE;
+    }
+    if (s->cudaUploadMemory)
+    {
+        vkFreeMemory(device, s->cudaUploadMemory, nullptr);
+        s->cudaUploadMemory = VK_NULL_HANDLE;
+    }
+    s->cudaUploadSize = 0;
     // CUDA holds a reference to the VkDeviceMemory via the imported handle.
     // Destroy the CUDA-side resources first so the underlying memory can be
     // safely freed below.
@@ -89,6 +118,219 @@ void destroyTexture(VulkanBackend* backend, VkTextureState* s)
     s->width = s->height = 0;
     s->format = PixelFormat::eRGBA8_UNORM;
 }
+
+bool updateTextureDescriptor(VkDevice device, VkTextureState* s)
+{
+    if (!s || device == VK_NULL_HANDLE || s->descriptorSet == VK_NULL_HANDLE ||
+        s->view == VK_NULL_HANDLE || s->sampler == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    VkDescriptorImageInfo imageInfo = {};
+    imageInfo.sampler = s->sampler;
+    imageInfo.imageView = s->view;
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = s->descriptorSet;
+    write.dstBinding = 0;
+    write.dstArrayElement = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &imageInfo;
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    return true;
+}
+
+#if OMNIUI_HAS_CUDA
+bool importVkBufferMemoryToCuda(VkDevice device,
+                                VkDeviceMemory memory,
+                                VkDeviceSize memorySize,
+                                cudaExternalMemory_t* outExternalMemory,
+                                void** outPtr)
+{
+    if (!outExternalMemory || !outPtr || device == VK_NULL_HANDLE || memory == VK_NULL_HANDLE || memorySize == 0)
+        return false;
+
+    *outExternalMemory = nullptr;
+    *outPtr = nullptr;
+
+    cudaExternalMemoryHandleDesc extMemDesc = {};
+    extMemDesc.size = memorySize;
+
+#if defined(_WIN32)
+    VkMemoryGetWin32HandleInfoKHR getHandleInfo = {};
+    getHandleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
+    getHandleInfo.memory = memory;
+    getHandleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
+    auto vkGetMemoryWin32HandleKHR = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(
+        vkGetDeviceProcAddr(device, "vkGetMemoryWin32HandleKHR"));
+    if (!vkGetMemoryWin32HandleKHR)
+    {
+        fprintf(stderr, "VulkanByteImageGpu: vkGetMemoryWin32HandleKHR not available for CUDA upload buffer\n");
+        return false;
+    }
+    HANDLE handle = nullptr;
+    VkResult vkErr = vkGetMemoryWin32HandleKHR(device, &getHandleInfo, &handle);
+    if (vkErr != VK_SUCCESS || !handle)
+    {
+        fprintf(stderr, "VulkanByteImageGpu: failed to export CUDA upload buffer memory handle (%d)\n", vkErr);
+        return false;
+    }
+    extMemDesc.type = cudaExternalMemoryHandleTypeOpaqueWin32;
+    extMemDesc.handle.win32.handle = handle;
+    extMemDesc.handle.win32.name = nullptr;
+#else
+    VkMemoryGetFdInfoKHR getFdInfo = {};
+    getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+    getFdInfo.memory = memory;
+    getFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+    auto vkGetMemoryFdKHR = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR"));
+    if (!vkGetMemoryFdKHR)
+    {
+        fprintf(stderr, "VulkanByteImageGpu: vkGetMemoryFdKHR not available for CUDA upload buffer\n");
+        return false;
+    }
+    int fd = -1;
+    VkResult vkErr = vkGetMemoryFdKHR(device, &getFdInfo, &fd);
+    if (vkErr != VK_SUCCESS || fd < 0)
+    {
+        fprintf(stderr, "VulkanByteImageGpu: failed to export CUDA upload buffer memory fd (%d)\n", vkErr);
+        return false;
+    }
+    extMemDesc.type = cudaExternalMemoryHandleTypeOpaqueFd;
+    extMemDesc.handle.fd = fd;
+#endif
+
+    cudaExternalMemory_t externalMemory = nullptr;
+    cudaError_t err = cudaImportExternalMemory(&externalMemory, &extMemDesc);
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "VulkanByteImageGpu: cudaImportExternalMemory(upload buffer) failed: %s\n",
+                cudaGetErrorString(err));
+#if !defined(_WIN32)
+        if (extMemDesc.handle.fd >= 0)
+            close(extMemDesc.handle.fd);
+#endif
+        return false;
+    }
+
+    cudaExternalMemoryBufferDesc bufferDesc = {};
+    bufferDesc.offset = 0;
+    bufferDesc.size = memorySize;
+    void* ptr = nullptr;
+    err = cudaExternalMemoryGetMappedBuffer(&ptr, externalMemory, &bufferDesc);
+    if (err != cudaSuccess || !ptr)
+    {
+        fprintf(stderr, "VulkanByteImageGpu: cudaExternalMemoryGetMappedBuffer failed: %s\n",
+                cudaGetErrorString(err));
+        cudaDestroyExternalMemory(externalMemory);
+        return false;
+    }
+
+    *outExternalMemory = externalMemory;
+    *outPtr = ptr;
+    return true;
+}
+
+bool ensureCudaUploadBuffer(VulkanBackend* backend,
+                            VkTextureState* s,
+                            VkDeviceSize requiredSize)
+{
+    if (!backend || !s || requiredSize == 0)
+        return false;
+    if (s->cudaUploadBuffer != VK_NULL_HANDLE && s->cudaUploadPtr && s->cudaUploadSize >= requiredSize)
+        return true;
+
+    VkDevice device = backend->getDevice();
+    VkPhysicalDevice phys = backend->getPhysicalDevice();
+    if (device == VK_NULL_HANDLE || phys == VK_NULL_HANDLE)
+        return false;
+
+    if (s->cudaUploadPtr)
+    {
+        cudaFree(s->cudaUploadPtr);
+        s->cudaUploadPtr = nullptr;
+    }
+    if (s->cudaUploadExternalMemory)
+    {
+        cudaDestroyExternalMemory(s->cudaUploadExternalMemory);
+        s->cudaUploadExternalMemory = nullptr;
+    }
+    if (s->cudaUploadBuffer)
+    {
+        vkDestroyBuffer(device, s->cudaUploadBuffer, nullptr);
+        s->cudaUploadBuffer = VK_NULL_HANDLE;
+    }
+    if (s->cudaUploadMemory)
+    {
+        vkFreeMemory(device, s->cudaUploadMemory, nullptr);
+        s->cudaUploadMemory = VK_NULL_HANDLE;
+    }
+    s->cudaUploadSize = 0;
+
+    VkExternalMemoryBufferCreateInfo extBufferInfo = {};
+    extBufferInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+#if defined(_WIN32)
+    extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+#else
+    extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+#endif
+
+    VkBufferCreateInfo bufferInfo = {};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.pNext = &extBufferInfo;
+    bufferInfo.size = requiredSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &bufferInfo, nullptr, &s->cudaUploadBuffer) != VK_SUCCESS)
+    {
+        fprintf(stderr, "VulkanByteImageGpu: vkCreateBuffer(CUDA upload) failed\n");
+        return false;
+    }
+
+    VkMemoryRequirements req = {};
+    vkGetBufferMemoryRequirements(device, s->cudaUploadBuffer, &req);
+    VkExportMemoryAllocateInfo exportInfo = {};
+    exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+#if defined(_WIN32)
+    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+#else
+    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+#endif
+    VkMemoryAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.pNext = &exportInfo;
+    allocInfo.allocationSize = req.size;
+    allocInfo.memoryTypeIndex = findMemoryType(phys, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (allocInfo.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(device, &allocInfo, nullptr, &s->cudaUploadMemory) != VK_SUCCESS)
+    {
+        fprintf(stderr, "VulkanByteImageGpu: vkAllocateMemory(CUDA upload) failed\n");
+        destroyTexture(backend, s);
+        return false;
+    }
+    if (vkBindBufferMemory(device, s->cudaUploadBuffer, s->cudaUploadMemory, 0) != VK_SUCCESS)
+    {
+        fprintf(stderr, "VulkanByteImageGpu: vkBindBufferMemory(CUDA upload) failed\n");
+        destroyTexture(backend, s);
+        return false;
+    }
+
+    s->cudaUploadSize = req.size;
+    if (!importVkBufferMemoryToCuda(device, s->cudaUploadMemory, s->cudaUploadSize,
+                                    &s->cudaUploadExternalMemory, &s->cudaUploadPtr))
+    {
+        destroyTexture(backend, s);
+        return false;
+    }
+    return true;
+}
+#endif
 
 } // anonymous namespace
 
@@ -230,7 +472,8 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImage(
         || s->height != height
         || s->format != format)
     {
-        destroyTexture(m_backend, s);
+        const bool keepDescriptorSet = s->descriptorSet != VK_NULL_HANDLE;
+        destroyTexture(m_backend, s, keepDescriptorSet);
 
         VkImageCreateInfo imageInfo = {};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -246,20 +489,6 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImage(
                         | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-#if OMNIUI_HAS_CUDA
-        // Allocate every texture as exportable so the fromGpu=true path can
-        // import the same VkDeviceMemory into CUDA later. The cost is one
-        // extra VkExternal* struct in the create chain — no runtime overhead
-        // when CUDA is not used.
-        VkExternalMemoryImageCreateInfo extImageInfo = {};
-        extImageInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-#  if defined(_WIN32)
-        extImageInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-#  else
-        extImageInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-#  endif
-        imageInfo.pNext = &extImageInfo;
-#endif
         if (vkCreateImage(device, &imageInfo, nullptr, &s->image) != VK_SUCCESS)
             return result;
 
@@ -269,24 +498,14 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImage(
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = memReq.size;
         allocInfo.memoryTypeIndex = findMemoryType(phys, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-#if OMNIUI_HAS_CUDA
-        VkExportMemoryAllocateInfo exportInfo = {};
-        exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-#  if defined(_WIN32)
-        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-#  else
-        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-#  endif
-        allocInfo.pNext = &exportInfo;
-#endif
         if (vkAllocateMemory(device, &allocInfo, nullptr, &s->memory) != VK_SUCCESS)
         {
             destroyTexture(m_backend, s); return result;
         }
         vkBindImageMemory(device, s->image, s->memory, 0);
 #if OMNIUI_HAS_CUDA
-        s->externalMemory = true;
-        s->memorySize = memReq.size;
+        s->externalMemory = false;
+        s->memorySize = 0;
 #endif
 
         VkImageViewCreateInfo viewInfo = {};
@@ -354,9 +573,12 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImage(
     }
 
 #if OMNIUI_HAS_CUDA
-    // --- Fast path: source is a CUDA device pointer. Import the
-    // VkDeviceMemory as a CUDA mipmapped array (lazy, once per state),
-    // then cudaMemcpy2DToArray straight from caller's device buffer.
+    // --- Fast path: source is a CUDA device pointer. Import an exportable
+    // Vulkan transfer buffer into CUDA, copy device-to-device into that
+    // buffer, then publish into a normal sampled VkImage with a Vulkan
+    // buffer-to-image copy. Sampling a CUDA-imported external VkImage hit
+    // driver faults in the headless ImGui pass; this keeps the sampled image
+    // on the ordinary Vulkan path while keeping pixel data on the GPU.
     if (fromGpu)
     {
         if (isR8)
@@ -366,248 +588,123 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImage(
                 fprintf(stderr, "VulkanByteImageGpu: fromGpu=true with R8 format is not supported (caller must pass RGBA8)\n");
             return result;
         }
-        if (!s->externalMemory || s->memory == VK_NULL_HANDLE || s->memorySize == 0)
-        {
-            fprintf(stderr, "VulkanByteImageGpu: fromGpu requested but image was not allocated as external\n");
-            return result;
-        }
-
-        // Channel descriptor must match the VkFormat byte-for-byte so
-        // ``cudaExternalMemoryGetMappedMipmappedArray`` accepts the
-        // import. The legacy importer used a hardcoded RGBA8 desc which
-        // worked only for the 8-bit formats.
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
-        switch (format)
-        {
-            case PixelFormat::eRGBA8_UNORM:
-            case PixelFormat::eRGBA8_SRGB:
-            case PixelFormat::eBGRA8_UNORM:
-                channelDesc = cudaCreateChannelDesc(8, 8, 8, 8, cudaChannelFormatKindUnsigned);
-                break;
-            case PixelFormat::eR16_FLOAT:
-                channelDesc = cudaCreateChannelDesc(16, 0, 0, 0, cudaChannelFormatKindFloat);
-                break;
-            case PixelFormat::eR32_FLOAT:
-                channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
-                break;
-            case PixelFormat::eRG16_FLOAT:
-                channelDesc = cudaCreateChannelDesc(16, 16, 0, 0, cudaChannelFormatKindFloat);
-                break;
-            case PixelFormat::eRG32_FLOAT:
-                channelDesc = cudaCreateChannelDesc(32, 32, 0, 0, cudaChannelFormatKindFloat);
-                break;
-            case PixelFormat::eRGBA16_FLOAT:
-                channelDesc = cudaCreateChannelDesc(16, 16, 16, 16, cudaChannelFormatKindFloat);
-                break;
-            case PixelFormat::eRGBA32_FLOAT:
-                channelDesc = cudaCreateChannelDesc(32, 32, 32, 32, cudaChannelFormatKindFloat);
-                break;
-            default:
-                // Should be unreachable — covered by the switch above.
-                break;
-        }
-
-        // Lazy CUDA import — done once per (image, size). destroyTexture
-        // resets cudaImportTried whenever it tears down the image.
-        if (!s->cudaImportTried)
-        {
-            s->cudaImportTried = true;
-            if (!importVkImageMemoryToCudaWithFormat(
-                    device, phys, s->memory, s->memorySize,
-                    (int)width, (int)height, channelDesc, &s->cudaImport))
-            {
-                static std::atomic<bool> warned{false};
-                if (!warned.exchange(true, std::memory_order_relaxed))
-                    fprintf(stderr, "VulkanByteImageGpu: importVkImageMemoryToCudaWithFormat failed; fromGpu disabled\n");
-                return result;
-            }
-        }
-        if (!s->cudaImport.array)
-            return result;
-
-        // Lazy init the V↔C external-semaphore pair (once per backend).
-        if (!m_syncInitTried)
-        {
-            m_syncInitTried = true;
-            if (!createCudaInteropSemaphores(device, phys, &m_sync))
-            {
-                fprintf(stderr, "VulkanByteImageGpu: createCudaInteropSemaphores failed; "
-                                "fromGpu disabled\n");
-                return result;
-            }
-        }
-        if (!m_sync.initialized)
-            return result;
-
-        // Allocate two one-shot command buffers — one for the pre-copy V→C
-        // transition (UNDEFINED|SHADER_READ → GENERAL, signals vkSemVkDone),
-        // and one for the post-copy C→V transition (GENERAL → SHADER_READ,
-        // waits on vkSemCuDone).
-        VkCommandBuffer cmds[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-        VkCommandBufferAllocateInfo cbAlloc = {};
-        cbAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cbAlloc.commandPool = cmdPool;
-        cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbAlloc.commandBufferCount = 2;
-        if (vkAllocateCommandBuffers(device, &cbAlloc, cmds) != VK_SUCCESS)
-        {
-            fprintf(stderr, "VulkanByteImageGpu: vkAllocateCommandBuffers (sync) failed\n");
-            return result;
-        }
-
-        auto recordTransition = [&](VkCommandBuffer cmd,
-                                    VkImageLayout oldLayout, VkImageLayout newLayout)
-        {
-            VkCommandBufferBeginInfo bi = {};
-            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &bi);
-            VkImageMemoryBarrier b = {};
-            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            b.oldLayout = oldLayout;
-            b.newLayout = newLayout;
-            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.image = s->image;
-            b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            b.subresourceRange.levelCount = 1;
-            b.subresourceRange.layerCount = 1;
-            b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-            b.dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &b);
-            vkEndCommandBuffer(cmd);
-        };
-
-        const VkImageLayout fromLayout = (s->descriptorSet == VK_NULL_HANDLE)
-            ? VK_IMAGE_LAYOUT_UNDEFINED
-            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        recordTransition(cmds[0], fromLayout, VK_IMAGE_LAYOUT_GENERAL);
-        recordTransition(cmds[1], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-
-        // Step 1 (V→C): submit the pre-copy transition, signalling vkSemVkDone.
-        // Mirrors CudaVulkanInterop::syncVulkanToCuda.
-        const uint64_t signalVkDone = ++m_sync.timelineValue;
-        const uint64_t signalCuDone = ++m_sync.timelineValue;
-
-        VkTimelineSemaphoreSubmitInfo timelineSignal = {};
-        timelineSignal.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-        timelineSignal.signalSemaphoreValueCount = 1;
-        timelineSignal.pSignalSemaphoreValues = &signalVkDone;
-
-        VkSubmitInfo submitV2C = {};
-        submitV2C.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitV2C.commandBufferCount = 1;
-        submitV2C.pCommandBuffers = &cmds[0];
-        submitV2C.signalSemaphoreCount = 1;
-        submitV2C.pSignalSemaphores = &m_sync.vkSemVkDone;
-        if (m_sync.useTimeline)
-            submitV2C.pNext = &timelineSignal;
-
-        if (vkQueueSubmit(queue, 1, &submitV2C, VK_NULL_HANDLE) != VK_SUCCESS)
-        {
-            fprintf(stderr, "VulkanByteImageGpu: vkQueueSubmit (V→C) failed\n");
-            vkFreeCommandBuffers(device, cmdPool, 2, cmds);
-            return result;
-        }
-
-        // Step 2: CUDA waits on extSemVkDone, does the copy, then signals
-        // extSemCuDone — all asynchronously on the default stream. Mirrors
-        // CudaVulkanInterop::syncVulkanToCuda's wait + the syncCudaToVulkan
-        // signal pattern (CudaVulkanInterop.cpp:432-456).
-        cudaExternalSemaphoreWaitParams waitParams = {};
-        if (m_sync.useTimeline)
-            waitParams.params.fence.value = signalVkDone;
-        cudaError_t cuErr = cudaWaitExternalSemaphoresAsync(
-            &m_sync.extSemVkDone, &waitParams, 1, /*stream=*/nullptr);
-        if (cuErr != cudaSuccess)
-        {
-            fprintf(stderr, "VulkanByteImageGpu: cudaWaitExternalSemaphoresAsync failed: %s\n",
-                    cudaGetErrorString(cuErr));
-            vkQueueWaitIdle(queue);
-            vkFreeCommandBuffers(device, cmdPool, 2, cmds);
-            return result;
-        }
-
         const void* srcDev = static_cast<const void*>(mipMapBuffers[0]);
         const size_t srcPitch = (mipMapStrides && mipMapStrides[0])
             ? mipMapStrides[0]
             : (size_t)width * bytesPerPixel;
         const size_t rowBytes = (size_t)width * bytesPerPixel;
-        cuErr = cudaMemcpy2DToArrayAsync(
-            s->cudaImport.array,
-            /*wOffset=*/0, /*hOffset=*/0,
+        const VkDeviceSize uploadSize = rowBytes * height;
+        if (!ensureCudaUploadBuffer(m_backend, s, uploadSize))
+        {
+            fprintf(stderr, "VulkanByteImageGpu: CUDA upload buffer unavailable; fromGpu disabled\n");
+            return result;
+        }
+
+        cudaError_t cuErr = cudaMemcpy2DAsync(
+            s->cudaUploadPtr,
+            rowBytes,
             srcDev,
-            /*spitch=*/srcPitch,
-            /*width=*/rowBytes,
-            /*height=*/height,
+            srcPitch,
+            rowBytes,
+            height,
             cudaMemcpyDeviceToDevice,
             /*stream=*/nullptr);
         if (cuErr != cudaSuccess)
         {
-            fprintf(stderr, "VulkanByteImageGpu: cudaMemcpy2DToArrayAsync failed: %s\n",
+            fprintf(stderr, "VulkanByteImageGpu: cudaMemcpy2DAsync(upload buffer) failed: %s\n",
                     cudaGetErrorString(cuErr));
-            vkQueueWaitIdle(queue);
-            vkFreeCommandBuffers(device, cmdPool, 2, cmds);
             return result;
         }
-
-        cudaExternalSemaphoreSignalParams signalParams = {};
-        if (m_sync.useTimeline)
-            signalParams.params.fence.value = signalCuDone;
-        cuErr = cudaSignalExternalSemaphoresAsync(
-            &m_sync.extSemCuDone, &signalParams, 1, /*stream=*/nullptr);
+        cuErr = cudaStreamSynchronize(/*stream=*/nullptr);
         if (cuErr != cudaSuccess)
         {
-            fprintf(stderr, "VulkanByteImageGpu: cudaSignalExternalSemaphoresAsync failed: %s\n",
+            fprintf(stderr, "VulkanByteImageGpu: cudaStreamSynchronize(upload buffer) failed: %s\n",
                     cudaGetErrorString(cuErr));
-            vkQueueWaitIdle(queue);
-            vkFreeCommandBuffers(device, cmdPool, 2, cmds);
             return result;
         }
 
-        // Step 3 (C→V): submit the post-copy transition, waiting on
-        // vkSemCuDone. Mirrors CudaVulkanInterop::syncCudaToVulkan
-        // (CudaVulkanInterop.cpp:444-483).
-        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        VkTimelineSemaphoreSubmitInfo timelineWait = {};
-        timelineWait.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-        timelineWait.waitSemaphoreValueCount = 1;
-        timelineWait.pWaitSemaphoreValues = &signalCuDone;
-
-        VkSubmitInfo submitC2V = {};
-        submitC2V.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitC2V.commandBufferCount = 1;
-        submitC2V.pCommandBuffers = &cmds[1];
-        submitC2V.waitSemaphoreCount = 1;
-        submitC2V.pWaitSemaphores = &m_sync.vkSemCuDone;
-        submitC2V.pWaitDstStageMask = &waitStage;
-        if (m_sync.useTimeline)
-            submitC2V.pNext = &timelineWait;
-
-        if (vkQueueSubmit(queue, 1, &submitC2V, VK_NULL_HANDLE) != VK_SUCCESS)
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkCommandBufferAllocateInfo cbAlloc = {};
+        cbAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbAlloc.commandPool = cmdPool;
+        cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAlloc.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device, &cbAlloc, &cmd) != VK_SUCCESS)
         {
-            fprintf(stderr, "VulkanByteImageGpu: vkQueueSubmit (C→V) failed\n");
-            vkQueueWaitIdle(queue);
-            vkFreeCommandBuffers(device, cmdPool, 2, cmds);
+            fprintf(stderr, "VulkanByteImageGpu: vkAllocateCommandBuffers (fromGpu upload) failed\n");
             return result;
         }
+        {
+            VkCommandBufferBeginInfo bi = {};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(cmd, &bi);
 
-        // Synchronous-API contract: callers expect the texture to be ready
-        // for sampling when updateImage returns. The CUDA→Vulkan semaphore
-        // chain replaces the old vkQueueWaitIdle + cudaDeviceSynchronize as
-        // the *correctness* mechanism (no more racing the layout transition
-        // against an unfinished CUDA copy); the trailing vkQueueWaitIdle
-        // here only enforces "finished by return time".
+            VkImageMemoryBarrier toTransfer = {};
+            toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            toTransfer.oldLayout = (s->descriptorSet == VK_NULL_HANDLE)
+                ? VK_IMAGE_LAYOUT_UNDEFINED
+                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toTransfer.image = s->image;
+            toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            toTransfer.subresourceRange.levelCount = 1;
+            toTransfer.subresourceRange.layerCount = 1;
+            toTransfer.srcAccessMask = (toTransfer.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+                ? 0
+                : VK_ACCESS_SHADER_READ_BIT;
+            toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd,
+                (toTransfer.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+                    ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                    : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+
+            VkBufferImageCopy region = {};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = { width, height, 1 };
+            vkCmdCopyBufferToImage(cmd, s->cudaUploadBuffer, s->image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+            VkImageMemoryBarrier toRead = toTransfer;
+            toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &toRead);
+
+            vkEndCommandBuffer(cmd);
+        }
+
+        VkSubmitInfo submit = {};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &cmd;
+        if (vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS)
+        {
+            fprintf(stderr, "VulkanByteImageGpu: vkQueueSubmit (fromGpu upload) failed\n");
+            vkQueueWaitIdle(queue);
+            vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
+            return result;
+        }
         vkQueueWaitIdle(queue);
-        vkFreeCommandBuffers(device, cmdPool, 2, cmds);
+        vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
 
         if (s->descriptorSet == VK_NULL_HANDLE)
         {
             s->descriptorSet = ImGui_ImplVulkan_AddTexture(
                 s->sampler, s->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+        else
+        {
+            updateTextureDescriptor(device, s);
         }
         result.imGuiReference = reinterpret_cast<void*>(s->descriptorSet);
         return result;
@@ -741,6 +838,10 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImage(
     {
         s->descriptorSet = ImGui_ImplVulkan_AddTexture(
             s->sampler, s->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    else
+    {
+        updateTextureDescriptor(device, s);
     }
 
     result.imGuiReference = reinterpret_cast<void*>(s->descriptorSet);

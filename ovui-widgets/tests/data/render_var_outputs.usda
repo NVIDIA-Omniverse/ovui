@@ -1,0 +1,156 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    def Camera "PreviewCamera"
+    {
+        float focalLength = 35
+        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, -8, 4, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+}
+
+def Scope "Render"
+{
+    def Scope "Vars"
+    {
+        def RenderVar "LdrColor"
+        {
+            uniform string sourceName = "LdrColor"
+        }
+
+        def RenderVar "HdrColor"
+        {
+            uniform string sourceName = "HdrColor"
+        }
+
+        def RenderVar "DiffuseAlbedo"
+        {
+            uniform string sourceName = "DiffuseAlbedoSD"
+        }
+
+        def RenderVar "Depth"
+        {
+            uniform string sourceName = "DepthSD"
+        }
+
+        def RenderVar "DistanceToCamera"
+        {
+            uniform string sourceName = "DistanceToCameraSD"
+        }
+
+        def RenderVar "DistanceToImagePlane"
+        {
+            uniform string sourceName = "DistanceToImagePlaneSD"
+        }
+
+        def RenderVar "Normal"
+        {
+            uniform string sourceName = "NormalSD"
+        }
+
+        def RenderVar "CameraPosition"
+        {
+            uniform string sourceName = "Camera3dPositionSD"
+        }
+
+        def RenderVar "SemanticSegmentation"
+        {
+            uniform string sourceName = "SemanticSegmentation"
+        }
+
+        def RenderVar "SemanticIdMap"
+        {
+            uniform string sourceName = "SemanticIdMap"
+        }
+
+        def RenderVar "MysteryOutput"
+        {
+            uniform string sourceName = "MysteryAov"
+        }
+    }
+
+    def Scope "Products"
+    {
+        def RenderProduct "HdrProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            rel orderedVars = </Render/Vars/HdrColor>
+            uniform int2 resolution = (640, 480)
+        }
+
+        def RenderProduct "AlbedoProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            rel orderedVars = </Render/Vars/DiffuseAlbedo>
+            uniform int2 resolution = (640, 480)
+        }
+
+        def RenderProduct "ScalarProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            rel orderedVars = [
+                </Render/Vars/Depth>,
+                </Render/Vars/DistanceToCamera>,
+                </Render/Vars/DistanceToImagePlane>
+            ]
+            uniform int2 resolution = (640, 480)
+        }
+
+        def RenderProduct "VectorProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            rel orderedVars = [
+                </Render/Vars/Normal>,
+                </Render/Vars/CameraPosition>
+            ]
+            uniform int2 resolution = (640, 480)
+        }
+
+        def RenderProduct "CategoricalProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            rel orderedVars = [
+                </Render/Vars/SemanticSegmentation>,
+                </Render/Vars/SemanticIdMap>
+            ]
+            uniform int2 resolution = (640, 480)
+        }
+
+        def RenderProduct "MixedProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            rel orderedVars = [
+                </Render/Vars/LdrColor>,
+                </Render/Vars/HdrColor>,
+                </Render/Vars/MysteryOutput>
+            ]
+            uniform int2 resolution = (320, 240)
+        }
+
+        def RenderProduct "MissingVarProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            rel orderedVars = </Render/Vars/DoesNotExist>
+            uniform int2 resolution = (640, 480)
+        }
+
+        def RenderProduct "EmptyProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            uniform int2 resolution = (640, 480)
+        }
+
+        def RenderProduct "ImageOnlyProduct"
+        {
+            rel camera = </World/PreviewCamera>
+            rel orderedVars = </Render/Vars/LdrColor>
+            uniform int2 resolution = (640, 480)
+        }
+    }
+}

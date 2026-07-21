@@ -5,22 +5,22 @@ Use these existing classes and functions.
 ```python
 # ovui/runtime
 import omni.ui as ui
-from ovwidgets.app.layout import write_split_ini
-from ovwidgets.app.style import apply_global_styles, set_theme
-from ovwidgets.app.frame_clock import FrameClock
+from ovui_widgets.app.layout import write_split_ini
+from ovui_widgets.app.style import apply_global_styles, set_theme
+from ovui_widgets.app.frame_clock import FrameClock
 
 # process singletons and app services
-from ovwidgets.common import scheduler as common_scheduler
-from ovwidgets.common.recent_files import RecentFileList
-from ovwidgets.common.selection import SelectionBus
-from ovwidgets.common.settings import Settings
-from ovwidgets.common.snap import GridSnapProvider, SnapSystem, SurfaceSnapProvider
-from ovwidgets.common.undo import UndoManager
+from ovui_widgets.common import scheduler as common_scheduler
+from ovui_widgets.common.recent_files import RecentFileList
+from ovui_widgets.common.selection import SelectionBus
+from ovui_widgets.common.settings import Settings
+from ovui_widgets.common.snap import GridSnapProvider, SnapSystem, SurfaceSnapProvider
+from ovui_widgets.common.undo import UndoManager
 
 # widgets to compose; do not recreate these
-from ovwidgets.viewport.viewport_widget import ViewportWidget
-from ovwidgets.stage.window import StageWindow
-from ovwidgets.property.window import PropertyWindow
+from ovui_widgets.viewport.viewport_widget import ViewportWidget
+from ovui_widgets.stage.window import StageWindow
+from ovui_widgets.property.window import PropertyWindow
 
 # USD adapters and real renderer
 from ovui_data_adapters.openusd import (
@@ -32,7 +32,7 @@ from ovui_data_adapters.openusd import (
 )
 
 # menu/file open
-from ovwidgets.content.file_importer import FileImporterHelper
+from ovui_widgets.content.file_importer import FileImporterHelper
 ```
 
 Purpose and required calls:

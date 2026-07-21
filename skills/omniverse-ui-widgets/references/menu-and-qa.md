@@ -24,7 +24,7 @@ def _to_stage_open_path(url: str) -> str:
 
 def _build_menu_bar(self) -> None:
     self.menu_window = ui.Window(
-        "OvWidgetsTrial_Menu",
+        "OvuiWidgetsTrial_Menu",
         flags=(
             ui.WINDOW_FLAGS_NO_TITLE_BAR
             | ui.WINDOW_FLAGS_NO_RESIZE

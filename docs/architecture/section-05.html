@@ -247,7 +247,7 @@
         <li><code>Scene</code> is the container reached through <code>scene_view.scene</code>; Python adds transforms, shapes, gestures, and manipulators there.</li>
         <li><code>CameraModel</code> supplies view and projection matrices so 3D shapes line up with the current camera.</li>
         <li>Gestures attach to shapes or to <code>Screen</code> and call Python when the user clicks, drags, hovers, or scrolls.</li>
-        <li>ovwidgets uses these pieces in the viewport for camera motion, picking, transform gizmos, and selection outlines over the rendered image.</li>
+        <li>ovui-widgets uses these pieces in the viewport for camera motion, picking, transform gizmos, and selection outlines over the rendered image.</li>
       </ul>
       <div class="diagram scene-diagram" role="img" aria-label="Python scene code uses app data to build scene objects inside a rendered viewport area">
         <div class="draw-flow">
@@ -312,7 +312,7 @@
         <li><code>Transform</code> moves, scales, or turns child items, so a gizmo can follow a selected object while each axis handle remains its own shape.</li>
         <li><code>Screen</code> is useful for camera gestures because it can receive input anywhere in the scene area.</li>
         <li><code>Widget</code> can place normal <code>ovui</code> widgets as a scene item, while regular <code>ui.HStack</code>, <code>ui.VStack</code>, labels, fields, and menus can still sit around the <code>SceneView</code>.</li>
-        <li>ovwidgets adds higher-level viewport objects such as <code>CameraManipulator</code>, <code>TransformManipulator</code>, <code>PickGesture</code>, and <code>PickRectGesture</code>; selection outlines are driven through the renderer adapter instead of a local scene manipulator.</li>
+        <li>ovui-widgets adds higher-level viewport objects such as <code>CameraManipulator</code>, <code>TransformManipulator</code>, <code>PickGesture</code>, and <code>PickRectGesture</code>; selection outlines are driven through the renderer adapter instead of a local scene manipulator.</li>
       </ul>
       <p>Those pieces let a tool show more than a flat rendered image. The same window can contain the rendered frame, a camera gesture area, renderer-owned selection outline and highlight state, transform handles, and ordinary UI controls that change what the scene code draws.</p>
     </section>
@@ -342,11 +342,11 @@
           </div>
         </div>
         <div class="source-note">
-          <div class="source-note-title">Real use appears in examples, tests, and ovwidgets viewport code</div>
+          <div class="source-note-title">Real use appears in examples, tests, and ovui-widgets viewport code</div>
           <div class="source-note-list">
             <span class="source-pill">ovui/examples/scene_manipulator.py</span>
             <span class="source-pill">ovui/tests/scene</span>
-            <span class="source-pill">ovwidgets/ovwidgets/viewport</span>
+            <span class="source-pill">ovui-widgets/ovui_widgets/viewport</span>
           </div>
         </div>
         <p class="diagram-note">Read examples first for Python usage, tests for edge cases, and the viewport package for a full app use of camera, pick, gizmo, and outline behavior.</p>
@@ -362,7 +362,7 @@
       <h2>How scene data reaches views</h2>
       <p>Scene data reaches a view through Python code that already knows the app state. The scene package draws what it is told to draw; app code, widget code, or adapter-backed state decides which objects exist, where they are, and what should happen when the user acts.</p>
       <ul>
-        <li>The ovwidgets viewport receives frames from <code>RendererAdapter</code>, shows them with <code>ImageWithProvider</code>, and places a <code>SceneView</code> in the same <code>ui.ZStack</code>.</li>
+        <li>The ovui-widgets viewport receives frames from <code>RendererAdapter</code>, shows them with <code>ImageWithProvider</code>, and places a <code>SceneView</code> in the same <code>ui.ZStack</code>.</li>
         <li><code>CameraController</code> supplies view and projection matrices to both the renderer and <code>SceneView</code>, keeping gizmos and renderer-owned outlines aligned with the rendered frame.</li>
         <li><code>TransformManipulator</code> reads selection and transform state through <code>PrimTransformModel</code>, then draws translate, rotate, or scale handles.</li>
         <li>The viewport sends selection changes to <code>RendererAdapter.set_selection_highlight()</code>; the ovrtx adapter updates native selection-outline group state for the paths that changed.</li>

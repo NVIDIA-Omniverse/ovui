@@ -181,6 +181,11 @@ public:
     OMNIUI_PROPERTY(bool, expandOnBranchClick, DEFAULT, true, READ, isExpandOnBranchClick, WRITE, setExpandOnBranchClick);
 
     /**
+     * @brief When true, a single selected item is automatically scrolled into view.
+     */
+    OMNIUI_PROPERTY(bool, autoScrollSelection, DEFAULT, true, READ, isAutoScrollSelection, WRITE, setAutoScrollSelection);
+
+    /**
      * @brief When true, the tree nodes are never destroyed even if they are disappeared from the model. It's useul for
      * the temporary filtering if it's necessary to display thousands of nodes.
      */

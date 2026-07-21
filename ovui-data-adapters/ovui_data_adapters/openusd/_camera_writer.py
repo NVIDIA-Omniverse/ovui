@@ -11,7 +11,7 @@
 """View/projection-matrix → USD camera attribute writer.
 
 Given the OpenGL-convention ``(view_matrix, proj_matrix)`` produced by
-:class:`ovwidgets.viewport.camera_controller.CameraController`, this module
+:class:`ovui_widgets.viewport.camera_controller.CameraController`, this module
 authors equivalent ``UsdGeomCamera`` attributes onto USD camera prims so
 ovrtx (which reads camera intrinsics and world transform from the USD
 scene, not from an API call) can render the corresponding view.
@@ -52,7 +52,7 @@ _FIXED_HORIZONTAL_APERTURE = 20.955
 def _decompose_perspective(proj: np.ndarray) -> Tuple[float, float, float, float]:
     """Extract ``(fovy_rad, aspect, near, far)`` from a GL perspective matrix.
 
-    Inverse of :func:`ovwidgets.viewport.camera_controller._perspective`.
+    Inverse of :func:`ovui_widgets.viewport.camera_controller._perspective`.
 
     Assumes the input is the exact GL form::
 
@@ -159,7 +159,7 @@ def write_camera_from_matrices(
     view_matrix, proj_matrix :
         4×4 numpy arrays, OpenGL convention, row-major storage,
         column-vector math. Produced by
-        :meth:`ovwidgets.viewport.camera_controller.CameraController.get_matrices`.
+        :meth:`ovui_widgets.viewport.camera_controller.CameraController.get_matrices`.
     width, height :
         Viewport pixel dimensions. Accepted for signature stability with
         the adapter's per-frame call; aspect is already encoded in

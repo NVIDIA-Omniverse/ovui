@@ -175,5 +175,3 @@ void wrapManipulator(module& m)
         .OMNIUI_PYBIND_DEF_CALLBACK(on_build, Manipulator, OnBuild)
         /**/;
 }
-
-#undef __MY_AvictorA

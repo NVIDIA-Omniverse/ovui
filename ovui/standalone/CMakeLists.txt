@@ -148,8 +148,9 @@ if(NOT WIN32)
     target_link_libraries(omniui_standalone PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
-# Link GLFW (resolved via system libglfw3-dev; headless-only builds still need
-# the headers/symbols because StandaloneInit.cpp includes GlfwPlatform.h)
+# Link GLFW (resolved as either a system or bundled target; headless-only builds
+# still need the headers/symbols because StandaloneInit.cpp includes
+# GlfwPlatform.h).
 if(glfw3_FOUND)
     target_link_libraries(omniui_standalone PRIVATE glfw)
 elseif(GLFW3_FOUND)
@@ -173,7 +174,7 @@ if(OMNIUI_HAS_NVENC)
     target_include_directories(omniui_standalone PRIVATE ${NVENC_INCLUDE_DIR})
     # NVENC is loaded dynamically (via NvEncodeAPICreateInstance), no link lib needed
     # on Linux; on Windows we'd link nvcuvid.lib / nvEncodeAPI.lib
-    if(WIN32)
+    if(MSVC)
         find_library(NVENC_LIB nvEncodeAPI
             HINTS ${Video_Codec_SDK_DIR}/Lib/x64 $ENV{Video_Codec_SDK_DIR}/Lib/x64)
         if(NVENC_LIB)
@@ -186,6 +187,14 @@ endif()
 if(OMNIUI_HAS_CUDA_INTEROP)
     target_compile_definitions(omniui_standalone PRIVATE OMNIUI_HAS_CUDA_INTEROP=1)
     target_link_libraries(omniui_standalone PRIVATE CUDA::cuda_driver CUDA::cudart)
+    if(WIN32)
+        # GitHub-hosted builders have the CUDA Toolkit but no NVIDIA display
+        # driver. Delay-load the driver API so the wheel remains importable on
+        # those machines while retaining nvcuda.dll as a runtime requirement
+        # when CUDA interop is actually used.
+        target_link_options(omniui_standalone PRIVATE "/DELAYLOAD:nvcuda.dll")
+        target_link_libraries(omniui_standalone PRIVATE delayimp)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

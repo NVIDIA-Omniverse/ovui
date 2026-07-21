@@ -98,12 +98,20 @@ class GpuFrame:
     (or if it bails out) to release the mapping.
     """
 
-    __slots__ = ("ptr", "width", "height", "_mapping")
+    __slots__ = ("ptr", "width", "height", "stride", "_mapping")
 
-    def __init__(self, ptr: int, width: int, height: int, mapping: Optional[object] = None) -> None:
+    def __init__(
+        self,
+        ptr: int,
+        width: int,
+        height: int,
+        mapping: Optional[object] = None,
+        stride: Optional[int] = None,
+    ) -> None:
         self.ptr = ptr
         self.width = width
         self.height = height
+        self.stride = stride
         self._mapping = mapping
 
     def close(self) -> None:

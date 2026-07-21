@@ -15,9 +15,9 @@ concrete USD-mutation undo commands (``SetVisibilityCommand``,
 ``DeletePrimCommand``, ``NamespaceEditCommand``). Step 12 added
 ``UsdPropertyAdapter``, the USD-backed concrete property adapter.
 Step 13 relocates the ``read_bound_camera`` parser and
-``UsdStageAdapter`` itself; the moved files carry zero ``ovwidgets.*``
-runtime imports and rely on protocol-typed contracts from
-:mod:`ovui_data_adapters.common`.
+``UsdStageAdapter`` itself; the moved files carry zero ``ovui_widgets.*``
+runtime imports and rely on protocol-typed interfaces from
+the common adapter interfaces.
 """
 
 from ovui_data_adapters.openusd.bound_camera import read_bound_camera
@@ -33,6 +33,7 @@ from ovui_data_adapters.openusd.renderer_adapter import (
     AVAILABLE,
     OvRtxRendererAdapter,
 )
+from ovui_data_adapters.openusd.provider import OpenUSDProviderSession
 from ovui_data_adapters.openusd.stage_adapter import HAS_USD, UsdStageAdapter
 from ovui_data_adapters.openusd.transform_adapter import UsdTransformAdapter
 
@@ -43,6 +44,7 @@ __all__ = [
     "HAS_USD",
     "NamespaceEditCommand",
     "OvRtxRendererAdapter",
+    "OpenUSDProviderSession",
     "SetVisibilityCommand",
     "UsdLayerStackAdapter",
     "UsdPropertyAdapter",

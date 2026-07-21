@@ -284,7 +284,7 @@ void Stack::_drawContent(float elapsedTime)
 
     bool reversed = isReversed(direction);
 
-    const auto& children = _getChildren();
+    const auto& children = _getData<StackData>().m_children;
     for (size_t i = 0, n = children.size(); i < n; ++i)
     {
         const size_t currentSize = children.size();
@@ -298,7 +298,7 @@ void Stack::_drawContent(float elapsedTime)
           n = currentSize;
         }
 
-        std::shared_ptr<Widget> child(reversed ? children[n-(i+1)] : children[i]);
+        const std::shared_ptr<Widget>& child = reversed ? children[n-(i+1)] : children[i];
         if (!child)
         {
             OMNIUI_LOG_ERROR("Unexpected state. No child in m_children[%zu]", i);
@@ -326,13 +326,13 @@ void Stack::_drawContent(float elapsedTime)
 
         child->draw(elapsedTime);
 
-        float childWidth = child->getComputedWidth();
-        float childHeight = child->getComputedHeight();
+        float childWidth = 0.0f;
+        float childHeight = 0.0f;
 
         if (debugColor)
         {
-            float childWidth = child->getComputedWidth();
-            float childHeight = child->getComputedHeight();
+            childWidth = child->getComputedWidth();
+            childHeight = child->getComputedHeight();
             ImGui::GetWindowDrawList()->AddRect(
                 currentCursor, { currentCursor.x + childWidth + spacing, currentCursor.y + childHeight + spacing },
                 debugColor, 0, 0, 1);
@@ -341,12 +341,18 @@ void Stack::_drawContent(float elapsedTime)
         // Move the cursor according to the layout
         if (horizontal)
         {
-            float childWidth = child->getComputedWidth();
+            if (!debugColor)
+            {
+                childWidth = child->getComputedWidth();
+            }
             currentCursor.x += childWidth + spacing;
         }
         else if (vertical)
         {
-            float childHeight = child->getComputedHeight();
+            if (!debugColor)
+            {
+                childHeight = child->getComputedHeight();
+            }
             currentCursor.y += childHeight + spacing;
         }
     }

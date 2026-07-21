@@ -132,12 +132,13 @@
 
     <section>
       <h2>Purpose</h2>
-      <p>The widgets receive adapters from the application. The adapter packages explain how data reaches widgets: one package names the plain Python classes and shared records, while the OpenUSD package fills those classes from a real USD stage and renderer.</p>
+      <p>The widgets receive adapters from the application. The adapter packages explain how data reaches widgets: one package names the plain Python classes and shared records, while the OpenUSD and OVStage packages fill those classes from real scene and renderer runtimes.</p>
       <ul>
         <li><code>ovui_data_adapters.common</code> holds the shared adapter classes and records used by stage, property, transform, renderer, selection, command, and event code.</li>
-        <li><code>ovui_data_adapters.openusd</code> contains USD-backed classes for scene hierarchy, object properties, transforms, renderer frames, picking, and undoable USD edits.</li>
-        <li>ovwidgets tests use mock adapters, so stage rows, property rows, viewport behavior, and file browsing can be checked without a USD runtime or GPU.</li>
-        <li>The content browser uses the same adapter approach with <code>BackendAdapter</code>, <code>LocalFSBackend</code>, and file records in <code>ovwidgets.content.backends</code>.</li>
+        <li><code>ovui_data_adapters.openusd</code> contains USD-backed classes for scene hierarchy, object properties, transforms, renderer frames, picking, and undoable USD edits. Its standalone <code>usd-core</code> runtime is an optional packaging extra.</li>
+        <li><code>ovui_data_adapters.ovstage</code> drives the external native OVStage runtime directly — with no OpenUSD dependency or backing <code>Usd.Stage</code> — and attaches OVRTX in native BORROW mode for rendering and picking.</li>
+        <li>ovui-widgets tests use mock adapters, so stage rows, property rows, viewport behavior, and file browsing can be checked without a USD runtime or GPU.</li>
+        <li>The content browser uses the same adapter approach with <code>BackendAdapter</code>, <code>LocalFSBackend</code>, and file records in <code>ovui_widgets.content.backends</code>.</li>
       </ul>
       <div class="diagram data-diagram" role="img" aria-label="Widgets ask common adapters for data, OpenUSD-backed adapters read real data, and shared records carry events and values back">
         <div class="data-flow">
@@ -155,16 +156,19 @@
           </div>
           <div class="data-arrow" aria-hidden="true">&harr;</div>
           <div class="data-card">
-            <div class="data-name">OpenUSD-backed adapters</div>
+            <div class="data-name">Concrete adapters</div>
             <span class="data-pill">UsdStageAdapter</span>
             <span class="data-pill">UsdPropertyAdapter</span>
             <span class="data-pill">UsdTransformAdapter</span>
+            <span class="data-pill">OvstageStageAdapter</span>
+            <span class="data-pill">OvstageTransformAdapter</span>
             <span class="data-pill">OvRtxRendererAdapter</span>
+            <span class="data-pill">OvstageRendererAdapter</span>
           </div>
           <div class="data-arrow" aria-hidden="true">&harr;</div>
           <div class="data-card">
             <div class="data-name">Data source</div>
-            <div class="data-text">USD stage, renderer output, file storage, or test data created in Python.</div>
+            <div class="data-text">Standalone USD, native OVStage scenes and committed OVStage data, renderer output, file storage, or Python test data.</div>
           </div>
         </div>
         <div class="record-row">
@@ -197,7 +201,7 @@
 
     <section>
       <h2>OpenUSD-backed adapters</h2>
-      <p>The OpenUSD package is one concrete backend. Its files import USD, numeric array support, and the renderer only where they are needed, while callers continue to receive the common adapter objects described above. Its renderer path also authors the session RenderProduct data used by ovrtx, including <code>uniform uint[] deviceIds = [0]</code> for ovrtx 0.3 render and pick work.</p>
+      <p>The OpenUSD package is one concrete backend. Its required Python dependencies do not install a USD runtime; the optional <code>[standalone]</code> extra supplies <code>usd-core==25.11</code>, and an environment that already provides a compatible <code>pxr</code> can install the plain wheel instead.</p>
       <ul>
         <li><code>UsdStageAdapter</code> wraps a <code>Usd.Stage</code>, reads hierarchy data, computes visibility and flags, performs rename and reparent edits, emits <code>ChangeEvent</code>, and asks the undo manager to run USD edit commands.</li>
         <li><code>UsdPropertyAdapter</code> builds the selected-object property set, converts USD values into Python values, reports range and state metadata, handles multi-selection ambiguity, and writes edited values back to USD.</li>
@@ -206,6 +210,31 @@
         <li><code>SetVisibilityCommand</code>, <code>DeletePrimCommand</code>, and <code>NamespaceEditCommand</code> make common undo behavior work for USD mutations.</li>
       </ul>
       <p>The result is a normal handoff: the app opens a USD stage, creates the USD-backed adapters, gives them to widgets, and the visible widgets continue to use the common adapter methods they already know.</p>
+    </section>
+
+    <section>
+      <h2>Native OVStage runtime and OVRTX BORROW</h2>
+      <p>The OVStage provider has one scene owner. OVStage creates and owns the native scene and its committed renderer-facing ordinals, and the OVUI adapters drive that scene directly through OVStage's own APIs. The provider never imports <code>pxr</code> or the OpenUSD adapter package and never opens or mirrors a backing <code>Usd.Stage</code>; structural and runtime isolation tests enforce that boundary. OVRTX is initialized before <code>omni.ui</code>/OVStage, attaches in native BORROW mode, and never receives a replicated scene.</p>
+      <div class="record-row">
+        <div class="record-title">Native authoring and presentation flow</div>
+        <div class="record-pills">
+          <span class="data-pill">USD file</span>
+          <span class="data-pill">native OVStage scene</span>
+          <span class="data-pill">native adapter command</span>
+          <span class="data-pill">committed OVStage ordinal</span>
+          <span class="data-pill">OVRTX BORROW frame</span>
+        </div>
+      </div>
+      <ol>
+        <li>The provider session opens the scene through the native <code>ovstage.Stage</code> API and owns its lifetime, replacement, and cleanup. A runtime that cannot be verified fails scene open; the provider does not reopen the file into an OpenUSD stage as a fallback.</li>
+        <li>Native stage, property, transform, and selection adapters read and author through OVStage's own APIs. Every accepted mutation, undo, and redo commits a new OVStage ordinal that the renderer consumes; authoring integrates with the application undo manager.</li>
+        <li>Durable workflows that need USD composition or default-value resolution are deliberately unavailable natively: new-document creation and save/export raise, every layer-stack/composition operation reports an unsupported capability, and clearing authored values is unsupported. The standalone <code>openusd</code> provider covers those workflows. Prim create/delete, property and transform authoring, rendering, picking, and undo are supported natively.</li>
+        <li>Renderer-only presentation content (private viewport camera, RenderProduct/RenderVar wiring, fallback lighting) remains provider-owned and never becomes part of the user's durable scene data.</li>
+        <li>OVRTX attaches once with <code>Renderer.attach_ovstage(stage)</code> and renders via <code>Renderer.step(..., ordinal=scene.current_ordinal)</code>. It handles pixels, render-output mapping, picks, and renderer-global presentation control only.</li>
+        <li>OVRTX scene-data APIs remain prohibited in BORROW mode: no scene open/repopulation, attribute write, USD-reference mutation, prim query, or scene-replication call is used. The parameterless renderer <code>reset()</code> is allowed only to invalidate presentation state after an OVStage-owned resolution change; it is not a stage reset or authoring path. Shutdown detaches OVRTX before native OVStage destruction.</li>
+      </ol>
+      <p>The native runtime requires a full, matching Kit rendering build. Before native renderer construction, OVUI requires callable <code>ovrtx.RendererConfig</code>, <code>ovrtx.Renderer</code>, and the callable <code>Renderer.attach_ovstage</code>, <code>Renderer.detach_ovstage</code>, and <code>Renderer.step</code> APIs; attachment uses BORROW semantics, with the public <code>ovrtx.AttachMode.BORROW</code> symbol supplied only when a build exposes it because current runtimes default to BORROW. Attached rendering passes the committed OVStage ordinal through the <code>ordinal</code> keyword, and startup preflight requires callable <code>ovstage.Stage</code>. A missing capability aborts with its exact module or API name; <code>OVUI_WIDGETS_REQUIRE_OVRTX=0</code> does not enable a read-only path or a substitute renderer for this provider. Kit <code>python.sh</code> is the canonical native import and adapter-test host; the runnable USD Viewer uses this checkout's standalone ovui build because Kit's extension <code>omni.ui</code> does not provide the standalone <code>ui.init</code> lifecycle. Build and launch details are in the <a href="../../ovui-data-adapters/docs/kit-runtime.md" target="_top">Kit runtime guide</a>.</p>
+      <p>On attach-capable ovrtx 0.4, selected objects receive renderer-owned selection outlines through the dedicated outline-membership API, which stays within BORROW ownership because it never writes the borrowed OVStage. A runtime that does not expose that membership API degrades honestly: picking and logical selection remain valid and no outline appears, and the provider does not violate BORROW ownership with an OVRTX data write as a workaround.</p>
     </section>
 
     <section>
@@ -228,11 +257,11 @@
       <ul>
         <li>The stage browser asks <code>StageAdapter</code> for children, names, type data, visibility, rename, reparent, and change notices.</li>
         <li>The property inspector receives a <code>PropertyAdapter</code> for the current selection and builds rows from its attribute names, metadata, values, and edit calls.</li>
-        <li>The viewport receives <code>RendererAdapter</code>, <code>TransformAdapter</code>, and <code>StageAdapter</code> objects, so frame output, picking, transform edits, native selection-outline state, and camera framing do not depend on one backend.</li>
+        <li>The viewport receives <code>RendererAdapter</code>, <code>TransformAdapter</code>, and <code>StageAdapter</code> objects, so frame output, picking, transform edits, selection state, best-effort native outlining, and camera framing do not depend on one backend.</li>
         <li>The content browser receives <code>BackendAdapter</code>, so the same browser model can list, rename, copy, move, delete, and refresh storage entries from local files or another storage backend.</li>
         <li>New adapters can be added for another scene source, storage source, renderer, or test fixture while leaving the widget code mostly unchanged.</li>
       </ul>
-      <p>That completes the adapter explanation: ovui supplies core widgets, ovwidgets supplies app widgets, and adapters give those widgets a replaceable data source without forcing every widget to learn every backend.</p>
+      <p>That completes the adapter explanation: ovui supplies core widgets, ovui-widgets supplies app widgets, and adapters give those widgets a replaceable data source without forcing every widget to learn every backend.</p>
     </section>
 
     <nav class="bottom-nav" aria-label="Section navigation">

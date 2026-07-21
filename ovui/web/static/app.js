@@ -56,7 +56,7 @@ window = ui.Window(
     flags=ui.WINDOW_FLAGS_NO_RESIZE,
 )
 
-name_model = ui.SimpleStringModel("Victor")
+name_model = ui.SimpleStringModel("Omniverse")
 progress_model = ui.SimpleFloatModel(0.35, min=0.0, max=1.0)
 
 with window.frame:

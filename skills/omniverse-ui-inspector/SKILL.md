@@ -1,14 +1,16 @@
 ---
 name: omniverse-ui-inspector
-version: "0.1.0"
 description: |
   Use this skill when the user asks to inspect, screenshot, automate, click,
-  type into, or drive a running ovui/ovwidgets application through the
+  type into, or drive a running ovui/ovui-widgets application through the
   ovui-inspect FastAPI inspector. The skill provides an importable
   `ovuiinspect` module, an `ovui-inspect` CLI, and a screenshot-first
   mouse/keyboard workflow for controlling ovui apps launched with PYTHONPATH.
 author: "NVIDIA ovui Team <ovui-team@nvidia.com>"
 license: "LicenseRef-NVIDIA"
+metadata:
+  python-distribution: ovui
+  version: "0.2.0"
 tools:
   - Bash
   - Read
@@ -33,14 +35,14 @@ equivalent variable) to the local checkout of the ovui repository:
 
 ```bash
 PYTHONPATH="${OVUI_REPO}/skills/omniverse-ui-inspector:${PYTHONPATH:-}" \
-  python -m ovwidgets.app.headless --width 1280 --height 720
+  python -m ovui_widgets.app.headless --width 1280 --height 720
 ```
 
 For a windowed app, use:
 
 ```bash
 PYTHONPATH="${OVUI_REPO}/skills/omniverse-ui-inspector:${PYTHONPATH:-}" \
-  python -m ovwidgets.app
+  python -m ovui_widgets.app
 ```
 
 The app imports `ovuiinspect` during startup. Importing the module starts a
@@ -60,6 +62,8 @@ Defaults:
 - Host: `127.0.0.1`
 - Port: `9910`
 - Override with `OVUIINSPECT_HOST` and `OVUIINSPECT_PORT`
+- Application state and checkpoint endpoints disabled by default; enable them
+  for state-guided QA with `OVUIINSPECT_ENABLE_STATE=1`
 - Python execution endpoint disabled by default; enable with `OVUIINSPECT_ENABLE_EXECUTE=1`
 
 ## Interface Priority
@@ -95,6 +99,11 @@ Use the same loop as Kit Inspector, corrected for ovui:
 5. Repeat.
 
 Do not guess coordinates. Do not batch a full workflow between screenshots.
+Strict screenshot-first evidence chooses every action coordinate from the
+latest screenshot. If a workflow instead takes target geometry from `/state`,
+it is state-guided UI evidence even when it records screenshots before and
+after the real mouse or keyboard action. In a strict run, optional application
+state may verify the result after the action, but it must not choose the target.
 
 ```bash
 scripts/ovui-inspect screenshot --out proof/01_before.png
@@ -108,12 +117,19 @@ scripts/ovui-inspect screenshot --out proof/03_after_click.png
 
 Core commands:
 
-- `health` / `status`: check server, app attachment, queue depth, and execute setting.
+- `health` / `status`: check server, app attachment, queue depth, and opt-in settings.
+- `state [--out FILE]`: capture the attached application's read-only scene and
+  interaction state on the ovui frame loop. It requires
+  `OVUIINSPECT_ENABLE_STATE=1`. Use it after a strict Inspector input action to
+  check the active provider's scene state (native OVStage for the `ovstage`
+  provider; USD stage state only when the OpenUSD provider is selected) against
+  the provider-neutral adapter and UI views, or label geometry-guided use as
+  state-guided QA; never use it to mutate UI.
 - `wait --timeout 60`: wait until `/health` responds.
 - `screenshot --out file.png`: capture the full ovui framebuffer.
 - `move X Y`: move the injected ovui cursor.
 - `click X Y [--button left|right|middle] [--double]`: click in screenshot coordinates.
-- `drag X1 Y1 X2 Y2 [--button left|right|middle] [--duration SEC] [--steps N]`: drag over frame-stepped positions. `--duration` is converted to movement samples by the server; `--steps` is the exact sample count and wins when both are provided.
+- `drag X1 Y1 X2 Y2 [--button left|right|middle] [--duration SEC] [--steps N] [--modifiers ctrl,shift]`: drag over frame-stepped positions. Modifiers are held for the complete press/move/release gesture; `--duration` is converted to movement samples by the server and `--steps` wins when both are provided.
 - `scroll up|down|left|right [--amount N] [--x X --y Y]`: scroll at the current or specified position.
 - `type "text"`: send text input to the focused widget.
 - `press KEY [--modifiers ctrl,shift]`: send Enter, Escape, Tab, arrows, Delete, letters, digits, or F-keys.
@@ -123,6 +139,15 @@ Core commands:
 
 Read `references/api-endpoints.md` for raw HTTP paths and payloads.
 
+For evidence that must correlate a read-only application snapshot with the
+exact screenshot request registered beside it, use the raw `POST /checkpoint`
+endpoint described in `references/api-endpoints.md`. It returns frozen state,
+request-scoped capture metadata, and the captured image without recapturing or
+overwriting the initial evidence. This QA-only endpoint also requires
+`OVUIINSPECT_ENABLE_STATE=1`. Exact native request correlation requires a built
+ovui module with `_get_screenshot_result()`; the older schedule/poll fallback
+keeps capture available but supplies only Inspector-local identity.
+
 CLI commands exit `0` only when the HTTP request succeeds and the inspector
 response does not report `success: false`. HTTP errors, validation failures,
 disabled execute, timeouts, and connection failures exit nonzero while still
@@ -131,6 +156,9 @@ printing the JSON error payload.
 ## Operational Rules
 
 - Bind to localhost unless the user explicitly asks for a remote bind.
+- Enable `OVUIINSPECT_ENABLE_STATE=1` only when a QA run needs application
+  state or correlated checkpoints; the payload can contain file paths, scene
+  values, and interaction geometry.
 - Prefer mouse and keyboard commands over `/execute`; use `/execute` only for setup tasks that cannot reasonably be done through the visible UI.
 - If `/execute` is required, relaunch the app with `OVUIINSPECT_ENABLE_EXECUTE=1` and keep the code snippet small and auditable.
 - If FastAPI or uvicorn is missing, `ovuiinspect` logs the startup error and leaves the ovui app running without inspector endpoints.
@@ -138,7 +166,9 @@ printing the JSON error payload.
 
 ## Known Limits
 
-- The first version covers full-application screenshots, mouse input, keyboard input, optional Python execution, and clean shutdown.
+- The Inspector covers full-application screenshots, mouse input, keyboard
+  input, opt-in read-only application/scene snapshots, optional Python
+  execution, and clean shutdown.
 - It does not expose widget-tree inspection, named-window capture, menu-path clicking, dialog helpers, logs, or streaming execution yet.
 - ovui input is injected through ovui's in-process APIs, not OS-level tools. This is correct for app UI QA, but native OS dialogs may need a different method.
 - `combo` sends modifier key events through the same key-injection path as

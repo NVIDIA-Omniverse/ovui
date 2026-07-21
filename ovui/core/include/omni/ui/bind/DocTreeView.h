@@ -118,6 +118,10 @@
     "This flag allows to prevent expanding when the user clicks the plus icon. It's used in the case the user wants to control how the items expanded or collapsed.\n"
 
 
+#define OMNIUI_PYBIND_DOC_TreeView_autoScrollSelection                                                                 \
+    "When true, a single selected item is automatically scrolled into view.\n"
+
+
 #define OMNIUI_PYBIND_DOC_TreeView_keepAlive                                                                           \
     "When true, the tree nodes are never destroyed even if they are disappeared from the model. It's useul for the temporary filtering if it's necessary to display thousands of nodes.\n"
 

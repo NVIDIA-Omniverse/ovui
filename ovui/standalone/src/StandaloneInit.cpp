@@ -58,9 +58,12 @@
 #include <cuda_gl_interop.h>
 #endif
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace omni {
@@ -113,7 +116,10 @@ static void shutdownPlatformResources()
 
 // Scheduled screenshot: path set by scheduleScreenshot(), captured in tick() before swap.
 static std::string s_pendingScreenshotPath;
-static bool s_screenshotDone = false;
+static std::mutex s_screenshotMutex;
+static ScreenshotResult s_screenshotResult;
+static uint64_t s_nextScreenshotRequestId = 1;
+static bool s_screenshotDoneConsumed = false;
 
 // Vulkan streaming pipeline
 #ifdef OMNIUI_HAS_VULKAN
@@ -407,6 +413,19 @@ void shutdown()
 {
     s_shutdownInProgress = true;
 
+    {
+        std::lock_guard<std::mutex> lock(s_screenshotMutex);
+        if (s_screenshotResult.status == ScreenshotStatus::ePending)
+        {
+            s_screenshotResult.status = ScreenshotStatus::eFailed;
+            s_screenshotResult.actualFormat.clear();
+            s_screenshotResult.message =
+                "screenshot service shut down before the request completed";
+            s_screenshotDoneConsumed = false;
+        }
+        s_pendingScreenshotPath.clear();
+    }
+
     // Shut down streaming pipelines before tearing down the platform
     shutdownStreaming();
     shutdownPlatformResources();
@@ -422,27 +441,117 @@ void shutdown()
 // ImGui_ImplGlfw_NewFrame() which would otherwise overwrite our values
 // with the real GLFW cursor position.
 
+enum class InjectedInputEventKind
+{
+    MouseButton,
+    Key,
+};
+
+struct InjectedInputEvent
+{
+    InjectedInputEventKind kind;
+    int value;
+    bool pressed;
+};
+
 static struct InjectedInputState
 {
     bool hasMousePos = false;
     float mouseX = 0.0f;
     float mouseY = 0.0f;
 
-    bool hasMouseButton[5] = {};
-    bool mouseDown[5] = {};
+    // Ordered key/button events. Keeping these in one stream is required for
+    // modifier-click: ImGui must see the modifier event before the button event
+    // in the same queued-input drain.
+    std::vector<InjectedInputEvent> events;
 
     float scrollDx = 0.0f;
     float scrollDy = 0.0f;
     bool hasScroll = false;
 
-    // Key state is additive per-frame
-    struct KeyEvent { int key; bool pressed; };
-    std::vector<KeyEvent> keyEvents;
+    bool leftCtrlDown = false;
+    bool rightCtrlDown = false;
+    bool leftShiftDown = false;
+    bool rightShiftDown = false;
+    bool leftAltDown = false;
+    bool rightAltDown = false;
+    bool leftSuperDown = false;
+    bool rightSuperDown = false;
 
     // Character input is additive per-frame
     std::vector<unsigned int> charEvents;
     std::string textInput;
 } s_injected;
+
+static ImGuiKey modifierForInjectedLRKey(ImGuiKey key)
+{
+    switch (key)
+    {
+        case ImGuiKey_LeftCtrl:
+        case ImGuiKey_RightCtrl:
+            return ImGuiMod_Ctrl;
+        case ImGuiKey_LeftShift:
+        case ImGuiKey_RightShift:
+            return ImGuiMod_Shift;
+        case ImGuiKey_LeftAlt:
+        case ImGuiKey_RightAlt:
+            return ImGuiMod_Alt;
+        case ImGuiKey_LeftSuper:
+        case ImGuiKey_RightSuper:
+            return ImGuiMod_Super;
+        default:
+            return ImGuiKey_None;
+    }
+}
+
+static void setInjectedLRKeyDown(ImGuiKey key, bool pressed)
+{
+    switch (key)
+    {
+        case ImGuiKey_LeftCtrl:   s_injected.leftCtrlDown = pressed; break;
+        case ImGuiKey_RightCtrl:  s_injected.rightCtrlDown = pressed; break;
+        case ImGuiKey_LeftShift:  s_injected.leftShiftDown = pressed; break;
+        case ImGuiKey_RightShift: s_injected.rightShiftDown = pressed; break;
+        case ImGuiKey_LeftAlt:    s_injected.leftAltDown = pressed; break;
+        case ImGuiKey_RightAlt:   s_injected.rightAltDown = pressed; break;
+        case ImGuiKey_LeftSuper:  s_injected.leftSuperDown = pressed; break;
+        case ImGuiKey_RightSuper: s_injected.rightSuperDown = pressed; break;
+        default: break;
+    }
+}
+
+static bool isInjectedModDown(ImGuiKey mod)
+{
+    switch (mod)
+    {
+        case ImGuiMod_Ctrl:
+            return s_injected.leftCtrlDown || s_injected.rightCtrlDown;
+        case ImGuiMod_Shift:
+            return s_injected.leftShiftDown || s_injected.rightShiftDown;
+        case ImGuiMod_Alt:
+            return s_injected.leftAltDown || s_injected.rightAltDown;
+        case ImGuiMod_Super:
+            return s_injected.leftSuperDown || s_injected.rightSuperDown;
+        default:
+            return false;
+    }
+}
+
+static void applyInjectedKeyEvent(ImGuiIO& io, int rawKey, bool pressed)
+{
+    const ImGuiKey key = detail::normalizeInjectedImguiKey(rawKey);
+    if (key == ImGuiKey_None)
+        return;
+
+    io.AddKeyEvent(key, pressed);
+
+    const ImGuiKey mod = modifierForInjectedLRKey(key);
+    if (mod != ImGuiKey_None)
+    {
+        setInjectedLRKeyDown(key, pressed);
+        io.AddKeyEvent(mod, isInjectedModDown(mod));
+    }
+}
 
 void injectMouseMove(float x, float y)
 {
@@ -455,8 +564,7 @@ void injectMouseButton(int button, bool pressed)
 {
     if (button < 0 || button >= 5)
         return;
-    s_injected.hasMouseButton[button] = true;
-    s_injected.mouseDown[button] = pressed;
+    s_injected.events.push_back({InjectedInputEventKind::MouseButton, button, pressed});
 }
 
 void injectMouseScroll(float dx, float dy)
@@ -468,7 +576,7 @@ void injectMouseScroll(float dx, float dy)
 
 void injectKeyEvent(int key, bool pressed)
 {
-    s_injected.keyEvents.push_back({key, pressed});
+    s_injected.events.push_back({InjectedInputEventKind::Key, key, pressed});
 }
 
 void injectCharEvent(unsigned int ch)
@@ -500,14 +608,16 @@ void applyInjectedInput()
         io.AddMousePosEvent(s_injected.mouseX, s_injected.mouseY);
     }
 
-    for (int i = 0; i < 5; ++i)
+    for (const InjectedInputEvent& ev : s_injected.events)
     {
-        if (s_injected.hasMouseButton[i])
+        if (ev.kind == InjectedInputEventKind::MouseButton)
         {
-            io.AddMouseButtonEvent(i, s_injected.mouseDown[i]);
-            s_injected.hasMouseButton[i] = false;
+            io.AddMouseButtonEvent(ev.value, ev.pressed);
+            continue;
         }
+        applyInjectedKeyEvent(io, ev.value, ev.pressed);
     }
+    s_injected.events.clear();
 
     if (s_injected.hasScroll)
     {
@@ -516,14 +626,6 @@ void applyInjectedInput()
         s_injected.scrollDy = 0.0f;
         s_injected.hasScroll = false;
     }
-
-    for (auto& ev : s_injected.keyEvents)
-    {
-        const ImGuiKey key = detail::normalizeInjectedImguiKey(ev.key);
-        if (key != ImGuiKey_None)
-            io.AddKeyEvent(key, ev.pressed);
-    }
-    s_injected.keyEvents.clear();
 
     for (unsigned int ch : s_injected.charEvents)
     {
@@ -560,171 +662,363 @@ bool isSoftwareCursorEnabled()
 // Screenshot capture
 // ---------------------------------------------------------------------------
 
-// Internal: save pixels to file
-static bool savePixelsToFile(const char* filepath, const std::vector<unsigned char>& pixels, int width, int height)
+static bool isScreenshotTerminal(ScreenshotStatus status)
 {
-    // OpenGL reads bottom-to-top; flip vertically for image formats
-    int rowBytes = width * 4;
-    // Work on a copy to avoid mutating the input
-    std::vector<unsigned char> flipped(pixels);
-    std::vector<unsigned char> rowBuf(rowBytes);
-    for (int y = 0; y < height / 2; ++y)
-    {
-        unsigned char* top = flipped.data() + y * rowBytes;
-        unsigned char* bot = flipped.data() + (height - 1 - y) * rowBytes;
-        std::memcpy(rowBuf.data(), top, rowBytes);
-        std::memcpy(top, bot, rowBytes);
-        std::memcpy(bot, rowBuf.data(), rowBytes);
-    }
+    return status != ScreenshotStatus::eIdle && status != ScreenshotStatus::ePending;
+}
 
-    const char* ext = strrchr(filepath, '.');
-    int result = 0;
-    if (ext && (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0))
-    {
-        result = stbi_write_jpg(filepath, width, height, 4, flipped.data(), 95);
-    }
-    else if (ext && strcmp(ext, ".bmp") == 0)
-    {
-        result = stbi_write_bmp(filepath, width, height, 4, flipped.data());
-    }
-    else
-    {
-        result = stbi_write_png(filepath, width, height, 4, flipped.data(), rowBytes);
-    }
+static std::string screenshotFormatForPath(const std::string& path)
+{
+    const size_t dot = path.find_last_of('.');
+    std::string extension = dot == std::string::npos ? std::string{} : path.substr(dot);
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (extension == ".jpg" || extension == ".jpeg")
+        return "jpeg";
+    if (extension == ".bmp")
+        return "bmp";
+    return "png";
+}
 
-    if (!result)
+static uint64_t beginScreenshotResult(const std::string& path)
+{
+    std::lock_guard<std::mutex> lock(s_screenshotMutex);
+    if (s_screenshotResult.status == ScreenshotStatus::ePending)
+        return 0;
+
+    const uint64_t requestId = s_nextScreenshotRequestId++;
+    if (s_nextScreenshotRequestId == 0)
+        s_nextScreenshotRequestId = 1;
+    s_screenshotResult = {};
+    s_screenshotResult.requestId = requestId;
+    s_screenshotResult.status = ScreenshotStatus::ePending;
+    s_screenshotResult.path = path;
+    s_screenshotDoneConsumed = false;
+    return requestId;
+}
+
+static bool completeScreenshotResult(
+    uint64_t requestId,
+    ScreenshotStatus status,
+    const std::string& actualFormat,
+    int width,
+    int height,
+    const std::string& message)
+{
+    std::lock_guard<std::mutex> lock(s_screenshotMutex);
+    if (s_screenshotResult.requestId != requestId ||
+        s_screenshotResult.status != ScreenshotStatus::ePending)
     {
-        fprintf(stderr, "captureScreenshot: failed to write %s\n", filepath);
         return false;
     }
-
-    fprintf(stdout, "captureScreenshot: saved %s (%dx%d)\n", filepath, width, height);
+    s_screenshotResult.status = status;
+    s_screenshotResult.actualFormat = actualFormat;
+    s_screenshotResult.width = width;
+    s_screenshotResult.height = height;
+    s_screenshotResult.message = message;
     return true;
 }
 
-/// Helper: capture Vulkan framebuffer to file (no flip needed — Vulkan is top-down)
-#ifdef OMNIUI_HAS_VULKAN
-static void captureVulkanScreenshot(VulkanBackend* vkBackend, const std::string& path)
+static bool savePixelsToFile(
+    const std::string& filepath,
+    const std::vector<unsigned char>& pixels,
+    int width,
+    int height,
+    bool flipVertically,
+    std::string* error)
 {
-    if (!vkBackend) return;
-    int width = 0, height = 0;
-    vkBackend->getFramebufferSize(&width, &height);
-    if (width <= 0 || height <= 0) return;
-
-    std::vector<unsigned char> pixels(width * height * 4);
-    if (vkBackend->readbackPixels(pixels.data(), width, height))
+    const int rowBytes = width * 4;
+    const unsigned char* outputPixels = pixels.data();
+    std::vector<unsigned char> flipped;
+    if (flipVertically)
     {
-        const char* ext = strrchr(path.c_str(), '.');
-        int result = 0;
-        int rowBytes = width * 4;
-        if (ext && (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0))
-            result = stbi_write_jpg(path.c_str(), width, height, 4, pixels.data(), 95);
-        else if (ext && strcmp(ext, ".bmp") == 0)
-            result = stbi_write_bmp(path.c_str(), width, height, 4, pixels.data());
-        else
-            result = stbi_write_png(path.c_str(), width, height, 4, pixels.data(), rowBytes);
-        if (result)
-            fprintf(stdout, "captureScreenshot(VK): saved %s (%dx%d)\n", path.c_str(), width, height);
-        else
-            fprintf(stderr, "captureScreenshot(VK): failed to write %s\n", path.c_str());
+        flipped = pixels;
+        std::vector<unsigned char> rowBuffer(rowBytes);
+        for (int y = 0; y < height / 2; ++y)
+        {
+            unsigned char* top = flipped.data() + y * rowBytes;
+            unsigned char* bottom = flipped.data() + (height - 1 - y) * rowBytes;
+            std::memcpy(rowBuffer.data(), top, rowBytes);
+            std::memcpy(top, bottom, rowBytes);
+            std::memcpy(bottom, rowBuffer.data(), rowBytes);
+        }
+        outputPixels = flipped.data();
     }
-    s_screenshotDone = true;
+
+    const std::string format = screenshotFormatForPath(filepath);
+    int result = 0;
+    if (format == "jpeg")
+        result = stbi_write_jpg(filepath.c_str(), width, height, 4, outputPixels, 95);
+    else if (format == "bmp")
+        result = stbi_write_bmp(filepath.c_str(), width, height, 4, outputPixels);
+    else
+        result = stbi_write_png(filepath.c_str(), width, height, 4, outputPixels, rowBytes);
+
+    if (!result)
+    {
+        if (error)
+            *error = "image encoder failed to persist screenshot";
+        fprintf(stderr, "captureScreenshot: failed to write %s\n", filepath.c_str());
+        return false;
+    }
+
+    fprintf(stdout, "captureScreenshot: saved %s (%dx%d)\n", filepath.c_str(), width, height);
+    return true;
+}
+
+#ifdef OMNIUI_HAS_VULKAN
+static bool captureVulkanScreenshot(
+    VulkanBackend* vkBackend,
+    const std::string& path,
+    int* resultWidth,
+    int* resultHeight,
+    std::string* error)
+{
+    if (!vkBackend)
+    {
+        if (error)
+            *error = "Vulkan screenshot backend is unavailable";
+        return false;
+    }
+
+    int width = 0;
+    int height = 0;
+    vkBackend->getFramebufferSize(&width, &height);
+    if (resultWidth)
+        *resultWidth = width;
+    if (resultHeight)
+        *resultHeight = height;
+    if (width <= 0 || height <= 0)
+    {
+        if (error)
+            *error = "Vulkan framebuffer has an invalid extent";
+        return false;
+    }
+
+    std::vector<unsigned char> pixels(static_cast<size_t>(width) * height * 4);
+    if (!vkBackend->readbackPixels(pixels.data(), width, height))
+    {
+        if (error)
+            *error = "Vulkan framebuffer readback failed";
+        return false;
+    }
+    return savePixelsToFile(path, pixels, width, height, false, error);
 }
 #endif // OMNIUI_HAS_VULKAN
 
+#ifdef OMNIUI_HAS_EGL
+static void synchronizeEglScreenshotResult()
+{
+    auto* ep = dynamic_cast<HeadlessEglPlatform*>(s_platform.get());
+    if (!ep || !ep->isScreenshotDone())
+        return;
+
+    const uint64_t requestId = ep->screenshotRequestId();
+    const bool success = !ep->hadScreenshotError();
+    completeScreenshotResult(
+        requestId,
+        success ? ScreenshotStatus::eSucceeded : ScreenshotStatus::eFailed,
+        success ? ep->screenshotActualFormat() : std::string{},
+        ep->screenshotWidth(),
+        ep->screenshotHeight(),
+        ep->screenshotErrorMessage());
+}
+#endif
+
 bool scheduleScreenshot(const char* filepath)
 {
-    if (!s_platform || !filepath)
+    const std::string pathCopy = filepath ? filepath : "";
+    const uint64_t requestId = beginScreenshotResult(pathCopy);
+    if (requestId == 0)
         return false;
-    s_pendingScreenshotPath = filepath;
-    s_screenshotDone = false;
+    if (!s_platform)
+    {
+        completeScreenshotResult(
+            requestId, ScreenshotStatus::eFailed, {}, 0, 0,
+            "standalone screenshot service is not initialized");
+        return false;
+    }
+    if (pathCopy.empty())
+    {
+        completeScreenshotResult(
+            requestId, ScreenshotStatus::eFailed, {}, 0, 0,
+            "screenshot output path is empty");
+        return false;
+    }
 
-    std::string pathCopy = filepath;
+    s_pendingScreenshotPath = pathCopy;
 
 #ifdef OMNIUI_HAS_EGL
     if (auto* ep = dynamic_cast<HeadlessEglPlatform*>(s_platform.get()))
     {
-        ep->captureScreenshot(pathCopy);
+        ep->captureScreenshot(pathCopy, requestId);
         return true;
     }
 #endif
 
 #ifdef OMNIUI_HAS_VULKAN
-    // Headless platform path
     if (s_headlessMode)
     {
         auto* headless = dynamic_cast<HeadlessVulkanPlatform*>(s_platform.get());
-        if (headless)
+        if (!headless)
         {
-            headless->setPreSwapCallback([pathCopy]() {
-                auto* hp = dynamic_cast<HeadlessVulkanPlatform*>(s_platform.get());
-                if (hp)
-                    captureVulkanScreenshot(hp->getVulkanBackend(), pathCopy);
-            });
+            completeScreenshotResult(
+                requestId, ScreenshotStatus::eFailed, {}, 0, 0,
+                "headless Vulkan screenshot backend is unavailable");
+            return false;
         }
+        headless->setPreSwapCallback([pathCopy, requestId]() {
+            if (!isScreenshotRequestPending(requestId))
+                return;
+            auto* platform = dynamic_cast<HeadlessVulkanPlatform*>(s_platform.get());
+            int width = 0;
+            int height = 0;
+            std::string error;
+            bool success = false;
+            if (!platform)
+                error = "headless Vulkan screenshot backend is unavailable";
+            else
+                success = captureVulkanScreenshot(
+                    platform->getVulkanBackend(), pathCopy, &width, &height, &error);
+            const bool recorded = completeScreenshotResult(
+                requestId,
+                success ? ScreenshotStatus::eSucceeded : ScreenshotStatus::eFailed,
+                success ? screenshotFormatForPath(pathCopy) : std::string{},
+                width,
+                height,
+                error);
+            if (success && !recorded)
+                std::remove(pathCopy.c_str());
+        });
         return true;
     }
 #endif
 
-    // GLFW platform path
     if (!s_glfwPlatform)
+    {
+        completeScreenshotResult(
+            requestId, ScreenshotStatus::eFailed, {}, 0, 0,
+            "GLFW screenshot backend is unavailable");
         return false;
+    }
 
-    s_glfwPlatform->setPreSwapCallback([pathCopy]() {
+    s_glfwPlatform->setPreSwapCallback([pathCopy, requestId]() {
+        if (!isScreenshotRequestPending(requestId))
+            return;
 #ifdef OMNIUI_HAS_VULKAN
         if (s_glfwPlatform && s_glfwPlatform->getBackendType() == BackendType::eVulkan)
         {
-            captureVulkanScreenshot(s_glfwPlatform->getVulkanBackend(), pathCopy);
+            int width = 0;
+            int height = 0;
+            std::string error;
+            const bool success = captureVulkanScreenshot(
+                s_glfwPlatform->getVulkanBackend(), pathCopy, &width, &height, &error);
+            const bool recorded = completeScreenshotResult(
+                requestId,
+                success ? ScreenshotStatus::eSucceeded : ScreenshotStatus::eFailed,
+                success ? screenshotFormatForPath(pathCopy) : std::string{},
+                width,
+                height,
+                error);
+            if (success && !recorded)
+                std::remove(pathCopy.c_str());
             return;
         }
 #endif
 #ifndef OMNIUI_HEADLESS_ONLY
-        // OpenGL path: Use the GL viewport dimensions for glReadPixels so that on
-        // HiDPI / Retina displays (where the GL framebuffer is larger than the
-        // logical window size) we capture the full rendered image rather than just
-        // the bottom-left quadrant.
         GLint viewport[4] = {};
         glGetIntegerv(GL_VIEWPORT, viewport);
-        int width  = viewport[2];
+        int width = viewport[2];
         int height = viewport[3];
+        if ((width <= 0 || height <= 0) && s_glfwPlatform)
+            s_glfwPlatform->getWindowSize(1, &width, &height);
         if (width <= 0 || height <= 0)
         {
-            // Fallback to logical window size (non-HiDPI platforms)
-            if (s_glfwPlatform)
-                s_glfwPlatform->getWindowSize(1, &width, &height);
-        }
-        if (width <= 0 || height <= 0)
+            completeScreenshotResult(
+                requestId, ScreenshotStatus::eFailed, {}, width, height,
+                "OpenGL framebuffer has an invalid extent");
             return;
+        }
 
-        std::vector<unsigned char> pixels(width * height * 4);
+        std::vector<unsigned char> pixels(static_cast<size_t>(width) * height * 4);
+        while (glGetError() != GL_NO_ERROR)
+        {
+        }
         glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-        savePixelsToFile(pathCopy.c_str(), pixels, width, height);
-        s_screenshotDone = true;
+        std::string error;
+        bool success = glGetError() == GL_NO_ERROR;
+        if (!success)
+            error = "OpenGL framebuffer readback failed";
+        else
+            success = savePixelsToFile(pathCopy, pixels, width, height, true, &error);
+        const bool recorded = completeScreenshotResult(
+            requestId,
+            success ? ScreenshotStatus::eSucceeded : ScreenshotStatus::eFailed,
+            success ? screenshotFormatForPath(pathCopy) : std::string{},
+            width,
+            height,
+            error);
+        if (success && !recorded)
+            std::remove(pathCopy.c_str());
+#else
+        completeScreenshotResult(
+            requestId, ScreenshotStatus::eFailed, {}, 0, 0,
+            "OpenGL screenshot support is unavailable in this build");
 #endif
     });
 
     return true;
 }
 
-bool pollScreenshotDone()
+ScreenshotResult getLastScreenshotResult()
 {
 #ifdef OMNIUI_HAS_EGL
-    if (auto* ep = dynamic_cast<HeadlessEglPlatform*>(s_platform.get()))
-        return ep->isScreenshotDone();
+    synchronizeEglScreenshotResult();
 #endif
-    bool done = s_screenshotDone;
-    s_screenshotDone = false;
+    std::lock_guard<std::mutex> lock(s_screenshotMutex);
+    return s_screenshotResult;
+}
+
+bool cancelScheduledScreenshot(uint64_t requestId)
+{
+    std::lock_guard<std::mutex> lock(s_screenshotMutex);
+    if (requestId == 0 || s_screenshotResult.requestId != requestId ||
+        s_screenshotResult.status != ScreenshotStatus::ePending)
+    {
+        return false;
+    }
+    s_screenshotResult.status = ScreenshotStatus::eCancelled;
+    s_screenshotResult.actualFormat.clear();
+    s_screenshotResult.message = "screenshot request was cancelled";
+    s_screenshotDoneConsumed = false;
+    return true;
+}
+
+bool isScreenshotRequestPending(uint64_t requestId)
+{
+    std::lock_guard<std::mutex> lock(s_screenshotMutex);
+    return requestId != 0 && s_screenshotResult.requestId == requestId &&
+           s_screenshotResult.status == ScreenshotStatus::ePending;
+}
+
+bool pollScreenshotDone()
+{
+    const ScreenshotResult result = getLastScreenshotResult();
+    if (!isScreenshotTerminal(result.status))
+        return false;
+    std::lock_guard<std::mutex> lock(s_screenshotMutex);
+    if (s_screenshotDoneConsumed)
+        return false;
+    s_screenshotDoneConsumed = true;
     s_pendingScreenshotPath.clear();
-    return done;
+    return true;
 }
 
 bool hadLastScreenshotError()
 {
-#ifdef OMNIUI_HAS_EGL
-    if (auto* ep = dynamic_cast<HeadlessEglPlatform*>(s_platform.get()))
-        return ep->hadScreenshotError();
-#endif
-    return false;
+    const ScreenshotStatus status = getLastScreenshotResult().status;
+    return isScreenshotTerminal(status) && status != ScreenshotStatus::eSucceeded;
 }
 
 bool captureScreenshot(const char* filepath)

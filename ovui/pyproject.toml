@@ -1,10 +1,13 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel", "cmake>=3.22", "pybind11>=2.11"]
+requires = ["setuptools>=68.0", "wheel", "cmake>=3.22", "pybind11>=2.11", "conan>=2.14", "cyclonedx-python-lib>=5.0.0,<6"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui"
-dynamic = ["version"]
+# readme is dynamic: the PyPI long description is the repository root
+# README.md (the product overview), not ovui/README.md (the in-repo
+# framework guide). setup.py supplies it — see _read_long_description().
+dynamic = ["version", "readme"]
 description = "ovui — GPU-accelerated Python UI toolkit"
 requires-python = ">=3.12"
 license = {text = "NVIDIA Proprietary"}
@@ -24,6 +27,13 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/NVIDIA-Omniverse/ovui"
+
+[project.scripts]
+ovui-skill = "ovui_agent_skills:main"
+
+[project.entry-points."ovui.skills"]
+omniverse-ui-apis = "ovui_agent_skills:get_omniverse_ui_apis_skill"
+omniverse-ui-inspector = "ovui_agent_skills:get_omniverse_ui_inspector_skill"
 
 [project.optional-dependencies]
 examples = [

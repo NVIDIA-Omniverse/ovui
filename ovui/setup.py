@@ -32,12 +32,29 @@ from typing import Optional
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_MACOS = platform.system() == "Darwin"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "VERSION.md"
 BUILD_INFO_PATH = Path(__file__).resolve().parent / "python" / "omni" / "ui" / "_build_info.py"
+
+
+def _read_long_description() -> str:
+    """Return the PyPI long description: the repository root README.md.
+
+    The nested ovui/README.md is the in-repo native framework guide and must
+    not become the published package description. Failing loudly here keeps a
+    missing root README from silently shipping an empty description.
+    """
+    readme = REPO_ROOT / "README.md"
+    if not readme.is_file():
+        raise RuntimeError(f"{readme} not found — cannot build the PyPI long description")
+    text = readme.read_text(encoding="utf-8")
+    if not text.strip():
+        raise RuntimeError(f"{readme} is empty — refusing to ship an empty PyPI description")
+    return text
 
 
 def _read_project_version() -> str:
@@ -194,6 +211,76 @@ def _find_artifact(build_dir: Path, subdir: str, filename: str) -> "Path | None"
 
 class CMakeBuild(build_ext):
     """Custom build_ext that runs cmake to produce the shared libraries."""
+
+    def _generate_sbom(self, build_dir: Path, pkg_dir: Path) -> None:
+        """Generate a CycloneDX SBOM and copy it into the package directory.
+
+        Runs two commands against the SBOM tools under ovui/tools/sbom:
+          1. conan cyclonedx  — resolves the C++ dep graph and emits CycloneDX JSON
+          2. enrich_sbom_licenses.py — adds license text, CPEs, and Python deps
+
+        Both conan and cyclonedx-python-lib are declared in pyproject.toml
+        build-system.requires so they are always available here.  The conan
+        cyclonedx extension (cmd_cyclonedx.py) is installed on first run via
+        `conan config install`; subsequent runs are no-ops because the file
+        already exists in the Conan home.
+        """
+        sbom_tools_dir = REPO_ROOT / "ovui" / "tools" / "sbom"
+        conanfile = sbom_tools_dir / "conanfile.py"
+        enrich_script = sbom_tools_dir / "enrich_sbom_licenses.py"
+        sbom_path = build_dir / "sbom.cdx.json"
+
+        if not conanfile.exists():
+            print(f"  [sbom] conanfile.py not found at {conanfile} — skipping")
+            return
+
+        try:
+            conan = _find_tool("conan")
+        except RuntimeError:
+            print("  [sbom] conan not found — skipping SBOM generation")
+            return
+
+        # Ensure a default profile exists (needed in fresh CI environments).
+        subprocess.check_call([conan, "profile", "detect", "--exist-ok"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Ensure the cyclonedx extension is installed in the Conan home.
+        import os as _os
+        conan_home = Path(_os.path.expanduser("~")) / ".conan2"
+        ext_dst = conan_home / "extensions" / "commands" / "cmd_cyclonedx.py"
+        if not ext_dst.exists():
+            print("  [sbom] installing conan cyclonedx extension ...")
+            ext_dst.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.check_call([
+                conan, "config", "install",
+                "https://github.com/conan-io/conan-extensions.git",
+                "-sf", "extensions/commands/sbom",
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # conan config install places the file at the conan home root;
+            # move it to the correct commands directory if needed.
+            misplaced = conan_home / "cmd_cyclonedx.py"
+            if misplaced.exists() and not ext_dst.exists():
+                shutil.move(str(misplaced), str(ext_dst))
+
+        print("  [sbom] running conan cyclonedx ...")
+        subprocess.check_call([
+            conan, "cyclonedx",
+            "--format", "1.4_json",
+            str(conanfile),
+            "--no-build-requires",
+            "--out-file", str(sbom_path),
+        ])
+
+        if enrich_script.exists():
+            print("  [sbom] enriching SBOM with license text, CPEs, and Python deps ...")
+            subprocess.check_call([
+                sys.executable, str(enrich_script),
+                "--sbom", str(sbom_path),
+            ])
+
+        dst = pkg_dir / "sbom.cdx.json"
+        shutil.copy2(str(sbom_path), str(dst))
+        print(f"  [sbom] copied sbom.cdx.json -> {dst}")
 
     def build_extension(self, ext: Extension) -> None:
         # Directories
@@ -379,6 +466,9 @@ class CMakeBuild(build_ext):
             shutil.copy2(str(notices_src), str(pkg_dir / notices_src.name))
             print(f"  copied {notices_src.name}")
 
+        # ---- Generate and bundle SBOM ----
+        self._generate_sbom(build_dir, pkg_dir)
+
         # ---- Copy omni.ui_scene artifacts ----
         # _scene.so and libovuiscene.so* go into a sibling omni/ui_scene/ dir.
         scene_pkg_dir = pkg_dir.parent / "ui_scene"
@@ -422,6 +512,34 @@ class CMakeBuild(build_ext):
                 print(f"  copied scene {py_file.name}")
 
 
+class BuildPyWithAgentSkills(build_py):
+    """Bundle repo-owned Agent Skills without moving their source trees."""
+
+    def run(self) -> None:
+        super().run()
+        source_root = REPO_ROOT / "skills"
+        target_root = Path(self.build_lib) / "ovui_agent_skills" / "skills"
+        if target_root.exists():
+            shutil.rmtree(target_root)
+
+        shutil.copytree(
+            source_root / "omniverse-ui-apis",
+            target_root / "omniverse-ui-apis",
+        )
+
+        inspector_source = source_root / "omniverse-ui-inspector"
+        inspector_target = target_root / "omniverse-ui-inspector"
+        inspector_target.mkdir(parents=True)
+        for filename in ("SKILL.md", "requirements.txt"):
+            shutil.copy2(inspector_source / filename, inspector_target / filename)
+        for dirname in ("references", "scripts", "ovuiinspect"):
+            shutil.copytree(
+                inspector_source / dirname,
+                inspector_target / dirname,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+
+
 # Ensure the omni namespace package exists
 def _ensure_namespace_packages(pkg_dir: Path):
     """Create __init__.py for the 'omni' namespace package if needed."""
@@ -439,15 +557,25 @@ setup(
     name="ovui",
     version=_QUALIFIED_VERSION,
     description="ovui — GPU-accelerated Python UI toolkit",
+    long_description=_read_long_description(),
+    long_description_content_type="text/markdown",
     ext_modules=[CMakeExtension("omni.ui._ui")],
-    cmdclass={"build_ext": CMakeBuild},
-    packages=["omni", "omni.ui", "omni.ui.markdown_providers", "omni.ui.standalone", "omni.ui_scene"],
+    cmdclass={"build_ext": CMakeBuild, "build_py": BuildPyWithAgentSkills},
+    packages=[
+        "omni",
+        "omni.ui",
+        "omni.ui.markdown_providers",
+        "omni.ui.standalone",
+        "omni.ui_scene",
+        "ovui_agent_skills",
+    ],
     package_dir={
         "omni":                      "python/omni",
         "omni.ui":                   "python/omni/ui",
         "omni.ui.markdown_providers": "python/omni/ui/markdown_providers",
         "omni.ui.standalone":        "python/omni/ui/standalone",
         "omni.ui_scene":             "python/omni/ui_scene",
+        "ovui_agent_skills":         "python/ovui_agent_skills",
     },
     package_data={
         "omni.ui": [
@@ -458,6 +586,7 @@ setup(
             "*.dll",
             "*.pyd",
             "THIRD_PARTY_NOTICES.md",
+            "sbom.cdx.json",
             "resources/fonts/*.ttf",
             "resources/fonts/*.txt",
             "resources/fonts/*.md",

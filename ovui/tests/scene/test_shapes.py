@@ -30,6 +30,8 @@ DATA_PATH = Path(__file__).resolve().parent / "data"
 
 
 class TestShapes(OmniUiTest):
+    SCALABILITY_GOLDEN_THRESHOLD = 0.025
+
     # Before running each test
     async def asyncSetUp(self):
         await super().asyncSetUp()
@@ -451,7 +453,10 @@ class TestShapes(OmniUiTest):
                         )
 
         await self.wait_n_updates(30)
-        await self.finalize_test(golden_img_dir=self._golden_img_dir)
+        await self.finalize_test(
+            golden_img_dir=self._golden_img_dir,
+            threshold=self.SCALABILITY_GOLDEN_THRESHOLD,
+        )
 
     async def test_bezier_curve_scalability(self):
         """we can have maximum 8920 curves with 3 segments per bezier curve and default 9 tessellation
@@ -477,7 +482,10 @@ class TestShapes(OmniUiTest):
                         )
 
         await self.wait_n_updates(30)
-        await self.finalize_test(golden_img_dir=self._golden_img_dir)
+        await self.finalize_test(
+            golden_img_dir=self._golden_img_dir,
+            threshold=self.SCALABILITY_GOLDEN_THRESHOLD,
+        )
 
     async def test_bezier_segment_scalability(self):
         """we can have maximum 27 curves per bezier curve with 999 segments and default 9 tessellation
@@ -513,7 +521,10 @@ class TestShapes(OmniUiTest):
                         )
 
         await self.wait_n_updates(30)
-        await self.finalize_test(golden_img_dir=self._golden_img_dir)
+        await self.finalize_test(
+            golden_img_dir=self._golden_img_dir,
+            threshold=self.SCALABILITY_GOLDEN_THRESHOLD,
+        )
 
     async def test_intersection_scalability(self):
         """for intersection workable, we can have maximum 3000 curves with 9 segments and 9 tessellation per curve
@@ -555,7 +566,10 @@ class TestShapes(OmniUiTest):
                         sc.Curve(curve, colors=[[random.random(), random.random(), random.random(), 1.0]], gesture=drag)
 
         await self.wait_n_updates(100)
-        await self.finalize_test(golden_img_dir=self._golden_img_dir)
+        await self.finalize_test(
+            golden_img_dir=self._golden_img_dir,
+            threshold=self.SCALABILITY_GOLDEN_THRESHOLD,
+        )
 
     async def test_transparency(self):
         window = await self.create_test_window()

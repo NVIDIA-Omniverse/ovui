@@ -472,7 +472,7 @@ bool TreeView::_setSelection(std::vector<std::shared_ptr<const AbstractItemModel
         }
     }
 
-    if (data.m_selection.size() == 1)
+    if (this->isAutoScrollSelection() && data.m_selection.size() == 1)
     {
         // Scroll to the selection only if there is one object selected.
         data.m_scrollHere = node;
@@ -669,6 +669,7 @@ void TreeView::setExpanded(const std::shared_ptr<const AbstractItemModel::Abstra
 void TreeView::dirtyWidgets()
 {
     this->_setWidgetsDirty(_getData<TreeViewData>().m_root.get(), true, true);
+    this->forceRasterDirty(BakeDirtyReason::eContentChanged);
 }
 
 void TreeView::_drawContent(float elapsedTime)
@@ -741,6 +742,7 @@ void TreeView::_drawContent(float elapsedTime)
     float computedContentHeight = this->getComputedContentHeight();
     ImVec2 cursorAtEndTable{ cursorAtBeginTable.x + computedContentWidth, cursorAtBeginTable.y + data.m_contentHeight };
     ImGui::SetCursorScreenPos(cursorAtEndTable);
+    ImGui::Dummy(ImVec2{ 0.0f, 0.0f });
 
     auto drawList = ImGui::GetWindowDrawList();
 
@@ -1346,6 +1348,8 @@ void TreeView::_populateNodeWidget(TreeView::Node* node)
     node->heightComputed = true;
     data.m_sumHeights += maxHeight;
     data.m_numHeights++;
+    data.m_contentHeightDirty = true;
+    this->forceHeightDirty(SizeDirtyReason::eSizeChanged);
 }
 
 void TreeView::_populateNodeWidgetsRecursive(TreeView::Node* node)
@@ -1502,6 +1506,7 @@ float TreeView::_drawNodeInTable(const std::unique_ptr<TreeView::Node>& node,
         if (visible)
         {
             ImGui::PushID(node.get());
+            const bool expandedBeforeDraw = node->expanded;
 
             ImVec2 nodeCursor{ cursorAtBeginTableX, cursorAtBeginTableY + currentOffset };
             ImVec2 nodeSize{ data.m_contentWidth, nodeHeight };
@@ -1679,9 +1684,43 @@ float TreeView::_drawNodeInTable(const std::unique_ptr<TreeView::Node>& node,
                 }
             }
 
+            bool branchClickHandled = false;
+            if (data.m_resizeColumn == 0 && nodeSize.y > 0.0f && this->isExpandOnBranchClick())
+            {
+                float branchWidth = 0.0f;
+                if (!node->widgetsForInspector.empty() && node->widgetsForInspector[0].first)
+                {
+                    branchWidth = node->widgetsForInspector[0].first->getComputedWidth();
+                }
+                if (branchWidth <= 0.0f)
+                {
+                    branchWidth = nodeHeight;
+                }
+                if (!data.m_columnComputedSizes.empty())
+                {
+                    branchWidth = std::min(branchWidth, data.m_columnComputedSizes[0]);
+                }
+
+                const ImVec2 branchRectMax{ nodeCursor.x + branchWidth, nodeRectMax.y };
+                const bool branchHovered = hovered && ImGui::IsMouseHoveringRect(nodeCursor, branchRectMax);
+                branchClickHandled = branchHovered && node->expanded != expandedBeforeDraw;
+
+                if (!branchClickHandled && branchHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                {
+                    const auto& model = this->getModel();
+                    if (model && model->canItemHaveChildren(node->item))
+                    {
+                        const ImGuiIO& io = ImGui::GetIO();
+                        this->_setExpanded(node.get(), !node->expanded, io.KeyShift);
+                        branchClickHandled = true;
+                    }
+                }
+            }
+
             // Selection button
             ImGui::SetCursorScreenPos(nodeCursor);
-            if (data.m_resizeColumn == 0 && nodeSize.y > 0.0f && ImGui::InvisibleButton("##selection", nodeSize))
+            if (!branchClickHandled && data.m_resizeColumn == 0 && nodeSize.y > 0.0f &&
+                ImGui::InvisibleButton("##selection", nodeSize))
             {
                 const ImGuiIO& io = ImGui::GetIO();
                 if (io.KeyCtrl)
@@ -1736,13 +1775,14 @@ float TreeView::_drawNodeInTable(const std::unique_ptr<TreeView::Node>& node,
     if (visible)
     {
         // Recomputing the widget size takes a very long time if we have thousands of items. To be in a reasonable time,
-        // we don't do it every frame. We compute it when the size is changed and if the item is visible on the screen.
-        // We assume that other widgets always have a fixed size.
-        node->widthComputed = false;
-        node->heightComputed = false;
+        // we don't do it every frame. Cached node sizes stay valid after a plain draw; otherwise an expanded TreeView
+        // forces visible rows back through width/height measurement on the next layout pass even when the model and
+        // delegate widgets did not change.
         if (node->widgetsDirty)
         {
             node->widgetsPopulated = false;
+            node->widthComputed = false;
+            node->heightComputed = false;
         }
     }
 
@@ -1764,6 +1804,7 @@ float TreeView::_drawNodeInTable(const std::unique_ptr<TreeView::Node>& node,
             // Window space
             float targetY = cursorAtBeginTableY + currentOffset - window->Pos.y;
             ImGui::SetScrollFromPosY(window, targetY, 0.5f);
+            this->forceRasterDirty(BakeDirtyReason::eContentChanged);
         }
     }
 
@@ -2249,6 +2290,9 @@ void TreeView::_setExpanded(TreeView::Node* node, bool expanded, bool recursive,
 
     auto& data = _getData<TreeViewData>();
     data.m_contentHeightDirty = true;
+    this->forceWidthDirty(SizeDirtyReason::eSizeChanged);
+    this->forceHeightDirty(SizeDirtyReason::eSizeChanged);
+    this->forceRasterDirty(BakeDirtyReason::eContentChanged);
 
     if (node == data.m_root.get())
     {

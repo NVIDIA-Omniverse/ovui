@@ -769,6 +769,11 @@ float Widget::getScreenPositionY() const
 
 float Widget::getComputedWidth() const
 {
+    if (m_data->m_marginWidthCache == 0.0f)
+    {
+        return m_data->m_computedContentWidth;
+    }
+
     // TODO: For now it's the only way to apply DPI to margins. In ImGui DpiScale is only available between frameBegin
     // and frameEnd and it means we can't premultiply margins when we load them in Widget::updateStyle().
     // TODO: Get rid of DPI at all
@@ -812,6 +817,11 @@ void Widget::setComputedContentWidth(float width)
 
 float Widget::getComputedHeight() const
 {
+    if (m_data->m_marginHeightCache == 0.0f)
+    {
+        return m_data->m_computedContentHeight;
+    }
+
     // TODO: For now it's the only way to apply DPI to margins. In ImGui DpiScale is only available between frameBegin
     // and frameEnd and it means we can't premultiply margins when we load them in Widget::updateStyle().
     // TODO: Get rid of DPI at all

@@ -56,7 +56,7 @@ trial. In a temporary standalone app, `ui.Workspace.get_window("DockSpace")`
 is MainWindow's internal host and is not a replacement for the root dock
 node IDs in `imgui.ini`. If no split layout is preseeded, Stage Browser and
 Viewport both start floating at the same coordinates and Viewport covers
-Stage. Therefore call `write_split_ini()` from `ovwidgets.app.layout` before
+Stage. Therefore call `write_split_ini()` from `ovui_widgets.app.layout` before
 `ui.init()`, while the current directory is the temp trial root, so
 `imgui.ini` is written outside the repo and loaded by standalone ImGui on
 startup.
@@ -172,7 +172,7 @@ EXERCISE_CONFIGS = {
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Disposable ovwidgets skill trial")
+    parser = argparse.ArgumentParser(description="Disposable ovui-widgets skill trial")
     parser.add_argument("usd_path", help="USD file to open at startup")
     parser.add_argument("--exercise", type=int, choices=tuple(EXERCISE_CONFIGS), required=True)
     parser.add_argument("--width", type=int, default=1280)

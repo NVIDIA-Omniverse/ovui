@@ -1,0 +1,497 @@
+#usda 1.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def PhysicsScene "PhysicsScene"
+    {
+        vector3f physics:gravityDirection = (0, -1, 0)
+        float physics:gravityMagnitude = 9.81
+    }
+
+    def Xform "Arena"
+    {
+        def Cube "Floor" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            bool physics:collisionEnabled = 1
+            color3f[] primvars:displayColor = [(0.18, 0.20, 0.24)]
+            double3 xformOp:translate = (0, -0.22, 0)
+            float3 xformOp:scale = (14, 0.12, 9)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "LeftRail" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            bool physics:collisionEnabled = 1
+            color3f[] primvars:displayColor = [(0.08, 0.42, 0.75)]
+            double3 xformOp:translate = (-7.1, 0.45, 0)
+            float3 xformOp:scale = (0.25, 0.8, 9)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "RightRail" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            bool physics:collisionEnabled = 1
+            color3f[] primvars:displayColor = [(0.78, 0.16, 0.54)]
+            double3 xformOp:translate = (7.1, 0.45, 0)
+            float3 xformOp:scale = (0.25, 0.8, 9)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "BackRail" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            bool physics:collisionEnabled = 1
+            color3f[] primvars:displayColor = [(0.26, 0.30, 0.36)]
+            double3 xformOp:translate = (0, 0.45, -4.6)
+            float3 xformOp:scale = (14, 0.8, 0.25)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "FrontRail" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            bool physics:collisionEnabled = 1
+            color3f[] primvars:displayColor = [(0.26, 0.30, 0.36)]
+            double3 xformOp:translate = (0, 0.45, 4.6)
+            float3 xformOp:scale = (14, 0.8, 0.25)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "LeftRamp" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            bool physics:collisionEnabled = 1
+            color3f[] primvars:displayColor = [(0.48, 0.58, 0.70)]
+            double3 xformOp:translate = (-2.8, 1.25, -0.6)
+            quatd xformOp:orient = (0.991445, 0, 0, 0.130526)
+            float3 xformOp:scale = (5.2, 0.18, 1.5)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        def Cube "RightRamp" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            bool physics:collisionEnabled = 1
+            color3f[] primvars:displayColor = [(0.48, 0.58, 0.70)]
+            double3 xformOp:translate = (2.8, 2.05, 0.8)
+            quatd xformOp:orient = (0.991445, 0, 0, -0.130526)
+            float3 xformOp:scale = (5.2, 0.18, 1.5)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        def Cube "CenterBumper" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            bool physics:collisionEnabled = 1
+            color3f[] primvars:displayColor = [(0.08, 0.10, 0.14)]
+            double3 xformOp:translate = (0, 0.45, 0)
+            quatd xformOp:orient = (0.92388, 0, 0.382683, 0)
+            float3 xformOp:scale = (1.2, 0.9, 1.2)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+    }
+
+    def Xform "RainbowDrops"
+    {
+        def Xform "CubeRed01" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.8
+            vector3f physics:velocity = (0.5, 0, 0.2)
+            vector3f physics:angularVelocity = (1.2, 0.8, 0.4)
+            double3 xformOp:translate = (-4.2, 7.0, -2.6)
+            quatd xformOp:orient = (1, 0, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.75
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(1.0, 0.12, 0.08)]
+                float3[] extent = [(-0.375, -0.375, -0.375), (0.375, 0.375, 0.375)]
+            }
+        }
+
+        def Xform "CubeOrange02" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.8
+            vector3f physics:velocity = (0.2, 0, -0.1)
+            vector3f physics:angularVelocity = (0.4, 1.1, 0.9)
+            double3 xformOp:translate = (-3.0, 8.2, -1.3)
+            quatd xformOp:orient = (0.965926, 0, 0.258819, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.75
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(1.0, 0.48, 0.05)]
+                float3[] extent = [(-0.375, -0.375, -0.375), (0.375, 0.375, 0.375)]
+            }
+        }
+
+        def Xform "CubeYellow03" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.8
+            vector3f physics:velocity = (0.0, 0, 0.35)
+            vector3f physics:angularVelocity = (0.8, 0.2, 1.0)
+            double3 xformOp:translate = (-1.8, 9.5, -2.2)
+            quatd xformOp:orient = (0.991445, 0.130526, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.75
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(1.0, 0.84, 0.08)]
+                float3[] extent = [(-0.375, -0.375, -0.375), (0.375, 0.375, 0.375)]
+            }
+        }
+
+        def Xform "CubeGreen04" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.8
+            vector3f physics:velocity = (-0.3, 0, 0.1)
+            vector3f physics:angularVelocity = (1.1, 0.3, 0.7)
+            double3 xformOp:translate = (-0.6, 10.7, -0.8)
+            quatd xformOp:orient = (0.92388, 0, 0, 0.382683)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.75
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(0.12, 0.78, 0.22)]
+                float3[] extent = [(-0.375, -0.375, -0.375), (0.375, 0.375, 0.375)]
+            }
+        }
+
+        def Xform "CubeCyan05" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.8
+            vector3f physics:velocity = (-0.2, 0, -0.25)
+            vector3f physics:angularVelocity = (0.5, 1.2, 0.4)
+            double3 xformOp:translate = (0.6, 9.7, 0.7)
+            quatd xformOp:orient = (0.991445, 0, 0.130526, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.75
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(0.0, 0.62, 0.95)]
+                float3[] extent = [(-0.375, -0.375, -0.375), (0.375, 0.375, 0.375)]
+            }
+        }
+
+        def Xform "CubeBlue06" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.8
+            vector3f physics:velocity = (0.2, 0, -0.35)
+            vector3f physics:angularVelocity = (0.3, 0.7, 1.2)
+            double3 xformOp:translate = (1.8, 8.7, 1.8)
+            quatd xformOp:orient = (0.965926, 0.258819, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.75
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(0.10, 0.24, 1.0)]
+                float3[] extent = [(-0.375, -0.375, -0.375), (0.375, 0.375, 0.375)]
+            }
+        }
+
+        def Xform "CubePurple07" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.8
+            vector3f physics:velocity = (0.1, 0, 0.15)
+            vector3f physics:angularVelocity = (1.0, 0.5, 0.5)
+            double3 xformOp:translate = (3.0, 7.8, 0.2)
+            quatd xformOp:orient = (0.92388, 0, 0.382683, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.75
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(0.62, 0.18, 1.0)]
+                float3[] extent = [(-0.375, -0.375, -0.375), (0.375, 0.375, 0.375)]
+            }
+        }
+
+        def Xform "CubeMagenta08" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.8
+            vector3f physics:velocity = (-0.45, 0, -0.1)
+            vector3f physics:angularVelocity = (0.4, 0.9, 0.8)
+            double3 xformOp:translate = (4.2, 9.0, -1.5)
+            quatd xformOp:orient = (1, 0, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.75
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(1.0, 0.15, 0.62)]
+                float3[] extent = [(-0.375, -0.375, -0.375), (0.375, 0.375, 0.375)]
+            }
+        }
+
+        def Xform "CubeRed09" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.6
+            vector3f physics:velocity = (0.25, 0, 0.3)
+            vector3f physics:angularVelocity = (0.8, 1.0, 0.2)
+            double3 xformOp:translate = (-4.8, 11.0, 1.7)
+            quatd xformOp:orient = (0.991445, 0.130526, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.62
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(1.0, 0.12, 0.08)]
+                float3[] extent = [(-0.31, -0.31, -0.31), (0.31, 0.31, 0.31)]
+            }
+        }
+
+        def Xform "CubeOrange10" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.6
+            vector3f physics:velocity = (-0.15, 0, 0.2)
+            vector3f physics:angularVelocity = (0.7, 0.4, 1.1)
+            double3 xformOp:translate = (-3.4, 12.2, 2.6)
+            quatd xformOp:orient = (0.965926, 0, 0.258819, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.62
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(1.0, 0.48, 0.05)]
+                float3[] extent = [(-0.31, -0.31, -0.31), (0.31, 0.31, 0.31)]
+            }
+        }
+
+        def Xform "CubeYellow11" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.6
+            vector3f physics:velocity = (0.0, 0, -0.25)
+            vector3f physics:angularVelocity = (0.3, 1.1, 0.9)
+            double3 xformOp:translate = (-2.0, 13.4, 1.3)
+            quatd xformOp:orient = (0.991445, 0, 0, 0.130526)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.62
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(1.0, 0.84, 0.08)]
+                float3[] extent = [(-0.31, -0.31, -0.31), (0.31, 0.31, 0.31)]
+            }
+        }
+
+        def Xform "CubeGreen12" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.6
+            vector3f physics:velocity = (-0.25, 0, -0.1)
+            vector3f physics:angularVelocity = (1.2, 0.2, 0.4)
+            double3 xformOp:translate = (-0.6, 12.7, 2.2)
+            quatd xformOp:orient = (0.92388, 0, 0.382683, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.62
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(0.12, 0.78, 0.22)]
+                float3[] extent = [(-0.31, -0.31, -0.31), (0.31, 0.31, 0.31)]
+            }
+        }
+
+        def Xform "CubeCyan13" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.6
+            vector3f physics:velocity = (0.2, 0, 0.0)
+            vector3f physics:angularVelocity = (0.5, 0.9, 0.7)
+            double3 xformOp:translate = (0.8, 14.0, 1.0)
+            quatd xformOp:orient = (0.991445, 0.130526, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.62
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(0.0, 0.62, 0.95)]
+                float3[] extent = [(-0.31, -0.31, -0.31), (0.31, 0.31, 0.31)]
+            }
+        }
+
+        def Xform "CubeBlue14" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.6
+            vector3f physics:velocity = (0.15, 0, -0.25)
+            vector3f physics:angularVelocity = (0.6, 0.5, 1.0)
+            double3 xformOp:translate = (2.2, 12.9, 2.7)
+            quatd xformOp:orient = (0.965926, 0, 0.258819, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.62
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(0.10, 0.24, 1.0)]
+                float3[] extent = [(-0.31, -0.31, -0.31), (0.31, 0.31, 0.31)]
+            }
+        }
+
+        def Xform "CubePurple15" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.6
+            vector3f physics:velocity = (-0.1, 0, 0.3)
+            vector3f physics:angularVelocity = (1.0, 0.7, 0.3)
+            double3 xformOp:translate = (3.6, 11.6, 1.6)
+            quatd xformOp:orient = (0.92388, 0, 0, 0.382683)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.62
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(0.62, 0.18, 1.0)]
+                float3[] extent = [(-0.31, -0.31, -0.31), (0.31, 0.31, 0.31)]
+            }
+        }
+
+        def Xform "CubeMagenta16" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            float physics:mass = 0.6
+            vector3f physics:velocity = (-0.3, 0, -0.2)
+            vector3f physics:angularVelocity = (0.2, 1.0, 0.8)
+            double3 xformOp:translate = (5.0, 12.8, 2.4)
+            quatd xformOp:orient = (1, 0, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cube "CubeGeom" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                double size = 0.62
+                bool physics:collisionEnabled = 1
+                color3f[] primvars:displayColor = [(1.0, 0.15, 0.62)]
+                float3[] extent = [(-0.31, -0.31, -0.31), (0.31, 0.31, 0.31)]
+            }
+        }
+    }
+}

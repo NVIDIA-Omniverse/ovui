@@ -49,6 +49,8 @@ void wrapTreeView(module& m)
             "selection", &TreeView::getSelection, &TreeView::setSelection, OMNIUI_PYBIND_DOC_TreeView_setSelection)
         .def_property("expand_on_branch_click", &TreeView::isExpandOnBranchClick, &TreeView::setExpandOnBranchClick,
                       OMNIUI_PYBIND_DOC_TreeView_expandOnBranchClick)
+        .def_property("auto_scroll_selection", &TreeView::isAutoScrollSelection, &TreeView::setAutoScrollSelection,
+                      OMNIUI_PYBIND_DOC_TreeView_autoScrollSelection)
         .def_property("keep_alive", &TreeView::isKeepAlive, &TreeView::setKeepAlive, OMNIUI_PYBIND_DOC_TreeView_keepAlive)
         .def_property("keep_expanded", &TreeView::isKeepExpanded, &TreeView::setKeepExpanded,
                       OMNIUI_PYBIND_DOC_TreeView_keepExpanded)

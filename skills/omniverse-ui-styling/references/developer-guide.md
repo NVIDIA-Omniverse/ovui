@@ -1,6 +1,6 @@
 # Developer Guide
 
-Read this when building a new ovui or ovwidgets surface, or when reshaping an existing surface so it matches the target architecture.
+Read this when building a new ovui or ovui-widgets surface, or when reshaping an existing surface so it matches the target architecture.
 
 ## Scenario A — standard-looking surface
 

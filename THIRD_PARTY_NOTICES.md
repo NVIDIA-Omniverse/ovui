@@ -29,6 +29,7 @@ at <https://github.com/NVIDIA-Omniverse/ovui/issues>.
 
 ---
 
+
 ## 1. Vendored C/C++ source (in tree)
 
 These third-party C/C++ sources are copied directly into this repository
@@ -583,6 +584,7 @@ at install time and are not vendored.
 |---|---|---|---|
 | `fastapi` | >=0.100.0 | MIT | runtime |
 | `httpx` | >=0.25.0 | BSD-3-Clause | runtime |
+| `python-multipart` | >=0.0.7 | Apache-2.0 | runtime |
 | `uvicorn` | >=0.23.0 | BSD-3-Clause | runtime |
 | `cmake` | (unpinned) | Apache-2.0 OR BSD-3-Clause | example |
 | `cuda-python` | 13.2.0 | LicenseRef-NVIDIA-SOFTWARE-LICENSE | optional:examples |
@@ -593,7 +595,7 @@ at install time and are not vendored.
 | `wheel` | 0.47.0 | MIT | example |
 
 Notes:
-- `fastapi`, `httpx`, `uvicorn` are declared by the
+- `fastapi`, `httpx`, `python-multipart`, `uvicorn` are declared by the
   `skills/omniverse-ui-inspector/` developer skill; they are not part of the
   shipped `omni-ui` Python wheel.
 - `cuda-python` reports `LicenseRef-NVIDIA-SOFTWARE-LICENSE` (NVIDIA CUDA

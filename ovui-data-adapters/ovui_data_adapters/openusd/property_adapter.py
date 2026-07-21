@@ -28,8 +28,10 @@ except ImportError:
     Gf = Sdf = Usd = None  # type: ignore[assignment]
 
 from ovui_data_adapters.common import (
+    AdapterCapability,
     AttributeMetadata,
     Command,
+    PropertyCapabilities,
     PropertyAdapter,
     UndoManagerProtocol,
 )
@@ -211,6 +213,11 @@ _MATRIX_IDENTITY: Dict[str, tuple] = {
 }
 
 
+_OPENUSD_PROPERTY_CAPABILITIES = PropertyCapabilities(
+    clear_values=AdapterCapability.supported(),
+)
+
+
 def _range_bound(range_dict: Any, key: str) -> Optional[float]:
     """Coerce ``range_dict[key]`` to ``float`` or ``None``.
 
@@ -362,39 +369,132 @@ def _default_value(value_type: str) -> Any:
 # Undo command
 # ──────────────────────────────────────────────────────────────────────────────
 
+class _PropertyEditToken:
+    """Per-invocation ownership record for one begin/end edit transaction.
+
+    Freezes everything the transaction may rely on BEFORE any authoring:
+    the full ``Usd.EditTarget`` (mapping included), its layer, the MAPPED
+    spec paths every member write will land on (computed through the
+    frozen target's ``MapToSpecPath`` — identical to the composed paths
+    for identity mappings, variant/reference spec paths otherwise), and
+    the exact pre-edit snapshot of exactly those specs. ``wrote`` records
+    whether THIS invocation actually authored — foreign or invalidation
+    changes observed at ``end_edit`` without an owned write never create
+    history. ``registry_keys`` are this token's claims in the shared
+    cross-adapter spec-ownership registry.
+    """
+
+    __slots__ = ("edit_target", "layer", "paths", "spec_paths", "attr_name",
+                 "pre", "wrote", "registry_keys", "__weakref__")
+
+    def __init__(self, edit_target, layer, paths, spec_paths, attr_name,
+                 pre, registry_keys):
+        self.edit_target = edit_target
+        self.layer = layer
+        self.paths = paths
+        self.spec_paths = spec_paths
+        self.attr_name = attr_name
+        self.pre = pre
+        self.wrote = False
+        self.registry_keys = registry_keys
+
+
+# Cross-adapter spec ownership: (layer identifier, spec path) → weak token.
+# Two adapters sharing the same stage/layer/property must not overlap one
+# logical edit; begin_edit refuses BEFORE any capture or authoring while a
+# LIVE token owns any of the mapped specs. Values are weak so an adapter
+# discarded mid-edit releases its claims automatically.
+_ACTIVE_SPEC_EDITS: Dict[tuple, Any] = {}
+
+
+def _spec_claim_live(key: tuple) -> bool:
+    ref = _ACTIVE_SPEC_EDITS.get(key)
+    if ref is None:
+        return False
+    if ref() is None:
+        _ACTIVE_SPEC_EDITS.pop(key, None)
+        return False
+    return True
+
+
+def _release_spec_claims(token: "_PropertyEditToken") -> None:
+    for key in token.registry_keys:
+        ref = _ACTIVE_SPEC_EDITS.get(key)
+        if ref is not None and ref() is token:
+            _ACTIVE_SPEC_EDITS.pop(key, None)
+
+
 class SetAttributeCommand(Command):
-    """Undo/redo command for a USD attribute value change."""
+    """Undo/redo command for a USD attribute value change.
+
+    Anchored on EXACT pre/post property-spec snapshots of the layer the
+    edit's FROZEN target mapped to: undo restores the exact prior authored
+    opinion — including the ABSENCE of one — and redo replays the exact
+    post-edit state, immune to later edit-target changes.
+
+    Every replay invocation is ATOMIC: a fresh compensation baseline of
+    the layer's current state is captured first; if the replay fails at
+    any point, the baseline is restored and verified before the primary
+    failure propagates, so a half-replayed layer can never survive with a
+    misleading history cursor.
+    """
 
     def __init__(
         self,
-        stage: Any,
-        paths: List[str],
+        layer: Any,
+        spec_paths: List[Any],
         attr_name: str,
-        value_type: str,
-        old_value: Any,
-        new_value: Any,
+        pre_snapshot: Any,
+        post_snapshot: Any,
     ) -> None:
-        self._stage = stage
-        self._paths = paths
+        self._layer = layer
+        self._spec_paths = list(spec_paths)
         self._attr_name = attr_name
-        self._value_type = value_type
-        self._old_value = old_value
-        self._new_value = new_value
+        self._pre = pre_snapshot
+        self._post = post_snapshot
+        self.label = f"Set {attr_name}"
 
-    def _write(self, value: Any) -> None:
-        usd_val = _to_usd(value, self._value_type)
-        for path in self._paths:
-            prim = self._stage.GetPrimAtPath(path)
-            if prim.IsValid():
-                attr = prim.GetAttribute(self._attr_name)
-                if attr.IsValid():
-                    attr.Set(usd_val)
+    def _fresh_baseline(self) -> Any:
+        from ovui_data_adapters.openusd.commands import (
+            _TargetedVisibilitySnapshot,
+        )
+
+        return _TargetedVisibilitySnapshot(
+            self._layer, (), prop_name=self._attr_name,
+            prop_spec_paths=self._spec_paths)
+
+    def _replay_atomic(self, snapshot: Any) -> None:
+        # Fresh per-invocation compensation baseline: captured BEFORE any
+        # mutation, so a failure mid-replay can restore and verify the
+        # exact invocation state instead of leaving a half-replayed layer.
+        baseline = self._fresh_baseline()
+        try:
+            snapshot.replay(self._layer)
+        except BaseException as primary:  # noqa: BLE001 — compensated
+            try:
+                baseline.replay(self._layer)
+            except BaseException as secondary:  # noqa: BLE001 — noted
+                add_note = getattr(primary, "add_note", None)
+                if callable(add_note):
+                    add_note(
+                        "compensation replay also failed; the layer state "
+                        "is conservative (genuine notices retained): "
+                        f"{type(secondary).__name__}: {secondary}"
+                    )
+            raise
 
     def do(self) -> None:
-        self._write(self._new_value)
+        # push() executes do() while the post state is already current:
+        # the verified matches() guard avoids a redundant re-replay (and
+        # its notices) without weakening redo, which replays explicitly.
+        if not self._post.matches(self._layer):
+            self._replay_atomic(self._post)
+
+    def redo(self) -> None:
+        self._replay_atomic(self._post)
 
     def undo(self) -> None:
-        self._write(self._old_value)
+        self._replay_atomic(self._pre)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -443,6 +543,14 @@ class UsdPropertyAdapter(PropertyAdapter):
         self._props: Dict[str, UsdAttributeProp] = {}
         self._edit_snapshots: Dict[str, Any] = {}
         self._subscribers: List[Callable] = []
+        # An undoable namespace mutation (delete/rename/reparent) settles
+        # this adapter's in-flight edit transactions before it executes;
+        # the registration is weak, so a discarded adapter unregisters
+        # itself.
+        register = getattr(
+            undo_manager, "register_pre_namespace_settler", None)
+        if callable(register):
+            register(self._settle_active_edits)
         self._refresh()
 
     # ── Internal ──────────────────────────────────────────────────────────────
@@ -743,9 +851,65 @@ class UsdPropertyAdapter(PropertyAdapter):
         ]
 
     def begin_edit(self, attr_name: str) -> None:
-        self._edit_snapshots[attr_name] = self.get_value(attr_name)
-        if self._undo_manager:
-            self._undo_manager.begin_group(f"Set {attr_name}")
+        # STRUCTURED per-invocation ownership: refuse a nested edit of the
+        # same attribute BEFORE any capture or authoring — the refusal
+        # leaves the first invocation's token, snapshot, and pending
+        # authoring completely intact.
+        if attr_name in self._edit_snapshots:
+            raise RuntimeError(
+                f"nested edit of {attr_name!r} refused: an edit "
+                "transaction for this attribute is already active"
+            )
+        from ovui_data_adapters.openusd.commands import (
+            _TargetedVisibilitySnapshot,
+        )
+
+        # The MAPPED spec paths are frozen BEFORE authoring: every member
+        # write lands on edit_target.MapToSpecPath(composed property), so
+        # identity mappings capture the composed paths and direct
+        # variants/references/offsets capture the exact mapped specs.
+        # The snapshot therefore owns exactly this edit's specs — never
+        # the whole layer, so foreign concurrent content in the same
+        # layer is never owned. An UNCERTAIN mapping (empty mapped path)
+        # refuses before any authoring can become untracked.
+        edit_target = self._stage.GetEditTarget()
+        layer = edit_target.GetLayer()
+        spec_paths = []
+        for path in self._paths:
+            composed = Sdf.Path(str(path)).AppendProperty(attr_name)
+            mapped = edit_target.MapToSpecPath(composed)
+            if mapped.isEmpty:
+                raise RuntimeError(
+                    f"edit of {attr_name!r} refused: the current edit "
+                    f"target cannot map {composed} to a layer spec path "
+                    "(uncertain mapping)"
+                )
+            spec_paths.append(mapped)
+        # SHARED ownership: refuse overlap with any LIVE transaction on
+        # the same (layer, spec) — including one owned by a different
+        # adapter instance on the same stage and UndoManager — before
+        # any mutation, so overlapping edits can never entangle history.
+        registry_keys = [
+            (str(layer.identifier), str(spec)) for spec in spec_paths
+        ]
+        for key in registry_keys:
+            if _spec_claim_live(key):
+                raise RuntimeError(
+                    f"overlapping edit refused: {key[1]} in {key[0]} is "
+                    "owned by another active edit transaction"
+                )
+        pre = _TargetedVisibilitySnapshot(
+            layer, (), prop_name=attr_name, prop_spec_paths=spec_paths)
+        # NOTE: no undo group is opened. The transaction pushes exactly
+        # one command at end_edit; an open group would swallow FOREIGN
+        # commands (e.g. a deletion arriving mid-edit) into this edit's
+        # history entry and made unmatched end_edit close foreign groups.
+        token = _PropertyEditToken(
+            edit_target, layer, list(self._paths), spec_paths, attr_name,
+            pre, registry_keys)
+        for key in registry_keys:
+            _ACTIVE_SPEC_EDITS[key] = weakref.ref(token)
+        self._edit_snapshots[attr_name] = token
 
     def set_value(self, attr_name: str, value: Any) -> None:
         prop = self._props[attr_name]
@@ -766,30 +930,143 @@ class UsdPropertyAdapter(PropertyAdapter):
             # would raise mid-edit.
             return
         usd_val = _to_usd(value, prop.value_type)
-        for path in self._paths:
-            prim = self._stage.GetPrimAtPath(path)
-            if prim.IsValid():
+        token = self._edit_snapshots.get(attr_name)
+
+        if isinstance(token, _PropertyEditToken):
+            # Author EVERY member against the FROZEN edit target. A
+            # genuine synchronous notice callback fired by one member's
+            # Set() may change the stage target before the next member,
+            # so the frozen target is re-asserted PER MEMBER — one
+            # transaction can never split across layers. A foreign
+            # mid-write target change is preserved: the previous target
+            # is restored only when the current one is still ours.
+            # ``wrote`` is marked BEFORE the attempt so even a write that
+            # throws mid-way stays owned — end_edit/cancel_edit then
+            # restore or record the exact truth instead of ignoring
+            # partial authorship.
+            token.wrote = True
+            for path in self._paths:
+                prim = self._stage.GetPrimAtPath(path)
+                if not prim.IsValid():
+                    continue
                 attr = prim.GetAttribute(attr_name)
-                if attr.IsValid():
+                if not attr.IsValid():
+                    continue
+                previous_target = self._stage.GetEditTarget()
+                self._stage.SetEditTarget(token.edit_target)
+                try:
                     attr.Set(usd_val)
+                finally:
+                    if self._stage.GetEditTarget() == token.edit_target:
+                        self._stage.SetEditTarget(previous_target)
+        else:
+            for path in self._paths:
+                prim = self._stage.GetPrimAtPath(path)
+                if prim.IsValid():
+                    attr = prim.GetAttribute(attr_name)
+                    if attr.IsValid():
+                        attr.Set(usd_val)
         self._notify()
 
     def end_edit(self, attr_name: str) -> None:
-        old = self._edit_snapshots.pop(attr_name, None)
-        new = self.get_value(attr_name)
-        if self._undo_manager:
-            if old != new:
-                prop = self._props[attr_name]
-                cmd = SetAttributeCommand(
-                    self._stage,
-                    list(self._paths),
-                    attr_name,
-                    prop.value_type,
-                    old,
-                    new,
-                )
-                self._undo_manager.push(cmd)
-            self._undo_manager.end_group()
+        from ovui_data_adapters.openusd.commands import (
+            _TargetedVisibilitySnapshot,
+        )
+
+        token = self._edit_snapshots.pop(attr_name, None)
+        if not isinstance(token, _PropertyEditToken):
+            # Unmatched end: inert by contract — it owns nothing and may
+            # not close a foreign group or touch any state.
+            return
+        _release_spec_claims(token)
+        if not token.wrote:
+            # This invocation authored nothing: whatever changed (foreign
+            # concurrent edits, a deletion, nothing at all) is not this
+            # transaction's to record.
+            return
+        if any(
+            not self._stage.GetPrimAtPath(path).IsValid()
+            for path in token.paths
+        ):
+            # A prim this edit wrote to was invalidated/deleted by a
+            # NON-undoable out-of-band mutation before the transaction
+            # closed (undoable namespace commands settle this edit FIRST
+            # through the UndoManager's pre-namespace settlers, so they
+            # never reach this guard): the foreign resync owns the truth
+            # now, and recording or "restoring" over it would fabricate
+            # history for a foreign change.
+            return
+        try:
+            # "Changed" is decided from the FROZEN TARGET's truth, not the
+            # resolved value: an edit shadowed by a stronger layer still
+            # authored real state and must stay undoable, while a
+            # same-value commit that left the layer untouched is a genuine
+            # no-op and never pollutes history.
+            if token.pre.matches(token.layer):
+                return
+            post = _TargetedVisibilitySnapshot(
+                token.layer, (), prop_name=attr_name,
+                prop_spec_paths=token.spec_paths)
+            if self._undo_manager:
+                self._undo_manager.push(SetAttributeCommand(
+                    token.layer, token.spec_paths, attr_name,
+                    token.pre, post))
+        except BaseException as primary:  # noqa: BLE001 — compensated
+            # STRUCTURED cancellation: a failure after authoring (post
+            # capture, push, replay verification) must not leave authored
+            # state with no history entry. Restore and verify the exact
+            # invocation baseline; the primary throwable stays primary.
+            try:
+                token.pre.replay(token.layer)
+            except BaseException as secondary:  # noqa: BLE001 — noted
+                add_note = getattr(primary, "add_note", None)
+                if callable(add_note):
+                    add_note(
+                        "baseline restoration also failed; layer state is "
+                        "conservative (genuine notices retained): "
+                        f"{type(secondary).__name__}: {secondary}"
+                    )
+            raise
+
+    def cancel_edit(self, attr_name: str) -> None:
+        """Cancel an active edit transaction, restoring its exact baseline.
+
+        Called by the owning model when the buffered write (or any step
+        between ``begin_edit`` and ``end_edit``) raises: any partial
+        authorship this invocation performed is removed by replaying the
+        pre-edit snapshot (verified), no history entry is created, and the
+        token is released. Safe (inert) without an active transaction.
+        """
+        token = self._edit_snapshots.pop(attr_name, None)
+        if not isinstance(token, _PropertyEditToken):
+            return
+        _release_spec_claims(token)
+        if token.wrote and all(
+            self._stage.GetPrimAtPath(path).IsValid()
+            for path in token.paths
+        ):
+            # Restore the exact pre-edit specs. Skipped when a target
+            # prim was genuinely deleted out-of-band: replaying would
+            # RESURRECT spec shells for a prim the foreign mutation
+            # removed.
+            token.pre.replay(token.layer)
+
+    def _settle_active_edits(self) -> None:
+        """Finalize or cancel every active edit transaction NOW.
+
+        Registered with the UndoManager as a pre-namespace settler: an
+        undoable namespace mutation (prim deletion, rename, reparent)
+        settles in-flight edits first, so every surviving owned write
+        gets its truthful history entry BEFORE the namespace changes and
+        no foreign namespace command is ever entangled with an active
+        edit. Edits that never wrote are cancelled without residue.
+        """
+        for attr_name in list(self._edit_snapshots):
+            token = self._edit_snapshots.get(attr_name)
+            if isinstance(token, _PropertyEditToken) and token.wrote:
+                self.end_edit(attr_name)
+            else:
+                self.cancel_edit(attr_name)
 
     def subscribe_changes(self, callback: Callable) -> Any:
         # PropertyAdapter's subscribe_changes contract takes a no-arg
@@ -806,6 +1083,9 @@ class UsdPropertyAdapter(PropertyAdapter):
 
     def get_scheme(self) -> str:
         return "usd"
+
+    def get_capabilities(self) -> PropertyCapabilities:
+        return _OPENUSD_PROPERTY_CAPABILITIES
 
     def clear_value(self, attr_name: str) -> None:
         """Remove the authored opinion for ``attr_name`` on every selected prim.

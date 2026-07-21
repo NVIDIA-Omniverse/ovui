@@ -32,12 +32,17 @@ class _NoopTickPatch:
         self._patch = patch.object(standalone._ui, "_standalone_tick", lambda: None)
         self._patch.__enter__()
         # Reset module state so each test starts from a clean slate.
+        # ``_initialized`` must read True: _tick_one_frame re-checks it under
+        # the native lock and skips the (stubbed) tick when torn down.
+        self._was_initialized = standalone._initialized
+        standalone._initialized = True
         standalone._frame_index = 0
         standalone._last_tick_time = None
         standalone._next_frame_futures = []
         return self
 
     def __exit__(self, *exc):
+        standalone._initialized = self._was_initialized
         return self._patch.__exit__(*exc)
 
 

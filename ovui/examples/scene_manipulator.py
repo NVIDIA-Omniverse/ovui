@@ -27,6 +27,7 @@ Usage::
 """
 
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from pathlib import Path
 _REPO_PYTHON = Path(__file__).resolve().parent.parent / "python"
 if _REPO_PYTHON.is_dir() and str(_REPO_PYTHON) not in sys.path:
     sys.path.insert(0, str(_REPO_PYTHON))
+_SCRIPT_DIR = Path(__file__).resolve().parent
 
 import omni.ui as ui
 from omni.ui_scene import scene as sc
@@ -73,6 +75,7 @@ _headless_mgr = _HeadlessGestureManager()
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 _SCREENSHOT = "--screenshot" in sys.argv
+_SCREENSHOT_FAILED = False
 
 WIN_W, WIN_H = 900, 680
 SCENE_H      = 580          # pixels of vertical space for the 3D viewport
@@ -469,10 +472,12 @@ with win.frame:
 
 async def _main():
     from omni.ui import testing
+    global _SCREENSHOT_FAILED
 
     await testing.wait_frames(12)          # let the scene settle
 
     if _SCREENSHOT:
+        screenshot_ok = True
         _status.text = (
             "Position: (+0.00, +0.00, +0.00)"
             "  |  omni.ui.scene translate manipulator  |  drag arrows to translate"
@@ -480,9 +485,14 @@ async def _main():
         await testing.wait_frames(6)
 
         # ── Initial state screenshot ──────────────────────────────────────────
-        out0 = "examples/scene_manipulator_screenshot.png"
-        testing.capture_screenshot(out0)
-        print(f"screenshot saved: {out0}")
+        out0 = str(_SCRIPT_DIR / "scene_manipulator_screenshot.png")
+        os.makedirs(os.path.dirname(out0) or ".", exist_ok=True)
+        ok = testing.capture_screenshot(out0)
+        if ok:
+            print(f"screenshot saved: {out0}")
+        else:
+            print(f"ERROR: screenshot capture failed: {out0}", file=sys.stderr)
+            screenshot_ok = False
 
         # ── Test X-axis drag: drag from the X-arrow shaft midpoint rightward ─
         # Project the X arrow shaft midpoint (0.95, 0, 0) to screen coords
@@ -521,9 +531,16 @@ async def _main():
         await testing.wait_frames(4)
 
         # ── Post-drag screenshot ──────────────────────────────────────────────
-        out1 = "examples/scene_manipulator_after_drag.png"
-        testing.capture_screenshot(out1)
-        print(f"screenshot saved: {out1}")
+        out1 = str(_SCRIPT_DIR / "scene_manipulator_after_drag.png")
+        os.makedirs(os.path.dirname(out1) or ".", exist_ok=True)
+        ok = testing.capture_screenshot(out1)
+        if ok:
+            print(f"screenshot saved: {out1}")
+        else:
+            print(f"ERROR: screenshot capture failed: {out1}", file=sys.stderr)
+            screenshot_ok = False
+        if not screenshot_ok:
+            _SCREENSHOT_FAILED = True
         print(f"cube position after X drag: {manipulator._pos}")
         return
 
@@ -538,3 +555,5 @@ async def _main():
 
 
 ui.run(_main())
+if _SCREENSHOT and _SCREENSHOT_FAILED:
+    sys.exit(1)

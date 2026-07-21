@@ -1,18 +1,21 @@
 ---
 name: omniverse-ui-styling
 description: >-
-  Use this skill for ovui and ovwidgets styling work: palettes, colour /
+  Use this skill for ovui and ovui-widgets styling work: palettes, colour /
   float / URL constants, theme shades, ui.style.default, style dictionaries,
   selector grammar, widget name variants, style_type_name_override values,
   naming conventions, style hierarchy, the centralised style module, and
   styling reviews. This skill is the authoritative target style guide.
 author: "NVIDIA ovui Team <ovui-team@nvidia.com>"
 license: "LicenseRef-NVIDIA"
+metadata:
+  python-distribution: ovui-widgets-app
+  version: "0.2.0"
 ---
 
 # OVUI Styling
 
-This skill is the authoritative style guide for ovui and ovwidgets. It defines the target architecture, naming conventions, selector grammar, and centralised module layout that every styling decision must follow.
+This skill is the authoritative style guide for ovui and ovui-widgets. It defines the target architecture, naming conventions, selector grammar, and centralised module layout that every styling decision must follow.
 
 ## Required workflow
 
@@ -23,7 +26,7 @@ This skill is the authoritative style guide for ovui and ovwidgets. It defines t
    - per-surface override or new domain type
    - styling review.
 2. Read the references that cover the decision before changing code. The guide is split by topic; load only what is relevant.
-3. Inspect existing ovui and ovwidgets style code with `rg` before introducing a new constant or selector. Reuse the existing naming family; do not invent a parallel one.
+3. Inspect existing ovui and ovui-widgets style code with `rg` before introducing a new constant or selector. Reuse the existing naming family; do not invent a parallel one.
 4. Keep constants and styles in separate layers:
    - constants live in the centralised module (`cl.*`, `fl.*`, `url.*`)
    - style dictionaries map selectors to property values

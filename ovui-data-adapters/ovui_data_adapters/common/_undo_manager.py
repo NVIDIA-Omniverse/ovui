@@ -10,17 +10,18 @@
 
 """Structural protocol for undo managers consumed by data adapters.
 
-Part of ``ovui-data-adapters-common`` — zero-dependency, stdlib-only.
+Part of ``ovui-data-adapters-common``; this module is stdlib-only at runtime.
 
 Concrete OpenUSD adapters (added in later refactor steps) need to type
 their ``undo_manager`` parameter without importing the concrete
-``ovwidgets.common.undo.UndoManager`` class — that import would create
-the forbidden ``ovui-data-adapters-openusd -> ovwidgets-common`` edge.
+``ovui_data_adapters.services.undo.UndoManager`` class. Keeping the protocol
+in adapter-common avoids forcing low-level adapter packages to depend on the
+higher-level services distribution.
 
 Any object exposing the three group/push methods below satisfies this
-protocol. The concrete ``UndoManager`` and ``_NullUndoManager`` classes
-in ``ovwidgets.common.undo`` satisfy it structurally; future non-widget
-undo backends can satisfy it without importing widget code.
+protocol. The concrete ``UndoManager`` and ``_NullUndoManager`` classes in
+``ovui_data_adapters.services.undo`` satisfy it structurally; the
+``ovui_widgets.common.undo`` compatibility path re-exports that manager.
 """
 
 from typing import Protocol, runtime_checkable

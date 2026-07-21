@@ -43,7 +43,7 @@ way is the same `pip install -e .` invocation CI uses.
 ### Headless Vulkan (matches CI leg B1)
 
 ```bash
-source ~/dev/ovui/ovwidgets/_venv312/bin/activate
+source ~/dev/ovui/ovui-widgets/_venv312/bin/activate
 export OMNIUI_HEADLESS=1
 export OMNIUI_BACKEND=vulkan
 pytest tests/ --forked -m "not requires_gl and not requires_cuda" -q
@@ -94,14 +94,16 @@ Currently registered:
 | `OMNIUI_LAVAPIPE`                 | `1` — pin the Vulkan ICD to Mesa Lavapipe (CPU rasterizer, used in CI for reproducibility).  |
 | `OMNIUI_EGL_FORCE_SURFACELESS`    | `1` — force `EGL_MESA_platform_surfaceless`, no display server.                              |
 | `MESA_GL_VERSION_OVERRIDE`        | `3.3` — what Mesa advertises to the application.                                             |
-| `OMNI_UI_GOLDEN_STRICT`           | `1` — fail on missing goldens instead of silently generating them. Will be re-enabled on B1 once `tests/golden/vulkan/` is rebaselined on Lavapipe. |
+| `OMNI_UI_GOLDEN_STRICT`           | `1` — fail on missing goldens instead of silently generating them. CI sets this on B1 and B3 so PRs cannot silently create or drift baselines. |
 | `OMNI_UI_GENERATE_GOLDEN`         | `1` — overwrite the golden with the current capture. Use when intentionally rebaselining.    |
-| `OMNI_UI_SKIP_GOLDEN_TESTS`       | `1` — render normally but skip the image comparison. CI sets this on B1 (until Lavapipe rebaseline) and B3.       |
+| `OMNI_UI_SKIP_GOLDEN_TESTS`       | `1` — render normally but skip the image comparison. This is for temporary local diagnostics only; PR CI should not set it.       |
 | `OMNI_UI_GOLDEN_DIR`              | Override the golden root. Defaults to `tests/golden/`.                                       |
 
 The `_backend_tag()` helper in `tests/test_base.py` derives the backend
-subdirectory (`vulkan`, `egl`, or `opengl`) from these variables. See
-`tests/test_backend_tag.py` for the canonical mapping.
+subdirectory (`vulkan`, `egl`, or `opengl`) from these variables. On AArch64,
+the test helper also looks for an approved per-image override under an
+`aarch64/` child directory. See `tests/test_backend_tag.py` for the canonical
+backend mapping.
 
 ---
 
@@ -127,9 +129,13 @@ pytest tests/ -m "requires_gl"
 ### Reading
 `finalize_test()` in `OmniUiTest` saves a screenshot to
 `tests/captured/<ImageName>.png` and compares it to
-`tests/golden/<backend_tag>/<ImageName>.png`. A legacy untagged path
-(`tests/golden/<ImageName>.png`) is read as a transitional fallback when no
-tagged baseline exists yet — but writes always target the tagged path.
+`tests/golden/<backend_tag>/<ImageName>.png`. On AArch64 it first checks
+`tests/golden/<backend_tag>/aarch64/<ImageName>.png`, allowing only images with
+proven architecture-specific rasterization to override the shared baseline. A
+legacy untagged path (`tests/golden/<ImageName>.png`) is read as a transitional
+fallback when no tagged baseline exists yet. Writes target the architecture
+override on AArch64 and the shared backend path on other architectures; they
+never target the legacy path.
 
 The comparison metric is mean per-channel absolute difference (range
 `[0, 255]`). On mismatch the failure message has the format
@@ -143,7 +149,9 @@ CI parsers depend on that exact format — see `tests/test_base.py:392`.
 ### Regenerating
 
 After an *intentional* rendering change, regenerate the affected backend's
-baselines under that exact backend's environment:
+baselines under that exact backend and architecture environment. An AArch64
+run writes to the `aarch64/` override directory and leaves shared x86_64
+baselines untouched:
 
 ```bash
 # from a workstation with the right backend env exported
@@ -169,13 +177,11 @@ dispatched branch.
 Strict mode prevents goldens from being created accidentally during a
 random local run and committed without review.
 
-B1 currently sets `OMNI_UI_SKIP_GOLDEN_TESTS=1`: the existing
-`tests/golden/vulkan/` baselines were captured on a real GPU and Mesa
-Lavapipe (the CI software ICD) drifts on anti-aliased edges by 1-9%,
-which the always-strict mismatch check treats as a regression. The
-render path still runs (only the byte-comparison is skipped). B1 will
-drop the skip and switch to strict mode once the Vulkan goldens are
-regenerated on Lavapipe via `generate-goldens.yml`.
+B1 and B3 run with `OMNI_UI_GOLDEN_STRICT=1`. Missing baselines fail the
+run, and existing baselines are compared on every PR. Regenerate backend
+baselines with `generate-goldens.yml` after intentional visual changes,
+then review and commit the resulting PNG diff like any other source
+change.
 
 ---
 
@@ -188,9 +194,9 @@ non-instrumented CPython aborts at import time on hosted runners.
 
 | Leg | Workflow                            | Runner / framework            | Backend          | Goldens     | Markers excluded            |
 | --- | ----------------------------------- | ----------------------------- | ---------------- | ----------- | --------------------------- |
-| B1  | `.github/workflows/test-b1-vulkan.yml`      | pytest                        | Vulkan + Lavapipe        | skipped (`OMNI_UI_SKIP_GOLDEN_TESTS=1`) until rebaselined on Lavapipe (`tests/golden/vulkan/` was captured on a real GPU) | `requires_gl`, `requires_cuda` (auto: `requires_glfw`) |
+| B1  | `.github/workflows/test-b1-vulkan.yml`      | pytest                        | Vulkan + Lavapipe        | strict compare against `tests/golden/vulkan/` | `requires_gl`, `requires_cuda` (auto: `requires_glfw`) |
 | B2  | `.github/workflows/test-b2-vulkan-asan.yml` | ctest (native C++)            | none (CPU)               | n/a (no pytest) | n/a (runs `markdown_model_tests`, `markdown_fuzz_tests` only)  |
-| B3  | `.github/workflows/test-b3-egl.yml`         | pytest                        | EGL surfaceless          | skipped until `tests/golden/egl/` is populated | `requires_cuda` (auto: `requires_glfw`) |
+| B3  | `.github/workflows/test-b3-egl.yml`         | pytest                        | EGL surfaceless          | strict compare against `tests/golden/egl/` | `requires_cuda` (auto: `requires_glfw`) |
 
 Helper workflows:
 
@@ -204,5 +210,4 @@ B2 runs the native C++ tests (`markdown_model_tests`, `markdown_fuzz_tests`)
 under AddressSanitizer via CTest. No renderer or compositor is involved, so
 golden comparison does not apply. B1 owns golden enforcement.
 
-B3 will switch to strict mode once the EGL baselines are generated and
-committed (Step 31 of issue #36).
+B3 owns EGL-surfaceless golden enforcement.

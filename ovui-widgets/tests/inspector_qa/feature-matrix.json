@@ -1,0 +1,1203 @@
+{
+  "schema_version": 2,
+  "support_status_definition": {
+    "supported": "The OVStage provider implements the feature within the scope stated by this ledger.",
+    "accepted_unsupported": "The feature cannot be implemented faithfully by the native-only OVStage provider (no OpenUSD bridge) and is explicitly accepted rather than emulated.",
+    "not_applicable": "The original ledger item was mis-scoped and is retained only as an audit record."
+  },
+  "evidence_status_definition": {
+    "inspector_covered": "A named state-guided real-runtime scenario performs the complete scoped visible action through ovui-inspect and records screenshots plus semantic evidence.",
+    "inspector_partial": "A named state-guided real-runtime scenario exercises the feature, but one or more required variants or interaction assertions remain outside that scenario.",
+    "contract_covered": "Lower-level adapter/widget tests cover the declared contract; no complete real-runtime Inspector scenario is claimed.",
+    "open_evidence": "The feature may be implemented, but the required evidence has not been completed."
+  },
+  "release_tier_definition": {
+    "ovui_0_1_baseline": "The feature was present in the ovui 0.1 USD Stage adapter or USD Viewer and is part of the parity baseline.",
+    "post_0_1_usd_extension": "The feature was added to the USD-backed product after 0.1; it is tracked separately from the strict 0.1 parity claim.",
+    "ovui_0_2_ovstage_only": "The feature or limitation exists only in the native OVStage integration."
+  },
+  "baseline_manifest": {
+    "name": "ovui_0_1_usd_stage_adapter_and_viewer",
+    "scope": "Provider-dependent adapter and USD Viewer operations present in ovui 0.1. Provider-neutral ovui primitives and unchanged camera-navigation controls are outside this migration ledger.",
+    "feature_ids": [
+      "file.new",
+      "file.open",
+      "file.save",
+      "file.save_as",
+      "file.export_stage",
+      "stage.hierarchy",
+      "stage.usd_child_order",
+      "stage.expand_collapse",
+      "stage.filter",
+      "stage.selection_from_row",
+      "stage.selection_from_viewport",
+      "stage.multiselect",
+      "stage.delete",
+      "stage.rename",
+      "stage.reparent",
+      "stage.visibility",
+      "stage.default_prim_identity",
+      "stage.composition_badges",
+      "create.geometry_meshes",
+      "create.geometry_shapes",
+      "create.lights",
+      "create.camera",
+      "create.scope",
+      "create.xform",
+      "create.material",
+      "property.scalar_edit",
+      "property.vector_edit",
+      "property.token_edit",
+      "property.clear_reset",
+      "property.multi_selection",
+      "transform.translate",
+      "transform.rotate",
+      "transform.scale",
+      "transform.snap",
+      "history.undo",
+      "history.redo",
+      "layers.layer_stack",
+      "layers.edit_target_read",
+      "layers.edit_target_write",
+      "layers.save_layer",
+      "layers.save_layer_as",
+      "layers.create_sublayer",
+      "layers.insert_sublayer",
+      "layers.remove_sublayer",
+      "layers.reload_layer",
+      "layers.mute_layer",
+      "layers.lock_layer",
+      "layers.move_sublayer",
+      "layers.replace_sublayer",
+      "layers.prim_spec_read",
+      "layers.prim_spec_edit",
+      "layers.layer_snapshot",
+      "layers.layer_restore",
+      "layers.transfer_layer_content",
+      "layers.merge_down",
+      "layers.flatten_sublayers",
+      "renderer.initial_frame",
+      "renderer.point_pick",
+      "renderer.pick_miss",
+      "renderer.marquee_pick",
+      "renderer.selection_outline",
+      "livestream.headless_full_ui",
+      "livestream.windowed_viewport"
+    ]
+  },
+  "features": [
+    {
+      "id": "file.new",
+      "surface": "File",
+      "required_evidence": [
+        "menu_click",
+        "empty_file_backed_usd",
+        "ovstage_open",
+        "screenshot",
+        "native_scene_state",
+        "old_history_cleared"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API can construct an in-memory stage but exposes no durable new-document creation; the provider fails closed instead of writing an empty USD file through an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_provider_file_actions_fail_without_side_effects",
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_stage_capabilities_advertise_exact_native_authoring"
+      ]
+    },
+    {
+      "id": "file.open",
+      "surface": "File",
+      "required_evidence": [
+        "menu_click",
+        "dialog_accept",
+        "screenshot",
+        "native_scene_state"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_file_workflows.py::test_file_open_dialog_loads_scene_into_native_ovstage"
+      ]
+    },
+    {
+      "id": "file.save",
+      "surface": "File",
+      "required_evidence": [
+        "shortcut_or_menu",
+        "disk_round_trip",
+        "scene_comparison"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The native-only provider cannot export or persist documents (can_export_stage is False); Save stays disabled in the File menu instead of offering an action the provider would refuse.",
+      "contract_evidence": [
+        "ovui-widgets/tests/test_menu_bar.py::TestFileMenuIncludesSaveItems::test_save_items_disabled_with_loaded_native_ovstage_session",
+        "ovui-widgets/tests/test_ovstage_inert_features.py::test_ovstage_provider_session_reports_persistent_and_authoring_gates"
+      ]
+    },
+    {
+      "id": "file.save_as",
+      "surface": "File",
+      "required_evidence": [
+        "menu_click",
+        "dialog_accept",
+        "overwrite_confirm",
+        "disk_round_trip"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The native-only provider cannot export or persist documents (can_export_stage is False); Save As stays disabled in the File menu instead of offering an action the provider would refuse.",
+      "contract_evidence": [
+        "ovui-widgets/tests/test_menu_bar.py::TestFileMenuIncludesSaveItems::test_save_items_disabled_with_loaded_native_ovstage_session",
+        "ovui-widgets/tests/test_ovstage_inert_features.py::test_ovstage_provider_session_reports_persistent_and_authoring_gates"
+      ]
+    },
+    {
+      "id": "file.export_stage",
+      "surface": "File",
+      "required_evidence": [
+        "provider_capability",
+        "composed_usd_export",
+        "reopen_round_trip",
+        "active_stage_identity_check"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_stage_capabilities_advertise_exact_native_authoring",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_provider_file_actions_fail_without_side_effects"
+      ],
+      "scope_note": "The exact OVStage 0.1 API exposes no stage export or serialization; export fails closed with an explicit reason instead of delegating to an OpenUSD bridge."
+    },
+    {
+      "id": "file.combined_snapshot_export",
+      "surface": "File",
+      "required_evidence": [
+        "persistent_export_scope",
+        "transient_state_excluded",
+        "live_stage_unmodified"
+      ],
+      "release_tier": "ovui_0_2_ovstage_only",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The native-only provider exports nothing at all: neither the persistent composed document nor a one-file snapshot that would also materialize transient OVStage preview, physics, and private presentation state.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_stage_capabilities_advertise_exact_native_authoring"
+      ]
+    },
+    {
+      "id": "stage.hierarchy",
+      "surface": "Stage",
+      "required_evidence": [
+        "visible_rows",
+        "parent_child_topology",
+        "adapter_native_comparison"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_stage_browser_workflows.py::test_stage_hierarchy_rows_and_expand_collapse_reflect_native_topology"
+      ]
+    },
+    {
+      "id": "stage.usd_child_order",
+      "surface": "Stage",
+      "required_evidence": [
+        "composed_usd_get_all_children_order",
+        "live_ovstage_identity_filter",
+        "visible_row_order",
+        "before_after_screenshot"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_stage_topology.py::test_children_enumerate_in_native_order_not_authored_usd_order"
+      ],
+      "scope_note": "Exact OVStage enumerates children in its own native (lexicographic) order; authored USD child order is not preserved and is not restored through an OpenUSD bridge."
+    },
+    {
+      "id": "stage.expand_collapse",
+      "surface": "Stage",
+      "required_evidence": [
+        "row_click",
+        "before_after_screenshot",
+        "selection_preserved"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_stage_browser_workflows.py::test_stage_hierarchy_rows_and_expand_collapse_reflect_native_topology"
+      ]
+    },
+    {
+      "id": "stage.filter",
+      "surface": "Stage",
+      "required_evidence": [
+        "field_click",
+        "keyboard_type",
+        "filtered_rows",
+        "clear"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_stage_browser_workflows.py::test_stage_multiselect_filter_clear_and_visibility_round_trip"
+      ]
+    },
+    {
+      "id": "stage.selection_from_row",
+      "surface": "Selection",
+      "required_evidence": [
+        "row_click",
+        "stage_selection",
+        "property_selection",
+        "viewport_selection"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_stage_browser_workflows.py::test_stage_multiselect_filter_clear_and_visibility_round_trip"
+      ]
+    },
+    {
+      "id": "stage.selection_from_viewport",
+      "surface": "Selection",
+      "scenarios": [
+        "test_ovstage_stage_workflows.py::test_viewport_pick_delete_undo_redo_preserve_native_scene_state"
+      ],
+      "required_evidence": [
+        "viewport_click",
+        "selection_path",
+        "renderer_pick_path",
+        "screenshots"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered"
+    },
+    {
+      "id": "stage.multiselect",
+      "surface": "Selection",
+      "required_evidence": [
+        "ctrl_click",
+        "shift_click",
+        "all_surfaces_match"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_stage_browser_workflows.py::test_stage_multiselect_filter_clear_and_visibility_round_trip"
+      ]
+    },
+    {
+      "id": "stage.delete",
+      "surface": "Stage",
+      "scenarios": [
+        "test_ovstage_stage_workflows.py::test_viewport_pick_delete_undo_redo_preserve_native_scene_state"
+      ],
+      "required_evidence": [
+        "delete_key",
+        "native_absent",
+        "row_absent",
+        "screenshots"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered"
+    },
+    {
+      "id": "stage.rename",
+      "surface": "Stage",
+      "required_evidence": [
+        "f2",
+        "keyboard_type",
+        "commit",
+        "collision",
+        "native_scene_state"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_stage_browser_workflows.py::test_stage_rename_and_reparent_remap_selection_with_undo_redo"
+      ]
+    },
+    {
+      "id": "stage.reparent",
+      "surface": "Stage",
+      "required_evidence": [
+        "row_drag",
+        "drop_target",
+        "native_namespace_state",
+        "cycle_rejection"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_stage_browser_workflows.py::test_stage_rename_and_reparent_remap_selection_with_undo_redo"
+      ]
+    },
+    {
+      "id": "stage.visibility",
+      "surface": "Stage",
+      "required_evidence": [
+        "eye_click",
+        "native_visibility",
+        "ovstage_visibility",
+        "viewport_change"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_stage_browser_workflows.py::test_stage_multiselect_filter_clear_and_visibility_round_trip"
+      ]
+    },
+    {
+      "id": "stage.default_prim_identity",
+      "surface": "Stage",
+      "required_evidence": [
+        "visible_identity_marker",
+        "root_default_prim_metadata",
+        "native_metadata_inert"
+      ],
+      "scope_note": "Exact OVStage exposes no default-prim metadata; identity flags stay truthfully inert instead of being derived from an OpenUSD bridge.",
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_stage_topology.py::test_badge_and_item_flags_are_truthfully_inert_without_composition_data"
+      ]
+    },
+    {
+      "id": "stage.composition_badges",
+      "surface": "Stage",
+      "required_evidence": [
+        "references",
+        "payloads",
+        "inherits",
+        "specializes",
+        "instance",
+        "inactive",
+        "class",
+        "over"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "Exact OVStage exposes no composition-arc metadata; badges stay truthfully inert instead of being derived from an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_stage_topology.py::test_badge_and_item_flags_are_truthfully_inert_without_composition_data"
+      ]
+    },
+    {
+      "id": "create.geometry_meshes",
+      "surface": "Create",
+      "required_evidence": [
+        "menu_each_family",
+        "native_types",
+        "ovstage_paths",
+        "viewport",
+        "undo_redo"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "open_evidence",
+      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
+    },
+    {
+      "id": "create.geometry_shapes",
+      "surface": "Create",
+      "required_evidence": [
+        "menu_each_family",
+        "native_types",
+        "ovstage_paths",
+        "viewport",
+        "undo_redo"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "open_evidence",
+      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
+    },
+    {
+      "id": "create.lights",
+      "surface": "Create",
+      "required_evidence": [
+        "menu_each_type",
+        "native_types",
+        "ovstage_paths",
+        "viewport"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "open_evidence",
+      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
+    },
+    {
+      "id": "create.camera",
+      "surface": "Create",
+      "required_evidence": [
+        "menu_click",
+        "camera_schema",
+        "ovstage_path",
+        "camera_choice"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "open_evidence",
+      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
+    },
+    {
+      "id": "create.scope",
+      "surface": "Create",
+      "required_evidence": [
+        "menu_click",
+        "scope_schema",
+        "ovstage_path"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "open_evidence",
+      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
+    },
+    {
+      "id": "create.xform",
+      "surface": "Create",
+      "required_evidence": [
+        "menu_click",
+        "xform_schema",
+        "ovstage_path"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_ovstage_stage_workflows.py::test_create_xform_through_visible_menu_populates_native_ovstage"
+      ]
+    },
+    {
+      "id": "create.material",
+      "surface": "Create",
+      "required_evidence": [
+        "menu_click",
+        "material_network",
+        "ovstage_path"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "open_evidence",
+      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
+    },
+    {
+      "id": "property.scalar_edit",
+      "surface": "Property",
+      "required_evidence": [
+        "field_click",
+        "keyboard_type",
+        "native_value",
+        "ui_row_value"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_property_transform_workflows.py::test_property_scalar_vector_token_and_mixed_selection_edit_native_ovstage"
+      ]
+    },
+    {
+      "id": "property.vector_edit",
+      "surface": "Property",
+      "required_evidence": [
+        "component_field",
+        "native_value",
+        "ui_row_value",
+        "viewport_change"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_property_transform_workflows.py::test_property_scalar_vector_token_and_mixed_selection_edit_native_ovstage"
+      ]
+    },
+    {
+      "id": "property.token_edit",
+      "surface": "Property",
+      "required_evidence": [
+        "combo_click",
+        "selection",
+        "native_value",
+        "ui_row_value"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_property_transform_workflows.py::test_property_scalar_vector_token_and_mixed_selection_edit_native_ovstage"
+      ]
+    },
+    {
+      "id": "property.clear_reset",
+      "surface": "Property",
+      "required_evidence": [
+        "context_menu",
+        "opinion_removed",
+        "composed_value",
+        "undo_redo"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "OVStage exposes no authored-opinion/default query, so clear-to-default is refused and reset controls stay disabled instead of guessing a default value.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_property_capabilities_match_missing_clear_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_property_clear_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "property.multi_selection",
+      "surface": "Property",
+      "required_evidence": [
+        "mixed_value",
+        "edit_all",
+        "distinct_undo_restore"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_property_transform_workflows.py::test_property_scalar_vector_token_and_mixed_selection_edit_native_ovstage"
+      ]
+    },
+    {
+      "id": "transform.translate",
+      "surface": "Viewport",
+      "required_evidence": [
+        "gizmo_drag",
+        "native_matrix",
+        "ovstage_matrix",
+        "property_refresh"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_property_transform_workflows.py::test_grid_snap_viewport_translate_authors_native_ovstage"
+      ]
+    },
+    {
+      "id": "transform.rotate",
+      "surface": "Viewport",
+      "required_evidence": [
+        "tool_shortcut",
+        "gizmo_drag",
+        "native_matrix",
+        "ovstage_matrix"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_value_authoring_contract.py::test_transform_command_is_exact_notified_and_rejects_nonfinite"
+      ],
+      "scenarios": [
+        "test_property_transform_workflows.py::test_viewport_translate_rotate_scale_gizmos_author_native_ovstage"
+      ]
+    },
+    {
+      "id": "transform.scale",
+      "surface": "Viewport",
+      "required_evidence": [
+        "tool_shortcut",
+        "gizmo_drag",
+        "native_matrix",
+        "ovstage_matrix"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_value_authoring_contract.py::test_transform_command_is_exact_notified_and_rejects_nonfinite"
+      ],
+      "scenarios": [
+        "test_property_transform_workflows.py::test_viewport_translate_rotate_scale_gizmos_author_native_ovstage"
+      ]
+    },
+    {
+      "id": "transform.snap",
+      "surface": "Viewport",
+      "required_evidence": [
+        "snap_toggle",
+        "gizmo_drag",
+        "quantized_matrix"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_property_transform_workflows.py::test_grid_snap_viewport_translate_authors_native_ovstage"
+      ]
+    },
+    {
+      "id": "history.undo",
+      "surface": "Edit",
+      "scenarios": [
+        "test_ovstage_stage_workflows.py::test_viewport_pick_delete_undo_redo_preserve_native_scene_state"
+      ],
+      "required_evidence": [
+        "ctrl_z",
+        "native_restore",
+        "selection_restore"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered"
+    },
+    {
+      "id": "history.redo",
+      "surface": "Edit",
+      "scenarios": [
+        "test_ovstage_stage_workflows.py::test_viewport_pick_delete_undo_redo_preserve_native_scene_state"
+      ],
+      "required_evidence": [
+        "ctrl_shift_z",
+        "native_reapply"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered"
+    },
+    {
+      "id": "layers.layer_stack",
+      "surface": "Layers",
+      "required_evidence": [
+        "visible_stack",
+        "logical_root",
+        "sublayer_order",
+        "population_wrappers_hidden"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.edit_target_read",
+      "surface": "Layers",
+      "required_evidence": [
+        "visible_authoring_layer",
+        "adapter_edit_target",
+        "exact_usd_edit_target"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.edit_target_write",
+      "surface": "Layers",
+      "required_evidence": [
+        "row_action",
+        "exact_usd_edit_target",
+        "population_sync",
+        "authored_layer"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.save_layer",
+      "surface": "Layers",
+      "required_evidence": [
+        "row_action",
+        "disk_content",
+        "dirty_state_cleared"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.save_layer_as",
+      "surface": "Layers",
+      "required_evidence": [
+        "exported_layer_file",
+        "optional_parent_replacement",
+        "composition_sync",
+        "undo_restore"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ],
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge."
+    },
+    {
+      "id": "layers.create_sublayer",
+      "surface": "Layers",
+      "required_evidence": [
+        "create_action",
+        "anonymous_or_file_layer",
+        "composition_sync",
+        "undo_redo"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.insert_sublayer",
+      "surface": "Layers",
+      "required_evidence": [
+        "file_dialog",
+        "existing_layer_reference",
+        "composed_prims",
+        "population_sync"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.remove_sublayer",
+      "surface": "Layers",
+      "required_evidence": [
+        "remove_action",
+        "sublayer_reference_removed",
+        "composed_prims_removed",
+        "population_sync"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.reload_layer",
+      "surface": "Layers",
+      "required_evidence": [
+        "reload_confirmation",
+        "disk_content_restored",
+        "composition_sync",
+        "dirty_state_cleared"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.mute_layer",
+      "surface": "Layers",
+      "required_evidence": [
+        "mute_toggle",
+        "composition_excluded",
+        "unmute_restore",
+        "population_sync"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.lock_layer",
+      "surface": "Layers",
+      "required_evidence": [
+        "lock_toggle",
+        "authoring_disabled",
+        "unlock_restore",
+        "persistent_lock_metadata"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.move_sublayer",
+      "surface": "Layers",
+      "required_evidence": [
+        "row_drag",
+        "sublayer_order",
+        "composition_sync",
+        "undo_redo"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.replace_sublayer",
+      "surface": "Layers",
+      "required_evidence": [
+        "atomic_reference_replace",
+        "old_identifier_returned",
+        "composition_sync",
+        "failure_compensation"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ],
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge."
+    },
+    {
+      "id": "layers.prim_spec_read",
+      "surface": "Layers",
+      "required_evidence": [
+        "expand_specs",
+        "ordered_direct_children",
+        "spec_identity",
+        "selection"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.prim_spec_edit",
+      "surface": "Layers",
+      "required_evidence": [
+        "export_remove_import_round_trip",
+        "composition_sync",
+        "undo_redo",
+        "dirty_state"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ]
+    },
+    {
+      "id": "layers.layer_snapshot",
+      "surface": "Layers",
+      "required_evidence": [
+        "content_snapshot",
+        "parent_position",
+        "mute_lock_state",
+        "edit_target_state"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ],
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge."
+    },
+    {
+      "id": "layers.layer_restore",
+      "surface": "Layers",
+      "required_evidence": [
+        "content_restored",
+        "parent_position_restored",
+        "mute_lock_restored",
+        "edit_target_restored"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ],
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge."
+    },
+    {
+      "id": "layers.transfer_layer_content",
+      "surface": "Layers",
+      "required_evidence": [
+        "source_opinions_copied",
+        "source_preserved",
+        "stronger_source_wins",
+        "composition_sync"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ],
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge."
+    },
+    {
+      "id": "layers.merge_down",
+      "surface": "Layers",
+      "required_evidence": [
+        "stronger_layer_merged_into_weaker",
+        "source_reference_removed",
+        "undo_restores_both_layers",
+        "redo_reapplies"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ],
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge."
+    },
+    {
+      "id": "layers.flatten_sublayers",
+      "surface": "Layers",
+      "required_evidence": [
+        "all_direct_sublayers_merged",
+        "direct_references_removed",
+        "undo_restores_parent_and_children",
+        "redo_reapplies"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_ovstage_adapter_capabilities.py::test_ovstage_layer_capabilities_match_inert_layer_stack_behavior",
+        "ovui-data-adapters/ovui_data_adapters/ovstage/tests/test_unsupported_behavior.py::test_unsupported_layer_surface_has_no_hybrid_delegate"
+      ],
+      "scope_note": "The exact OVStage 0.1 API exposes no logical USD layer stack; the native-only layer adapter is truthfully inert (empty stack, refused mutations) instead of delegating to an OpenUSD bridge."
+    },
+    {
+      "id": "renderer.initial_frame",
+      "surface": "Viewport",
+      "required_evidence": [
+        "real_ovrtx",
+        "borrow_attach",
+        "nonblack_viewport",
+        "screenshot"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "scenarios": [
+        "test_ovstage_stage_workflows.py::test_viewport_pick_delete_undo_redo_preserve_native_scene_state"
+      ]
+    },
+    {
+      "id": "renderer.point_pick",
+      "surface": "Viewport",
+      "scenarios": [
+        "test_ovstage_stage_workflows.py::test_viewport_pick_delete_undo_redo_preserve_native_scene_state"
+      ],
+      "required_evidence": [
+        "viewport_click",
+        "renderer_pick_path",
+        "selection_bus"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered"
+    },
+    {
+      "id": "renderer.pick_miss",
+      "surface": "Viewport",
+      "required_evidence": [
+        "empty_viewport_click",
+        "selection_clear"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_point_pick_empty_space_near_geometry_reports_miss"
+      ],
+      "scenarios": [
+        "test_renderer_feature_workflows.py::test_camera_point_miss_and_marquee_use_real_borrow_renderer"
+      ]
+    },
+    {
+      "id": "renderer.marquee_pick",
+      "surface": "Viewport",
+      "required_evidence": [
+        "rectangle_query",
+        "multiple_hits",
+        "selection_sync"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_marquee_pick_dedupes_scene_paths_and_drops_runtime_paths",
+        "ovui-widgets/tests/test_viewport_selection_sync.py::test_marquee_pick_validates_paths_and_common_bus_clears_highlight",
+        "ovui-widgets/tests/test_viewport_resolution_coordinates.py::test_marquee_rect_is_clipped_to_aspect_fit_display_rect"
+      ],
+      "scenarios": [
+        "test_renderer_feature_workflows.py::test_camera_point_miss_and_marquee_use_real_borrow_renderer"
+      ]
+    },
+    {
+      "id": "renderer.selection_outline",
+      "surface": "Viewport",
+      "required_evidence": [
+        "outline_membership_tracks_selection",
+        "renderer_owned_presentation_state_only",
+        "zero_data_plane_attribute_writes"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "contract_covered",
+      "scope_note": "Per-prim selection outlines follow viewport/stage selection via the renderer-owned membership API (ovrtx 0.4); no writes enter the borrowed OVStage data plane.",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_outline_lifecycle_set_move_clear_with_single_activation",
+        "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_selection_highlight_degrades_honestly_without_outline_api",
+        "ovui-data-adapters/tests/ovstage/test_renderer_borrow_contract.py::test_ovrtx_renderer_calls_remain_presentation_only"
+      ]
+    },
+    {
+      "id": "renderer.settings",
+      "surface": "Viewport tools",
+      "required_evidence": [
+        "settings_edit",
+        "usd_setting",
+        "render_change",
+        "reset"
+      ],
+      "release_tier": "post_0_1_usd_extension",
+      "support_status": "accepted_unsupported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_renderer_feature_parity.py::test_render_settings_fail_closed_without_native_authoring"
+      ],
+      "scope_note": "Native OVStage render-setting discovery and authoring are not available; the catalog is empty and read/validate/apply/reset are rejected as unsupported instead of authoring backing USD."
+    },
+    {
+      "id": "livestream.headless_full_ui",
+      "surface": "Livestream",
+      "required_evidence": [
+        "provider_neutral_rgba_frame",
+        "packed_and_channel_last_layouts",
+        "returned_input",
+        "zero_ovrtx_scene_data_calls"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_provider_registration.py::test_ovstage_session_creates_real_common_livestream_tap_without_ovrtx_data_api",
+        "ovui-widgets/tests/test_livestream_tap.py"
+      ]
+    },
+    {
+      "id": "livestream.windowed_viewport",
+      "surface": "Livestream",
+      "required_evidence": [
+        "mapped_ovrtx_rgba_tee",
+        "gpu_zero_copy_when_compatible",
+        "cpu_fallback_when_required",
+        "mapping_lifetime_and_shutdown"
+      ],
+      "release_tier": "ovui_0_1_baseline",
+      "support_status": "supported",
+      "evidence_status": "inspector_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_renderer_livestream.py::test_init_gates_provider_neutral_livestream_and_exposes_property",
+        "ovui-data-adapters/tests/ovstage/test_renderer_livestream.py::test_zero_copy_ui_and_livestream_share_one_cuda_mapping",
+        "ovui-data-adapters/tests/ovstage/test_renderer_livestream.py::test_livestream_only_tees_cuda_output_and_returns_host_frame",
+        "ovui-data-adapters/tests/ovstage/test_renderer_livestream.py::test_livestream_cuda_failure_falls_back_to_cpu_output",
+        "ovui-data-adapters/tests/ovstage/test_renderer_livestream.py::test_shutdown_closes_livestream_once_and_releases_renderer"
+      ],
+      "scope_note": "The renderer-owned tap tees the mapped presentation output; it does not query or author OVRTX scene data. External-client reconnect evidence remains a validation enhancement, not an implementation gap.",
+      "scenarios": [
+        "test_renderer_feature_workflows.py::test_windowed_livestream_tees_borrowed_frame_and_shuts_down_cleanly"
+      ]
+    },
+    {
+      "id": "physics.enable_play_stop",
+      "surface": "Physics",
+      "required_evidence": [
+        "menu_clicks",
+        "rendered_motion",
+        "ovstage_transform",
+        "cleanup"
+      ],
+      "release_tier": "ovui_0_2_ovstage_only",
+      "support_status": "supported",
+      "evidence_status": "contract_covered",
+      "contract_evidence": [
+        "ovui-data-adapters/tests/ovstage/test_physics_controls.py"
+      ]
+    }
+  ]
+}

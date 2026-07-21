@@ -5,26 +5,11 @@
 # Runs the Python test suite against the standalone Vulkan backend on
 # stock ubuntu-22.04 with the Lavapipe software ICD.
 #
-# Golden image comparison is DISABLED here (OMNI_UI_SKIP_GOLDEN_TESTS=1)
-# until Lavapipe-specific baselines are generated. Both knobs matter:
-#
-#   * OMNI_UI_GOLDEN_STRICT controls what to do when a golden is MISSING
-#     (strict=fail, non-strict=auto-generate on first run). Leaving it
-#     unset would let CI silently promote drifted output to "the truth".
-#   * OMNI_UI_SKIP_GOLDEN_TESTS controls what to do when a golden EXISTS
-#     and the comparison would otherwise run. The goldens checked into
-#     tests/golden/vulkan/ were captured on a DGXC runner with a real
-#     GPU; Lavapipe (software ICD) disagrees by 1-9% on anti-aliased
-#     glyph edges, which always-strict comparison treats as a
-#     regression. Skipping the comparison keeps the render path
-#     covered (finalize_test_no_image still runs) without flagging
-#     ICD-driven sub-pixel drift.
-#
-# Plan to re-enable: run .github/workflows/generate-goldens.yml
-# (workflow_dispatch, backend: vulkan) on the same Lavapipe runner this
-# workflow uses, commit the regenerated tests/golden/vulkan/ baselines,
-# then drop OMNI_UI_SKIP_GOLDEN_TESTS and add OMNI_UI_GOLDEN_STRICT=1
-# here so future drift is enforced.
+# Golden image comparison is enforced in strict mode. Baselines under
+# tests/golden/vulkan/ must be generated on the same hosted Lavapipe
+# runner class this workflow uses; regenerate them with
+# .github/workflows/generate-goldens.yml (workflow_dispatch,
+# backend: vulkan) after intentional renderer or layout changes.
 #
 # Refs: ovui issue #36 (Phase 6, B1 leg).
 
@@ -53,10 +38,7 @@ jobs:
       OMNIUI_HEADLESS: "1"
       OMNIUI_BACKEND: "vulkan"
       OMNIUI_LAVAPIPE: "1"
-      # Skip image-comparison: the GPU-baselined goldens drift on
-      # Lavapipe. Render path still exercised. See header comment for
-      # the rebaseline plan.
-      OMNI_UI_SKIP_GOLDEN_TESTS: "1"
+      OMNI_UI_GOLDEN_STRICT: "1"
       DEBIAN_FRONTEND: noninteractive
 
     defaults:
@@ -103,11 +85,49 @@ jobs:
         run: |
           set -o pipefail
           ulimit -c 0
-          pytest tests/ \
-            --forked \
-            -m "not requires_gl and not requires_cuda" \
-            -q \
-            --color=yes 2>&1 | tee /tmp/pytest-b1.log
+          mkdir -p coverage-reports/b1
+          rm -f .coverage
+          {
+            pytest \
+              tests/test_markdown_provider_coverage.py \
+              tests/test_python_utility_coverage.py \
+              --cov \
+              --cov-config=.coveragerc \
+              --cov-report= \
+              -q \
+              --color=yes
+            pytest tests/ \
+              --ignore=tests/test_markdown_provider_coverage.py \
+              --ignore=tests/test_python_utility_coverage.py \
+              --forked \
+              -m "not requires_gl and not requires_cuda" \
+              --cov \
+              --cov-append \
+              --cov-config=.coveragerc \
+              --cov-report=term-missing:skip-covered \
+              --cov-report=xml:coverage-reports/b1/coverage.xml \
+              --cov-report=html:coverage-reports/b1/html \
+              -q \
+              --color=yes
+          } 2>&1 | tee /tmp/pytest-b1.log
+
+      - name: Add coverage summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## B1 Python coverage"
+            echo
+            if [ -f .coverage ]; then
+              echo '```text'
+              python -m coverage report --show-missing --skip-covered || true
+              echo '```'
+              echo
+              echo "Download the \`coverage-b1\` artifact for HTML and XML reports."
+            else
+              echo "No coverage data file was produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload pytest log
         if: always()
@@ -115,6 +135,14 @@ jobs:
         with:
           name: pytest-b1-log
           path: /tmp/pytest-b1.log
+          if-no-files-found: warn
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-b1
+          path: ovui/coverage-reports/b1/
           if-no-files-found: warn
 
       - name: Upload captured diffs (on failure)

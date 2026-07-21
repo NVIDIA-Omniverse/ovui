@@ -18,12 +18,15 @@ frame loop through :func:`drain_pending`.
 import base64
 import contextlib
 import io
+import itertools
 import os
+import struct
 import sys
 import tempfile
 import threading
 import time
 import traceback
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -35,7 +38,7 @@ __all__ = [
     "status",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 9910
@@ -104,6 +107,7 @@ _BUTTONS = {"left": 0, "right": 1, "middle": 2}
 _MODIFIER_ORDER = ("ctrl", "shift", "alt", "super")
 _DRAG_DEFAULT_STEPS = 10
 _DRAG_STEPS_PER_SECOND = 60.0
+_LEGACY_SCREENSHOT_REQUEST_IDS = itertools.count(1)
 
 
 @dataclass
@@ -164,6 +168,7 @@ class _State:
                 "attached_at": self.attached_at,
                 "last_frame_at": self.last_frame_at,
                 "queue_depth": len(self.queue),
+                "state_enabled": _state_enabled(),
                 "execute_enabled": _execute_enabled(),
                 "startup_error": self.startup_error,
                 "last_error": self.last_error,
@@ -199,6 +204,10 @@ def _enabled() -> bool:
 
 def _execute_enabled() -> bool:
     return _truthy_env("OVUIINSPECT_ENABLE_EXECUTE", False)
+
+
+def _state_enabled() -> bool:
+    return _truthy_env("OVUIINSPECT_ENABLE_STATE", False)
 
 
 def _log(message: str) -> None:
@@ -255,14 +264,16 @@ def _key_code(name: str) -> int:
 def _modifier_codes(modifiers: Optional[list[str]]) -> list[int]:
     if not modifiers:
         return []
-    lookup = {name.strip().lower(): True for name in modifiers if name.strip()}
-    codes: list[int] = []
-    for name in _MODIFIER_ORDER:
-        if name in lookup or (name == "ctrl" and "control" in lookup):
-            codes.append(_key_code(name))
-    unknown = sorted(set(lookup) - {"ctrl", "control", "shift", "alt", "super", "meta", "cmd"})
+    lookup = {name.strip().lower() for name in modifiers if name.strip()}
+    unknown = sorted(lookup - {"ctrl", "control", "shift", "alt", "super", "meta", "cmd"})
     if unknown:
         raise ValueError(f"unsupported modifier(s): {', '.join(unknown)}")
+    aliases = {"control": "ctrl", "meta": "super", "cmd": "super"}
+    normalized = {aliases.get(name, name) for name in lookup}
+    codes: list[int] = []
+    for name in _MODIFIER_ORDER:
+        if name in normalized:
+            codes.append(_key_code(name))
     return codes
 
 
@@ -287,12 +298,16 @@ def _make_click(
     button: str,
     double: bool,
     timeout: float,
+    modifiers: Optional[list[str]] = None,
 ) -> _Command:
     button_index = _BUTTONS.get(button)
     if button_index is None:
         raise ValueError("button must be one of: left, right, middle")
     x, y = _validate_xy(x, y)
+    modifier_codes = _modifier_codes(modifiers)
     steps: list[tuple[str, tuple[Any, ...]]] = [("move", (x, y)), ("wait", ())]
+    for code in modifier_codes:
+        steps.append(("key", (code, True)))
     clicks = 2 if double else 1
     for _ in range(clicks):
         steps.extend([
@@ -301,6 +316,10 @@ def _make_click(
             ("button", (button_index, False)),
             ("wait", ()),
         ])
+    for code in reversed(modifier_codes):
+        steps.append(("key", (code, False)))
+    if modifier_codes:
+        steps.append(("wait", ()))
     command = _Command("steps", {}, timeout)
     command.steps = steps
     return command
@@ -326,6 +345,7 @@ def _make_drag(
     timeout: float,
     steps_count: Optional[int] = None,
     duration: Optional[float] = None,
+    modifiers: Optional[list[str]] = None,
 ) -> _Command:
     button_index = _BUTTONS.get(button)
     if button_index is None:
@@ -333,17 +353,23 @@ def _make_drag(
     x1, y1 = _validate_xy(x1, y1)
     x2, y2 = _validate_xy(x2, y2)
     steps_count = _resolve_drag_steps(steps_count, duration)
+    modifier_codes = _modifier_codes(modifiers)
     steps: list[tuple[str, tuple[Any, ...]]] = [
         ("move", (x1, y1)),
         ("wait", ()),
-        ("button", (button_index, True)),
-        ("wait", ()),
     ]
+    for code in modifier_codes:
+        steps.append(("key", (code, True)))
+    steps.extend([("button", (button_index, True)), ("wait", ())])
     for i in range(1, steps_count + 1):
         t = i / steps_count
         steps.append(("move", (x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)))
         steps.append(("wait", ()))
     steps.extend([("button", (button_index, False)), ("wait", ())])
+    for code in reversed(modifier_codes):
+        steps.append(("key", (code, False)))
+    if modifier_codes:
+        steps.append(("wait", ()))
     command = _Command("steps", {}, timeout)
     command.steps = steps
     return command
@@ -448,33 +474,306 @@ def _advance_steps(
         command.succeed()
 
 
-def _advance_screenshot(command: _Command, ui_native: Any) -> None:
-    path = str(command.payload["path"])
-    if not command.scheduled:
-        command.scheduled = True
-        schedule = getattr(ui_native, "_schedule_screenshot", None)
-        if callable(schedule):
-            if not schedule(path):
-                command.fail("_schedule_screenshot returned False")
-            return
-        capture = getattr(ui_native, "_capture_screenshot", None)
-        if callable(capture):
-            if capture(path) and Path(path).exists():
-                command.succeed(path=path)
-            else:
-                command.fail("_capture_screenshot failed")
-            return
-        command.fail("ovui screenshot API is unavailable")
-        return
+def _screenshot_metadata(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy the request-scoped screenshot fields into a JSON-safe mapping."""
 
-    poll = getattr(ui_native, "_poll_screenshot_done", None)
-    done = True
-    if callable(poll):
-        done = bool(poll())
-    if done and Path(path).exists():
-        command.succeed(path=path)
-    elif time.monotonic() >= command.deadline:
-        command.fail("screenshot timed out before ovui wrote the image")
+    return {
+        "request_id": snapshot.get("request_id"),
+        "status": snapshot.get("status"),
+        "done": snapshot.get("done"),
+        "success": snapshot.get("success"),
+        "path": snapshot.get("path"),
+        "actual_format": snapshot.get("actual_format"),
+        "width": snapshot.get("width"),
+        "height": snapshot.get("height"),
+        "message": snapshot.get("message"),
+    }
+
+
+def _read_screenshot_result(ui_native: Any) -> Optional[dict[str, Any]]:
+    get_result = getattr(ui_native, "_get_screenshot_result", None)
+    if not callable(get_result):
+        return None
+    snapshot = get_result()
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("_get_screenshot_result() must return a mapping")
+    return dict(snapshot)
+
+
+def _probe_image_file(path: Path) -> tuple[str, int, int]:
+    """Return the codec and extent encoded in a persisted PNG or JPEG."""
+
+    data = path.read_bytes()
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        if len(data) < 24 or data[12:16] != b"IHDR":
+            raise ValueError("PNG output has no complete IHDR header")
+        width, height = struct.unpack(">II", data[16:24])
+        if width <= 0 or height <= 0:
+            raise ValueError(f"PNG output has an invalid extent: {width}x{height}")
+        return "png", width, height
+
+    if data.startswith(b"\xff\xd8"):
+        sof_markers = {
+            0xC0,
+            0xC1,
+            0xC2,
+            0xC3,
+            0xC5,
+            0xC6,
+            0xC7,
+            0xC9,
+            0xCA,
+            0xCB,
+            0xCD,
+            0xCE,
+            0xCF,
+        }
+        offset = 2
+        while offset < len(data):
+            while offset < len(data) and data[offset] == 0xFF:
+                offset += 1
+            if offset >= len(data):
+                break
+            marker = data[offset]
+            offset += 1
+            if marker == 0xD9:
+                break
+            if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+                continue
+            if offset + 2 > len(data):
+                break
+            segment_length = int.from_bytes(data[offset : offset + 2], "big")
+            if segment_length < 2 or offset + segment_length > len(data):
+                break
+            if marker in sof_markers and segment_length >= 7:
+                height = int.from_bytes(data[offset + 3 : offset + 5], "big")
+                width = int.from_bytes(data[offset + 5 : offset + 7], "big")
+                if width <= 0 or height <= 0:
+                    raise ValueError(f"JPEG output has an invalid extent: {width}x{height}")
+                return "jpeg", width, height
+            offset += segment_length
+        raise ValueError("JPEG output has no supported frame header")
+
+    raise ValueError("output does not have a PNG or JPEG signature")
+
+
+def _validate_screenshot_identity(
+    command: _Command,
+    snapshot: Mapping[str, Any],
+) -> bool:
+    expected_id = command.payload.get("_screenshot_request_id")
+    try:
+        request_id = int(snapshot.get("request_id", 0))
+    except (TypeError, ValueError):
+        command.fail(f"screenshot result has an invalid request ID: {snapshot.get('request_id')!r}")
+        return False
+    if expected_id is None:
+        if request_id <= 0:
+            command.fail(f"screenshot scheduler returned no request ID: {snapshot!r}")
+            return False
+        command.payload["_screenshot_request_id"] = request_id
+    elif request_id != expected_id:
+        command.fail(
+            "screenshot result changed request ID while waiting: "
+            f"expected {expected_id}, got {request_id}"
+        )
+        return False
+
+    expected_path = str(command.payload["path"])
+    actual_path = snapshot.get("path")
+    if actual_path != expected_path:
+        command.fail(
+            f"screenshot request {request_id} reported an unexpected path: "
+            f"{actual_path!r} != {expected_path!r}"
+        )
+        return False
+    return True
+
+
+def _validate_completed_screenshot(
+    command: _Command,
+    snapshot: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    request_id = int(command.payload["_screenshot_request_id"])
+    status = snapshot.get("status")
+    if snapshot.get("success") is not True or status != "succeeded":
+        command.fail(
+            f"screenshot request {request_id} failed: "
+            f"status={status!r}, message={snapshot.get('message')!r}"
+        )
+        return None
+
+    try:
+        width = int(snapshot.get("width", 0))
+        height = int(snapshot.get("height", 0))
+    except (TypeError, ValueError):
+        width = height = 0
+    if width <= 0 or height <= 0:
+        command.fail(
+            f"screenshot request {request_id} completed with an invalid extent: "
+            f"{snapshot.get('width')!r}x{snapshot.get('height')!r}"
+        )
+        return None
+
+    path = Path(str(command.payload["path"]))
+    actual_format = str(snapshot.get("actual_format", "")).strip().lower().lstrip(".")
+    expected_format = path.suffix.lower().lstrip(".")
+    compatible_formats = {"jpg", "jpeg"} if expected_format in {"jpg", "jpeg"} else {"png"}
+    if actual_format not in compatible_formats:
+        command.fail(
+            f"screenshot request {request_id} completed with an unexpected format: "
+            f"{actual_format!r} for {path.suffix!r}"
+        )
+        return None
+    try:
+        byte_count = path.stat().st_size
+    except OSError as exc:
+        command.fail(
+            f"screenshot request {request_id} succeeded but its output is unavailable: {exc}"
+        )
+        return None
+    if byte_count <= 0:
+        command.fail(f"screenshot request {request_id} produced an empty image file")
+        return None
+    try:
+        with path.open("rb") as stream:
+            signature = stream.read(8)
+    except OSError as exc:
+        command.fail(f"screenshot request {request_id} output could not be read: {exc}")
+        return None
+    if actual_format == "png" and signature != b"\x89PNG\r\n\x1a\n":
+        command.fail(f"screenshot request {request_id} output is not a valid PNG file")
+        return None
+    if actual_format in {"jpg", "jpeg"} and not signature.startswith(b"\xff\xd8"):
+        command.fail(f"screenshot request {request_id} output is not a valid JPEG file")
+        return None
+
+    metadata = _screenshot_metadata(snapshot)
+    metadata["request_id"] = request_id
+    metadata["width"] = width
+    metadata["height"] = height
+    metadata["bytes"] = byte_count
+    return metadata
+
+
+def _advance_screenshot_request(
+    command: _Command,
+    ui_native: Any,
+) -> Optional[dict[str, Any]]:
+    """Advance one exact screenshot request and return terminal metadata."""
+
+    schedule = getattr(ui_native, "_schedule_screenshot", None)
+    get_result = getattr(ui_native, "_get_screenshot_result", None)
+    if not callable(schedule):
+        command.fail("ovui screenshot scheduler is unavailable")
+        return None
+
+    if not callable(get_result):
+        poll = getattr(ui_native, "_poll_screenshot_done", None)
+        if not callable(poll):
+            command.fail(
+                "ovui screenshot completion API is unavailable; "
+                "_get_screenshot_result or _poll_screenshot_done is required"
+            )
+            return None
+        return _advance_legacy_screenshot_request(command, ui_native, schedule, poll)
+
+    if not command.scheduled:
+        path = str(command.payload["path"])
+        if not schedule(path):
+            snapshot = _read_screenshot_result(ui_native)
+            detail = f": {snapshot!r}" if snapshot is not None else ""
+            command.fail(f"_schedule_screenshot returned False{detail}")
+            return None
+        command.scheduled = True
+        command.payload["_screenshot_contract"] = "request_scoped"
+
+    snapshot = _read_screenshot_result(ui_native)
+    if snapshot is None:
+        command.fail("ovui request-scoped screenshot result API is unavailable")
+        return None
+    if not _validate_screenshot_identity(command, snapshot):
+        return None
+    command.payload.setdefault("_screenshot_registration", _screenshot_metadata(snapshot))
+
+    done = snapshot.get("done")
+    status = snapshot.get("status")
+    if done is not True:
+        if done is not False or status != "pending":
+            request_id = command.payload["_screenshot_request_id"]
+            command.fail(
+                f"screenshot request {request_id} returned an inconsistent non-terminal result: "
+                f"status={status!r}, done={done!r}"
+            )
+        return None
+    return _validate_completed_screenshot(command, snapshot)
+
+
+def _advance_legacy_screenshot_request(
+    command: _Command,
+    ui_native: Any,
+    schedule: Any,
+    poll: Any,
+) -> Optional[dict[str, Any]]:
+    """Adapt the older schedule/poll API to the Inspector result schema."""
+
+    path = Path(str(command.payload["path"]))
+    if not command.scheduled:
+        if not schedule(str(path)):
+            command.fail("_schedule_screenshot returned False")
+            return None
+        request_id = next(_LEGACY_SCREENSHOT_REQUEST_IDS)
+        command.payload["_screenshot_request_id"] = request_id
+        command.payload["_screenshot_contract"] = "legacy_schedule_poll"
+        command.payload["_screenshot_registration"] = {
+            "request_id": request_id,
+            "status": "pending",
+            "done": False,
+            "success": False,
+            "path": str(path),
+            "actual_format": "",
+            "width": 0,
+            "height": 0,
+            "message": "legacy schedule/poll compatibility path",
+        }
+        command.scheduled = True
+
+    if not poll():
+        return None
+
+    had_error = getattr(ui_native, "_had_last_screenshot_error", None)
+    if callable(had_error) and had_error():
+        command.fail("legacy screenshot backend reported a capture failure")
+        return None
+
+    try:
+        actual_format, width, height = _probe_image_file(path)
+    except (OSError, ValueError) as exc:
+        command.fail(f"legacy screenshot output is invalid: {exc}")
+        return None
+
+    snapshot = {
+        "request_id": command.payload["_screenshot_request_id"],
+        "status": "succeeded",
+        "done": True,
+        "success": True,
+        "path": str(path),
+        "actual_format": actual_format,
+        "width": width,
+        "height": height,
+        "message": "legacy schedule/poll compatibility path",
+    }
+    return _validate_completed_screenshot(command, snapshot)
+
+
+def _advance_screenshot(command: _Command, ui_native: Any) -> None:
+    metadata = _advance_screenshot_request(command, ui_native)
+    if metadata is not None:
+        command.succeed(
+            path=str(command.payload["path"]),
+            screenshot_request=command.payload["_screenshot_registration"],
+            screenshot_result=metadata,
+        )
 
 
 def _advance_execute(command: _Command, application: Optional[Any]) -> None:
@@ -497,6 +796,80 @@ def _advance_execute(command: _Command, application: Optional[Any]) -> None:
     command.succeed(stdout=stdout.getvalue(), stderr=stderr.getvalue())
 
 
+def _json_safe(value: Any) -> Any:
+    """Return a JSON-serializable representation of inspector state.
+
+    Application state providers are expected to return ordinary mappings and
+    sequences.  This defensive conversion keeps a stray ``Path``, enum, tuple,
+    or native runtime value from turning a successful main-thread snapshot
+    into a FastAPI serialization failure after the command has completed.
+    """
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(item) for item in value]
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and enum_value is not value:
+        return _json_safe(enum_value)
+    return repr(value)
+
+
+def _capture_application_state(application: Optional[Any]) -> dict[str, Any]:
+    if application is None:
+        raise ValueError("no application is attached")
+    capture = getattr(application, "get_inspector_state", None)
+    if not callable(capture):
+        raise ValueError("attached application has no get_inspector_state()")
+    state = capture()
+    if not isinstance(state, dict):
+        raise ValueError("get_inspector_state() must return a dict")
+    return _json_safe(state)
+
+
+def _advance_state(command: _Command, application: Optional[Any]) -> None:
+    """Capture the attached application's read-only QA state on its UI thread."""
+
+    try:
+        state = _capture_application_state(application)
+    except ValueError as exc:
+        command.fail(str(exc))
+        return
+    command.succeed(state=state)
+
+
+def _advance_checkpoint(
+    command: _Command,
+    ui_native: Any,
+    application: Optional[Any],
+) -> None:
+    """Correlate read-only state with one exact screenshot request.
+
+    State capture and screenshot registration happen together during the first
+    queued UI-thread advance. Later advances only wait for that request's
+    terminal result; the state is never recaptured or overwritten.
+    """
+
+    if "_checkpoint_state" not in command.payload:
+        try:
+            command.payload["_checkpoint_state"] = _capture_application_state(application)
+        except ValueError as exc:
+            command.fail(str(exc))
+            return
+
+    metadata = _advance_screenshot_request(command, ui_native)
+    if metadata is not None:
+        command.succeed(
+            state=command.payload["_checkpoint_state"],
+            screenshot_request=command.payload["_screenshot_registration"],
+            screenshot_result=metadata,
+        )
+
+
 def _advance_shutdown(command: _Command, application: Optional[Any]) -> None:
     if application is None:
         command.fail("no application is attached")
@@ -509,8 +882,25 @@ def _advance_shutdown(command: _Command, application: Optional[Any]) -> None:
     command.succeed(message="shutdown requested")
 
 
+def _cancel_screenshot_request(command: _Command, ui_native: Any) -> None:
+    if command.kind not in {"screenshot", "checkpoint"}:
+        return
+    if command.payload.get("_screenshot_contract") != "request_scoped":
+        return
+    if command.payload.get("_screenshot_cancel_attempted"):
+        return
+    request_id = command.payload.get("_screenshot_request_id")
+    cancel = getattr(ui_native, "_cancel_screenshot", None)
+    if request_id is None or not callable(cancel):
+        return
+    command.payload["_screenshot_cancel_attempted"] = True
+    with contextlib.suppress(Exception):
+        cancel(int(request_id))
+
+
 def _advance_command(command: _Command, ui_native: Any, application: Optional[Any]) -> None:
     if time.monotonic() >= command.deadline:
+        _cancel_screenshot_request(command, ui_native)
         command.fail(f"{command.kind} command timed out")
         return
     try:
@@ -518,13 +908,20 @@ def _advance_command(command: _Command, ui_native: Any, application: Optional[An
             _advance_steps(command, ui_native, application)
         elif command.kind == "screenshot":
             _advance_screenshot(command, ui_native)
+        elif command.kind == "checkpoint":
+            _advance_checkpoint(command, ui_native, application)
         elif command.kind == "execute":
             _advance_execute(command, application)
+        elif command.kind == "state":
+            _advance_state(command, application)
         elif command.kind == "shutdown":
             _advance_shutdown(command, application)
         else:
             command.fail(f"internal error: unsupported command {command.kind!r}")
+        if command.error:
+            _cancel_screenshot_request(command, ui_native)
     except Exception:
+        _cancel_screenshot_request(command, ui_native)
         command.fail(traceback.format_exc())
 
 
@@ -560,13 +957,24 @@ def drain_pending(ui_native: Any, *, application: Optional[Any] = None) -> int:
     return 1
 
 
-def _image_bytes(fmt: str, timeout: float) -> tuple[bytes, str, dict[str, Any]]:
+def _capture_path(suffix: str) -> str:
+    """Reserve a unique output name without leaving a stale file behind."""
+
+    file_descriptor, path = tempfile.mkstemp(prefix="ovuiinspect_", suffix=suffix)
+    os.close(file_descriptor)
+    os.unlink(path)
+    return path
+
+
+def _capture_bytes(
+    kind: str,
+    fmt: str,
+    timeout: float,
+) -> tuple[bytes, str, dict[str, Any]]:
     suffix = ".jpg" if fmt in {"jpg", "jpeg"} else ".png"
     media_type = "image/jpeg" if suffix == ".jpg" else "image/png"
-    tmp = tempfile.NamedTemporaryFile(prefix="ovuiinspect_", suffix=suffix, delete=False)
-    path = tmp.name
-    tmp.close()
-    command = _Command("screenshot", {"path": path}, timeout)
+    path = _capture_path(suffix)
+    command = _Command(kind, {"path": path}, timeout)
     result = _submit(command)
     if not result.get("success"):
         with contextlib.suppress(FileNotFoundError):
@@ -576,6 +984,14 @@ def _image_bytes(fmt: str, timeout: float) -> tuple[bytes, str, dict[str, Any]]:
     with contextlib.suppress(FileNotFoundError):
         os.unlink(path)
     return data, media_type, result
+
+
+def _image_bytes(fmt: str, timeout: float) -> tuple[bytes, str, dict[str, Any]]:
+    return _capture_bytes("screenshot", fmt, timeout)
+
+
+def _checkpoint_bytes(fmt: str, timeout: float) -> tuple[bytes, str, dict[str, Any]]:
+    return _capture_bytes("checkpoint", fmt, timeout)
 
 
 def _create_app() -> Any:
@@ -595,6 +1011,7 @@ def _create_app() -> Any:
         y: float
         button: str = "left"
         double: bool = False
+        modifiers: Optional[list[str]] = None
         timeout: float = 5.0
 
     class DragRequest(BaseModel):
@@ -605,6 +1022,7 @@ def _create_app() -> Any:
         button: str = "left"
         steps: Optional[int] = None
         duration: Optional[float] = None
+        modifiers: Optional[list[str]] = None
         timeout: float = 10.0
 
     class ScrollRequest(BaseModel):
@@ -637,6 +1055,16 @@ def _create_app() -> Any:
             raise HTTPException(status_code=400, detail=result.get("error", "request failed"))
         return result
 
+    def require_state_enabled() -> None:
+        if not _state_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "application state endpoints are disabled; set "
+                    "OVUIINSPECT_ENABLE_STATE=1 before launch"
+                ),
+            )
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         return _STATE.snapshot()
@@ -644,6 +1072,36 @@ def _create_app() -> Any:
     @app.get("/status")
     def get_status() -> dict[str, Any]:
         return _STATE.snapshot()
+
+    @app.get("/state")
+    def get_application_state(timeout: float = 5.0) -> dict[str, Any]:
+        """Return a read-only application/scene snapshot from the UI thread."""
+
+        require_state_enabled()
+        return checked(_submit(_Command("state", {}, timeout)))
+
+    @app.post("/checkpoint")
+    def capture_checkpoint(timeout: float = 5.0, fmt: str = "png") -> dict[str, Any]:
+        """Return state and the exact screenshot request registered beside it."""
+
+        require_state_enabled()
+        fmt = fmt.lower()
+        if fmt not in {"png", "jpg", "jpeg"}:
+            raise HTTPException(status_code=400, detail="fmt must be png, jpg, or jpeg")
+        data, media_type, result = _checkpoint_bytes(fmt, timeout)
+        if not result.get("success"):
+            raise HTTPException(status_code=503, detail=result.get("error", "checkpoint failed"))
+        return {
+            "success": True,
+            "state": result["state"],
+            "screenshot": {
+                "request": result["screenshot_request"],
+                "result": result["screenshot_result"],
+                "image_base64": base64.b64encode(data).decode("ascii"),
+                "mime_type": media_type,
+                "bytes": len(data),
+            },
+        }
 
     def capture_application_image(fmt: str, timeout: float) -> Response:
         fmt = fmt.lower()
@@ -705,6 +1163,7 @@ def _create_app() -> Any:
                 request.button,
                 request.double,
                 request.timeout,
+                request.modifiers,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -722,6 +1181,7 @@ def _create_app() -> Any:
                 request.timeout,
                 request.steps,
                 request.duration,
+                request.modifiers,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

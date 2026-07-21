@@ -172,7 +172,7 @@ are disabled.
 
 ### Python Dependencies
 
-- **Python** >= 3.8
+- **Python** >= 3.12
 - **pybind11** >= 2.11 (installed automatically by pip, or `pip install pybind11`)
 - **setuptools** >= 68.0
 

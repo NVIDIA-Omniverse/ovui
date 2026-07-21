@@ -16,10 +16,25 @@ enable_testing()
 
 include(FetchContent)
 
-# --- Freetype: try system, fall back to FetchContent ---
-find_package(Freetype QUIET)
-if(NOT Freetype_FOUND AND NOT FREETYPE_FOUND)
-    message(STATUS "Freetype not found on system - downloading via FetchContent")
+option(OMNIUI_USE_BUNDLED_FREETYPE "Build the pinned FetchContent FreeType as a static library" OFF)
+option(OMNIUI_USE_BUNDLED_GLFW "Build the pinned FetchContent GLFW as a static library" OFF)
+option(OMNIUI_REQUIRE_VULKAN "Fail configuration when the Vulkan SDK is unavailable" OFF)
+option(OMNIUI_REQUIRE_CUDA "Fail configuration when the CUDA Toolkit is unavailable" OFF)
+
+# The bundled dependency mode is used by binary-wheel builds. Both upstream
+# projects honor BUILD_SHARED_LIBS, and GLFW also exposes an explicit library
+# type override. ovui's own native libraries declare SHARED directly, so this
+# does not change their linkage type.
+if(OMNIUI_USE_BUNDLED_FREETYPE OR OMNIUI_USE_BUNDLED_GLFW)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build dependencies as static libraries" FORCE)
+endif()
+
+# --- FreeType: try system, fall back to FetchContent ---
+if(NOT OMNIUI_USE_BUNDLED_FREETYPE)
+    find_package(Freetype QUIET)
+endif()
+if(OMNIUI_USE_BUNDLED_FREETYPE OR (NOT Freetype_FOUND AND NOT FREETYPE_FOUND))
+    message(STATUS "Using bundled static FreeType 2.13.2")
     FetchContent_Declare(
         freetype
         GIT_REPOSITORY https://github.com/freetype/freetype.git
@@ -36,6 +51,10 @@ if(NOT Freetype_FOUND AND NOT FREETYPE_FOUND)
     if(NOT TARGET Freetype::Freetype)
         add_library(Freetype::Freetype ALIAS freetype)
     endif()
+    get_target_property(_omniui_freetype_type freetype TYPE)
+    if(NOT _omniui_freetype_type STREQUAL "STATIC_LIBRARY")
+        message(FATAL_ERROR "Bundled FreeType must be static, got ${_omniui_freetype_type}")
+    endif()
 endif()
 
 option(OMNIUI_HEADLESS_ONLY "Build only headless Vulkan support (no GLFW/OpenGL required)" OFF)
@@ -44,10 +63,12 @@ option(OMNI_UI_BUILD_WEB_RUNTIME "Build the browser WebAssembly app with embedde
 
 # --- GLFW: try system; FetchContent fallback only for non-headless-only builds ---
 if(NOT EMSCRIPTEN)
-    find_package(glfw3 3.3 QUIET)
-    if(NOT glfw3_FOUND)
+    if(NOT OMNIUI_USE_BUNDLED_GLFW)
+        find_package(glfw3 3.3 QUIET)
+    endif()
+    if(OMNIUI_USE_BUNDLED_GLFW OR NOT glfw3_FOUND)
         if(NOT OMNIUI_HEADLESS_ONLY)
-            message(STATUS "GLFW3 not found on system - downloading via FetchContent")
+            message(STATUS "Using bundled static GLFW 3.4")
             FetchContent_Declare(
                 glfw
                 GIT_REPOSITORY https://github.com/glfw/glfw.git
@@ -58,7 +79,12 @@ if(NOT EMSCRIPTEN)
             set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
             set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
             set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+            set(GLFW_LIBRARY_TYPE STATIC CACHE STRING "" FORCE)
             FetchContent_MakeAvailable(glfw)
+            get_target_property(_omniui_glfw_type glfw TYPE)
+            if(NOT _omniui_glfw_type STREQUAL "STATIC_LIBRARY")
+                message(FATAL_ERROR "Bundled GLFW must be static, got ${_omniui_glfw_type}")
+            endif()
             set(glfw3_FOUND TRUE)
         else()
             message(STATUS "GLFW3 not found - skipped (OMNIUI_HEADLESS_ONLY=ON)")
@@ -71,13 +97,19 @@ if(NOT EMSCRIPTEN)
     find_package(Vulkan QUIET)
     find_package(CUDAToolkit QUIET)
 endif()
+if(OMNIUI_REQUIRE_VULKAN AND NOT Vulkan_FOUND)
+    message(FATAL_ERROR "OMNIUI_REQUIRE_VULKAN=ON but the Vulkan SDK was not found")
+endif()
+if(OMNIUI_REQUIRE_CUDA AND NOT CUDAToolkit_FOUND)
+    message(FATAL_ERROR "OMNIUI_REQUIRE_CUDA=ON but the CUDA Toolkit was not found")
+endif()
 if(NOT (EMSCRIPTEN AND (OMNI_UI_BUILD_PYODIDE_BINDINGS OR OMNI_UI_BUILD_WEB_RUNTIME)))
     find_package(pybind11 QUIET)
 endif()
 if(CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION} found at ${CUDAToolkit_TARGET_DIR}")
 else()
-    message(STATUS "CUDA Toolkit not found - CUDA-Vulkan interop will be disabled")
+    message(STATUS "CUDA Toolkit not found - CUDA-Vulkan interop disabled (omni.ui.has_gpu_byte_image() will be False)")
     if(WIN32 AND Vulkan_FOUND)
         message(WARNING
             "CUDA Toolkit was not found, so ovui will build without CUDA-Vulkan "

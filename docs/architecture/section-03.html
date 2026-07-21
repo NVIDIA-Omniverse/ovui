@@ -120,10 +120,10 @@
     <header class="hero">
       <p class="eyebrow">Section 3</p>
       <h1>Code Organization</h1>
-      <p class="lead">ovui provides Python UI building blocks and scene drawing helpers. ovwidgets combines them into an application, common Python classes, and app widgets. Data adapters feed those widgets from real or mock data, with OpenUSD adapters as one concrete backend.</p>
+      <p class="lead">ovui provides Python UI building blocks and scene drawing helpers. ovui-widgets combines them into an application, common Python classes, and app widgets. Data adapters feed those widgets from real or mock data, with OpenUSD adapters as one concrete backend.</p>
     </header>
 
-    <div class="diagram flow-diagram" role="img" aria-label="How ovui, ovwidgets, data adapters, OpenUSD adapters, and tests fit together">
+    <div class="diagram flow-diagram" role="img" aria-label="How ovui, ovui-widgets, data adapters, OpenUSD adapters, and tests fit together">
       <div class="flow-grid">
         <div class="flow-card is-start">
           <div class="flow-name">ovui</div>
@@ -134,7 +134,7 @@
         </div>
         <div class="flow-arrow" aria-hidden="true">&rarr;</div>
         <div class="flow-card">
-          <div class="flow-name">ovwidgets</div>
+          <div class="flow-name">ovui-widgets</div>
           <span class="flow-pill">Application</span>
           <div class="flow-text">Settings, SelectionBus, UndoManager, menus, status UI, and frame timing.</div>
           <span class="flow-pill">stage / property / content / viewport</span>
@@ -145,7 +145,7 @@
           <div class="flow-name">Data adapters</div>
           <span class="flow-pill">ovui_data_adapters.common</span>
           <div class="flow-text">StageAdapter, PropertyAdapter, TransformAdapter, RendererAdapter.</div>
-          <span class="flow-pill">ovwidgets.common.testing</span>
+          <span class="flow-pill">ovui_widgets.common.testing</span>
           <div class="flow-text">Mock data for widget and app tests.</div>
         </div>
         <div class="flow-arrow" aria-hidden="true">&harr;</div>
@@ -160,12 +160,12 @@
         <div class="use-list">
           <span class="flow-pill">ovui/examples</span>
           <span class="flow-pill">ovui/tests</span>
-          <span class="flow-pill">ovwidgets/tests</span>
-          <span class="flow-pill">python -m ovwidgets.app</span>
-          <span class="flow-pill">python -m ovwidgets.app.headless</span>
+          <span class="flow-pill">ovui-widgets/tests</span>
+          <span class="flow-pill">python -m ovui_widgets.app</span>
+          <span class="flow-pill">python -m ovui_widgets.app.headless</span>
         </div>
       </div>
-      <p class="diagram-note">The flow starts with ovui widgets and scene parts, grows into app widgets in ovwidgets, then reaches data through common adapters and OpenUSD adapters.</p>
+      <p class="diagram-note">The flow starts with ovui widgets and scene parts, grows into app widgets in ovui-widgets, then reaches data through common adapters and OpenUSD adapters.</p>
     </div>
 
     <section>
@@ -192,10 +192,10 @@
 
     <section>
       <h2>Application</h2>
-      <p><code>ovwidgets.app.Application</code> starts the app. It initializes the UI runtime, creates the workspace, opens the stage, property, content, and viewport windows, runs the frame loop, and owns the common Python classes that several widgets need.</p>
+      <p><code>ovui_widgets.app.Application</code> starts the app. It initializes the UI runtime, creates the workspace, opens the stage, property, content, and viewport windows, runs the frame loop, and owns the common Python classes that several widgets need.</p>
       <ul>
         <li><code>Application</code> owns <code>Settings</code>, <code>SelectionBus</code>, <code>UndoManager</code>, <code>RecentFileList</code>, <code>FrameClock</code>, and <code>call_later()</code>.</li>
-        <li><code>ovwidgets.common</code> supplies <code>ManagedWindow</code>, <code>ErrorReporter</code>, <code>SnapSystem</code>, common style helpers, and mock adapters.</li>
+        <li><code>ovui_widgets.common</code> supplies <code>ManagedWindow</code>, <code>ErrorReporter</code>, <code>SnapSystem</code>, common style helpers, and mock adapters.</li>
         <li>Menus, status messages, key routing, theme changes, delayed callbacks, file open requests, and viewport render cadence all meet in this app code.</li>
       </ul>
       <p>This is the place to read when a change affects several widgets at once, especially selection, undo, settings, recent files, status messages, or app startup.</p>
@@ -203,7 +203,7 @@
 
     <section>
       <h2>Widgets</h2>
-      <p>The widgets in ovwidgets are the visible tools users work with. Each widget owns its child widgets and models, while instances of common Python classes and data adapters carry values between the widgets and the data they show or edit.</p>
+      <p>The widgets in ovui-widgets are the visible tools users work with. Each widget owns its child widgets and models, while instances of common Python classes and data adapters carry values between the widgets and the data they show or edit.</p>
       <ul>
         <li><strong>Stage Browser:</strong> <code>StageWindow</code>, <code>StageWidget</code>, <code>HierarchyModel</code>, and <code>StageDelegate</code> show hierarchy rows, type badges, visibility controls, filtering, rename, and drag feedback.</li>
         <li><strong>Property Inspector:</strong> <code>PropertyWindow</code>, <code>PropertyWidget</code>, <code>AttributesWidget</code>, and <code>AttributeModel</code> show selected-object attributes and editors.</li>
@@ -237,13 +237,13 @@
 
     <section>
       <h2>Tests, examples, and entry points</h2>
-      <p>Tests and examples cover the code at several sizes: base UI samples build widgets and scene views, ovwidgets tests drive widgets with mock data adapters, and OpenUSD tests use real USD stages when <code>pxr</code> is available.</p>
+      <p>Tests and examples cover the code at several sizes: base UI samples build widgets and scene views, ovui-widgets tests drive widgets with mock data adapters, and OpenUSD tests use real USD stages when <code>pxr</code> is available.</p>
       <ul>
         <li><code>ovui/examples</code> creates demo windows, markdown widgets, scene manipulators, and image demos.</li>
         <li><code>ovui/tests</code> and <code>ovui/standalone/tests</code> cover widgets, scene gestures, frame output, and offscreen runs.</li>
-        <li><code>ovwidgets/tests</code> covers app startup, widget behavior, mock data adapters, selection, transforms, renderer frames, and OpenUSD adapters.</li>
-        <li>Desktop app start: <code>python -m ovwidgets.app</code> or <code>ovwidgets</code>, optionally followed by a USD file path.</li>
-        <li>Headless app start: <code>python -m ovwidgets.app.headless</code> or <code>ovwidgets-headless</code>, with width, height, or a USD file path.</li>
+        <li><code>ovui-widgets/tests</code> covers app startup, widget behavior, mock data adapters, selection, transforms, renderer frames, and OpenUSD adapters.</li>
+        <li>Desktop app start: <code>python -m ovui_widgets.app</code> or <code>ovui-widgets</code>, optionally followed by a USD file path.</li>
+        <li>Headless app start: <code>python -m ovui_widgets.app.headless</code> or <code>ovui-widgets-headless</code>, with width, height, or a USD file path.</li>
       </ul>
       <p>When looking for a change, start from the entry point or test that matches the user-visible behavior, follow it into the widget, then follow the adapter that supplies its values.</p>
     </section>

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovui-data-adapters-services"
+dynamic = ["version"]
+description = "Frontend-neutral behavior services built above ovui data-adapter contracts."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ovui-data-adapters-common>=0.1.0",
+]
+
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["ovui_data_adapters.services*"]
+# Source lives two levels up at ``ovui-data-adapters/ovui_data_adapters/services/`` -
+# same ``dist/<sub>/pyproject.toml`` + ``where = "../.."`` pattern as
+# the existing common/openusd adapter distributions. This pattern
+# supports editable installs (``pip install -e``) and wheel builds run
+# in-tree; **sdist builds from the ``dist/<sub>/`` stub are NOT
+# supported** because setuptools cannot include source two levels above
+# the project root in a self-contained release tarball. If sdist
+# publishing of adapters is ever needed, restructure to co-located
+# pyprojects (``ovui-data-adapters/<sub>/pyproject.toml`` next to
+# source with ``where = ["."]``).
+where = ["../.."]

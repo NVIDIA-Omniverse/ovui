@@ -26,6 +26,7 @@
     OMNIUI_PYBIND_INIT_CAST(root_visible, setRootVisible, bool)                                                        \
     OMNIUI_PYBIND_INIT_CAST(selection, setSelection, std::vector<std::shared_ptr<const AbstractItemModel::AbstractItem>>)              \
     OMNIUI_PYBIND_INIT_CAST(expand_on_branch_click, setExpandOnBranchClick, bool)                                      \
+    OMNIUI_PYBIND_INIT_CAST(auto_scroll_selection, setAutoScrollSelection, bool)                                       \
     OMNIUI_PYBIND_INIT_CAST(keep_alive, setKeepAlive, bool)                                                            \
     OMNIUI_PYBIND_INIT_CAST(keep_expanded, setKeepExpanded, bool)                                                      \
     OMNIUI_PYBIND_INIT_CAST(drop_between_items, setDropBetweenItems, bool)                                             \
@@ -47,6 +48,8 @@
     OMNIUI_PYBIND_DOC_TreeView_setSelection                                                                            \
     "\n    `expand_on_branch_click : `\n        "                                                                      \
     OMNIUI_PYBIND_DOC_TreeView_expandOnBranchClick                                                                     \
+    "\n    `auto_scroll_selection : `\n        "                                                                       \
+    OMNIUI_PYBIND_DOC_TreeView_autoScrollSelection                                                                     \
     "\n    `keep_alive : `\n        "                                                                                  \
     OMNIUI_PYBIND_DOC_TreeView_keepAlive                                                                               \
     "\n    `keep_expanded : `\n        "                                                                               \

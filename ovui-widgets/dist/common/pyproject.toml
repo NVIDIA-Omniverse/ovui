@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ovui-widgets-common"
+dynamic = ["version"]
+description = "ovui-widgets shared library: WidgetServices protocol, types, adapters, settings, selection, undo, scheduler, error reporter, icon caches, managed window, dialogs, snap, mock adapters (numpy in [testing] extra)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ovui>=0.1.0",
+    "ovui-data-adapters-common>=0.1.0",
+]
+
+[project.optional-dependencies]
+# numpy is required only by ovui_widgets.common.testing.mock_renderer (runtime)
+# and ovui_widgets.common.adapters (TYPE_CHECKING). Widget packages that don't
+# use the mocks at runtime do not need numpy installed.
+testing = ["numpy"]
+
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["ovui_widgets.common*"]
+where = ["../.."]
+
+[tool.setuptools.package-data]
+# Step 8/13 transferred icon ownership from ``ovui-widgets-app`` to
+# ``ovui-widgets-common``. ``importlib.resources.files("ovui_widgets.common")``
+# resolves to these globs both in the editable in-tree layout and in a
+# built wheel, so chevron / action / asset / status icons reach widget
+# consumers (stage_delegate, layer_delegate, group_widget,
+# file_browser_delegate, navigation_model) regardless of how the
+# distribution was installed.
+"ovui_widgets.common" = [
+    "icons/*.png",
+    "resources/icons/*.svg",
+    "resources/icons/*.png",
+]
+"ovui_widgets.common.style" = ["icons/*.svg", "icons/*.png"]

@@ -151,16 +151,16 @@
     <header class="hero">
       <p class="eyebrow">Section 6</p>
       <h1>Application</h1>
-      <p class="lead">Sections 4 and 5 covered ovui widgets and scene drawing pieces. The ovwidgets application is where those parts become a complete tool, with widgets, menus, status text, settings, selection, undo, themes, startup, and frame timing kept together.</p>
+      <p class="lead">Sections 4 and 5 covered ovui widgets and scene drawing pieces. The ovui-widgets application is where those parts become a complete tool, with widgets, menus, status text, settings, selection, undo, themes, startup, and frame timing kept together.</p>
     </header>
 
     <section>
       <h2>Purpose</h2>
       <p>The application contains widgets and holds the app state they share. <code>Application</code> starts ovui, creates the docked work area, opens the stage browser, property inspector, content browser, viewport, and related widgets, then keeps selection, settings, undo, recent files, snapping, and deferred callbacks available while the frame loop runs.</p>
       <ul>
-        <li>Startup enters through <code>python -m ovwidgets.app</code>, the <code>ovwidgets</code> console command, or the headless entry point.</li>
+        <li>Startup enters through <code>python -m ovui_widgets.app</code>, the <code>ovui-widgets</code> console command, or the headless entry point.</li>
         <li><code>Application.run()</code> initializes ovui, applies global styles, writes the saved widget placement, applies the chosen theme, and starts <code>run_async()</code>.</li>
-        <li>For a headless USD launch, <code>Application.run()</code> preconstructs <code>OvRtxRendererAdapter</code> before <code>ui.init</code>; <code>open_file()</code> reuses that renderer before <code>Usd.Stage.Open</code> so ovrtx owns its loader setup before USD opens the stage.</li>
+        <li>Standalone entrypoints preconstruct the selected OVRTX renderer before importing <code>omni.ui</code> or creating OVStage. <code>open_file()</code> reuses that exact renderer, so the Kit OVRTX/OVStage runtime shares one Carbonite/plugin framework; a failed early attempt is never retried after a stage opens.</li>
         <li><code>run_async()</code> creates the menu row, status row, widget windows, default mock adapters, shortcut routing, file-drop handling, and the frame loop.</li>
         <li>When a stage opens, <code>_load_stage()</code> clears old selection, creates data adapters, hands them to widgets, swaps the viewport renderer, and resets render timing.</li>
       </ul>
@@ -257,12 +257,12 @@
             <span class="source-pill">test_application_frame_cadence.py</span>
           </div>
         </div>
-        <p class="diagram-note">Read the entry point for launch behavior, <code>Application</code> for shared wiring, and <code>ovwidgets.common</code> for reusable classes.</p>
+        <p class="diagram-note">Read the entry point for launch behavior, <code>Application</code> for shared wiring, and <code>ovui_widgets.common</code> for reusable classes.</p>
       </div>
       <ul>
-        <li><code>ovwidgets/ovwidgets/app</code> contains <code>application.py</code>, the main source for startup, widget creation, file opening, adapter handoff, frame updates, and shutdown.</li>
+        <li><code>ovui-widgets/ovui_widgets/app</code> contains <code>application.py</code>, the main source for startup, widget creation, file opening, adapter handoff, frame updates, and shutdown.</li>
         <li>The same app package contains <code>menu_bar.py</code>, <code>status_bar.py</code>, and <code>settings_dialog.py</code>, which own the visible app chrome around widgets.</li>
-        <li><code>ovwidgets/ovwidgets/common</code> owns common Python classes, widget-window helpers, mock adapters, style resources, and test-friendly stand-ins.</li>
+        <li><code>ovui-widgets/ovui_widgets/common</code> owns common Python classes, widget-window helpers, mock adapters, style resources, and test-friendly stand-ins.</li>
       </ul>
     </section>
 

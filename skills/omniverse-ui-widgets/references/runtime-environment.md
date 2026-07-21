@@ -20,13 +20,13 @@ export OVRTX_RUNTIME="${OVRTX_RUNTIME:-$OVRTX_ROOT/python/ovrtx/bin}"
 # Disposable trial workspace; pick any writable scratch root outside the repo.
 : "${TRIAL_ROOT:?set TRIAL_ROOT to a writable scratch directory outside the repo}"
 export EVIDENCE_ROOT="${EVIDENCE_ROOT:-$TRIAL_ROOT/evidence}"
-export USD_FIXTURE="${USD_FIXTURE:-$REPO/ovwidgets/tests/data/simple_scene.usda}"
+export USD_FIXTURE="${USD_FIXTURE:-$REPO/ovui-widgets/tests/data/simple_scene.usda}"
 export PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
 test -n "$PYTHON_BIN" || { echo "python3 not found" >&2; exit 1; }
 
-export OVWIDGETS_REQUIRE_OVRTX=1
+export OVUI_WIDGETS_REQUIRE_OVRTX=1
 export OVRTX_SKIP_USD_CHECK=1
-export PYTHONPATH=$TRIAL_ROOT:$REPO/skills/omniverse-ui-inspector:$REPO/ovwidgets:$REPO/ovui-data-adapters:$REPO/ovui/python:$OVRTX_ROOT/python:$USD_INSTALL/lib/python:${PYTHONPATH:-}
+export PYTHONPATH=$TRIAL_ROOT:$REPO/skills/omniverse-ui-inspector:$REPO/ovui-widgets:$REPO/ovui-data-adapters:$REPO/ovui/python:$OVRTX_ROOT/python:$USD_INSTALL/lib/python:${PYTHONPATH:-}
 export LD_LIBRARY_PATH=$USD_INSTALL/lib:$OVRTX_RUNTIME:${LD_LIBRARY_PATH:-}
 ```
 
@@ -35,7 +35,7 @@ bare `python`: this machine may not provide that alias. Missing `python3` is an
 environment failure, but missing `python` is not acceptable when `python3`
 exists.
 
-The fixture `ovwidgets/tests/data/simple_scene.usda` contains stable prims:
+The fixture `ovui-widgets/tests/data/simple_scene.usda` contains stable prims:
 `/World/Cube`, `/World/Sphere`, `/World/Pyramid`, and `/World/Pillar`.
 Use `/World/Cube` as the default selected prim in proof screenshots.
 
@@ -47,14 +47,14 @@ fall back to a mock renderer.
 Required renderer sequence:
 
 1. Construct `OvRtxRendererAdapter()` before the first `Usd.Stage.Open(path)`.
-   This matches `ovwidgets.app.Application.open_file()`: constructing ovrtx
+   This matches `ovui_widgets.app.Application.open_file()`: constructing ovrtx
    first primes the MDL cache before pxr opens the stage.
 2. Only after the renderer exists, import/open the USD stage.
 3. Call `renderer.load_stage(stage)`.
 4. If any step raises or `AVAILABLE` is false while
-   `OVWIDGETS_REQUIRE_OVRTX=1`, abort the trial.
+   `OVUI_WIDGETS_REQUIRE_OVRTX=1`, abort the trial.
 5. Print a proof marker such as
-   `[ovwidgets-trial] renderer=OvRtxRendererAdapter stage=/.../simple_scene.usda`
+   `[ovui-widgets-trial] renderer=OvRtxRendererAdapter stage=/.../simple_scene.usda`
    after `load_stage()` succeeds.
 
 Minimal fail-fast helper:
@@ -75,7 +75,7 @@ def open_usd_with_required_ovrtx(path: str):
         raise RuntimeError(f"Usd.Stage.Open returned None for {path}")
     renderer.load_stage(stage)
     print(
-        f"[ovwidgets-trial] renderer={type(renderer).__name__} stage={path}",
+        f"[ovui-widgets-trial] renderer={type(renderer).__name__} stage={path}",
         flush=True,
     )
     return stage, renderer

@@ -1,6 +1,6 @@
 # Target Style Architecture
 
-This is the authoritative architecture every ovui and ovwidgets surface must adopt for styling. Use it as the target schema when adding new widgets, adding new style, or reviewing existing style code.
+This is the authoritative architecture every ovui and ovui-widgets surface must adopt for styling. Use it as the target schema when adding new widgets, adding new style, or reviewing existing style code.
 
 ## Single source of truth
 

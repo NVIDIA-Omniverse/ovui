@@ -21,6 +21,7 @@ __all__ = ["OmniUiTest"]
 import asyncio
 import os
 import pathlib
+import platform
 import shutil
 import struct
 import unittest
@@ -78,10 +79,17 @@ def _is_vulkan_backend() -> bool:
     return _backend_tag() == "vulkan"
 
 
+def _architecture_tag() -> str | None:
+    """Return the golden-image architecture override, when one is needed."""
+    if platform.machine().lower() in ("aarch64", "arm64"):
+        return "aarch64"
+    return None
+
+
 def _try_read_pixels(width: int, height: int) -> bytes | None:
     """Try to capture the framebuffer via OpenGL glReadPixels.
 
-    Returns RGBA bytes or None if PyOpenGL is not available.
+    Returns RGBA bytes or None if PyOpenGL is not available or capture fails.
     """
     try:
         from OpenGL.GL import glReadPixels, GL_RGBA, GL_UNSIGNED_BYTE
@@ -258,25 +266,27 @@ class OmniUiTest(unittest.IsolatedAsyncioTestCase):
 
             tests/golden/<backend_tag>/<ImageName>.png  -- reference images
                                                            (vulkan/, egl/, opengl/)
+            tests/golden/<backend_tag>/aarch64/<ImageName>.png
+                                                        -- ARM override, when present
             tests/captured/<ImageName>.png              -- latest capture
             tests/captured/diff_<ImageName>.png         -- amplified diff (on failure)
 
-        Reads tolerate a legacy untagged golden at ``tests/golden/<ImageName>.png``
-        as a transitional fallback when no tagged baseline exists yet. Writes
-        (first-run promotion or ``OMNI_UI_GENERATE_GOLDEN=1`` regeneration)
-        always target the backend-tagged path, never the legacy root.
+        On AArch64, reads prefer an architecture override and fall back to the
+        shared backend baseline. Reads also tolerate a legacy untagged golden
+        at ``tests/golden/<ImageName>.png`` as a transitional fallback when no
+        tagged baseline exists yet. Writes (first-run promotion or
+        ``OMNI_UI_GENERATE_GOLDEN=1`` regeneration) target the architecture
+        override on AArch64 and the backend-tagged path on other architectures,
+        never the legacy root.
         """
         from compare_utils import CompareMetric
 
         # Pump a few frames to ensure all layout is settled.
         await self.wait_n_updates(4)
 
-        # OMNI_UI_SKIP_GOLDEN_TESTS=1 disables image-comparison entirely:
-        # B2 sets it because ASan instrumentation perturbs the rasterizer's
-        # float math enough to drift comparisons; B3 sets it (transitionally)
-        # while tests/golden/egl/ is empty. Render still runs — only the
-        # capture-and-compare half is skipped — so the compositor stays in
-        # ASan's scope.
+        # OMNI_UI_SKIP_GOLDEN_TESTS=1 disables image-comparison entirely.
+        # This is only for temporary diagnostics; PR CI should use strict
+        # golden comparison so missing or drifted baselines fail.
         if os.environ.get("OMNI_UI_SKIP_GOLDEN_TESTS", "").strip() == "1":
             import pytest
             await self.finalize_test_no_image()
@@ -306,14 +316,20 @@ class OmniUiTest(unittest.IsolatedAsyncioTestCase):
         captured_dir.mkdir(parents=True, exist_ok=True)
 
         name = golden_img_name or f"{self._test_name}.png"
-        # Reads prefer the backend-tagged location and fall back to the
-        # legacy untagged path during migration. Writes (first-run promotion
-        # and OMNI_UI_GENERATE_GOLDEN=1) always target the tagged path so
-        # regeneration cannot resurrect the legacy layout.
+        # AArch64's Lavapipe and FreeType rasterization differs slightly from
+        # x86_64 for a small subset of images. Prefer an approved architecture
+        # override when one exists, then share the backend baseline. Writes on
+        # AArch64 target the override so regeneration cannot replace x86_64's
+        # canonical backend baseline. The legacy untagged path remains the last
+        # read-only fallback during migration.
         tagged_path = golden_dir / name
+        architecture = _architecture_tag()
+        architecture_path = golden_dir / architecture / name if architecture else None
         legacy_path = golden_root / name
-        golden_write_path = tagged_path
-        if tagged_path.exists() or not legacy_path.exists():
+        golden_write_path = architecture_path or tagged_path
+        if architecture_path is not None and architecture_path.exists():
+            golden_read_path = architecture_path
+        elif tagged_path.exists() or not legacy_path.exists():
             golden_read_path = tagged_path
         else:
             golden_read_path = legacy_path
@@ -373,12 +389,17 @@ class OmniUiTest(unittest.IsolatedAsyncioTestCase):
         """
         from compare_utils import compare
 
+        generate = os.environ.get("OMNI_UI_GENERATE_GOLDEN", "").strip() == "1"
+        strict = os.environ.get("OMNI_UI_GOLDEN_STRICT", "").strip() == "1"
+
+        captured_path.parent.mkdir(parents=True, exist_ok=True)
+        captured_path.unlink(missing_ok=True)
+
         captured_ok = False
         if _is_vulkan_backend():
             # No GL context → schedule a pre-swap capture that the platform
             # writes to disk itself (it handles Vulkan readback).
             from omni.ui import _ui
-            captured_path.parent.mkdir(parents=True, exist_ok=True)
             if _ui._schedule_screenshot(str(captured_path)):
                 await self.wait_n_updates(1)
                 # Poll a couple more frames in case the compositor lags.
@@ -410,37 +431,39 @@ class OmniUiTest(unittest.IsolatedAsyncioTestCase):
             rgba = _try_read_pixels(width, height)
             if rgba is not None:
                 _save_screenshot(captured_path, width, height, rgba)
-                captured_ok = True
+                captured_ok = captured_path.exists()
 
-        if captured_ok:
-
-            generate = os.environ.get("OMNI_UI_GENERATE_GOLDEN", "").strip() == "1"
-            strict = os.environ.get("OMNI_UI_GOLDEN_STRICT", "").strip() == "1"
-
-            if not golden_read_path.exists():
-                # CI sets OMNI_UI_GOLDEN_STRICT=1 to forbid silent baseline
-                # generation; OMNI_UI_GENERATE_GOLDEN=1 is the explicit opt-in
-                # to (re)create the golden even under strict mode.
-                if strict and not generate:
-                    raise AssertionError(
-                        f"Golden reference missing in strict mode: {golden_write_path}"
-                    )
-                golden_write_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(captured_path), str(golden_write_path))
-                print(f"[golden] Generated: {golden_write_path}")
-            elif generate:
-                golden_write_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(captured_path), str(golden_write_path))
-                print(f"[golden] Regenerated: {golden_write_path}")
-            else:
-                # Compare captured against golden
-                diff_val = compare(
-                    golden_read_path, captured_path, diff_path,
-                    threshold=threshold, cmp_metric=cmp_metric,
+        if not captured_ok:
+            if strict or generate:
+                raise AssertionError(
+                    f"Golden image capture failed for {self._test_name}: {captured_path}"
                 )
-                if diff_val >= threshold:
-                    self.fail(
-                        f"Golden image mismatch for {self._test_name}: "
-                        f"error={diff_val:.6f} >= threshold={threshold} "
-                        f"(metric={cmp_metric})"
-                    )
+            return
+
+        if not golden_read_path.exists():
+            # CI sets OMNI_UI_GOLDEN_STRICT=1 to forbid silent baseline
+            # generation; OMNI_UI_GENERATE_GOLDEN=1 is the explicit opt-in
+            # to (re)create the golden even under strict mode.
+            if strict and not generate:
+                raise AssertionError(
+                    f"Golden reference missing in strict mode: {golden_write_path}"
+                )
+            golden_write_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(captured_path), str(golden_write_path))
+            print(f"[golden] Generated: {golden_write_path}")
+        elif generate:
+            golden_write_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(captured_path), str(golden_write_path))
+            print(f"[golden] Regenerated: {golden_write_path}")
+        else:
+            # Compare captured against golden
+            diff_val = compare(
+                golden_read_path, captured_path, diff_path,
+                threshold=threshold, cmp_metric=cmp_metric,
+            )
+            if diff_val >= threshold:
+                self.fail(
+                    f"Golden image mismatch for {self._test_name}: "
+                    f"error={diff_val:.6f} >= threshold={threshold} "
+                    f"(metric={cmp_metric})"
+                )

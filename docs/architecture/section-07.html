@@ -143,7 +143,7 @@
     <header class="hero">
       <p class="eyebrow">Section 7</p>
       <h1>Widgets and Data Adapters</h1>
-      <p class="lead">After the ovui widgets, scene drawing tools, and application are in place, ovwidgets has enough structure for app widgets that can be kept, derived from, copied, or replaced when building a scene tool.</p>
+      <p class="lead">After the ovui widgets, scene drawing tools, and application are in place, ovui-widgets has enough structure for app widgets that can be kept, derived from, copied, or replaced when building a scene tool.</p>
     </header>
 
     <section>
@@ -217,7 +217,7 @@
         </div>
         <p class="diagram-note">The application is the meeting point. Widgets stay focused on their own UI, while adapters provide the data each widget needs to draw and edit.</p>
       </div>
-      <p>This organization is the practical reuse point for ovwidgets. The viewport can stay in place while the renderer is replaced, the content browser can stay in place while storage is replaced, or the property inspector can stay in place while new property sections are added, all without rewriting the rest of the app.</p>
+      <p>This organization is the practical reuse point for ovui-widgets. The viewport can stay in place while the renderer is replaced, the content browser can stay in place while storage is replaced, or the property inspector can stay in place while new property sections are added, all without rewriting the rest of the app.</p>
     </section>
 
     <section>
@@ -282,7 +282,7 @@
 
     <section>
       <h2>How widgets stay independent</h2>
-      <p>ovwidgets keeps the widgets independent by making the application responsible for shared state. A widget can be tested with mocks, used inside the full app, or swapped for a custom widget because it receives the objects it needs instead of reaching across to sibling widgets.</p>
+      <p>ovui-widgets keeps the widgets independent by making the application responsible for shared state. A widget can be tested with mocks, used inside the full app, or swapped for a custom widget because it receives the objects it needs instead of reaching across to sibling widgets.</p>
       <div class="diagram widget-diagram" role="img" aria-label="Widget independence comes from injected adapters, app state classes, and focused widget ownership">
         <div class="independence-grid">
           <div class="independence-card">

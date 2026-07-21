@@ -17,19 +17,19 @@ from typing import Any, Callable
 
 import omni.ui as ui
 
-from ovwidgets.app.frame_clock import FrameClock
-from ovwidgets.app.style import apply_global_styles, set_theme
-from ovwidgets.common import scheduler as common_scheduler
-from ovwidgets.common.recent_files import RecentFileList
-from ovwidgets.common.scheduler import CallbackHandle
-from ovwidgets.common.selection import SelectionBus
-from ovwidgets.common.settings import Settings
-from ovwidgets.common.snap import GridSnapProvider, SnapSystem, SurfaceSnapProvider
-from ovwidgets.common.undo import UndoManager
-from ovwidgets.content.file_importer import FileImporterHelper
-from ovwidgets.property.window import PropertyWindow
-from ovwidgets.stage.window import StageWindow
-from ovwidgets.viewport.viewport_widget import ViewportWidget
+from ovui_widgets.app.frame_clock import FrameClock
+from ovui_widgets.app.style import apply_global_styles, set_theme
+from ovui_widgets.common import scheduler as common_scheduler
+from ovui_widgets.common.recent_files import RecentFileList
+from ovui_widgets.common.scheduler import CallbackHandle
+from ovui_widgets.common.selection import SelectionBus
+from ovui_widgets.common.settings import Settings
+from ovui_widgets.common.snap import GridSnapProvider, SnapSystem, SurfaceSnapProvider
+from ovui_widgets.common.undo import UndoManager
+from ovui_widgets.content.file_importer import FileImporterHelper
+from ovui_widgets.property.window import PropertyWindow
+from ovui_widgets.stage.window import StageWindow
+from ovui_widgets.viewport.viewport_widget import ViewportWidget
 from ovui_data_adapters.openusd import (
     AVAILABLE,
     OvRtxRendererAdapter,
@@ -99,13 +99,13 @@ class TrialApp:
 ```
 
 Simple `self.selection_bus` and `self.undo_manager` attributes satisfy
-`ovwidgets.common.services.WidgetServices`; do not add duplicate properties
+`ovui_widgets.common.services.WidgetServices`; do not add duplicate properties
 unless you also keep working setters. The widget service surface is exactly
 `selection_bus`, `undo_manager`, and `call_later(delay_secs, callback)`.
 
 ## App Initialization Pattern
 
-The run loop mirrors the reusable pieces from `ovwidgets.app.Application` but
+The run loop mirrors the reusable pieces from `ovui_widgets.app.Application` but
 constructs only the surfaces requested by the exercise.
 
 ```python
@@ -128,9 +128,9 @@ def run(self, usd_path: str, *, width: int = 1280, height: int = 720):
         os.chdir(trial_root)
         write_split_ini()
         if _ui_init_supports_kwarg(ui.init, "max_fps"):
-            ui.init("OvWidgetsTrial", width=width, height=height, max_fps=target_fps)
+            ui.init("OvuiWidgetsTrial", width=width, height=height, max_fps=None)
         else:
-            ui.init("OvWidgetsTrial", width=width, height=height)
+            ui.init("OvuiWidgetsTrial", width=width, height=height)
         self._ui_native = ui._ui
         self._setup_optional_ovuiinspect()
         apply_global_styles()

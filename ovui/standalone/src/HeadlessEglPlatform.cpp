@@ -14,7 +14,11 @@
 
 #ifdef OMNIUI_HAS_EGL
 
+#include "StandaloneGlyphManager.h"
 #include "StandaloneWindowCallbackManager.h"
+
+#include <omni/ui/platform/PlatformRegistry.h>
+#include <omni/ui/Font.h>
 
 #include <EGL/eglext.h>
 #include <glad/glad.h>
@@ -25,16 +29,90 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#elif defined(__linux__) || defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 
 namespace omni {
 namespace ui {
 namespace standalone {
+
+// ---------------------------------------------------------------------------
+// Font loading helper (same strategy as GlfwPlatform and HeadlessVulkanPlatform)
+// ---------------------------------------------------------------------------
+
+static std::string findFontPath(const char* fontFile)
+{
+    namespace fs = std::filesystem;
+
+#ifdef _WIN32
+    {
+        HMODULE hModule = nullptr;
+        if (GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&findFontPath), &hModule))
+        {
+            wchar_t modulePath[MAX_PATH];
+            if (GetModuleFileNameW(hModule, modulePath, MAX_PATH))
+            {
+                fs::path dir = fs::path(modulePath).parent_path();
+                for (int up = 0; up < 8 && !dir.empty(); ++up, dir = dir.parent_path())
+                {
+                    fs::path candidate = dir / "resources" / "fonts" / fontFile;
+                    if (fs::exists(candidate))
+                        return candidate.string();
+                }
+            }
+        }
+    }
+#elif defined(__linux__) || defined(__APPLE__)
+    {
+        Dl_info info;
+        if (dladdr(reinterpret_cast<void*>(&findFontPath), &info) && info.dli_fname)
+        {
+            fs::path dir = fs::path(info.dli_fname).parent_path();
+            for (int up = 0; up < 8 && !dir.empty(); ++up, dir = dir.parent_path())
+            {
+                fs::path candidate = dir / "resources" / "fonts" / fontFile;
+                if (fs::exists(candidate))
+                    return candidate.string();
+            }
+        }
+    }
+#endif
+
+    {
+        fs::path candidate = fs::path("resources") / "fonts" / fontFile;
+        if (fs::exists(candidate))
+            return candidate.string();
+    }
+
+    {
+        std::error_code ec;
+        fs::path cwd = fs::current_path(ec);
+        for (int i = 0; i < 6 && !cwd.empty(); ++i)
+        {
+            fs::path candidate = cwd / "resources" / "fonts" / fontFile;
+            if (fs::exists(candidate))
+                return candidate.string();
+            cwd = cwd.parent_path();
+        }
+    }
+
+    return {};
+}
 
 HeadlessEglPlatform::HeadlessEglPlatform()
 {
@@ -106,8 +184,39 @@ bool HeadlessEglPlatform::setupFboAndImGui(int width, int height)
     m_imguiContextCreated = true;
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.MouseDrawCursor = true;
     io.DisplaySize = ImVec2(static_cast<float>(width), static_cast<float>(height));
+    io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+    fprintf(stdout,
+            "EGL_DISPLAY_METRICS DisplaySize=%dx%d DisplayFramebufferScale=1.00,1.00\n",
+            width, height);
     ImGui::StyleColorsDark();
+
+    // Load fonts before initializing the OpenGL backend so it uploads an atlas
+    // containing the standalone UI font instead of ImGui's built-in bitmap font.
+    {
+        std::string fontPath = findFontPath("NotoSans-Regular.ttf");
+        if (fontPath.empty())
+            fontPath = findFontPath("roboto_medium.ttf");
+
+        auto glyphManager = std::make_shared<StandaloneGlyphManager>();
+        if (!fontPath.empty() && glyphManager->loadFonts(fontPath, 1.0f))
+        {
+            fprintf(stdout, "EGL_FONT_LOADED %s\n", fontPath.c_str());
+            auto* normalFont = reinterpret_cast<ImFont*>(
+                glyphManager->getFont(FontStyle::eLarge));
+            if (normalFont)
+                io.FontDefault = normalFont;
+
+            PlatformRegistry::instance().setGlyphManager(glyphManager);
+        }
+        else
+        {
+            fprintf(stdout, "HeadlessEglPlatform: using ImGui default font\n");
+        }
+    }
+
     if (!ImGui_ImplOpenGL3_Init("#version 330 core"))
     {
         fprintf(stderr, "HeadlessEglPlatform: ImGui_ImplOpenGL3_Init failed\n");
@@ -120,16 +229,40 @@ bool HeadlessEglPlatform::setupFboAndImGui(int width, int height)
 
 // -- EGL screenshot API ------------------------------------------------------
 
-void HeadlessEglPlatform::captureScreenshot(const std::string& path)
+void HeadlessEglPlatform::captureScreenshot(const std::string& path, uint64_t requestId)
 {
     m_pendingScreenshotPath = path;
+    m_pendingScreenshotRequestId = requestId;
     m_screenshotDone        = false;
     m_screenshotError       = false;
+    m_screenshotActualFormat.clear();
+    m_screenshotWidth = 0;
+    m_screenshotHeight = 0;
+    m_screenshotErrorMessage.clear();
 }
 
 bool HeadlessEglPlatform::isScreenshotDone() const { return m_screenshotDone; }
 
 bool HeadlessEglPlatform::hadScreenshotError() const { return m_screenshotError; }
+
+uint64_t HeadlessEglPlatform::screenshotRequestId() const
+{
+    return m_pendingScreenshotRequestId;
+}
+
+const std::string& HeadlessEglPlatform::screenshotActualFormat() const
+{
+    return m_screenshotActualFormat;
+}
+
+int HeadlessEglPlatform::screenshotWidth() const { return m_screenshotWidth; }
+
+int HeadlessEglPlatform::screenshotHeight() const { return m_screenshotHeight; }
+
+const std::string& HeadlessEglPlatform::screenshotErrorMessage() const
+{
+    return m_screenshotErrorMessage;
+}
 
 // -- Window lifecycle --------------------------------------------------------
 
@@ -535,6 +668,52 @@ void HeadlessEglPlatform::drainDeferredQueue()
 
 // -- Run loop ----------------------------------------------------------------
 
+static std::string screenshotFormatForPath(const std::string& path)
+{
+    const size_t dot = path.find_last_of('.');
+    std::string extension = dot == std::string::npos ? std::string{} : path.substr(dot);
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (extension == ".jpg" || extension == ".jpeg")
+        return "jpeg";
+    if (extension == ".bmp")
+        return "bmp";
+    return "png";
+}
+
+static bool writeScreenshot(
+    const std::string& path,
+    const std::vector<uint8_t>& pixels,
+    int width,
+    int height,
+    std::string* actualFormat)
+{
+    const int rowBytes = width * 4;
+    std::vector<uint8_t> flipped(pixels);
+    std::vector<uint8_t> rowBuffer(rowBytes);
+    for (int y = 0; y < height / 2; ++y)
+    {
+        uint8_t* top = flipped.data() + y * rowBytes;
+        uint8_t* bottom = flipped.data() + (height - 1 - y) * rowBytes;
+        std::memcpy(rowBuffer.data(), top, rowBytes);
+        std::memcpy(top, bottom, rowBytes);
+        std::memcpy(bottom, rowBuffer.data(), rowBytes);
+    }
+
+    const std::string format = screenshotFormatForPath(path);
+    int result = 0;
+    if (format == "jpeg")
+        result = stbi_write_jpg(path.c_str(), width, height, 4, flipped.data(), 95);
+    else if (format == "bmp")
+        result = stbi_write_bmp(path.c_str(), width, height, 4, flipped.data());
+    else
+        result = stbi_write_png(path.c_str(), width, height, 4, flipped.data(), rowBytes);
+    if (result && actualFormat)
+        *actualFormat = format;
+    return result != 0;
+}
+
 bool HeadlessEglPlatform::tick()
 {
     if (!m_imguiInitialized)
@@ -575,30 +754,44 @@ bool HeadlessEglPlatform::tick()
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     glFlush();
 
-    // Screenshot readback: drain any pending capture request into a PNG file.
+    // Screenshot readback: drain any pending capture request into its image file.
     if (!m_pendingScreenshotPath.empty())
     {
+        if (!isScreenshotRequestPending(m_pendingScreenshotRequestId))
+        {
+            m_pendingScreenshotPath.clear();
+            m_screenshotDone = true;
+            return true;
+        }
+        m_screenshotWidth = m_width;
+        m_screenshotHeight = m_height;
         glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
         std::vector<uint8_t> pixels(m_width * m_height * 4);
+        while (glGetError() != GL_NO_ERROR)
+        {
+        }
         glReadPixels(0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
         if (glGetError() != GL_NO_ERROR)
         {
             fprintf(stderr, "HeadlessEglPlatform: glReadPixels failed for %s\n",
                     m_pendingScreenshotPath.c_str());
             m_screenshotError = true;
+            m_screenshotErrorMessage = "OpenGL framebuffer readback failed";
         }
         else
         {
-            // Vertical flip: stb negative-stride trick (GL origin = bottom-left).
-            const uint8_t* topRow = pixels.data() + (m_height - 1) * m_width * 4;
-            int stride = -(m_width * 4);
-            int ok = stbi_write_png(m_pendingScreenshotPath.c_str(),
-                                    m_width, m_height, 4, topRow, stride);
+            const bool ok = writeScreenshot(
+                m_pendingScreenshotPath,
+                pixels,
+                m_width,
+                m_height,
+                &m_screenshotActualFormat);
             if (!ok)
             {
-                fprintf(stderr, "HeadlessEglPlatform: stbi_write_png failed for %s\n",
+                fprintf(stderr, "HeadlessEglPlatform: image write failed for %s\n",
                         m_pendingScreenshotPath.c_str());
                 m_screenshotError = true;
+                m_screenshotErrorMessage = "image encoder failed to persist screenshot";
             }
             else
             {

@@ -117,7 +117,7 @@
     <header class="hero">
       <p class="eyebrow">Section 1</p>
       <h1>ovui Project Overview</h1>
-      <p class="lead">ovui is a Python UI framework, a library of ready-made app widgets, and a runnable reference application for building scene, viewport, and data tools that look polished and behave consistently. The Python-facing UI layer (<code>ovui</code>) supplies the primitives; ovwidgets supplies the app widgets (stage browser, property inspector, content browser, viewport, composition view); data adapters connect those widgets to OpenUSD or custom backends; the supplied application wires everything together; and an inspector pipeline lets people and AI coding agents drive the running UI through the same screenshot-action loop.</p>
+      <p class="lead">ovui is a Python UI framework, a library of ready-made app widgets, and a runnable reference application for building scene, viewport, and data tools that look polished and behave consistently. The Python-facing UI layer (<code>ovui</code>) supplies the primitives; ovui-widgets supplies the app widgets (stage browser, property inspector, content browser, viewport, composition view); data adapters connect those widgets to OpenUSD or custom backends; the supplied application wires everything together; and an inspector pipeline lets people and AI coding agents drive the running UI through the same screenshot-action loop.</p>
     </header>
 
     <section>
@@ -135,7 +135,7 @@
 
     <section>
       <h2>The project in three parts</h2>
-      <p>The repository is easiest to understand by following the path from UI primitives to app workflows and then to data. The base layer supplies the Python UI vocabulary. ovwidgets adds application views and app state. Scene, viewport, and adapter code decide where hierarchy data, attributes, files, transforms, and rendered frames come from.</p>
+      <p>The repository is easiest to understand by following the path from UI primitives to app workflows and then to data. The base layer supplies the Python UI vocabulary. ovui-widgets adds application views and app state. Scene, viewport, and adapter code decide where hierarchy data, attributes, files, transforms, and rendered frames come from.</p>
       <div class="diagram overview-diagram" role="img" aria-label="ovui project parts: Python UI layer, app widgets and application views, and scene, viewport, and data adapters">
         <div class="overview-grid">
           <div class="overview-card is-primary">
@@ -190,9 +190,9 @@
         <li><strong>Keep widgets and replace the data.</strong> Connect a stage browser, property inspector, viewport, content browser, or composition view to proprietary data, a remote backend, local storage, generated data, or a test backend.</li>
         <li><strong>Write new data adapters.</strong> Use adapters as the connection point for hierarchy data, attributes, transforms, rendered frames, content browsing, and composition data.</li>
         <li><strong>Use the <code>ovui</code> API directly.</strong> Build focused controls from windows, stacks, fields, tree views, menus, markdown, image providers, styles, screenshots, scene views, gestures, and manipulators; app widgets can still be mixed in later.</li>
-        <li><strong>Use ovwidgets as skills for Claude Code, Codex, or Cursor.</strong> The repository ships Claude Code-compatible skills in <code>skills/</code>: <code>skills/omniverse-ui-apis</code> for atomic <code>ovui</code> construction, <code>skills/omniverse-ui-widgets</code> for composing standalone apps from the existing widget set, and <code>skills/omniverse-ui-inspector</code> for driving a running app through a screenshot-first inspector. Pointing an AI coding agent at these skills hands it the proven layout, model-view, styling, adapter, and inspector patterns the supplied application already uses, so the generated tool starts from real ovwidgets components and patterns rather than generic UI code, and looks and behaves like the rest of the toolkit.</li>
+        <li><strong>Use ovui-widgets as skills for Claude Code, Codex, or Cursor.</strong> The repository ships Claude Code-compatible skills in <code>skills/</code>: <code>skills/omniverse-ui-apis</code> for atomic <code>ovui</code> construction, <code>skills/omniverse-ui-widgets</code> for composing standalone apps from the existing widget set, and <code>skills/omniverse-ui-inspector</code> for driving a running app through a screenshot-first inspector. Pointing an AI coding agent at these skills hands it the proven layout, model-view, styling, adapter, and inspector patterns the supplied application already uses, so the generated tool starts from real ovui-widgets components and patterns rather than generic UI code, and looks and behaves like the rest of the toolkit.</li>
       </ul>
-      <p>These choices can be combined: begin with the full application, replace one backend, add one widget, reuse the content browser, build a custom tool area from UI primitives, and let an AI coding agent generate the next tool by reusing ovwidgets through the skills above. ovui is organized so a project can take the amount that matches the tool's goal without rewriting every piece at once.</p>
+      <p>These choices can be combined: begin with the full application, replace one backend, add one widget, reuse the content browser, build a custom tool area from UI primitives, and let an AI coding agent generate the next tool by reusing ovui-widgets through the skills above. ovui is organized so a project can take the amount that matches the tool's goal without rewriting every piece at once.</p>
     </section>
 
     <nav class="bottom-nav" aria-label="Section navigation">

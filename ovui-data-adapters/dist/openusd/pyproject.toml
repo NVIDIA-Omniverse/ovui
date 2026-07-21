@@ -6,23 +6,26 @@ build-backend = "setuptools.build_meta"
 name = "ovui-data-adapters-openusd"
 dynamic = ["version"]
 description = "Concrete OpenUSD data adapters and renderer-side OpenUSD support."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "ovui-data-adapters-common>=0.1.0",
-    "usd-core==25.11",
     "numpy>=1.20",
-    "ovrtx>=0.1",
 ]
 
 [project.optional-dependencies]
+standalone = ["usd-core==25.11"]
 livestream = ["ovstream"]
+
+[project.entry-points."ovui_data_adapters.adapters"]
+openusd = "ovui_data_adapters.openusd.register:register"
 
 [tool.setuptools.packages.find]
 namespaces = true
 include = ["ovui_data_adapters.openusd*"]
 # Source lives two levels up at ``ovui-data-adapters/ovui_data_adapters/openusd/`` —
 # same ``dist/<sub>/pyproject.toml`` + ``where = "../.."`` pattern as
-# ``ovwidgets/dist/``. This pattern supports editable installs
+# ``ovui-widgets/dist/``. This pattern supports editable installs
 # (``pip install -e``) and wheel builds run in-tree; **sdist builds from
 # the ``dist/<sub>/`` stub are NOT supported** because setuptools cannot
 # include source two levels above the project root in a self-contained

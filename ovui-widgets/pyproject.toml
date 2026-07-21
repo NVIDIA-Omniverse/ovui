@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = ["."]
+
+[[tool.mypy.overrides]]
+module = ["omni.*", "pxr.*", "ovrtx.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+# E402: module-level imports not at top — intentional lazy/deferred import pattern
+# E702: multiple statements on one line (semicolons) — pre-existing style
+# E731: lambda assigned to variable — pre-existing style
+# F401: imported but unused — accepted for re-export and conditional imports
+# F841: local variable assigned but never used — pre-existing
+ignore = ["E501", "E402", "E702", "E731", "F401", "F841"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+timeout = 300
+timeout_method = "thread"
+markers = [
+    "performance: Layers window performance benchmarks (LAYERS-PLAN Step 61)",
+    "inspector_qa: state-guided real USD Viewer QA driven through ovui-inspect (opt-in)",
+    "requires_ovstage: test needs the Kit-integrated ovstage runtime module",
+    "requires_ovphysx: test needs the ovphysx runtime module",
+    "requires_ovrtx: test needs the ovrtx runtime and supported NVIDIA GPU",
+    "requires_cuda_vulkan_gl_interop: test needs a real GPU with CUDA/Vulkan/OpenGL interop",
+]

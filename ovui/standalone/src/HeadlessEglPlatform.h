@@ -39,9 +39,14 @@ public:
     ~HeadlessEglPlatform() override;
 
     // -- EGL screenshot API --------------------------------------------------
-    void captureScreenshot(const std::string& path);
+    void captureScreenshot(const std::string& path, uint64_t requestId);
     bool isScreenshotDone() const;
     bool hadScreenshotError() const;
+    uint64_t screenshotRequestId() const;
+    const std::string& screenshotActualFormat() const;
+    int screenshotWidth() const;
+    int screenshotHeight() const;
+    const std::string& screenshotErrorMessage() const;
 
     // -- Window lifecycle ----------------------------------------------------
     WindowId createWindow(const char* title, int width, int height) override;
@@ -158,10 +163,15 @@ private:
     WindowId    m_mainWindowId       = kInvalidWindowId;
     WindowId    m_nextWindowId       = 1;
     std::string m_pendingScreenshotPath;
+    uint64_t    m_pendingScreenshotRequestId = 0;
     bool        m_imguiContextCreated = false;  // ImGui::CreateContext() succeeded
     bool        m_imguiInitialized    = false;  // ImGui_ImplOpenGL3_Init() succeeded
     bool        m_screenshotDone      = false;
     bool        m_screenshotError     = false;
+    std::string m_screenshotActualFormat;
+    int         m_screenshotWidth     = 0;
+    int         m_screenshotHeight    = 0;
+    std::string m_screenshotErrorMessage;
     std::mutex              m_deferMutex;
     std::vector<DeferredEntry> m_deferredQueue;
 };

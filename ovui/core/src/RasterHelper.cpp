@@ -25,6 +25,7 @@
 #include <omni/ui/MenuItem.h>
 #include <omni/ui/RasterHelper.h>
 
+#include <cmath>
 #include <iterator>
 #include <unordered_set>
 
@@ -294,7 +295,14 @@ bool RasterHelper::_rasterHelperBegin(float posX, float posY, float width, float
         // live draw active while the user interacts with the popup.
         bool hovered = ctx->HoveredWindow && currentWindow && ImGui::IsWindowChildOf(ctx->HoveredWindow, currentWindow, true, false);
 
+        const ImGuiIO& io = ImGui::GetIO();
+        constexpr float kMouseMoveEpsilon = 0.1f;
+        const bool mouseMoved =
+            fabsf(io.MouseDelta.x) > kMouseMoveEpsilon || fabsf(io.MouseDelta.y) > kMouseMoveEpsilon;
+        const bool mouseWheel = io.MouseWheel != 0.0f || io.MouseWheelH != 0.0f;
+
         bool justLeaved = !hovered && m_prv->m_lastHovered;
+        bool justEntered = hovered && !m_prv->m_lastHovered;
         // Keep it to know it was hovered the previous frame
         m_prv->m_lastHovered = hovered;
 
@@ -318,9 +326,13 @@ bool RasterHelper::_rasterHelperBegin(float posX, float posY, float width, float
         }
 
         // The main cpature-show logic
-        if (this->_isDirtyDrawList() || justLeaved || m_prv->m_mousePressedInsideFrame || m_prv->m_editingMode)
+        const bool hoveredNeedsLiveDraw = hovered && (justEntered || mouseMoved || mouseWheel);
+
+        if (this->_isDirtyDrawList() || justLeaved || hoveredNeedsLiveDraw || m_prv->m_mousePressedInsideFrame ||
+            m_prv->m_editingMode)
         {
-            // It just became dirty, or the mouse just left the area, or mouse is pressed and not released
+            // It just became dirty, the hover state changed, the cursor is moving in the area, or mouse is pressed
+            // and not released.
             // Don't capture
             m_prv->m_isCaptureRaster = false;
             // Don't draw cached
@@ -330,15 +342,6 @@ bool RasterHelper::_rasterHelperBegin(float posX, float posY, float width, float
             m_prv->m_framesToBake = _getRasterDealy();
             // Undirty
             m_prv->m_drawListDirty[m_prv->m_drawListIndex] = false;
-        }
-        else if (hovered)
-        {
-            // Mouse hovers the area
-
-            // Don't capture when hovered
-            m_prv->m_isCaptureRaster = false;
-            // Don't draw raster when hovered
-            isDrawRaster = false;
         }
         else if (m_prv->m_framesToBake == 0)
         {

@@ -11,17 +11,18 @@
 """Abstract base classes for all OvGear adapters.
 
 ABCs that decouple the UI from any specific
-USD or RTX implementation; concrete adapters live in ovwidgets.stage / ovwidgets.viewport.
+USD or RTX implementation; concrete adapters live in ovui_widgets.stage / ovui_widgets.viewport.
 
-Part of ``ovui-data-adapters-common`` — zero-dependency, stdlib-only at
-runtime. ``ovwidgets/common/adapters.py`` is a one-step re-export shim
-that resolves to this module.
+This abstract-contract module remains stdlib-only at runtime even though the
+distribution's separate livestream helper requires NumPy.
+``ovui_widgets/common/adapters.py`` is a one-step re-export shim that resolves to
+this module.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum, Flag, auto
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type
 
@@ -31,6 +32,24 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Ty
 # while __init__ is still being initialized would re-enter a partially
 # constructed namespace. The private path is what ``_undo_manager`` uses too.
 from ovui_data_adapters.common._bound_camera_pose import BoundCameraPose
+from ovui_data_adapters.common.render_targets import (
+    RenderTargetActivationResult,
+    RenderTargetCatalog,
+)
+from ovui_data_adapters.common.render_vars import (
+    RenderVarOutputCatalog,
+    RenderVarOutputFrame,
+    RenderVarOutputRequest,
+    RenderVarOutputRequestResult,
+    RenderVarProbeRequest,
+    RenderVarProbeResult,
+)
+from ovui_data_adapters.common.point_cloud import (
+    PointCloudFrame,
+    PointCloudOutputCatalog,
+    PointCloudRequest,
+    PointCloudRequestResult,
+)
 from ovui_data_adapters.common._subscription import SubscriptionProtocol
 
 if TYPE_CHECKING:
@@ -42,14 +61,13 @@ if TYPE_CHECKING:
     # :meth:`RendererAdapter.render_frame`.
     NDArray = np.ndarray
 else:
-    # Runtime view: ``ovui-data-adapters-common`` is a zero-dependency
-    # package, so we cannot import numpy at module load. ``Any`` makes
-    # the public ``RendererAdapter.render_frame`` annotation
-    # introspectable via ``typing.get_type_hints()`` without forcing a
-    # runtime numpy dependency. Concrete adapters in
-    # ``ovui-data-adapters-openusd`` (which DOES depend on numpy) still
-    # return a real ``np.ndarray``; this alias only types the public
-    # contract.
+    # Runtime view: keep the abstract-contract import lightweight rather than
+    # importing numpy solely for an annotation. ``Any`` makes the public
+    # ``RendererAdapter.render_frame`` annotation introspectable via
+    # ``typing.get_type_hints()``. Concrete adapters still return a real
+    # ``np.ndarray``; this alias only types the public contract. The common
+    # distribution's separate livestream helper declares its actual numpy
+    # runtime dependency in package metadata.
     NDArray = Any
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -65,7 +83,7 @@ ContextManager = Any   # Return type alias for suppress_change_notifications().
 
 # GpuFrameHandle is the type-only alias for
 # :meth:`RendererAdapter.render_frame`'s GPU return type. Inlined here as
-# ``Any`` (was previously imported from ``ovwidgets.common.types``; that
+# ``Any`` (was previously imported from ``ovui_widgets.common.types``; that
 # file also defines it as ``Any``). Keeping it inline removes the last
 # TYPE_CHECKING dependency on widget-side modules. The contract is
 # semantic: an RGBA uint8 buffer or zero-copy GPU pointer (concrete
@@ -162,6 +180,14 @@ class ChangeEventType(Enum):
     LAYER_INFO = "layer"    # Layer metadata changed (e.g., defaultPrim)
 
 
+class TransformEditMode(Enum):
+    """How a transform edit should be applied for a path."""
+
+    DIRECT = "direct"
+    REDIRECTED = "redirected"
+    BLOCKED = "blocked"
+
+
 VIEWPORT_CAMERA_POSE_SOURCE = "viewport-camera-pose"
 _CAMERA_POSE_PROPERTY_NAMES = frozenset(
     {
@@ -251,6 +277,33 @@ class StageChoice:
 
 
 @dataclass(frozen=True)
+class TransformEditPolicy:
+    """Widget-facing transform edit decision.
+
+    ``DIRECT`` means viewport tools may write the transform adapter normally.
+    ``REDIRECTED`` means controls remain active, but the concrete adapter
+    sends the edit to a backend control target instead of writing the scene
+    transform directly. ``BLOCKED`` means transform controls should be
+    disabled for that path.
+    """
+
+    mode: TransformEditMode
+    reason: str = ""
+
+    @property
+    def is_editable(self) -> bool:
+        return self.mode in (TransformEditMode.DIRECT, TransformEditMode.REDIRECTED)
+
+    @property
+    def direct_write_allowed(self) -> bool:
+        return self.mode is TransformEditMode.DIRECT
+
+    @property
+    def redirected(self) -> bool:
+        return self.mode is TransformEditMode.REDIRECTED
+
+
+@dataclass(frozen=True)
 class ChangeEvent:
     """Emitted by StageAdapter when the backing scene changes."""
 
@@ -258,6 +311,13 @@ class ChangeEvent:
     resynced_paths: Tuple[str, ...]
     event_type: ChangeEventType
     source: Optional[str] = None
+    # Optional adapter-owned semantic record for visibility edits. Shape:
+    # {"authored": (prim path, ...),                      # from genuine notices
+    #  "boundaries": {prim path: (old, new)}}             # VisibilityState pairs
+    # ``authored`` names only prims whose visibility opinions the genuine
+    # USD notices reported; ``boundaries`` may cover additional evaluated
+    # prims but can only prune model work, never add repaint roots.
+    visibility_delta: Optional[Any] = None
 
     def get_common_prefix(self) -> str:
         """Return the common path ancestor of all changed+resynced paths.
@@ -307,6 +367,148 @@ class AttributeMetadata:
     is_time_sampled: bool = False
     is_locked: bool = False
     is_authored: bool = True
+
+
+class AdapterCapabilityStatus(Enum):
+    """Static support state for one adapter-provided action.
+
+    A capability reports whether an adapter can perform an action at all.
+    It does not answer whether the action is valid for the current UI state
+    (for example, saving a clean layer or deleting with no selection).
+    """
+
+    SUPPORTED = "supported"
+    READ_ONLY = "read_only"
+    UNSUPPORTED = "unsupported"
+
+
+@dataclass(frozen=True)
+class AdapterCapability:
+    """One static action advertised by an adapter capability surface.
+
+    ``read_only`` is reserved for adapters that can expose a surface for
+    inspection but cannot perform its authoring mutation. ``supported_actions``
+    intentionally returns only fully supported actions.
+    """
+
+    status: AdapterCapabilityStatus
+    reason: str = ""
+
+    @classmethod
+    def supported(cls, reason: str = "") -> "AdapterCapability":
+        return cls(AdapterCapabilityStatus.SUPPORTED, reason)
+
+    @classmethod
+    def read_only(cls, reason: str = "") -> "AdapterCapability":
+        return cls(AdapterCapabilityStatus.READ_ONLY, reason)
+
+    @classmethod
+    def unsupported(cls, reason: str = "") -> "AdapterCapability":
+        return cls(AdapterCapabilityStatus.UNSUPPORTED, reason)
+
+    @property
+    def is_supported(self) -> bool:
+        return self.status is AdapterCapabilityStatus.SUPPORTED
+
+    @property
+    def is_read_only(self) -> bool:
+        return self.status is AdapterCapabilityStatus.READ_ONLY
+
+    @property
+    def is_unsupported(self) -> bool:
+        return self.status is AdapterCapabilityStatus.UNSUPPORTED
+
+
+def _supported_actions(capabilities: Any) -> Tuple[str, ...]:
+    return tuple(
+        capability_field.name
+        for capability_field in fields(capabilities)
+        if isinstance(
+            capability := getattr(capabilities, capability_field.name),
+            AdapterCapability,
+        )
+        and capability.is_supported
+    )
+
+
+@dataclass(frozen=True)
+class StageCapabilities:
+    """Static stage-level action support exposed by a provider session."""
+
+    create_stage: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    export_stage: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    create_prims: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    delete_prims: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+
+    def supported_actions(self) -> Tuple[str, ...]:
+        return _supported_actions(self)
+
+
+@dataclass(frozen=True)
+class PropertyCapabilities:
+    """Static property authoring support exposed by a property adapter.
+
+    ``clear_values`` covers the shared public operation that removes authored
+    opinions. Existing reset affordances are backed by that same adapter
+    operation until a distinct reset API exists.
+    """
+
+    clear_values: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+
+    def supported_actions(self) -> Tuple[str, ...]:
+        return _supported_actions(self)
+
+
+@dataclass(frozen=True)
+class LayerStackCapabilities:
+    """Static layer-stack action support exposed by a layer adapter."""
+
+    layer_stack: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    edit_target_read: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    edit_target_write: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    save_layer: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    save_layer_as: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    create_sublayer: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    insert_sublayer: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    remove_sublayer: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    reload_layer: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    mute_layer: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    lock_layer: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    move_sublayer: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    replace_sublayer: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    prim_spec_read: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    prim_spec_edit: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    layer_snapshot: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    layer_restore: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+    transfer_layer_content: AdapterCapability = field(default_factory=AdapterCapability.unsupported)
+
+    def supported_actions(self) -> Tuple[str, ...]:
+        return _supported_actions(self)
+
+
+@dataclass(frozen=True)
+class AdapterCapabilities:
+    """Provider-session capability snapshot.
+
+    This surface is limited to provider/session actions. Per-selection
+    property capabilities and per-stage layer-stack capabilities live on the
+    concrete :class:`PropertyAdapter` and :class:`LayerStackAdapter`
+    instances, where the backing stage/selection context actually exists.
+    """
+
+    stage: StageCapabilities = field(default_factory=StageCapabilities)
+
+
+class UnresolvedDeliveryDebtError(RuntimeError):
+    """Non-destructive, retryable refusal: provider delivery is still owed.
+
+    Raised by adapter disposal — and recognized by application replacement
+    and shutdown preflights — when genuine visibility roots could not be
+    proven delivered to the provider stream. The raising adapter remains
+    fully functional: its listeners, subscribers, and the owed roots stay
+    intact, and the refused operation may be retried after the provider
+    recovers (the retry delivers the complete owed union first).
+    """
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -470,34 +672,43 @@ class StageAdapter(ABC):
         """Return the combined world-space AABB enclosing ``paths``.
 
         Returns ``None`` when ``paths`` is empty, when the stage is
-        unavailable, or when no prim contributes a non-empty bound. The
-        pseudo-root path ``"/"`` is treated as "everything" — iterate the
-        pseudo-root's children rather than asking USD to bound the root
-        directly (``BBoxCache.ComputeWorldBound`` returns an empty bound
-        for the pseudo-root because it isn't an Imageable prim).
+        unavailable, or when no prim contributes a non-empty bound.
+        Concrete adapters may treat a selected grouping prim as a subtree
+        request so frame-selection behavior matches user expectations for
+        hierarchy selections. The pseudo-root path ``"/"`` is treated as
+        "everything".
         """
 
     @abstractmethod
     def compute_prim_world_aabb_with_extent_fallback(self, path: str) -> AABB:
         """Return ``((min_xyz, max_xyz))`` for the prim at ``path`` or ``None``.
 
-        For ``UsdGeom.Boundable`` prims this prefers
-        ``Boundable.ComputeExtentFromPlugins`` so a Property-panel
-        ``radius`` / ``size`` edit invalidates the cached ``extent``
-        attribute correctly. Non-Boundable selections (Xforms, Scopes)
-        fall back to ``UsdGeom.BBoxCache``.
+        Implementations should use backend-native or mirrored geometry data
+        and return ``None`` when that data is unavailable. This method is for
+        one concrete prim; subtree/group selection behavior belongs in
+        :meth:`compute_world_aabb`.
         """
 
     @abstractmethod
     def read_bound_camera(self) -> Optional[BoundCameraPose]:
-        """Parse the stage's authored ``boundCamera`` and return a pose.
+        """Return a bound-camera pose when the adapter can provide one.
 
-        Returns ``None`` when the stage has no ``customLayerData``
-        ``cameraSettings``, or when neither the ``boundCamera`` Path 1
-        (resolve to a ``UsdGeom.Camera`` prim) nor the ``Perspective``
-        preset Path 2 yield a usable pose. Callers fall back to bbox
-        framing in that case.
+        A concrete adapter may parse authored camera metadata, read a
+        mirrored camera prim, or derive a basic framing pose from computed
+        bounds. Returns ``None`` when no adapter-supported bound-camera data
+        or computed bounds are available; callers then fall back to bbox
+        framing.
         """
+
+    def read_stage_up_axis(self) -> str:
+        """Return the stage up-axis metadata as ``"Y"`` or ``"Z"``.
+
+        The default keeps older/minimal adapters compatible and matches USD's
+        effective default. USD-backed adapters should override this so
+        viewport fallback framing can apply stage orientation even when no
+        bound-camera pose exists.
+        """
+        return "Y"
 
     # ── Viewport selector defaults ───────────────────────────────────────────
     #
@@ -552,6 +763,15 @@ class StageAdapter(ABC):
         """
         return []
 
+    def get_render_target_catalog(self) -> RenderTargetCatalog:
+        """Return a rich render-target catalog, if supported.
+
+        The default empty catalog keeps existing adapters source-compatible.
+        Backends that know sensor/source/output metadata should override this
+        instead of exposing backend objects to UI code.
+        """
+        return RenderTargetCatalog()
+
 
 class TransformAdapter(ABC):
     """3D transform read/write adapter used by viewport manipulation."""
@@ -571,6 +791,41 @@ class TransformAdapter(ABC):
     @abstractmethod
     def can_transform(self, path: str) -> bool:
         """False for instance proxies, abstract prims, etc."""
+
+    def get_transform_edit_policy(self, path: str) -> TransformEditPolicy:
+        """Return the edit policy used by viewport transform controls.
+
+        Older adapters only implement :meth:`can_transform`; the default
+        policy preserves that behavior. Physics-aware adapters override this
+        to distinguish direct writes from solver-owned/redirected edits.
+        """
+        if self.can_transform(path):
+            return TransformEditPolicy(TransformEditMode.DIRECT)
+        return TransformEditPolicy(
+            TransformEditMode.BLOCKED,
+            reason="transform is unavailable for this path",
+        )
+
+    def teleport_local_transform(self, path: str, matrix: List[List[float]]) -> None:
+        """Apply an explicit teleport/reset-style local transform edit.
+
+        Backends with running simulation can override this to bound the edit
+        by a pause or step-synchronization point. The default preserves the
+        historical direct write behavior.
+        """
+        self.set_local_transform(path, matrix)
+
+    def reset_local_transform(self, path: str) -> None:
+        """Reset local transform to identity using teleport semantics."""
+        self.teleport_local_transform(
+            path,
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        )
 
 
 class PropertyAdapter(ABC):
@@ -607,12 +862,24 @@ class PropertyAdapter(ABC):
     @abstractmethod
     def end_edit(self, attr_name: str) -> None: ...
 
+    def cancel_edit(self, attr_name: str) -> None:
+        """Cancel an active edit transaction without recording history.
+
+        Backends that keep per-edit state (snapshots, tokens) override
+        this to release it and remove any partial authorship; the default
+        matches backends whose ``begin_edit`` holds no state.
+        """
+
     @abstractmethod
     def subscribe_changes(self, callback: Callable[[], None]) -> SubscriptionProtocol: ...
 
     @abstractmethod
     def get_scheme(self) -> str:
         """Return backend identifier, e.g. 'usd' or 'mock'."""
+
+    def get_capabilities(self) -> PropertyCapabilities:
+        """Return explicit property actions supported by this adapter."""
+        return PropertyCapabilities()
 
     def get_resolved_asset_path(self, attr_name: str) -> Optional[str]:
         """Resolved absolute path for an asset-path attribute.
@@ -672,10 +939,10 @@ class RendererAdapter(ABC):
         implementation: :class:`ovui_data_adapters.common.GpuFrame`)
         carrying a renderer-owned GPU pointer for callers that support
         direct GPU presentation. The runtime annotation uses the
-        zero-dependency ``NDArray`` alias (resolves to ``Any`` at
-        runtime, ``numpy.ndarray`` for static type checkers) so
-        :func:`typing.get_type_hints` works without forcing a numpy
-        runtime dependency on this package.
+        lightweight ``NDArray`` alias (resolves to ``Any`` at runtime,
+        ``numpy.ndarray`` for static type checkers) so
+        :func:`typing.get_type_hints` works without importing NumPy merely to
+        inspect this abstract contract.
         """
 
     def get_active_camera_path(self) -> Optional[str]:
@@ -706,6 +973,142 @@ class RendererAdapter(ABC):
         to restore their fallback render product.
         """
         return False
+
+    def supports_in_place_stage_swap(self) -> bool:
+        """Whether ``load_stage`` can transition this renderer from its
+        currently-loaded stage to a different one *in place*, with an
+        authoritative OLD-or-NEW identity even if cleanup reports afterward.
+
+        When ``True``, the application reuses this already-attached renderer
+        for a document replacement instead of constructing a second renderer
+        that would run alongside it — two live GPU renderers contending for
+        native scene/RenderSettings resolution can freeze the frame loop.
+        The default declines so renderers that require a fresh instance per
+        stage (e.g. a borrow-mode renderer that cannot swap an attached
+        scene) keep the construct-fresh path. Implementations that return
+        ``True`` should also implement :meth:`is_stage_current`; an unknown
+        identity after a throwing load is handled fail-closed.
+        """
+        return False
+
+    def is_stage_current(self, stage: Any) -> Optional[bool]:
+        """Return whether ``stage`` is the renderer's authoritative stage.
+
+        In-place renderers use this after a throwing :meth:`load_stage` to
+        distinguish a complete-old failure from a committed-new failure that
+        surfaced cleanup debt. ``None`` means the renderer cannot prove either
+        identity; callers must fail closed rather than assume rollback.
+        """
+        return None
+
+    @property
+    def supports_live_local_transform(self) -> bool:
+        """Whether this renderer can preview local transforms without authoring."""
+        return False
+
+    def set_live_local_transform(self, path: str, matrix: Matrix4d) -> bool:
+        """Preview a prim-local transform without mutating authoritative data.
+
+        Returns ``True`` when the renderer accepted the preview. The default
+        declines so renderers remain source-compatible until they opt in.
+        """
+        return False
+
+    def clear_live_local_transforms(self, paths: List[str]) -> None:
+        """Release live transform previews for ``paths`` when supported."""
+        return None
+
+    def activate_render_target(
+        self,
+        target_id: Optional[str] = None,
+        render_product_path: Optional[str] = None,
+    ) -> RenderTargetActivationResult:
+        """Activate a descriptor-backed render target, if supported.
+
+        The default rejected result keeps existing renderer adapters
+        source-compatible until concrete adapters opt in to richer SRD 6.1
+        activation reporting.
+        """
+        return RenderTargetActivationResult.rejected_result(
+            "Render target activation is not supported.",
+            warning_code="unsupported",
+        )
+
+    def list_point_cloud_outputs(
+        self,
+        render_product_path: Optional[str] = None,
+    ) -> PointCloudOutputCatalog:
+        """Return point-cloud outputs available to this renderer, if supported."""
+
+        return PointCloudOutputCatalog()
+
+    def set_point_cloud_request(
+        self,
+        viewport_id: str,
+        request: Optional[PointCloudRequest],
+    ) -> PointCloudRequestResult:
+        """Request point-cloud extraction for one viewport, if supported."""
+
+        return PointCloudRequestResult.rejected_result(
+            "Point-cloud output is not supported.",
+            warning_code="unsupported",
+        )
+
+    def get_latest_point_cloud_frame(
+        self,
+        viewport_id: str,
+        render_product_path: Optional[str] = None,
+    ) -> Optional[PointCloudFrame]:
+        """Return the latest point-cloud snapshot for one viewport, if available."""
+
+        return None
+
+    def clear_point_cloud_request(self, viewport_id: str) -> None:
+        """Clear a viewport point-cloud extraction request, if supported."""
+
+        return None
+
+    def list_render_var_outputs(
+        self,
+        render_product_path: Optional[str] = None,
+    ) -> RenderVarOutputCatalog:
+        """Return visualizable RenderVar outputs available to this renderer."""
+
+        return RenderVarOutputCatalog()
+
+    def set_render_var_output_request(
+        self,
+        viewport_id: str,
+        request: Optional[RenderVarOutputRequest],
+    ) -> RenderVarOutputRequestResult:
+        """Request RenderVar output visualization for one viewport, if supported."""
+
+        return RenderVarOutputRequestResult.rejected_result(
+            "RenderVar output visualization is not supported.",
+            warning_code="unsupported",
+        )
+
+    def get_latest_render_var_output_frame(
+        self,
+        viewport_id: str,
+        render_product_path: Optional[str] = None,
+    ) -> Optional[RenderVarOutputFrame]:
+        """Return the latest RenderVar visualization snapshot, if available."""
+
+        return None
+
+    def clear_render_var_output_request(self, viewport_id: str) -> None:
+        """Clear a viewport RenderVar visualization request, if supported."""
+
+        return None
+
+    def probe_render_var_output(
+        self,
+        request: RenderVarProbeRequest,
+    ) -> RenderVarProbeResult:
+        """Return a raw RenderVar value probe result, if supported."""
+
+        return RenderVarProbeResult.unsupported_result()
 
     @abstractmethod
     def set_resolution(self, width: int, height: int) -> None:
@@ -759,7 +1162,7 @@ class SelectionAdapter(ABC):
 # LayerStackAdapter family.
 #
 # Layer-stack types consumed by the Layers window. Moved here from
-# ``ovwidgets.layers.adapter`` per issue #38 so the full adapter family lives in
+# ``ovui_widgets.layers.adapter`` per issue #38 so the full adapter family lives in
 # one canonical location alongside ``StageAdapter`` / ``TransformAdapter`` /
 # ``PropertyAdapter`` / ``RendererAdapter`` / ``SelectionAdapter``.
 # ──────────────────────────────────────────────────────────────────────────────
@@ -830,8 +1233,8 @@ class PrimSpecifier(Enum):
 class LayerSnapshot:
     """Opaque-ish round-trip token produced by :meth:`LayerStackAdapter.snapshot_layer`.
 
-    LAYERS-PLAN Step 42 — :class:`~ovwidgets.layers.commands.MergeDownCommand`
-    and :class:`~ovwidgets.layers.commands.FlattenSublayersCommand` use this
+    LAYERS-PLAN Step 42 — :class:`~ovui_widgets.layers.commands.MergeDownCommand`
+    and :class:`~ovui_widgets.layers.commands.FlattenSublayersCommand` use this
     record to restore a layer after a destructive merge. The snapshot
     captures enough state to rebuild the layer at its original position
     under its original parent and to replay its mute / lock flags +
@@ -908,12 +1311,16 @@ class LayerStackAdapter(ABC):
 
     Change-event contract — see :class:`LayerEventType` for the full
     taxonomy. Subscribers receive :class:`LayerEvent` instances over
-    :meth:`subscribe_events`; commands in ``ovwidgets.layers/commands/`` wrap
+    :meth:`subscribe_events`; commands in ``ovui_widgets.layers/commands/`` wrap
     mutators with do/undo logic — the adapter never pushes to an undo
     stack on its own.
     """
 
     # ── Stack discovery ──────────────────────────────────────────────
+
+    def get_capabilities(self) -> LayerStackCapabilities:
+        """Return explicit layer actions supported by this adapter."""
+        return LayerStackCapabilities()
 
     @abstractmethod
     def get_root_layer(self) -> LayerHandle:
@@ -1009,7 +1416,7 @@ class LayerStackAdapter(ABC):
     ) -> SubscriptionProtocol:
         """Subscribe to layer-stack change events.
 
-        Returns an RAII :class:`~ovwidgets.common.settings.Subscription`; callers keep
+        Returns an RAII :class:`~ovui_widgets.common.settings.Subscription`; callers keep
         the handle alive for the subscription to remain active. The adapter
         must invoke ``callback`` on every emitted :class:`LayerEvent`.
         """
@@ -1116,7 +1523,7 @@ class LayerStackAdapter(ABC):
         event on the parent (atomic replace — one notification, not two).
         Raises :class:`IndexError` on out-of-range positions.
 
-        Used by :class:`~ovwidgets.layers.commands.ReplaceSublayerCommand`
+        Used by :class:`~ovui_widgets.layers.commands.ReplaceSublayerCommand`
         (LAYERS-PLAN Step 31a) and by the Save-As-with-replace flow
         (Step 36).
         """
@@ -1191,8 +1598,8 @@ class LayerStackAdapter(ABC):
         """
 
     # ── Merge / Flatten support (LAYERS-PLAN Step 42) ───────────────
-    # :class:`~ovwidgets.layers.commands.MergeDownCommand` and
-    # :class:`~ovwidgets.layers.commands.FlattenSublayersCommand` use the
+    # :class:`~ovui_widgets.layers.commands.MergeDownCommand` and
+    # :class:`~ovui_widgets.layers.commands.FlattenSublayersCommand` use the
     # snapshot/restore pair to round-trip a destructive merge across
     # undo. ``transfer_layer_content`` is the atomic merge primitive
     # — it copies every root prim spec from ``src`` into ``dst`` in
@@ -1239,7 +1646,7 @@ class LayerStackAdapter(ABC):
         """Copy every root prim spec from ``src`` into ``dst``.
 
         Used as the merge primitive for
-        :class:`~ovwidgets.layers.commands.MergeDownCommand`: after calling
+        :class:`~ovui_widgets.layers.commands.MergeDownCommand`: after calling
         this, ``dst`` holds the union of its own opinions and the
         source's opinions (source wins on overlapping specs — matches
         USD's stronger-over-weaker composition rule for a merge from

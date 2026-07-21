@@ -1,0 +1,145 @@
+#usda 1.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def Xform "Hierarchy"
+    {
+        def Scope "Looks"
+        {
+        }
+
+        def Xform "GroupA"
+        {
+            def Cube "BoxA"
+            {
+                double size = 1
+                float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            }
+
+            def Sphere "BallA"
+            {
+                double radius = 0.5
+                float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            }
+        }
+
+        def Xform "GroupB"
+        {
+            def Mesh "TriangleMesh"
+            {
+                int[] faceVertexCounts = [3]
+                int[] faceVertexIndices = [0, 1, 2]
+                point3f[] points = [(-0.5, 0, 0), (0.5, 0, 0), (0, 1, 0)]
+                float3[] extent = [(-0.5, 0, 0), (0.5, 1, 0)]
+            }
+        }
+    }
+
+    def Xform "TransformCases"
+    {
+        def Xform "TranslateOnly"
+        {
+            double3 xformOp:translate = (1, 2, 3)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "RotateScale"
+        {
+            double3 xformOp:translate = (-2, 0.5, 4)
+            double3 xformOp:rotateXYZ = (10, 45, 90)
+            float3 xformOp:scale = (2, 1, 0.5)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+        }
+
+        def Xform "MatrixOnly"
+        {
+            matrix4d xformOp:transform = ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (4, 5, 6, 1))
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Xform "NestedParent"
+        {
+            double3 xformOp:translate = (0, 10, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "NestedChild"
+            {
+                double3 xformOp:translate = (0, 0, 2)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+    }
+
+    def Xform "VisibilityCases"
+    {
+        def Xform "HiddenParent"
+        {
+            uniform token visibility = "invisible"
+
+            def Cube "InheritedHiddenChild"
+            {
+                double size = 0.75
+            }
+        }
+
+        def Xform "VisibleParent"
+        {
+            uniform token visibility = "inherited"
+
+            def Sphere "ExplicitHiddenChild"
+            {
+                uniform token visibility = "invisible"
+                double radius = 0.4
+            }
+
+            def Sphere "InheritedVisibleChild"
+            {
+                uniform token visibility = "inherited"
+                double radius = 0.4
+            }
+        }
+    }
+
+    def Xform "AttributeCases"
+    {
+        def Xform "MirroredValues"
+        {
+            custom bool test:enabled = 1
+            custom int test:count = 7
+            custom float test:ratio = 0.25
+            custom double3 test:offset = (1, 2, 3)
+            custom token test:mode = "preview"
+            custom string test:label = "static-fixture"
+            custom asset test:assetPath = @./textures/example.png@
+            custom int[] test:indices = [0, 2, 4, 8]
+            custom matrix4d test:matrix = ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (9, 8, 7, 1))
+        }
+    }
+
+    def Xform "Cameras"
+    {
+        def Camera "MainCamera"
+        {
+            float focalLength = 35
+            float horizontalAperture = 20.955
+            double2 clippingRange = (0.1, 1000)
+            double3 xformOp:translate = (6, 4, 8)
+            double3 xformOp:rotateXYZ = (-20, 35, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
+    }
+}

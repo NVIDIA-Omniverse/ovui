@@ -1,9 +1,8 @@
 ---
 name: omniverse-ui-widgets
-version: "0.1.0"
 description: |
   Use this skill when a user asks to create or validate a disposable
-  standalone ovui/ovwidgets application from the existing widget set. The
+  standalone ovui/ovui-widgets application from the existing widget set. The
   application source should live outside the repo unless the user explicitly
   asks to productize it. The skill gives exact imports, runtime environment,
   ovrtx proof requirements, widget wiring, menu/file-open wiring, and
@@ -11,14 +10,17 @@ description: |
   atomic widget construction; use the omniverse-ui-apis skill instead.
 author: "NVIDIA ovui Team <ovui-team@nvidia.com>"
 license: "LicenseRef-NVIDIA"
+metadata:
+  python-distribution: ovui-widgets-app
+  version: "0.2.0"
 ---
 
-# Ovwidgets
+# ovui-widgets
 
 This skill is an operational recipe for creating temporary standalone
-ovwidgets applications that reuse the repo's existing widgets. The application
+ovui-widgets applications that reuse the repo's existing widgets. The application
 is disposable; the skill quality is the deliverable. It is for composite
-ovwidgets apps, not raw atomic `omni.ui` construction.
+ovui-widgets apps, not raw atomic `omni.ui` construction.
 
 ## Non-Negotiable Scope
 
@@ -37,13 +39,13 @@ $TRIAL_ROOT/
   logs/
 ```
 
-Do not add `ovwidgets/ovwidgets/apps/**`, do not add package discovery for a
+Do not add `ovui-widgets/ovui_widgets/apps/**`, do not add package discovery for a
 trial app, do not add app-step tests, and do not add shape flags to
-`python -m ovwidgets.app`. These are rejected shortcuts:
+`python -m ovui_widgets.app`. These are rejected shortcuts:
 
-- `python -m ovwidgets.app --viewport-only`
-- `python -m ovwidgets.app --viewport-stage`
-- `python -m ovwidgets.app --viewport-stage-property`
+- `python -m ovui_widgets.app --viewport-only`
+- `python -m ovui_widgets.app --viewport-stage`
+- `python -m ovui_widgets.app --viewport-stage-property`
 - `ApplicationComposition.viewport_only()`
 - `ApplicationComposition.viewport_stage()`
 - `ApplicationComposition.viewport_stage_property()`
@@ -78,7 +80,7 @@ trial app, do not add app-step tests, and do not add shape flags to
    composites.
 7. If this skill lacks information needed to complete the user's task,
    stop immediately and ask for the skill to be updated. Do not guess
-   missing ovwidgets behavior.
+   missing ovui-widgets behavior.
 8. For user-like UI QA, follow the strict screenshot-first workflow. Every
    user action must be preceded and followed by screenshots, interactions
    must use mouse/keyboard only via `ovui-inspect`, and programmatic
@@ -87,7 +89,7 @@ trial app, do not add app-step tests, and do not add shape flags to
 ## Reference Files
 
 - `references/source-map.md` - exact imports and required calls for the
-  existing ovwidgets classes the trial must reuse.
+  existing ovui-widgets classes the trial must reuse.
 - `references/runtime-environment.md` - portable shell environment
   (`$REPO`, `$USD_INSTALL`, `$OVRTX_ROOT`, `$TRIAL_ROOT`, `$EVIDENCE_ROOT`,
   `$USD_FIXTURE`, `$PYTHON_BIN`, `$PYTHONPATH`, `$LD_LIBRARY_PATH`) and the
@@ -120,13 +122,13 @@ Stop and fix the skill or environment before claiming success if any item is
 false:
 
 - The disposable app source lives under `$TRIAL_ROOT`, not under the repo.
-- No `ovwidgets/ovwidgets/apps/**` package was created.
-- No full `ovwidgets.app` launcher shape flags were added.
+- No `ovui-widgets/ovui_widgets/apps/**` package was created.
+- No full `ovui_widgets.app` launcher shape flags were added.
 - `ViewportWidget` is imported and reused; no new viewport implementation
   exists.
 - `StageWindow`, `PropertyWindow`, and `SelectionBus` are reused when needed.
 - The renderer is `OvRtxRendererAdapter`; `MockRendererAdapter` is not used.
-- `OVWIDGETS_REQUIRE_OVRTX=1` is set and fallback/mock/black screenshots abort.
+- `OVUI_WIDGETS_REQUIRE_OVRTX=1` is set and fallback/mock/black screenshots abort.
 - `simple_scene.usda` is open, and `/World/Cube` or another stable prim is
   selected in every final exercise screenshot.
 - Selection works Stage -> viewport -> Property and viewport -> Stage ->
@@ -140,7 +142,7 @@ false:
 
 ## When The Skill Is Insufficient
 
-If the user's task needs ovwidgets behavior not covered by this skill or its
+If the user's task needs ovui-widgets behavior not covered by this skill or its
 references, stop and ask for the skill to be updated. Do not guess API names,
 do not pattern-match against unrelated repos. Concrete examples of gaps that
 justify pausing:

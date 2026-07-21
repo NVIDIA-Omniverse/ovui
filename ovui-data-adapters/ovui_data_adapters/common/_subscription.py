@@ -10,7 +10,7 @@
 
 """Structural protocol for adapter change-subscription handles.
 
-Part of ``ovui-data-adapters-common`` — zero-dependency, stdlib-only.
+Part of ``ovui-data-adapters-common``; this module is stdlib-only at runtime.
 """
 
 from typing import Protocol, runtime_checkable
@@ -22,7 +22,7 @@ class SubscriptionProtocol(Protocol):
 
     Any object exposing a no-arg ``cancel()`` method that returns ``None``
     satisfies this protocol. The concrete ``Subscription`` class in
-    ``ovwidgets.common.settings`` satisfies it; the private ``_*Subscription``
+    ``ovui_widgets.common.settings`` satisfies it; the private ``_*Subscription``
     classes scattered through the codebase also satisfy it.
     """
 

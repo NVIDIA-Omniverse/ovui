@@ -21,9 +21,9 @@ Constraint G2 (Kit-free import rule) — Kit-free: imports only stdlib, ``pxr``,
 (``LayerStackAdapter`` ABC, ``SubscriptionProtocol``,
 ``UndoManagerProtocol``). Step 15 of the data-adapters plan completed
 the dependency-direction invariant: the file no longer imports
-``ovwidgets.common.settings.Subscription``,
-``ovwidgets.common.undo.UndoManager``, ``ErrorReporter``, or the
-``ovwidgets.common.scheduler`` — these are replaced by the private
+``ovui_widgets.common.settings.Subscription``,
+``ovui_widgets.common.undo.UndoManager``, ``ErrorReporter``, or the
+``ovui_widgets.common.scheduler`` — these are replaced by the private
 :class:`_LayerStackSubscription`, :class:`UndoManagerProtocol`, stdlib
 ``logging``, and a synchronous flush fallback respectively. No
 ``omni.kit.*``, ``omni.usd.UsdContext``, or ``carb.*`` touches anywhere
@@ -46,10 +46,12 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from pxr import Sdf, Tf, Usd, UsdUtils
 
 from ovui_data_adapters.common import (
+    AdapterCapability,
     LayerEvent,
     LayerEventType,
     LayerHandle,
     LayerSnapshot,
+    LayerStackCapabilities,
     LayerStackAdapter,
     PrimSpecDescriptor,
     PrimSpecifier,
@@ -61,12 +63,44 @@ from ovui_data_adapters.common import (
 _LOGGER = logging.getLogger(__name__)
 
 
+
+def _retain_failed_revocation(owner: object, handle: object) -> None:
+    stale = getattr(owner, "_stale_subscription_handles", None)
+    if stale is None:
+        try:
+            stale = []
+            setattr(owner, "_stale_subscription_handles", stale)
+        except Exception:
+            return
+    # Identity-deduplicated: repeated failures of ONE handle retain it
+    # exactly once. Retention is NEVER capped: every live registration
+    # keeps durable owner-side revocation ownership, and the collection
+    # is finite by construction — at most one small handle per admitted
+    # registration.
+    if not any(existing is handle for existing in stale):
+        stale.append(handle)
+
+
+def _drain_stale_revocations(owner: object) -> None:
+    """Retry every retained failed revocation; drop the resolved ones."""
+    stale = getattr(owner, "_stale_subscription_handles", None)
+    if not stale:
+        return
+    remaining = []
+    for handle in stale:
+        try:
+            handle.cancel()
+        except BaseException:  # noqa: BLE001 — still owned for retry
+            if not any(existing is handle for existing in remaining):
+                remaining.append(handle)
+    stale[:] = remaining
+
 class _LayerStackSubscription:
     """Private subscription handle for ``UsdLayerStackAdapter.subscribe_events``.
 
     Step 15: replaces the prior dependency on
-    ``ovwidgets.common.settings.Subscription`` so the moved openusd
-    layer-stack adapter carries zero ``ovwidgets.*`` runtime imports.
+    ``ovui_widgets.common.settings.Subscription`` so the moved openusd
+    layer-stack adapter carries zero ``ovui_widgets.*`` runtime imports.
     Structurally satisfies :class:`SubscriptionProtocol` from
     :mod:`ovui_data_adapters.common` — a no-arg ``cancel()`` method is
     the only required surface. Mirrors the ``_StageSubscription``
@@ -88,13 +122,25 @@ class _LayerStackSubscription:
         """Remove this subscriber from the owning adapter."""
         if self._cancelled:
             return
-        self._cancelled = True
         owner = self._owner_ref()
         if owner is not None:
-            owner._remove_subscriber(self._key, self._callback)
+            # Mark cancelled only AFTER removal succeeded: a failed
+            # revocation stays owned and genuinely retryable — retained
+            # by the OWNER, so garbage collection of this handle can
+            # never turn a live callback into an unowned registration.
+            try:
+                owner._remove_subscriber(self._key, self._callback)
+            except BaseException:
+                _retain_failed_revocation(owner, self)
+                raise
+        self._cancelled = True
 
     def __del__(self) -> None:
-        self.cancel()
+        try:
+            self.cancel()
+        except BaseException:  # noqa: BLE001 — never unraisable: the
+            # owner already retains durable revocation ownership.
+            pass
 
 
 _AUTO_AUTHORING_MARKER = "__DELTA_LAYER__"
@@ -128,6 +174,27 @@ OvGear writes under :data:`OVGEAR_LAYER_KEY`. Stages saved by Kit use
 :data:`KIT_LAYER_KEY`; reading both keeps locks and edit-target round-tripping
 across applications (LAYERS-ARCHITECTURE §7.6 deliberate interop).
 """
+
+_OPENUSD_LAYER_CAPABILITIES = LayerStackCapabilities(
+    layer_stack=AdapterCapability.supported(),
+    edit_target_read=AdapterCapability.supported(),
+    edit_target_write=AdapterCapability.supported(),
+    save_layer=AdapterCapability.supported(),
+    save_layer_as=AdapterCapability.supported(),
+    create_sublayer=AdapterCapability.supported(),
+    insert_sublayer=AdapterCapability.supported(),
+    remove_sublayer=AdapterCapability.supported(),
+    reload_layer=AdapterCapability.supported(),
+    mute_layer=AdapterCapability.supported(),
+    lock_layer=AdapterCapability.supported(),
+    move_sublayer=AdapterCapability.supported(),
+    replace_sublayer=AdapterCapability.supported(),
+    prim_spec_read=AdapterCapability.supported(),
+    prim_spec_edit=AdapterCapability.supported(),
+    layer_snapshot=AdapterCapability.supported(),
+    layer_restore=AdapterCapability.supported(),
+    transfer_layer_content=AdapterCapability.supported(),
+)
 
 _SUBLAYER_INFO_KEYS = frozenset({"subLayers", "subLayerOffsets"})
 """``Sdf.Notice.LayerInfoDidChange.key`` values that flag a sublayer edit.
@@ -231,9 +298,18 @@ class UsdLayerStackAdapter(LayerStackAdapter):
     Subscription is wired but silent until Step 5 registers Tf/Sdf notices.
     """
 
-    def __init__(self, stage: Usd.Stage, undo: UndoManagerProtocol) -> None:
+    def __init__(
+        self,
+        stage: Usd.Stage,
+        undo: UndoManagerProtocol,
+        *,
+        logical_root_layer: Any | None = None,
+        expose_session_layer: bool = True,
+    ) -> None:
         self._stage = stage
         self._undo = undo
+        self._logical_root_layer = logical_root_layer
+        self._expose_session_layer = bool(expose_session_layer)
 
         # Subscribers list first — initialise before anything that might
         # (in future steps) emit an event synchronously during construction.
@@ -268,8 +344,8 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         # round-trip through ``Sdf.Layer.Find`` for these. ``Usd.Stage``
         # always has a root layer; session layer is optional when the
         # stage was opened with ``LoadNone`` or similar — guard only that.
-        self._register(stage.GetRootLayer())
-        session = stage.GetSessionLayer()
+        self._register(self._root_layer())
+        session = self._session_layer()
         if session is not None:
             self._register(session)
 
@@ -300,6 +376,14 @@ class UsdLayerStackAdapter(LayerStackAdapter):
 
     # ── Internal helpers ─────────────────────────────────────────────
 
+    def _root_layer(self) -> Sdf.Layer:
+        return self._logical_root_layer or self._stage.GetRootLayer()
+
+    def _session_layer(self) -> Optional[Sdf.Layer]:
+        if not self._expose_session_layer:
+            return None
+        return self._stage.GetSessionLayer()
+
     def _register(self, sdf_layer: Sdf.Layer) -> LayerHandle:
         """Intern ``sdf_layer`` in both caches and return its handle."""
         identifier = sdf_layer.identifier
@@ -317,13 +401,23 @@ class UsdLayerStackAdapter(LayerStackAdapter):
 
         Falls back to ``Sdf.Layer.Find`` when the cache misses (e.g. the
         handle was minted from an identifier that has since been loaded
-        from disk). Returns ``None`` if the layer cannot be resolved —
-        which :meth:`is_missing` treats as the "missing" sentinel.
+        from disk). USD can invalidate a Python ``Sdf.Layer`` wrapper when a
+        file-backed sublayer is muted and leaves the composed layer stack;
+        reject that expired wrapper and reopen the file before a delegate
+        reads properties from it. Returns ``None`` if the layer cannot be
+        resolved, which :meth:`is_missing` treats as the missing sentinel.
         """
         sdf = self._sdf_layers.get(layer.identifier)
         if sdf is not None:
-            return sdf
+            try:
+                if bool(sdf):
+                    return sdf
+            except Exception:
+                pass
+            self._sdf_layers.pop(layer.identifier, None)
         found = Sdf.Layer.Find(layer.identifier)
+        if found is None and not layer.identifier.startswith("anon:"):
+            found = Sdf.Layer.FindOrOpen(layer.identifier)
         if found is not None:
             self._sdf_layers[layer.identifier] = found
         return found
@@ -342,7 +436,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         Writes always go through :meth:`_persist_lock_map` / :meth:`_write_custom_data`
         under :data:`OVGEAR_LAYER_KEY` — never under :data:`KIT_LAYER_KEY`.
         """
-        root = self._stage.GetRootLayer()
+        root = self._root_layer()
         custom = root.customLayerData or {}
         for namespace in _LOCK_NAMESPACES:
             ns = custom.get(namespace)
@@ -372,7 +466,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         is no longer part of the stack (e.g. the sublayer was removed since
         last save).
         """
-        root = self._stage.GetRootLayer()
+        root = self._root_layer()
         custom = root.customLayerData or {}
         stored: Optional[str] = None
         for namespace in _LOCK_NAMESPACES:
@@ -407,11 +501,14 @@ class UsdLayerStackAdapter(LayerStackAdapter):
 
     # ── Stack discovery ──────────────────────────────────────────────
 
+    def get_capabilities(self) -> LayerStackCapabilities:
+        return _OPENUSD_LAYER_CAPABILITIES
+
     def get_root_layer(self) -> LayerHandle:
-        return self._register(self._stage.GetRootLayer())
+        return self._register(self._root_layer())
 
     def get_session_layer(self) -> Optional[LayerHandle]:
-        session = self._stage.GetSessionLayer()
+        session = self._session_layer()
         if session is None:
             return None
         return self._register(session)
@@ -452,14 +549,14 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         visited: set[str] = set()
 
         if include_session:
-            session = self._stage.GetSessionLayer()
+            session = self._session_layer()
             if session is not None:
                 visited.add(session.identifier)
                 if include_anonymous or not session.anonymous:
                     result.append(session.identifier)
 
         self._walk(
-            self._stage.GetRootLayer(), include_anonymous, result, visited
+            self._root_layer(), include_anonymous, result, visited
         )
         return result
 
@@ -567,6 +664,8 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         self,
         callback: Callable[[LayerEvent], None],
     ) -> SubscriptionProtocol:
+
+        _drain_stale_revocations(self)
         self._subscribers.append(callback)
         return _LayerStackSubscription(weakref.ref(self), "events", callback)
 
@@ -1104,8 +1203,8 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         """Log a mutation failure without breaking the caller.
 
         Step 15: emits via stdlib ``logging`` instead of
-        ``ovwidgets.common.error_reporter`` so the openusd file carries
-        no ``ovwidgets.*`` imports. Bare-test environments simply see
+        ``ovui_widgets.common.error_reporter`` so the openusd file carries
+        no ``ovui_widgets.*`` imports. Bare-test environments simply see
         the log line on the configured handler; the ``bool`` return
         contract still tells the caller the operation failed.
         """
@@ -1142,7 +1241,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         Kit interop: writes ALWAYS target :data:`OVGEAR_LAYER_KEY`. Reads
         check :data:`KIT_LAYER_KEY` as a fallback (LAYERS-ARCHITECTURE §7.6).
         """
-        root = self._stage.GetRootLayer()
+        root = self._root_layer()
         full = dict(root.customLayerData or {})
         sub = dict(full.get(OVGEAR_LAYER_KEY, {}))
         sub[key] = value
@@ -1207,7 +1306,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
             the root, matching the "split root into a sublayer" gesture
             in LAYERS-ARCHITECTURE §13.3.
         """
-        root = self._stage.GetRootLayer()
+        root = self._root_layer()
 
         UsdUtils.CopyLayerMetadata(root, target)
 
@@ -1371,7 +1470,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
                 return
             # Self-inflicted customLayerData write: skip so the persist
             # flow does not generate phantom INFO / SUBLAYERS events.
-            if self._persisting and identifier == self._stage.GetRootLayer().identifier:
+            if self._persisting and identifier == self._root_layer().identifier:
                 return
             if key in _SUBLAYER_INFO_KEYS:
                 self._pending[identifier].add(_TOKEN_SUBLAYERS)
@@ -1420,7 +1519,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         with self._pending_lock:
             if self._destroyed:
                 return
-            root_id = self._stage.GetRootLayer().identifier
+            root_id = self._root_layer().identifier
             any_relevant = False
             for layer in layers:
                 identifier = getattr(layer, "identifier", None)
@@ -1469,7 +1568,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
                 return
             self._flush_scheduled = True
 
-        # Step 15: dropped the lazy ``ovwidgets.common.scheduler`` import.
+        # Step 15: dropped the lazy ``ovui_widgets.common.scheduler`` import.
         # The host application's ``call_later`` callback (injected via the
         # constructor) drives the deferred flush; bare-test environments
         # with no ``call_later`` registered fall through to a synchronous
@@ -1579,7 +1678,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         so the post-save poll still catches the genuine clean transition.
         """
         drifted: List[str] = []
-        root_id = self._stage.GetRootLayer().identifier
+        root_id = self._root_layer().identifier
         persisting = self._persisting
         # Snapshot the identifier list once so we are stable against the
         # handle cache being mutated during iteration (no mutations expected

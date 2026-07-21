@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #ifdef _WIN32
 #  ifdef OMNIUI_STANDALONE_EXPORTS
@@ -75,6 +76,27 @@ OMNIUI_STANDALONE_API bool isSoftwareCursorEnabled();
 // ---------------------------------------------------------------------------
 // Screenshot capture
 // ---------------------------------------------------------------------------
+enum class ScreenshotStatus : uint8_t
+{
+    eIdle,
+    ePending,
+    eSucceeded,
+    eFailed,
+    eCancelled,
+};
+
+/// Stable snapshot of the most recently scheduled screenshot request.
+struct OMNIUI_STANDALONE_API ScreenshotResult
+{
+    uint64_t requestId = 0;
+    ScreenshotStatus status = ScreenshotStatus::eIdle;
+    std::string path;
+    std::string actualFormat;
+    int width = 0;
+    int height = 0;
+    std::string message;
+};
+
 OMNIUI_STANDALONE_API bool captureScreenshot(const char* filepath);
 
 // Schedule a screenshot to be captured before the next buffer swap.
@@ -84,8 +106,16 @@ OMNIUI_STANDALONE_API bool scheduleScreenshot(const char* filepath);
 // Check whether a scheduled screenshot has been captured (and clear the flag).
 OMNIUI_STANDALONE_API bool pollScreenshotDone();
 
+/// Return a non-consuming snapshot of the latest screenshot request.
+OMNIUI_STANDALONE_API ScreenshotResult getLastScreenshotResult();
+
+/// Cancel a pending request by ID. Returns false for stale or terminal IDs.
+OMNIUI_STANDALONE_API bool cancelScheduledScreenshot(uint64_t requestId);
+
+/// Return whether requestId still names the pending screenshot request.
+OMNIUI_STANDALONE_API bool isScreenshotRequestPending(uint64_t requestId);
+
 // Return true if the most recent screenshot capture encountered an error.
-// Only meaningful for the EGL headless backend; always false for Vulkan/GLFW.
 OMNIUI_STANDALONE_API bool hadLastScreenshotError();
 
 // ---------------------------------------------------------------------------

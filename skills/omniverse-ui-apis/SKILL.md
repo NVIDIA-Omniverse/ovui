@@ -1,13 +1,16 @@
 ---
 name: omniverse-ui-apis
-description: Use when creating, modifying, inspecting, or reasoning about ovui UI from low-level atomic ovui widgets, including layout, Pixel/Percent/Fraction sizing, model-view widgets, TreeView/stage hierarchy trees, inputs, menus, windows, docking, viewport-like ovrtx panels, styling, or strict UI validation. Use when an agent must rebuild Stage-Browser-like, Property-Inspector-like, or Viewport-like UI from primitives without reusing high-level composite widgets. Do not use for ovwidgets composite-widget application work; use the omniverse-ui-widgets skill instead.
+description: Use when creating, modifying, inspecting, or reasoning about ovui UI from low-level atomic ovui widgets, including layout, Pixel/Percent/Fraction sizing, model-view widgets, TreeView/stage hierarchy trees, inputs, menus, windows, docking, viewport-like ovrtx panels, styling, or strict UI validation. Use when an agent must rebuild Stage-Browser-like, Property-Inspector-like, or Viewport-like UI from primitives without reusing high-level composite widgets. Do not use for ovui-widgets composite-widget application work; use the omniverse-ui-widgets skill instead.
 author: "NVIDIA ovui Team <ovui-team@nvidia.com>"
 license: "LicenseRef-NVIDIA"
+metadata:
+  python-distribution: ovui
+  version: "0.2.0"
 ---
 
 # Ovui Atomic UI
 
-Use this skill for raw or atomic ovui UI work. The default mode is atomic construction: build the UI from `ovui` primitives, value models, item models, delegates, windows, dock spaces, image providers, and scene/renderer embedding points. Do not use this skill for ovwidgets composite-widget application work; use `skills/omniverse-ui-widgets/SKILL.md` instead. Do not reuse high-level composite widgets such as `StageWidget`, `StageWindow`, `ViewportWidget`, `PropertyWindow`, `PropertyWidget` subclasses, `LayerWindow`, `LayersTree`, `ContentBrowserWindow`, or `ManagedWindow` unless the user explicitly allows composites. You may inspect those composites as examples of patterns to recreate, but the agent must reimplement equivalent behavior from atomic widgets.
+Use this skill for raw or atomic ovui UI work. The default mode is atomic construction: build the UI from `ovui` primitives, value models, item models, delegates, windows, dock spaces, image providers, and scene/renderer embedding points. Do not use this skill for ovui-widgets composite-widget application work; use `skills/omniverse-ui-widgets/SKILL.md` instead. Do not reuse high-level composite widgets such as `StageWidget`, `StageWindow`, `ViewportWidget`, `PropertyWindow`, `PropertyWidget` subclasses, `LayerWindow`, `LayersTree`, `ContentBrowserWindow`, or `ManagedWindow` unless the user explicitly allows composites. You may inspect those composites as examples of patterns to recreate, but the agent must reimplement equivalent behavior from atomic widgets.
 
 ## Required Workflow
 
@@ -61,7 +64,7 @@ Use this skill for raw or atomic ovui UI work. The default mode is atomic constr
 
 ## When the skill is insufficient
 
-If the user's task needs ovui behavior not covered by this skill or its references, **stop and ask Victor to update the skill**. Do not guess API names, do not pattern-match against unrelated repos. Concrete examples of gaps that justify pausing:
+If the user's task needs ovui behavior not covered by this skill or its references, **stop and ask the skill maintainer to update the skill**. Do not guess API names, do not pattern-match against unrelated repos. Concrete examples of gaps that justify pausing:
 
 - The exercise needs a widget the skill does not list (e.g. a graph editor, undo/redo integration, or a non-trivial gesture).
 - The viewport exercise needs ovrtx behavior beyond `step` + `LdrColor` + camera xform/intrinsics.

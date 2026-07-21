@@ -103,6 +103,34 @@ void registerPlatformBindings(pybind11::module_& m)
           "Schedule a screenshot to be captured before the next buffer swap", pybind11::arg("filepath"));
     m.def("_poll_screenshot_done", &standalone::pollScreenshotDone,
           "Check whether a scheduled screenshot has been captured");
+    m.def("_get_screenshot_result", []() {
+        const standalone::ScreenshotResult result = standalone::getLastScreenshotResult();
+        const char* status = "idle";
+        switch (result.status)
+        {
+            case standalone::ScreenshotStatus::ePending: status = "pending"; break;
+            case standalone::ScreenshotStatus::eSucceeded: status = "succeeded"; break;
+            case standalone::ScreenshotStatus::eFailed: status = "failed"; break;
+            case standalone::ScreenshotStatus::eCancelled: status = "cancelled"; break;
+            case standalone::ScreenshotStatus::eIdle: break;
+        }
+        pybind11::dict snapshot;
+        snapshot["request_id"] = result.requestId;
+        snapshot["status"] = status;
+        snapshot["done"] = result.status != standalone::ScreenshotStatus::eIdle &&
+                           result.status != standalone::ScreenshotStatus::ePending;
+        snapshot["success"] = result.status == standalone::ScreenshotStatus::eSucceeded;
+        snapshot["path"] = result.path;
+        snapshot["actual_format"] = result.actualFormat;
+        snapshot["width"] = result.width;
+        snapshot["height"] = result.height;
+        snapshot["message"] = result.message;
+        return snapshot;
+    }, "Return the request-scoped result of the latest screenshot");
+    m.def("_cancel_screenshot", &standalone::cancelScheduledScreenshot,
+          "Cancel a pending screenshot request by ID", pybind11::arg("request_id"));
+    m.def("_had_last_screenshot_error", &standalone::hadLastScreenshotError,
+          "Return whether the latest screenshot reached a failure status");
 
     // Streaming (FBO rendering + CUDA-GL interop)
     m.def("_init_streaming", &standalone::initStreaming,

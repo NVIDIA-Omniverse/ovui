@@ -339,7 +339,7 @@ The reference `OvRtxRendererAdapter` adds the production details (`ovui_data_ada
 - Return black frames (`np.zeros((h, w, 4), dtype=np.uint8)`) instead of raising on transient renderer failures.
 - Support `pick(x, y, callback, query_name)`, `pick_rect(...)`, `set_selection_highlight(paths)`, and `shutdown()`.
 
-For a validation prototype, build a temporary atomic shell rather than importing `ViewportWidget` or any high-level adapter. Call `ovrtx.Renderer` directly. If the prototype needs picking or selection highlighting and the user has not pre-authorized using an adapter, **stop and ask Victor to authorize the adapter or extend the skill** — recreating the picking ray and AABB pipeline from scratch is out of scope.
+For a validation prototype, build a temporary atomic shell rather than importing `ViewportWidget` or any high-level adapter. Call `ovrtx.Renderer` directly. If the prototype needs picking or selection highlighting and the user has not pre-authorized using an adapter, **stop and ask the skill maintainer to authorize the adapter or extend the skill** — recreating the picking ray and AABB pipeline from scratch is out of scope.
 
 ## Styling And Themes
 
