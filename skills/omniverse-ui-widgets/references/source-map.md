@@ -2,6 +2,18 @@
 
 Use these existing classes and functions.
 
+For native OVStage integrations, the public `OvstageRendererAdapter` creates
+its private viewport product with `viewport_quality=0` by default (progressive
+frames after resets, unchanged sampling targets and Eco mode). One-shot capture
+callers can explicitly request `viewport_quality=100` for the native full
+initial-quality budget, also through the OVStage renderer factories. Do not
+apply this policy to authored scene products or repeatedly overwrite quality
+on frame, mode, or resize callbacks. Explicitly resetting the private product's
+quality setting restores that adapter's configured value through the undoable
+authoring path; it does not clear the column to the native quality of `100`.
+Other products retain their existing reset semantics. The OpenUSD recipe below is unchanged;
+see `ovui-data-adapters/README.md` for the native provider's ownership boundary.
+
 ```python
 # ovui/runtime
 import omni.ui as ui
@@ -65,3 +77,13 @@ Purpose and required calls:
 - `OvRtxRendererAdapter` is the only acceptable renderer for visual proof.
   `MockRendererAdapter`, black frames, placeholders, or fallback warnings fail
   the trial.
+
+## Inspector contributions
+
+`ovui_widgets.viewport.inspector.ViewportInspector` packages the existing surface,
+renderer and SelectionBus interfaces as discoverable Inspector commands, and
+`ovui_widgets.app.media_inspector.media_commands` adds streaming and recording.
+The standard USD Viewer registers both through `Application.get_inspector_commands()`.
+See [inspector-commands.md](inspector-commands.md) for the vocabulary and host wiring.
+Headless applications that host the stock viewport without editor panels (USD
+Workbench, maintained in its own repository, is one) build on the same seams.

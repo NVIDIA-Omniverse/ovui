@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -78,6 +71,15 @@ public:
      */
     OMNIUI_API
     virtual void endEdit();
+
+    /**
+     * @brief True only while this model receives a FloatSlider/FloatDrag temporary scalar
+     * input cancellation (Escape or gamepad cancel) (restored value and end-edit callbacks). Ordinary
+     * commits and calls outside that dispatch return false. Query synchronously;
+     * this is not a persistent edit state. Other widget types are not covered.
+     */
+    OMNIUI_API
+    bool isEditCancelled() const noexcept;
 
     /**
      * @brief Set the value.

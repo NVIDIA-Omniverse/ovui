@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION is strictly
-# prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OVStage-native camera, render-output, and physics catalog contracts."""
 
@@ -28,6 +21,12 @@ from ovui_data_adapters.ovstage._constants import (
     PROVIDER_ENTRY_POINT_VALUE,
     PROVIDER_NAME,
 )
+from ovui_data_adapters.ovstage._authoring import (
+    MISSING,
+    NativeValueDescriptor,
+    NativeValueEditCommand,
+)
+from ovui_data_adapters.ovstage._catalog import native_catalog_snapshot
 from ovui_data_adapters.ovstage.provider import (
     _discover_rigid_body_paths,
     create_provider_session,
@@ -96,6 +95,40 @@ def test_camera_and_product_choices_are_type_driven_sorted_and_named(opened) -> 
     assert adapter.read_camera_pose("/World/Geometry/BlueCube") is None
 
 
+def test_camera_choices_never_build_the_full_stage_value_cache(
+    opened,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catalog discovery copies only type metadata and catalog-owned columns."""
+
+    import ovui_data_adapters.ovstage._scene as scene_module
+
+    _session, scene, adapter = opened
+    scene._ovui_native_catalog_cache = None
+
+    def reject_full_value_cache(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("camera discovery attempted the full-stage value cache")
+
+    monkeypatch.setattr(scene_module, "_kit_stage_cache", reject_full_value_cache)
+
+    assert [item.path for item in adapter.list_cameras()] == [
+        "/World/Cameras/Closeup",
+        "/World/Cameras/Main",
+    ]
+
+
+def test_referenced_camera_keeps_its_exact_native_world_transform(opened) -> None:
+    _session, scene, _adapter = opened
+
+    camera = native_catalog_snapshot(scene).prim("/World/Cameras/Main")
+
+    assert camera is not None
+    matrix = camera.value("worldMatrix")
+    assert matrix is not None
+    assert len(matrix) == 16
+    assert matrix[12:15] == pytest.approx((-6.0, -8.0, 5.0))
+
+
 def test_render_target_catalog_preserves_native_relationship_order(opened) -> None:
     _session, _scene, adapter = opened
     catalog = adapter.get_render_target_catalog()
@@ -130,6 +163,57 @@ def test_render_var_catalog_uses_exact_product_targets(opened) -> None:
     assert output.metadata["source_path"] == "/Render/Vars/DistanceToCamera"
     assert not hasattr(renderer, "_renderer")
     assert not hasattr(renderer, "_runtime_root_path")
+
+
+def test_aov_authoring_catalog_is_version_qualified_and_excludes_broken_outputs(
+    opened,
+) -> None:
+    _session, scene, _adapter = opened
+    renderer = _renderer_for(scene, "/Render/Products/MainCamera")
+    renderer._ovrtx_version = (0, 4, 0)
+    catalog = renderer.get_aov_authoring_catalog()
+    assert catalog.enabled is True
+    assert catalog.output("normal").source_name == "NormalSD"
+    assert {output.source_name for output in catalog.outputs}.isdisjoint(
+        {"DepthSD", "SemanticIdMap", "LdrColor"}
+    )
+
+    renderer._ovrtx_version = (0, 5, 0)
+    unsupported = renderer.get_aov_authoring_catalog()
+    assert unsupported.enabled is False
+    assert unsupported.outputs == ()
+
+
+def test_render_var_catalog_tracks_native_product_mode_compatibility(opened) -> None:
+    _session, scene, _adapter = opened
+    product_path = "/Render/Products/MainCamera"
+    renderer = _renderer_for(scene, product_path)
+    mode = NativeValueDescriptor(
+        name="omni:rtx:rendermode",
+        dtype=(1, 64, 1),
+        semantic=2,
+        native_is_array=False,
+        logical_is_array=False,
+    )
+    command = NativeValueEditCommand(
+        scene,
+        (product_path,),
+        mode,
+        (MISSING,),
+        ("PathTracing",),
+        source="test:render-mode",
+    )
+
+    command.do()
+    path_tracing = renderer.list_render_var_outputs(product_path).outputs[0]
+    assert path_tracing.render_var_name == "DistanceToCameraSD"
+    assert path_tracing.is_available is False
+    assert path_tracing.disabled_reason == "Requires Real-Time 2.0."
+
+    command.undo()
+    real_time = renderer.list_render_var_outputs(product_path).outputs[0]
+    assert real_time.render_var_name == "DistanceToCameraSD"
+    assert real_time.is_available is True
 
 
 def test_point_cloud_catalog_is_truthfully_disabled_without_native_channels(opened) -> None:

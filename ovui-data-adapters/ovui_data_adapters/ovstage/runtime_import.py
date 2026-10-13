@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OVSTAGE_ROOT import resolver for ovstage runtime modules."""
 
@@ -124,6 +117,18 @@ def configure_ovstage_root_environment(raw_root: str) -> tuple[Path, ...]:
     return runtime_dirs
 
 
+def _load_ovui_imgui() -> None:
+    """Load ovui's ImGui library before the OVStage runtime loads its own."""
+    try:
+        from ovui_data_adapters.common.ovrtx_import import _load_ovui_imgui as load
+    except Exception:
+        return
+    try:
+        load()
+    except Exception:
+        pass
+
+
 def resolve_ovstage_runtime_module(
     module_name: str,
     *,
@@ -137,6 +142,11 @@ def resolve_ovstage_runtime_module(
                 f"unsupported OVStage runtime module: {module_name!r}"
             ),
         )
+    # ovui's ImGui must be the one a process loads: the OVStage runtime bundles
+    # an older copy under the same library name, and whichever loads first wins.
+    # ovui's startup preload only knows the renderer it is built against, so the
+    # OVStage adapter arranges this for OVStage itself.
+    _load_ovui_imgui()
     importer = import_module_fn or importlib.import_module
     try:
         module = importer(module_name)

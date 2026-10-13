@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the Step-2.3 headless entrypoint and resolution plumbing.
 
@@ -334,7 +327,7 @@ def test_resolve_window_size_default_when_env_unset(monkeypatch):
     monkeypatch.delenv("OVGEAR_HEADLESS_HEIGHT", raising=False)
 
     from ovui_widgets.app.application import _resolve_window_size
-    assert _resolve_window_size() == (1280, 720)
+    assert _resolve_window_size({}) == (1280, 720)
 
 
 def test_resolve_window_size_honours_env_vars(monkeypatch):
@@ -342,16 +335,17 @@ def test_resolve_window_size_honours_env_vars(monkeypatch):
     monkeypatch.setenv("OVGEAR_HEADLESS_HEIGHT", "1080")
 
     from ovui_widgets.app.application import _resolve_window_size
-    assert _resolve_window_size() == (1920, 1080)
+    settings = {"app.window.width": 800, "app.window.height": 600}
+    assert _resolve_window_size(settings) == (1920, 1080)
 
 
-def test_resolve_window_size_partial_env_falls_back_to_defaults(monkeypatch):
-    """If only one env var is set, the other keeps its 1280×720 default."""
+def test_resolve_window_size_partial_env_falls_back_to_settings(monkeypatch):
+    """If only one env var is set, the other keeps its configured value."""
     monkeypatch.setenv("OVGEAR_HEADLESS_WIDTH", "800")
     monkeypatch.delenv("OVGEAR_HEADLESS_HEIGHT", raising=False)
 
     from ovui_widgets.app.application import _resolve_window_size
-    assert _resolve_window_size() == (800, 720)
+    assert _resolve_window_size({"app.window.height": 900}) == (800, 900)
 
 
 def test_application_run_calls_resolve_window_size(monkeypatch):
@@ -408,5 +402,6 @@ def test_application_run_calls_resolve_window_size(monkeypatch):
     assert captured["height"] == 480
     # The ovui pump is the Kit-style main-loop enforcer of
     # app.runLoops.main.rateLimitFrequency — ui.init receives the
-    # settings-derived cap (default 120), not None/uncapped.
-    assert captured["max_fps"] == 120.0
+    # settings-derived policy is uncapped until the user opts into a finite
+    # rateLimitFrequency.
+    assert captured["max_fps"] is None

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION is strictly
-# prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OVStage-native structural authoring contracts."""
 
@@ -18,11 +11,19 @@ from typing import Any, Iterator
 
 import pytest
 
-from ovui_data_adapters.common import ChangeEventType, CreateRequest, ReparentPosition
+from ovui_data_adapters.common import (
+    AovAuthoringRequest,
+    AovCameraState,
+    ChangeEventType,
+    CreateRequest,
+    ReparentPosition,
+)
 from ovui_data_adapters.ovstage._constants import (
     PROVIDER_ENTRY_POINT_VALUE,
     PROVIDER_NAME,
 )
+from ovui_data_adapters.ovstage._native import read_token_attribute
+from ovui_data_adapters.ovstage._catalog import native_catalog_snapshot
 from ovui_data_adapters.ovstage.provider import (
     create_provider_session,
     create_property_adapter,
@@ -157,6 +158,198 @@ def test_create_action_uses_native_type_and_is_one_undoable_resync(
         subscription.cancel()
 
 
+def _aov_request(
+    *,
+    source_name: str = "NormalSD",
+    render_var_name: str = "Normal",
+    product_path: str = "",
+    template_product_path: str = "",
+    template_camera_path: str = "",
+    template_ldr_path: str = "",
+) -> AovAuthoringRequest:
+    return AovAuthoringRequest(
+        output_id=render_var_name.lower(),
+        source_name=source_name,
+        render_var_name=render_var_name,
+        render_mode="RealTimePathTracing",
+        render_product_path=product_path,
+        template_render_product_path=template_product_path,
+        template_camera_path=template_camera_path,
+        template_ldr_render_var_path=template_ldr_path,
+        camera_state=AovCameraState(
+            view_matrix=(
+                (1.0, 0.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0, 0.0),
+                (0.0, 0.0, -10.0, 1.0),
+            ),
+            projection_matrix=(
+                (1.358, 0.0, 0.0, 0.0),
+                (0.0, 2.414, 0.0, 0.0),
+                (0.0, 0.0, -1.0, -1.0),
+                (0.0, 0.0, -0.2, 0.0),
+            ),
+            width=1280,
+            height=720,
+        ),
+    )
+
+
+def test_aov_graph_authors_complete_native_product_as_one_history_edge(
+    opened: tuple[Any, Any, Any, UndoManager],
+) -> None:
+    _session, scene, adapter, undo = opened
+    request = _aov_request()
+    preview = adapter.preview_aov_authoring(request)
+    assert preview.accepted is True
+
+    result = adapter.author_aov_graph(request)
+    assert result.accepted is True
+    snapshot = native_catalog_snapshot(scene)
+    product = snapshot.prim(preview.render_product_path)
+    normal = snapshot.prim("/Render/Vars/Normal")
+    assert product is not None and product.type_name == "RenderProduct"
+    assert product.value("camera") == (preview.camera_path,)
+    assert product.value("orderedVars") == (
+        "/Render/Vars/LdrColor",
+        "/Render/Vars/Normal",
+    )
+    assert product.value("resolution") == (1280, 720)
+    assert product.value("omni:rtx:rendermode") == "RealTimePathTracing"
+    assert normal is not None and normal.value("sourceName") == "NormalSD"
+
+    assert undo.undo() is True
+    assert adapter.get_item_at_path(preview.render_product_path) is None
+    assert adapter.get_item_at_path("/Render/Vars/Normal") is None
+    assert undo.redo() is True
+    redone = native_catalog_snapshot(scene).prim(preview.render_product_path)
+    assert redone is not None
+    assert redone.value("orderedVars") == (
+        "/Render/Vars/LdrColor",
+        "/Render/Vars/Normal",
+    )
+
+
+def test_aov_graph_clones_populated_templates_and_edits_string_source_name(
+    opened: tuple[Any, Any, Any, UndoManager],
+) -> None:
+    _session, scene, adapter, undo = opened
+    first = _aov_request()
+    first_preview = adapter.preview_aov_authoring(first)
+    assert adapter.author_aov_graph(first).accepted is True
+
+    second = _aov_request(
+        source_name="DiffuseAlbedoSD",
+        render_var_name="DiffuseAlbedo",
+        template_product_path=first_preview.render_product_path,
+        template_camera_path=first_preview.camera_path,
+        template_ldr_path=first_preview.ldr_render_var_path,
+    )
+    second_preview = adapter.preview_aov_authoring(second)
+    assert second_preview.accepted is True
+    assert adapter.author_aov_graph(second).accepted is True
+
+    snapshot = native_catalog_snapshot(scene)
+    product = snapshot.prim(second_preview.render_product_path)
+    output = snapshot.prim(second_preview.output_render_var_path)
+    assert product is not None
+    assert product.value("camera") == (second_preview.camera_path,)
+    assert product.value("orderedVars") == (
+        first_preview.ldr_render_var_path,
+        second_preview.output_render_var_path,
+    )
+    assert output is not None
+    assert output.value("sourceName") == "DiffuseAlbedoSD"
+
+    assert undo.undo() is True
+    assert adapter.get_item_at_path(second_preview.render_product_path) is None
+    assert adapter.get_item_at_path(second_preview.output_render_var_path) is None
+    assert undo.redo() is True
+    redone = native_catalog_snapshot(scene)
+    assert redone.prim(second_preview.output_render_var_path).value(
+        "sourceName"
+    ) == "DiffuseAlbedoSD"
+    assert redone.prim(second_preview.render_product_path).value("orderedVars") == (
+        first_preview.ldr_render_var_path,
+        second_preview.output_render_var_path,
+    )
+
+
+def test_aov_graph_reuses_compatible_canonical_var_and_blocks_mismatch(
+    opened: tuple[Any, Any, Any, UndoManager],
+) -> None:
+    _session, scene, adapter, undo = opened
+    request = _aov_request()
+    result = adapter.author_aov_graph(request)
+    assert result.accepted is True
+    compatible = adapter.preview_aov_authoring(request)
+    assert compatible.accepted is True
+    assert compatible.create_output_render_var is False
+
+    render_var = create_property_adapter(
+        scene,
+        ["/Render/Vars/Normal"],
+        undo,
+        adapter,
+    )
+    render_var.begin_edit("sourceName")
+    try:
+        render_var.set_value("sourceName", "WrongNormal")
+    finally:
+        render_var.end_edit("sourceName")
+    incompatible = adapter.preview_aov_authoring(request)
+    assert incompatible.accepted is False
+    assert incompatible.message == (
+        "/Render/Vars/Normal has Source Name WrongNormal; expected NormalSD."
+    )
+    assert adapter.get_item_at_path("/Render/Vars/Normal_01") is None
+
+
+def test_aov_existing_product_preserves_settings_and_order_through_undo_redo(
+    opened: tuple[Any, Any, Any, UndoManager],
+) -> None:
+    _session, scene, adapter, undo = opened
+    first = _aov_request()
+    first_preview = adapter.preview_aov_authoring(first)
+    assert adapter.author_aov_graph(first).accepted is True
+    product_path = first_preview.render_product_path
+    before = native_catalog_snapshot(scene).prim(product_path)
+    assert before is not None
+    camera_before = before.value("camera")
+    resolution_before = before.value("resolution")
+    ordered_before = before.value("orderedVars")
+
+    second = _aov_request(
+        source_name="DiffuseAlbedoSD",
+        render_var_name="DiffuseAlbedo",
+        product_path=product_path,
+    )
+    assert adapter.author_aov_graph(second).accepted is True
+    changed = native_catalog_snapshot(scene).prim(product_path)
+    assert changed is not None
+    assert changed.value("camera") == camera_before
+    assert changed.value("resolution") == resolution_before
+    assert changed.value("orderedVars") == (
+        *ordered_before,
+        "/Render/Vars/DiffuseAlbedo",
+    )
+
+    assert undo.undo() is True
+    restored = native_catalog_snapshot(scene).prim(product_path)
+    assert restored is not None
+    assert restored.value("camera") == camera_before
+    assert restored.value("resolution") == resolution_before
+    assert restored.value("orderedVars") == ordered_before
+    assert adapter.get_item_at_path("/Render/Vars/DiffuseAlbedo") is None
+    assert undo.redo() is True
+    redone = native_catalog_snapshot(scene).prim(product_path)
+    assert redone is not None
+    assert redone.value("orderedVars") == (
+        *ordered_before,
+        "/Render/Vars/DiffuseAlbedo",
+    )
+
+
 def test_rename_reparent_and_delete_are_native_and_undoable(
     opened: tuple[Any, Any, Any, UndoManager],
 ) -> None:
@@ -242,7 +435,7 @@ def test_every_available_action_creates_its_exact_native_type(
         assert item is not None
         assert adapter.get_type_name(item) == expected_type
 
-    assert len(expected_types) == 27
+    assert len(expected_types) == 28
     assert undo.can_undo() is True
     for path, expected_type in expected_types.items():
         item = adapter.get_item_at_path(path)
@@ -288,6 +481,78 @@ def test_create_default_scaffolds_unique_names_and_redo_clearing(
     )
     assert replacement.accepted is True
     assert undo.can_redo() is False
+
+
+def test_create_render_var_authors_default_and_round_trips_history(
+    opened: tuple[Any, Any, Any, UndoManager],
+) -> None:
+    _session, _scene, adapter, undo = opened
+
+    result = adapter.create_prim(CreateRequest("create.render_var"))
+
+    assert result.accepted is True
+    assert result.created_paths == (
+        "/Render",
+        "/Render/Vars",
+        "/Render/Vars/LdrColor",
+    )
+    assert read_token_attribute(
+        adapter._require_stage(), result.primary_path, "sourceName"
+    ) == "LdrColor"
+    assert undo.undo() is True
+    assert adapter.get_item_at_path(result.primary_path) is None
+    assert undo.redo() is True
+    assert read_token_attribute(
+        adapter._require_stage(), result.primary_path, "sourceName"
+    ) == "LdrColor"
+
+
+def test_create_render_var_reveals_preexisting_runtime_render_root(
+    tmp_path: Path,
+    ovstage_runtime: Any,
+) -> None:
+    scene_path = tmp_path / "runtime_render_root.usda"
+    scene_path.write_text(
+        _SCENE
+        + '''
+def Scope "Render"
+{
+    def Scope "OmniverseGlobalRenderSettings"
+    {
+    }
+}
+''',
+        encoding="utf-8",
+    )
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(scene_path))
+    undo = UndoManager()
+    adapter = create_stage_adapter(scene, undo)
+    try:
+        before = {
+            adapter.get_item_path(item)
+            for item in adapter.get_children(adapter.get_root())
+        }
+        assert "/Render" not in before
+
+        result = adapter.create_prim(CreateRequest("create.render_var"))
+
+        after = {
+            adapter.get_item_path(item)
+            for item in adapter.get_children(adapter.get_root())
+        }
+        assert result.accepted is True
+        assert "/Render" in after
+        assert adapter.get_item_at_path("/Render/Vars/LdrColor") is not None
+
+        assert undo.undo() is True
+        after_undo = {
+            adapter.get_item_path(item)
+            for item in adapter.get_children(adapter.get_root())
+        }
+        assert "/Render" not in after_undo
+    finally:
+        session.shutdown_scene()
 
 
 @pytest.mark.parametrize(

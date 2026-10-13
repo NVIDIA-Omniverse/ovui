@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Native Kit OVStage copy-in helpers.
 
@@ -126,9 +119,12 @@ def wait_operation(operation: Any) -> Any:
 class StageWriteBatch:
     """Write one or more fixed-width attributes at a single fresh ordinal.
 
-    A batch owns one path-list query.  Each row corresponds to one path passed
-    to the constructor; vector/matrix width is represented with DLPack lanes,
-    matching the public Kit OVStage tests.
+    Each row corresponds to one path passed to the constructor; vector/matrix
+    width is represented with DLPack lanes, matching the public Kit OVStage
+    tests.  By default the batch owns its path dictionary, path list, and query.
+    A caller may instead provide an adapter-owned path dictionary and query for
+    exactly the same ordered paths; those borrowed objects must outlive the
+    batch and are never released by it.
     """
 
     def __init__(
@@ -138,6 +134,8 @@ class StageWriteBatch:
         *,
         ordinal: int | None = None,
         commit: bool = True,
+        path_dictionary: Any = None,
+        query: Any = None,
     ) -> None:
         if not supports_native_stage_writes(stage):
             raise RuntimeError("Kit OVStage copy-in write API is unavailable")
@@ -148,19 +146,31 @@ class StageWriteBatch:
         self.prim_paths = paths
         self._requested_ordinal = None if ordinal is None else int(ordinal)
         self._commit = bool(commit)
+        self._provided_paths = path_dictionary
+        self._provided_query = query
         self.ordinal: int | None = None
         self._module: Any = None
         self._paths: Any = None
         self._path_list: Any = None
         self._query: Any = None
+        self._owns_paths = False
+        self._owns_path_list = False
+        self._owns_query = False
 
     def __enter__(self) -> "StageWriteBatch":
         try:
             self._module = import_module("ovstage")
-            path_dictionary_type = getattr(self._module, "PathDictionary")
-            self._paths = path_dictionary_type(self.stage)
-            self._path_list = self._paths.create_path_list_from_strings(self.prim_paths)
-            self._query = self.stage.query_from_path_list(self._path_list)
+            self._paths = self._provided_paths
+            if self._paths is None:
+                path_dictionary_type = getattr(self._module, "PathDictionary")
+                self._paths = path_dictionary_type(self.stage)
+                self._owns_paths = True
+            self._query = self._provided_query
+            if self._query is None:
+                self._path_list = self._paths.create_path_list_from_strings(self.prim_paths)
+                self._owns_path_list = True
+                self._query = self.stage.query_from_path_list(self._path_list)
+                self._owns_query = True
             self.ordinal = (
                 int(self.stage.begin_frame())
                 if self._requested_ordinal is None
@@ -181,7 +191,7 @@ class StageWriteBatch:
     def _release_resources(self, *, commit: bool) -> BaseException | None:
         cleanup_error: BaseException | None = None
         try:
-            if self._query is not None:
+            if self._owns_query and self._query is not None:
                 release = getattr(self._query, "release", None)
                 if callable(release):
                     wait_operation(release())
@@ -190,14 +200,15 @@ class StageWriteBatch:
         except BaseException as release_error:  # preserve a write error first
             cleanup_error = release_error
         try:
-            if self._paths is not None and self._path_list is not None:
+            if self._owns_path_list and self._paths is not None and self._path_list is not None:
                 self._paths.destroy_path_list(self._path_list)
         except BaseException as path_error:
             cleanup_error = cleanup_error or path_error
         try:
-            destroy = getattr(self._paths, "destroy", None)
-            if callable(destroy):
-                destroy()
+            if self._owns_paths:
+                destroy = getattr(self._paths, "destroy", None)
+                if callable(destroy):
+                    destroy()
         except BaseException as destroy_error:
             cleanup_error = cleanup_error or destroy_error
         try:
@@ -268,6 +279,46 @@ class StageWriteBatch:
         semantic = getattr(self._module.AttributeSemantic, "TOKEN_ID")
         self.write_fixed(attribute_name, ids, semantic=semantic)
 
+    def write_relationship_targets(
+        self,
+        attribute_name: str,
+        targets: Sequence[str],
+    ) -> None:
+        """Write one relationship-target array for a single queried prim."""
+
+        if self.ordinal is None or self._query is None:
+            raise RuntimeError("StageWriteBatch must be entered before writing")
+        if len(self.prim_paths) != 1:
+            raise ValueError("relationship writes require exactly one prim path")
+        target_values = tuple(str(value) for value in targets)
+        ids = np.asarray(
+            [self._paths.intern_path(value) for value in target_values],
+            dtype=np.uint64,
+        )
+        dtype = self._module.numpy_to_dldatatype(ids.dtype, lanes=1)
+        tensor = self._module.make_dltensor(
+            np.ascontiguousarray(ids),
+            dtype=dtype,
+            shape=[len(target_values)],
+            ndim=1,
+        )
+        semantic = getattr(self._module.AttributeSemantic, "RELATIONSHIP_PATH_ID")
+        operation = self.stage.write_attribute(
+            self._query,
+            str(attribute_name),
+            int(self.ordinal),
+            tensor,
+            is_array=True,
+            semantic=int(semantic),
+        )
+        wait_operation(operation)
+        _record_stage_write(
+            self.stage,
+            ordinal=int(self.ordinal),
+            attribute_name=str(attribute_name),
+            prim_paths=self.prim_paths,
+        )
+
     def delete_prims(self) -> None:
         """Delete every queried prim at this batch's ordinal."""
 
@@ -327,5 +378,19 @@ def write_token_attribute(
 
     with StageWriteBatch(stage, prim_paths) as batch:
         batch.write_tokens(attribute_name, values)
+        assert batch.ordinal is not None
+        return int(batch.ordinal)
+
+
+def write_relationship_attribute(
+    stage: Any,
+    prim_path: str,
+    attribute_name: str,
+    targets: Sequence[str],
+) -> int:
+    """Write one relationship-target array and return the committed ordinal."""
+
+    with StageWriteBatch(stage, [str(prim_path)]) as batch:
+        batch.write_relationship_targets(attribute_name, targets)
         assert batch.ordinal is not None
         return int(batch.ordinal)

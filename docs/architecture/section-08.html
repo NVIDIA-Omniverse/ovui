@@ -1,4 +1,6 @@
 <!doctype html>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -214,7 +216,7 @@
 
     <section>
       <h2>Native OVStage runtime and OVRTX BORROW</h2>
-      <p>The OVStage provider has one scene owner. OVStage creates and owns the native scene and its committed renderer-facing ordinals, and the OVUI adapters drive that scene directly through OVStage's own APIs. The provider never imports <code>pxr</code> or the OpenUSD adapter package and never opens or mirrors a backing <code>Usd.Stage</code>; structural and runtime isolation tests enforce that boundary. OVRTX is initialized before <code>omni.ui</code>/OVStage, attaches in native BORROW mode, and never receives a replicated scene.</p>
+      <p>The OVStage provider has one scene owner. OVStage creates and owns the native scene and its committed renderer-facing ordinals, and the OVUI adapters drive that scene directly through OVStage's own APIs. The provider never imports <code>pxr</code> or the OpenUSD adapter package and never opens or mirrors a backing <code>Usd.Stage</code>; structural and runtime isolation tests enforce that boundary. OVRTX is initialized before <code>omni.ui</code>/OVStage, attaches in <code>AttachMode.BORROW</code>, and never receives a replicated scene.</p>
       <div class="record-row">
         <div class="record-title">Native authoring and presentation flow</div>
         <div class="record-pills">
@@ -233,8 +235,8 @@
         <li>OVRTX attaches once with <code>Renderer.attach_ovstage(stage)</code> and renders via <code>Renderer.step(..., ordinal=scene.current_ordinal)</code>. It handles pixels, render-output mapping, picks, and renderer-global presentation control only.</li>
         <li>OVRTX scene-data APIs remain prohibited in BORROW mode: no scene open/repopulation, attribute write, USD-reference mutation, prim query, or scene-replication call is used. The parameterless renderer <code>reset()</code> is allowed only to invalidate presentation state after an OVStage-owned resolution change; it is not a stage reset or authoring path. Shutdown detaches OVRTX before native OVStage destruction.</li>
       </ol>
-      <p>The native runtime requires a full, matching Kit rendering build. Before native renderer construction, OVUI requires callable <code>ovrtx.RendererConfig</code>, <code>ovrtx.Renderer</code>, and the callable <code>Renderer.attach_ovstage</code>, <code>Renderer.detach_ovstage</code>, and <code>Renderer.step</code> APIs; attachment uses BORROW semantics, with the public <code>ovrtx.AttachMode.BORROW</code> symbol supplied only when a build exposes it because current runtimes default to BORROW. Attached rendering passes the committed OVStage ordinal through the <code>ordinal</code> keyword, and startup preflight requires callable <code>ovstage.Stage</code>. A missing capability aborts with its exact module or API name; <code>OVUI_WIDGETS_REQUIRE_OVRTX=0</code> does not enable a read-only path or a substitute renderer for this provider. Kit <code>python.sh</code> is the canonical native import and adapter-test host; the runnable USD Viewer uses this checkout's standalone ovui build because Kit's extension <code>omni.ui</code> does not provide the standalone <code>ui.init</code> lifecycle. Build and launch details are in the <a href="../../ovui-data-adapters/docs/kit-runtime.md" target="_top">Kit runtime guide</a>.</p>
-      <p>On attach-capable ovrtx 0.4, selected objects receive renderer-owned selection outlines through the dedicated outline-membership API, which stays within BORROW ownership because it never writes the borrowed OVStage. A runtime that does not expose that membership API degrades honestly: picking and logical selection remain valid and no outline appears, and the provider does not violate BORROW ownership with an OVRTX data write as a workaround.</p>
+      <p>The native runtime requires a full, matching Kit rendering build. Before native renderer construction, OVUI requires <code>ovrtx.AttachMode.BORROW</code> and the callable <code>Renderer.attach_ovstage</code>, <code>Renderer.detach_ovstage</code>, and <code>Renderer.step</code> APIs; attached rendering passes the committed OVStage ordinal through the <code>ordinal</code> keyword, and startup preflight requires callable <code>ovstage.Stage</code>. A missing capability aborts with its exact module or API name; <code>OVUI_WIDGETS_REQUIRE_OVRTX=0</code> does not enable a read-only path or a substitute renderer for this provider. Kit <code>python.sh</code> is the canonical native import and adapter-test host; the runnable USD Viewer uses this checkout's standalone ovui build because Kit's extension <code>omni.ui</code> does not provide the standalone <code>ui.init</code> lifecycle. Build and launch details are in the <a href="../../ovui-data-adapters/docs/kit-runtime.md" target="_top">Kit runtime guide</a>.</p>
+      <p>Current Kit external-attach callback forwarding still does not fully carry selection-outline membership into OVRTX's Hydra state. Picking and logical selection remain valid; the provider does not violate BORROW ownership with an OVRTX data write as a workaround.</p>
     </section>
 
     <section>

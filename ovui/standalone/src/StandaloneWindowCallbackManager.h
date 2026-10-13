@@ -1,19 +1,15 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 // Minimal IWindowCallbackManager for standalone mode.
 #pragma once
 
 #include <omni/ui/windowmanager/IWindowCallbackManager.h>
+
+#include "NativeTiming.h"
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -30,13 +26,31 @@ public:
                              windowmanager::DockPreference dockPref,
                              windowmanager::IEventListener* listener,
                              windowmanager::WindowSet* windowSet)
-        : m_title(title ? title : "")
+        : m_title()
         , m_width(width)
         , m_height(height)
         , m_dockPref(dockPref)
-        , m_listener(listener)
+        , m_listener(windowmanager::retainCallbackReference(listener))
         , m_windowSet(windowSet)
     {
+        if (title != nullptr)
+        {
+            m_title = title;
+        }
+        static constexpr char kMetricPrefix[] = "Window.draw.";
+        static constexpr char kMetricSuffix[] = " [ovui debug]";
+        m_performanceMetricName.reserve(
+            sizeof(kMetricPrefix) - 1 + m_title.size() + sizeof(kMetricSuffix));
+        m_performanceMetricName = kMetricPrefix;
+        if (m_title.empty())
+        {
+            m_performanceMetricName += "Untitled";
+        }
+        else
+        {
+            m_performanceMetricName += m_title;
+        }
+        m_performanceMetricName += kMetricSuffix;
     }
 
     const char* getTitle() override { return m_title.c_str(); }
@@ -48,8 +62,11 @@ public:
 
     void draw(float elapsedTime) override
     {
+        NativeTimingScope drawScope{ m_performanceMetricName.c_str(), m_performanceMetricId };
         if (m_listener)
+        {
             m_listener->onDraw(elapsedTime);
+        }
     }
 
 private:
@@ -59,6 +76,8 @@ private:
     windowmanager::DockPreference m_dockPref;
     windowmanager::IEventListenerPtr m_listener;
     windowmanager::WindowSet* m_windowSet;
+    std::string m_performanceMetricName;
+    uint32_t m_performanceMetricId{ 0 };
 };
 
 /// Minimal IWindowCallbackManager. Uses a single default WindowSet.

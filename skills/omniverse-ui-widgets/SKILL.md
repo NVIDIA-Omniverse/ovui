@@ -8,11 +8,10 @@ description: |
   ovrtx proof requirements, widget wiring, menu/file-open wiring, and
   screenshot-first QA expectations. Do not use this skill for raw `omni.ui`
   atomic widget construction; use the omniverse-ui-apis skill instead.
-author: "NVIDIA ovui Team <ovui-team@nvidia.com>"
-license: "LicenseRef-NVIDIA"
+license: "Apache-2.0"
 metadata:
   python-distribution: ovui-widgets-app
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # ovui-widgets
@@ -100,6 +99,8 @@ trial app, do not add app-step tests, and do not add shape flags to
 - `references/usd-and-dataflow.md` - USD open and wiring recipe, standalone
   docking sequence, exercise configurations and CLI, plus selection and
   dataflow wiring across Stage, Viewport, and Property surfaces.
+- `references/inspector-commands.md` - the viewport and media Inspector command
+  providers ovui-widgets ships and how a host wires them.
 - `references/menu-and-qa.md` - Exercise 4 menu bar with File > Open and
   the screenshot-first QA flow with `ovui-inspect`.
 

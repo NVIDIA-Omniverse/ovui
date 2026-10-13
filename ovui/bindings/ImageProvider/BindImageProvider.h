@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -15,6 +8,7 @@
 #include <omni/ui/ImageProvider/ImageProvider.h>
 
 #include <pybind11/pybind11.h>
+#include "../PlatformBindings.h"
 
 #include <cstdint>
 #include <memory>
@@ -49,8 +43,8 @@ void wrapImageProvider(module& m)
         .def_property_readonly("width", &ImageProvider::getWidth, "Gets image width.")
         .def_property_readonly("height", &ImageProvider::getHeight, "Gets image height.")
         .def("set_image_data",
-             [](ImageProvider* self, void* texReference, uint32_t width, uint32_t height, PixelFormat format) {
-                 self->setImageData(texReference, { width, height }, format);
+             [](ImageProvider* self, void* texReference, uint32_t width, uint32_t height, pybind11::object format) {
+                 self->setImageData(texReference, { width, height }, pixelFormatFromPython(format));
              })
         .def("set_image_data",
              [](ImageProvider* self, rtx::resourcemanager::RpResource& rpRsrc, int64_t presentationKey, void* metadata) {

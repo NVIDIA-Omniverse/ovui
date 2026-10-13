@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tumble inertia — Step B.4 of the Viewport Plan.
 
@@ -216,11 +209,14 @@ class AngularVelocityTracker:
     still before releasing, the last *motion* is the last non-zero
     change, not the release. That matches
     the camera navigation behavior "last non-zero delta".
+
+    An injected clock must resolve well below the 1-8 ms spacing of mouse
+    move events; :meth:`record` divides by that interval.
     """
 
     def __init__(
         self,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.perf_counter,
         max_handoff_age: float = DEFAULT_MAX_HANDOFF_AGE,
     ) -> None:
         self._clock = clock

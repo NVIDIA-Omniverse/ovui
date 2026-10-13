@@ -1,4 +1,6 @@
 @echo off
+REM SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+REM SPDX-License-Identifier: Apache-2.0
 REM Run the OvGear pytest suite with the Windows USD bootstrap in place.
 
 setlocal

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the Step C.4 scale gizmo.
 
@@ -116,6 +109,12 @@ def _fake_sender_with_moved(x: float, y: float, z: float) -> SimpleNamespace:
     """Stand-in for a shape's drag sender with a world-space ``moved`` delta."""
     moved = SimpleNamespace(x=x, y=y, z=z)
     payload = SimpleNamespace(moved=moved)
+    return SimpleNamespace(gesture_payload=payload)
+
+
+def _fake_sender_with_closest(x: float, y: float, z: float) -> SimpleNamespace:
+    """Stand-in for a line shape's absolute closest-point payload."""
+    payload = SimpleNamespace(line_closest_point=(x, y, z))
     return SimpleNamespace(gesture_payload=payload)
 
 
@@ -378,6 +377,41 @@ class TestPrimScaleChangedGestureLifecycle:
         g._on_began(_fake_sender_with_moved(0.0, 0.0, 0.0))
         g._on_changed(_fake_sender_with_moved(-5.0, 0.0, 0.0))
         assert g.current_factor == pytest.approx(MIN_SCALE_FACTOR)
+
+    def test_screen_fraction_is_stable_across_world_size_and_event_count(
+        self, wired_model
+    ):
+        endpoints = []
+        for world_size, samples in (
+            (10.0, (1.0,)),
+            (10.0, (0.25, 0.5, 0.75, 1.0)),
+            (100.0, (10.0,)),
+            (100.0, (2.5, 5.0, 7.5, 10.0)),
+        ):
+            g = PrimScaleChangedGesture(
+                model=wired_model,
+                axis=(1.0, 0.0, 0.0),
+                world_scale_fn=lambda size=world_size: size,
+            )
+            g._on_began(_fake_sender_with_closest(0.0, 0.0, 0.0))
+            for x in samples:
+                g._on_changed(_fake_sender_with_closest(x, 0.0, 0.0))
+            endpoints.append(g.current_factor)
+            assert g.cancel_active_drag() is True
+
+        assert endpoints == pytest.approx([1.1, 1.1, 1.1, 1.1])
+
+    def test_small_reverse_screen_drag_is_proportional(self, wired_model):
+        g = PrimScaleChangedGesture(
+            model=wired_model,
+            axis=(1.0, 0.0, 0.0),
+            world_scale_fn=lambda: 10.0,
+        )
+        g._on_began(_fake_sender_with_closest(0.0, 0.0, 0.0))
+        g._on_changed(_fake_sender_with_closest(-1.0, 0.0, 0.0))
+
+        assert g.current_factor == pytest.approx(0.9)
+        assert g.cancel_active_drag() is True
 
     def test_changed_while_inactive_is_noop(self, wired_model):
         g = PrimScaleChangedGesture(model=wired_model, axis=(1.0, 0.0, 0.0))

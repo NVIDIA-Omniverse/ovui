@@ -1,4 +1,6 @@
 <!doctype html>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -228,6 +230,14 @@
       </ul>
       <p>A useful agent prompt names all three pieces explicitly: which app to launch, which inspector commands to run between edits, and which skill to consult for code patterns. Example: <em>"Launch <code>python -m ovui_widgets.app</code> with <code>skills/omniverse-ui-inspector</code> on <code>PYTHONPATH</code>, wait for health, screenshot the current viewport, add a new toolbar button to <code>ViewportWidget</code> using the patterns in <code>skills/omniverse-ui-widgets/SKILL.md</code>, then re-screenshot and confirm the new button appears."</em></p>
       <p>Grounding the agent in screenshots from the running app and in the skills above is what makes the generated UI look and behave like the rest of ovui instead of generic code: the agent reuses real ovui-widgets components, follows the styling and selection conventions the application already enforces, and proves the change with a screenshot the user can read.</p>
+    </section>
+
+    <section>
+      <h2>Application commands on the same Inspector pipeline</h2>
+      <p>An application can implement <code>get_inspector_commands()</code> to contribute typed commands. Inspector exposes their descriptions and JSON argument schemas through <code>GET /commands</code>; the existing CLI provides <code>commands</code> and <code>call NAME --arguments JSON</code>. Requests use the same frame-loop queue as input, capture and Python execution. Async handlers yield across frames while retaining command order, and unregister/detach removes their contributions.</p>
+      <p>The reusable <code>ViewportInspector</code> supplies picking, selection, authored-camera discovery/binding, framing and manipulator commands. USD Viewer and smaller viewport hosts use the same provider. Streaming and recording are shared ovui services that USD Viewer registers; standalone viewport hosts such as USD Workbench, maintained in its own repository, register the same providers. There is no separate MCP frontend or process manager. Applications may also provide a persistent namespace for the existing gated <code>/execute</code> endpoint.</p>
+      <p>Viewport streaming binds directly to a RenderProduct CUDA texture, while application streaming uses the composed Vulkan/CUDA framebuffer. Both share the existing OVStream tap and Inspector queue.</p>
+      <p>See the <a href="../../skills/omniverse-ui-inspector/references/application-commands.md">contribution API</a> for registration, validation, owner-thread scheduling, cancellation and shutdown. These typed operations are API interactions; the strict screenshot-first discipline above continues to apply when claiming mouse/keyboard UI evidence.</p>
     </section>
 
     <nav class="bottom-nav" aria-label="Section navigation">

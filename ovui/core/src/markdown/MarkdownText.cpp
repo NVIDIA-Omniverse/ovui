@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 // Text-run layout: emoji/ZWJ scanning, UTF-8 decode, fallback-font
@@ -231,40 +224,50 @@ int _scanEmojiSequence(const char* p, const char* end, TwemojiAtlas* atlas,
 }
 
 // =====================================================================
-// Font-glyph probe -- astral-plane correctness fix
+// Font-glyph probes
 // =====================================================================
 
 bool _fontHasGlyph(ImFont* font, float fontSize, uint32_t cp)
 {
+    IM_UNUSED(fontSize);
     if (!font)
         return false;
+    // Answers "does this face provide a glyph for `cp`", which is a property
+    // of the font file alone.  It must NOT be answered from the atlas' bake
+    // state: ImGui 1.92 rasterizes glyphs lazily, so
+    // `ImFontBaked::IsGlyphLoaded` only reports whether a glyph has been
+    // rasterized *so far*.  Asking it instead made a face that merely had not
+    // drawn `cp` yet look like a face that lacks `cp` entirely, and the caller
+    // then rerouted ordinary Latin text to the fallback face.
+    // `ImFont::IsGlyphInFont` queries the font loader's character map
+    // directly, so it is bake-order independent and rasterizes nothing.
+    //
     // Astral-plane handling:
-    //  - ImWchar32 builds (IMGUI_USE_WCHAR32): glyph table is keyed by full
-    //    codepoint, so we can legitimately probe every codepoint here.
-    //    The prior `cp > 0xFFFF => return false` early-return broke the
-    //    fallback-font route for every emoji / CJK-Ext / math astral glyph
-    //    because the caller only routes when the active font reports
-    //    missing AND the fallback reports present.
-    //  - ImWchar16 builds: the glyph table literally cannot index past
-    //    the BMP.  We preserve the old `cp > 0xFFFF => false` behavior
-    //    since neither `IsGlyphLoaded` nor `FindGlyphNoFallback` would
-    //    succeed for such codepoints on this build.
-    if constexpr (sizeof(ImWchar) >= 4)
-    {
-        ImFontBaked* baked = font->GetFontBaked(fontSize);
-        if (!baked || !baked->IsGlyphLoaded(static_cast<ImWchar>(cp)))
-            return false;
-        return baked->FindGlyphNoFallback(static_cast<ImWchar>(cp)) != nullptr;
-    }
-    else
+    //  - ImWchar32 builds (IMGUI_USE_WCHAR32): ImWchar holds the full
+    //    codepoint, so every codepoint can be probed.
+    //  - ImWchar16 builds: ImWchar cannot represent anything past the BMP,
+    //    so astral codepoints are reported missing and the caller falls back.
+    if constexpr (sizeof(ImWchar) < 4)
     {
         if (cp > 0xFFFF)
             return false; // BMP-only build: caller must try fallback font.
-        ImFontBaked* baked = font->GetFontBaked(fontSize);
-        if (!baked || !baked->IsGlyphLoaded(static_cast<ImWchar>(cp)))
-            return false;
-        return baked->FindGlyphNoFallback(static_cast<ImWchar>(cp)) != nullptr;
     }
+    return font->IsGlyphInFont(static_cast<ImWchar>(cp));
+}
+
+bool _fontHasBakedGlyph(ImFont* font, float fontSize, uint32_t cp)
+{
+    if (!font)
+        return false;
+    if constexpr (sizeof(ImWchar) < 4)
+    {
+        if (cp > 0xFFFF)
+            return false;
+    }
+    ImFontBaked* baked = font->GetFontBaked(fontSize);
+    if (!baked || !baked->IsGlyphLoaded(static_cast<ImWchar>(cp)))
+        return false;
+    return baked->FindGlyphNoFallback(static_cast<ImWchar>(cp)) != nullptr;
 }
 
 // =====================================================================
@@ -570,9 +573,12 @@ void _renderTextRun(WalkState& state, ImFont* font, float fontSize, ImU32 color,
         {
             uint32_t cp;
             int cpLen = _decodeUtf8(p, end, &cp);
+            // Reroute only when the active face genuinely lacks `cp` AND the
+            // fallback face can draw it from the atlas already on the GPU --
+            // see _fontHasBakedGlyph() for why the two probes differ.
             if (fallbackFont
                 && !_fontHasGlyph(activeFont, activeFontSize, cp)
-                && _fontHasGlyph(fallbackFont, activeFontSize, cp))
+                && _fontHasBakedGlyph(fallbackFont, activeFontSize, cp))
             {
                 if (p > textStart)
                     _renderPlainTextRun(state, activeFont, activeFontSize, color, textStart, p);
@@ -583,7 +589,7 @@ void _renderTextRun(WalkState& state, ImFont* font, float fontSize, ImU32 color,
                     uint32_t nextCp;
                     int nextLen = _decodeUtf8(fallbackEnd, end, &nextCp);
                     if (_fontHasGlyph(activeFont, activeFontSize, nextCp)
-                        || !_fontHasGlyph(fallbackFont, activeFontSize, nextCp))
+                        || !_fontHasBakedGlyph(fallbackFont, activeFontSize, nextCp))
                         break;
                     fallbackEnd += nextLen;
                 }

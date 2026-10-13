@@ -1,6 +1,6 @@
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # OVUI 0.2 native OVStage / OVRTX Kit runtime
@@ -10,7 +10,7 @@ The `ovstage` provider uses one Kit rendering build for two connected roles:
 - OVStage owns the runtime stage lifecycle and renderer-facing committed
   ordinals. The OVUI adapters drive OVStage natively through its own
   `ovstage.Stage` API.
-- OVRTX attaches to OVStage in native BORROW mode and provides pixels, output
+- OVRTX attaches to OVStage in `AttachMode.BORROW` and provides pixels, output
   mapping, and picking without owning or replicating scene data.
 
 This is a native OVStage pipeline. The earlier hybrid USD-to-OVStage bridge —
@@ -45,7 +45,7 @@ and clean-installs the package stack; that proves wheel metadata, dependency
 resolution, and imports. It does not load Kit, OVStage, OVRTX, or a GPU.
 
 Native-provider GPU validation is recorded in the integration work for the
-native port and its follow-ups (PRs #100, #110, #113): the full application
+native port and its follow-ups: the full application
 ran with no OpenUSD distribution installed, and held-drag/present-overlap
 performance was measured on real ovstage + ovrtx runtimes. The Linux GPU smoke
 in §7 exercises open/render/pick/drag/shutdown for the current provider.
@@ -58,7 +58,9 @@ in §7 exercises open/render/pick/drag/shutdown for the current provider.
 
 ## 1. Define portable checkout and build variables
 
-Set these two variables to your checkouts before using the commands below:
+These development commands require access to the Kit source tree
+(`omniverse-kit`), including its rendering projects; an installed Kit runtime
+alone does not provide this layout. Set these two variables to your checkouts:
 
 ```bash
 : "${REPO_ROOT:?Set REPO_ROOT to the ovui checkout}"
@@ -155,15 +157,11 @@ mixed OVStage and OVRTX wheels. A build is compatible only when it exposes all
 of these exact APIs:
 
 - callable `ovstage.Stage`;
-- callable `ovrtx.RendererConfig` and callable `ovrtx.Renderer`;
+- `ovrtx.AttachMode.BORROW`, callable `ovrtx.RendererConfig`, and callable
+  `ovrtx.Renderer`;
 - callable `ovrtx.Renderer.attach_ovstage`,
   `ovrtx.Renderer.detach_ovstage`, and
   `ovrtx.Renderer.step`, with an `ordinal` keyword while attached.
-
-BORROW is the supported attachment mode. The current default-BORROW ovrtx API
-needs no `AttachMode` type, so the preflight does not require one; when an
-ovrtx build does expose `ovrtx.AttachMode.BORROW`, the provider passes that
-explicit mode to `ovrtx.RendererConfig`.
 
 The provider's startup preflight verifies the required modules and APIs and
 fails with a structured error naming the exact missing capability. The
@@ -209,8 +207,7 @@ The boundary is deliberate:
 3. Renderer-only presentation content (private viewport camera,
    RenderProduct/RenderVar wiring, fallback lighting) stays provider-owned and
    is never part of the user's durable scene data.
-4. OVRTX is created early, configured for BORROW attachment (passing
-   `ovrtx.AttachMode.BORROW` only when the build exposes it), attached
+4. OVRTX is created early, configured with `ovrtx.AttachMode.BORROW`, attached
    once with `Renderer.attach_ovstage(stage)`, and stepped with
    `Renderer.step(..., ordinal=scene.current_ordinal)`. A renderer is not
    detached and reattached to the same or a replacement stage: detach is
@@ -249,23 +246,6 @@ The native provider does not require the OpenUSD adapter package. Install
 `ovui-data-adapters/dist/openusd` in addition only when the same environment
 should also offer the standalone `openusd` provider; use its `[standalone]`
 extra only in an environment intended for that provider.
-
-`ovui-data-adapters-ovstage` contributes the optional Physics menu through
-installed entry-point metadata; a source-only `PYTHONPATH` entry does not
-register `ovui_widgets.components` entry points.
-
-Verify the component entry point before treating a run as a full parity run:
-
-```bash
-"$OVUI_PYTHON" - <<'PY'
-from importlib.metadata import entry_points
-
-names = {entry.name for entry in entry_points(group="ovui_widgets.components")}
-required = {"ovstage_physics_controls"}
-assert required <= names, (required - names, names)
-print(sorted(names))
-PY
-```
 
 The ovui build has additional system prerequisites documented in
 [`ovui/README.md`](../../ovui/README.md).
@@ -374,9 +354,6 @@ CI checks or establish Windows support.
   and does not enter a partial running state.
 - OVRTX's current picking contract uses CUDA-visible GPU 0. A source-product
   policy and end-to-end result for multi-GPU systems remain open.
-- Public render settings are authored in USD scenes by other tools. Private
-  camera, product, RenderVar, and runtime settings do not yet have a defined
-  persistence owner.
 - Windows package installation is separate from native runtime support. The
   complete native open/edit/render/pick/drag/shutdown flow has not been
   validated on Windows.
@@ -391,9 +368,9 @@ The hosted package checks do not close any of these native runtime limits.
 | `could not acquire usdrt::population::IUtils` | The rendering build is partial or libraries/plugins were loaded by the wrong framework instance. Build all of `rendering` and preserve early OVRTX bootstrap. |
 | `Failed to create HydraEngine` or missing MDL resources | The rendering build is incomplete or OVRTX initialized too late. Use the full build and application entrypoint. |
 | Wrong `ovstage` or `ovrtx` path | Remove stale wheels/checkouts from the environment and rerun the import check in §3. |
-| `RendererConfig`, `Renderer`, `attach_ovstage`, `detach_ovstage`, or attached `step(..., ordinal=...)` is missing | An incompatible OVRTX package was selected. There is no replication fallback. |
+| `AttachMode.BORROW`, `attach_ovstage`, or attached `step(..., ordinal=...)` is missing | An incompatible OVRTX package was selected. There is no replication fallback. |
 | A save/export/layer operation reports unsupported | Expected: the native provider does not implement those durable workflows. Use the standalone `openusd` provider. |
-| Selection works but no outline is visible | The selected ovrtx build does not expose the renderer-owned outline-membership API (attach-capable ovrtx 0.4 provides it). Selection still synchronizes; the outline degrades honestly. Do not work around it with an OVRTX data write. |
+| Selection works but no outline is visible | Current external-attach callback forwarding does not fully propagate the selection-outline membership state. Do not work around it with an OVRTX data write. |
 | First frame appears hung | Shader compilation is cold. Allow at least 120 seconds or use the smoke's 300-second timeout. |
 
 The provider never falls back to OVRTX scene replication or an OpenUSD stage.

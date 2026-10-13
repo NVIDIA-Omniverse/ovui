@@ -10,13 +10,6 @@
 > runtime guide does not establish Windows support. Use the
 > [Kit runtime guide](../ovui-data-adapters/docs/kit-runtime.md) for the current
 > contract.
->
-> The public [`NVIDIA-Omniverse/ovstage`](https://github.com/NVIDIA-Omniverse/ovstage)
-> repository distributes ovstage as prebuilt C packages (GitHub Releases) and
-> Python wheels (PyPI); it does not include the CMake source-build layout
-> (root `CMakeLists.txt`, `src\` trees, `setup.bat`) that the legacy steps
-> below assume. Follow the ovstage source-build sections only with an ovstage
-> source checkout that provides that layout.
 
 This guide records Windows build steps for the ovui-widgets reference app with
 the older ovrtx, ovstage, and optional ovphysx setup. It includes the base
@@ -40,6 +33,13 @@ Visual Studio compiler environment is already active.
   wheel that already contains its native runtime.
 - Access to the `ovui`, `OpenUSD`, `ovrtx`, `ovstage`, and `PhysX`
   repositories.
+
+> **Source access:** The native ovstage build commands below require access
+> to its development sources and their CMake build layout. The public
+> `NVIDIA-Omniverse/ovstage` repository distributes the runtime and does not
+> provide that CMake source layout. Cloning the public repository alone is
+> insufficient for those build steps; set `OVSTAGE_ROOT` to an available
+> development checkout, or use the published runtime for packaged-app usage.
 
 ## Workspace Variables
 
@@ -72,7 +72,8 @@ the launcher.
 git clone git@github.com:NVIDIA-Omniverse/ovui.git $env:REPO
 git clone https://github.com/PixarAnimationStudios/OpenUSD.git $env:USD_SRC
 git clone git@github.com:NVIDIA-Omniverse/ovrtx.git $env:OVRTX_ROOT
-git clone git@github.com:NVIDIA-Omniverse/ovstage.git $env:OVSTAGE_ROOT
+# Set OVSTAGE_ROOT to an existing ovstage development source checkout.
+# The public ovstage runtime repository does not provide this CMake layout.
 git clone git@github.com:NVIDIA-Omniverse/PhysX.git $env:PHYSX_ROOT
 ```
 
@@ -322,6 +323,7 @@ build or the selected ovphysx package.
 & $env:PYTHON_BIN -m pip install -e "$env:REPO\ovui"
 
 & $env:PYTHON_BIN -m pip install -e "$env:REPO\ovui-data-adapters\dist\common" --no-deps
+& $env:PYTHON_BIN -m pip install -e "$env:REPO\ovui-data-adapters\dist\services" --no-deps
 & $env:PYTHON_BIN -m pip install -e "$env:REPO\ovui-data-adapters\dist\openusd" --no-deps
 & $env:PYTHON_BIN -m pip install -e "$env:REPO\ovui-data-adapters\dist\ovstage" --no-deps
 

@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-License-Identifier: Apache-2.0
 #
 # Manual helper to regenerate golden baselines under the canonical
 # hosted-CI environment, then commit them back to the dispatched

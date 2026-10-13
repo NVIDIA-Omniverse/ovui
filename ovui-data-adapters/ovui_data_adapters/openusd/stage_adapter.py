@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """USD-backed StageAdapter wrapping a Usd.Stage.
 
@@ -17,6 +10,7 @@ rename/reparent (all undoable via UndoManager), and change notifications.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import math
 import os
 import re
@@ -48,24 +42,12 @@ except ImportError:
 from ovui_data_adapters.common import (
     AdapterItem,
     BadgeFlags,
+    BindMaterialRequest,
+    BindMaterialResult,
     BoundCameraPose,
     ChangeEvent,
     ChangeEventType,
     ContextManager,
-    CreateActionCatalog,
-    CreateActionCategory,
-    CreateActionCategoryDescriptor,
-    CreateActionDescriptor,
-    CreateActionErrorCode,
-    CreateActionRequirement,
-    CreateActionWarning,
-    CreateActionWarningSeverity,
-    CreateActionsAdapter,
-    CreateBindingPolicy,
-    CreatePlacementPolicy,
-    CreateRequest,
-    CreateResult,
-    CreateSelectionPolicy,
     CoreMaterialBindingPolicy,
     CoreMaterialCatalog,
     CoreMaterialDescriptor,
@@ -77,11 +59,23 @@ from ovui_data_adapters.common import (
     CoreMaterialsAdapter,
     CoreMaterialWarning,
     CoreMaterialWarningSeverity,
-    BindMaterialRequest,
-    BindMaterialResult,
+    CreateActionCatalog,
+    CreateActionCategory,
+    CreateActionCategoryDescriptor,
+    CreateActionDescriptor,
+    CreateActionErrorCode,
+    CreateActionRequirement,
+    CreateActionsAdapter,
+    CreateActionWarning,
+    CreateActionWarningSeverity,
     CreateAndBindMaterialResult,
+    CreateBindingPolicy,
     CreateMaterialRequest,
     CreateMaterialResult,
+    CreatePlacementPolicy,
+    CreateRequest,
+    CreateResult,
+    CreateSelectionPolicy,
     ItemFlags,
     RenderTargetCatalog,
     RenderTargetDescriptor,
@@ -94,6 +88,7 @@ from ovui_data_adapters.common import (
     SubscriptionProtocol,
     VisibilityState,
 )
+from ovui_data_adapters.common.ovrtx_import import ovrtx_root_mdl_base_dirs
 
 
 def _is_live_prim(item: Any) -> bool:
@@ -614,6 +609,18 @@ _OTHER_CREATE_ACTION_SPECS: tuple[_CreateActionSpec, ...] = (
         default_name="RenderProduct",
         schema_family="usd_render",
     ),
+    _CreateActionSpec(
+        "create.render_var",
+        "AOV",
+        CreateActionCategory.RENDER_PRODUCTS,
+        "RenderVar",
+        "render_var",
+        10,
+        description="Create an LdrColor RenderVar (AOV).",
+        default_parent_path="/Render/Vars",
+        default_name="LdrColor",
+        schema_family="usd_render",
+    ),
     _CreateActionSpec("create.sensor.generic-lidar", "Generic Lidar Sensor", CreateActionCategory.SENSORS, "OmniLidar", "sensor", 0, default_name="Lidar", schema_family="sensor"),
     _CreateActionSpec("create.camera", "Camera", CreateActionCategory.CAMERAS, "Camera", "camera", 0, default_name="Camera"),
     _CreateActionSpec("create.scope", "Scope", CreateActionCategory.SCOPES, "Scope", "scope", 0, default_parent_path="/", default_name="Scope"),
@@ -705,6 +712,19 @@ _CORE_MATERIAL_SPECS: tuple[_CoreMaterialSpec, ...] = (
         schema_family="mdl",
     ),
     _CoreMaterialSpec(
+        material_id="core_material.open_pbr",
+        label="OpenPBR",
+        group_id="base",
+        family=CoreMaterialFamily.MATERIALX,
+        kind=CoreMaterialKind.OPENPBR,
+        shader_type="open_pbr_uber_base",
+        order=20,
+        default_scope_path="/World/Looks",
+        default_name="OpenPBR",
+        capabilities=("materialx.openpbr",),
+        schema_family="openpbr",
+    ),
+    _CoreMaterialSpec(
         material_id="core_material.usd_preview_surface",
         label="USD Preview Surface",
         group_id="usd_materials",
@@ -762,6 +782,14 @@ def _core_material_mdl_search_dirs() -> tuple[Path, ...]:
             if value:
                 paths.append(Path(value).expanduser())
 
+    try:
+        ovrtx_spec = importlib.util.find_spec("ovrtx")
+        for location in getattr(ovrtx_spec, "submodule_search_locations", ()) or ():
+            paths.append(Path(location) / "bin" / "library" / "mdl" / "Base")
+    except (ImportError, ModuleNotFoundError, ValueError):
+        pass
+    paths.extend(ovrtx_root_mdl_base_dirs())
+
     for parent in Path(__file__).resolve().parents:
         paths.extend((
             parent / "ovrtx" / "examples" / "c" / "_deps" / "ovrtx-src" / "bin" / "library" / "mdl" / "Base",
@@ -785,6 +813,15 @@ def _core_material_mdl_module_available(spec: _CoreMaterialSpec) -> bool:
     return any((directory / source_asset).is_file() for directory in _core_material_mdl_search_dirs())
 
 
+def _core_material_openpbr_base_class_asset() -> Path | None:
+    """Locate the renderer's canonical OpenPBR composable class layer."""
+    for base_directory in _core_material_mdl_search_dirs():
+        candidate = base_directory.parent / "OpenPBR" / "open_pbr_uber_base_class.usda"
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
 def _core_material_schema_disabled_reason(spec: _CoreMaterialSpec) -> str:
     if spec.schema_family == "mdl":
         if UsdShade is None:
@@ -794,6 +831,11 @@ def _core_material_schema_disabled_reason(spec: _CoreMaterialSpec) -> str:
                 f"MDL material module {spec.shader_type}.mdl is not available in "
                 "this standalone build."
             )
+    if spec.schema_family == "openpbr":
+        if UsdShade is None:
+            return "UsdShade material schemas are not available in this OpenUSD build."
+        if _core_material_openpbr_base_class_asset() is None:
+            return "The renderer OpenPBR base-class asset is not available in this build."
     if spec.schema_family == "usd_shade" and UsdShade is None:
         return "UsdShade material schemas are not available in this OpenUSD build."
     return ""
@@ -1441,6 +1483,20 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
             return "Prim"
         return _ICON_MAP.get(raw, "Prim")
 
+    def get_light_shape_attributes(self, item: AdapterItem) -> dict[str, float]:
+        if not _is_live_prim(item) or self.get_type_category(item) != "Light":
+            return {}
+        values: dict[str, float] = {}
+        for name in ("width", "height", "radius", "length"):
+            try:
+                attribute = item.GetAttribute(f"inputs:{name}")
+                value = attribute.Get() if attribute else None
+                if value is not None:
+                    values[name] = float(value)
+            except (RuntimeError, TypeError, ValueError):
+                continue
+        return values
+
     def get_badge_flags(self, item: AdapterItem) -> BadgeFlags:
         flags = BadgeFlags.NONE
         if item.HasAuthoredReferences():
@@ -1500,8 +1556,8 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
     def set_visibility(self, item: AdapterItem, visible: bool) -> None:
         if not self.can_edit_visibility(item):
             raise ValueError(f"Visibility is not editable for {item.GetPath()}")
-        from ovui_data_adapters.openusd import SetVisibilityCommand
         from ovui_data_adapters.common import CommandCancelled
+        from ovui_data_adapters.openusd import SetVisibilityCommand
         cmd = SetVisibilityCommand(item, visible, adapter=self)
         self._ensure_scope_baseline()
         attempt = self._begin_visibility_attempt(
@@ -3220,6 +3276,18 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
             return "Y"
         return "Z" if axis == "Z" else "Y"
 
+    def read_stage_meters_per_unit(self) -> float:
+        """Return authored USD stage units for viewport-scale consumers."""
+        if not HAS_USD or self._stage is None:
+            return 1.0
+        try:
+            meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(self._stage))
+        except Exception:
+            return 1.0
+        if not math.isfinite(meters_per_unit) or meters_per_unit <= 0.0:
+            return 1.0
+        return meters_per_unit
+
     def list_cameras(self) -> List[StageChoice]:
         """Return selectable ``UsdGeom.Camera`` prims in stage traversal order."""
         if not HAS_USD or self._stage is None:
@@ -3365,6 +3433,11 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
                         "mdl_sub_identifier": (
                             spec.shader_type if spec.schema_family == "mdl" else ""
                         ),
+                        "openpbr_base_class_asset": (
+                            str(_core_material_openpbr_base_class_asset() or "")
+                            if spec.schema_family == "openpbr"
+                            else ""
+                        ),
                     },
                 )
             )
@@ -3486,10 +3559,32 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
                 (),
             )
             return prim, created_paths, ()
+        if material.kind is CoreMaterialKind.OPENPBR:
+            prim, created_paths = self._define_openpbr_material(material, material_path)
+            return prim, created_paths, ()
         if material.family is CoreMaterialFamily.MDL:
             prim, created_paths = self._define_mdl_material(material, material_path)
             return prim, created_paths, ()
         raise ValueError(f"Unsupported core material kind: {material.kind}")
+
+    def _define_openpbr_material(
+        self,
+        material: CoreMaterialDescriptor,
+        material_path: Any,
+    ) -> tuple[Any, tuple[str, ...]]:
+        """Compose the shipped OpenPBR class so all authoring inputs are visible."""
+        if UsdShade is None:
+            raise RuntimeError("UsdShade is unavailable.")
+        class_asset = str(material.metadata.get("openpbr_base_class_asset") or "")
+        if not class_asset or not Path(class_asset).is_file():
+            raise RuntimeError("The renderer OpenPBR base-class asset is unavailable.")
+
+        openpbr_material = UsdShade.Material.Define(self._stage, material_path)
+        openpbr_material.GetPrim().GetReferences().AddReference(
+            class_asset,
+            "/open_pbr_uber_base",
+        )
+        return openpbr_material.GetPrim(), (str(material_path),)
 
     def _define_mdl_material(
         self,
@@ -4064,8 +4159,7 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
                 ),
             )
 
-        snapshot = _create_snapshot_layer(edit_target_layer)
-        try:
+        def _author() -> tuple[Any, tuple[str, ...], tuple[CreateActionWarning, ...], bool]:
             _, parent_error = _create_ensure_parent(
                 self._stage,
                 parent_path,
@@ -4073,18 +4167,31 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
             )
             if parent_error:
                 raise ValueError(parent_error)
-            prim, created_paths, author_warnings, binding_applied = self._define_create_action_prim(
+            authored = self._define_create_action_prim(
                 action,
                 target_path,
                 binding_targets=binding_targets,
                 selection_paths=request.selection_paths,
             )
+            prim = authored[0]
             if prim is None or not prim.IsValid():
                 raise RuntimeError(f"Create action did not author {target_path}")
+            return authored
+
+        from ovui_data_adapters.openusd import CreatePrimCommand
+
+        # Not ``_push``: the adapter keeps its Tf.Notice collection for the
+        # create, as before. The command makes the create one undo step.
+        cmd = CreatePrimCommand(self._stage, f"Create {action.label}", _author)
+        try:
+            if self._undo_manager is not None:
+                self._undo_manager.push(cmd)
+            else:
+                cmd.do()
         except Exception as exc:
-            _create_restore_layer(edit_target_layer, snapshot)
             message = f"Create action failed: {exc}"
             return _create_action_error(message, CreateActionErrorCode.CREATE_FAILED)
+        prim, created_paths, author_warnings, binding_applied = cmd.result
 
         warnings = (*binding_warnings, *author_warnings)
         primary_path = str(prim.GetPath())
@@ -4181,6 +4288,9 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
         if action.prim_kind == "render_product":
             return self._define_render_product(target_path, selection_paths)
 
+        if action.prim_kind == "render_var":
+            return self._define_render_var(target_path)
+
         if action.prim_kind == "scope":
             prim = UsdGeom.Scope.Define(self._stage, target_path).GetPrim()
             return prim, (str(target_path),), (), False
@@ -4197,12 +4307,28 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
 
         raise ValueError(f"Unsupported create action kind: {action.prim_kind}")
 
+    def _define_render_var(
+        self,
+        target_path: Any,
+    ) -> tuple[Any, tuple[str, ...], tuple[CreateActionWarning, ...], bool]:
+        if UsdRender is None:
+            raise RuntimeError("UsdRender is unavailable.")
+        render_var = UsdRender.Var.Define(self._stage, target_path)
+        render_var.CreateSourceNameAttr().Set("LdrColor")
+        created_paths = (
+            str(target_path.GetParentPath().GetParentPath()),
+            str(target_path.GetParentPath()),
+            str(target_path),
+        )
+        return render_var.GetPrim(), created_paths, (), False
+
     def _define_create_mesh_prim(
         self,
         action: CreateActionDescriptor,
         target_path: Any,
     ) -> tuple[Any, tuple[str, ...], tuple[CreateActionWarning, ...], bool]:
         from pxr import Vt
+
         from ovui_data_adapters.openusd import create_prims
 
         mesh_name = _create_mesh_name(action)

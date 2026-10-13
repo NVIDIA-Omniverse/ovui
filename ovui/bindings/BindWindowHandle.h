@@ -1,16 +1,11 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
+
+#include "PlatformBindings.h"
 
 #include <omni/ui/WindowHandle.h>
 #include <omni/ui/bind/BindUtils.h>
@@ -50,7 +45,7 @@ void wrapWindowHandle(module& m)
 
     OMNIUI_IGNOREWARNING_MSC_WITH_PUSH(4996) // deprecation for WindowHandle::setVisible
     class_<WindowHandle, std::shared_ptr<WindowHandle>>(m, "WindowHandle", windowHandleDoc)
-        .def("notify_app_window_change", &WindowHandle::notifyAppWindowChange,
+        .def("notify_app_window_change", [](WindowHandle& self, pybind11::object window) { self.notifyAppWindowChange(appWindowFromPython(window)); },
              OMNIUI_PYBIND_DOC_WindowHandle_notifyAppWindowChange)
         .def_property_readonly("title", &WindowHandle::getTitle, OMNIUI_PYBIND_DOC_WindowHandle_getTitle)
         .def_property("position_x", &WindowHandle::getPositionX, &WindowHandle::setPositionX,

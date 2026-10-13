@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for ovui_widgets.app.layout — Step 11 default docking layout."""
 
@@ -217,7 +210,7 @@ class TestCollectLayoutIncludesContent:
 class TestSplitIniIsDpiAware:
     """``_build_split_ini`` must scale every dock dimension by the
     runtime DPI. Writing it at DPI 1.0 on a 200% display pins the side
-    panels at logical half-width, which is the reported HiDPI bug.
+    panels at logical half-width, which is the reported regression.
     """
 
     def _build_at_dpi(self, scale: float) -> str:

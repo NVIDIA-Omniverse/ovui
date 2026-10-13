@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for generic property provider hooks."""
 
@@ -15,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from ovui_data_adapters.common import AttributeMetadata, PropertyAdapter
+
 from ovui_widgets.property.builders import WidgetBuilderTable
 from ovui_widgets.property.payload import PropertyPayload
 from ovui_widgets.property.provider_hooks import (
@@ -284,3 +278,47 @@ def test_provider_property_widget_isolates_row_build_failures():
 
     assert built == ["ok"]
     assert "provider:bad" in widget.failures
+
+
+def test_provider_registration_ownership_is_identity_bound():
+    """a foreign same-ID contribution is rejected,
+    a stale handle no-ops on an independent replacement, and
+    remove_if_matches removes only the exact owner."""
+    import pytest
+
+    registry = PropertyProviderRegistry(object())
+    original = _contribution("shared", object())
+    handle = registry.add(original)
+
+    foreign = _contribution("shared", object())
+    with pytest.raises(ValueError, match="already registered"):
+        registry.add(foreign)
+
+    # Original removed and independently replaced under the same ID:
+    # the stale handle no-ops and the replacement survives.
+    assert registry.remove("shared") is True
+    registry.add(foreign)
+    assert handle.remove() is False
+    assert [c.descriptor.provider_id for c in registry.iter_contributions()] == [
+        "shared"
+    ]
+    assert registry.remove_if_matches("shared", original) is False
+    assert registry.remove_if_matches("shared", foreign) is True
+    assert registry.iter_contributions() == ()
+
+
+def test_provider_handle_is_generation_bound_across_same_object_readd():
+    """removing and re-adding the very same contribution
+    starts a new generation; the stale handle no-ops on it."""
+    registry = PropertyProviderRegistry(object())
+    contribution = _contribution("gen", object())
+    stale = registry.add(contribution)
+    assert registry.remove("gen") is True
+    fresh = registry.add(contribution)
+
+    assert stale.remove() is False
+    assert [c.descriptor.provider_id for c in registry.iter_contributions()] == [
+        "gen"
+    ]
+    assert fresh.remove() is True
+    assert registry.iter_contributions() == ()

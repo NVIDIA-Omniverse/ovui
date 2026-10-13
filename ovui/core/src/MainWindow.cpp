@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Log.h"
@@ -200,6 +193,12 @@ void MainWindow::_draw(float elapsedTime)
         this->getMainMenuBar()->setComputedHeight(0.0f);
 
         menuBarHeight = this->getMainMenuBar()->getComputedContentHeight();
+
+        // The main menu bar is drawn inside the host window, not by ImGui::BeginMainMenuBar(), so reserve its height
+        // in the main viewport's work area as BeginMainMenuBar() (BeginViewportSideBar) does. ImGui clamps floating
+        // windows to the work area, so a window placed at y=0 stays below the menu bar instead of covering it, as
+        // with the legacy omni.ui separate menu strip.
+        static_cast<ImGuiViewportP*>(viewport)->BuildWorkInsetMin.y += menuBarHeight;
     }
     else
     {
@@ -220,35 +219,17 @@ void MainWindow::_draw(float elapsedTime)
     host_window_flags |=
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
     host_window_flags |= ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
-                         ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_MenuBar;
+                         ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoScrollbar;
+    if (!uiHidden && this->getMainMenuBar()->isVisible())
+        host_window_flags |= ImGuiWindowFlags_MenuBar;
     // if (dockspace_flags & ImGuiDockNodeFlags_PassthruCentralNode)
     //     host_window_flags |= ImGuiWindowFlags_NoBackground;
 
     uint32_t background_color = 0xFF1F2124;
     m_mainFrame->_resolveStyleProperty(StyleColorProperty::eBackgroundColor, &background_color);
-    // Write the resolved MainFrame color into the BASE style for
-    // ``ImGuiCol_WindowBg`` BEFORE PushStyleColor so the platform
-    // layer's post-render clear (which reads the base, after the
-    // PushStyleColor/PopStyleColor cycle has already restored) sees
-    // our value rather than whatever ImGui initialised the slot to.
-    // Without this, any 1-px gap between widgets (e.g. between the
-    // MainMenuBar window and the host ``Begin("DockSpace")`` window)
-    // is cleared to the legacy gray-blue, producing a visible band.
-    {
-        const float r = ((background_color >> 0)  & 0xFF) / 255.0f;
-        const float g = ((background_color >> 8)  & 0xFF) / 255.0f;
-        const float b = ((background_color >> 16) & 0xFF) / 255.0f;
-        const float a = ((background_color >> 24) & 0xFF) / 255.0f;
-        ImGui::GetStyle().Colors[ImGuiCol_WindowBg] = ImVec4(r, g, b, a);
-    }
+    // Scope the color to the host window. Writing it into the base ImGui style would make it the background of every
+    // window that doesn't style its own.
     ImGui::PushStyleColor(ImGuiCol_WindowBg, background_color);
-    // Empty dock nodes (e.g. the strip immediately below the menu bar
-    // before the first child node opens) default to ImGui's
-    // ``ImGuiCol_DockingEmptyBg`` palette entry, which doesn't honor
-    // the application-side ``MainFrame`` style. Mirror it so the strip
-    // matches the host window background.
-    ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, background_color);
-    popColorCount += 1;
     popColorCount += 1;
 
     ImGui::PushStyleColor(ImGuiCol_WindowShadow, 0x00000000);
@@ -326,62 +307,57 @@ void MainWindow::_draw(float elapsedTime)
         // strip: DOCKSPACE_TOP_PADDING (menu height - 1) plus the active ImGui
         // docking separator size. This preserves the old dock content height
         // when the application uses MainWindow's internal docker.
-        const float dockspaceTopPadding = menuBarHeight + std::max(dockSplitterSize - 1.0f, 0.0f);
+        const float dockspaceTopPadding = menuBarHeight + dockSplitterSize;
         ImGui::SetCursorScreenPos(cursor);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
         ImGui::Dummy(ImVec2(0.0f, dockspaceTopPadding));
         ImGui::PopStyleVar();
 
         // draw the dockspace
-        // ``PassthruCentralNode`` makes the central (no-children) node
-        // transparent so the host window's ``WindowBg`` (i.e. the
-        // MainFrame-styled background) shows through any unoccupied
-        // strip — e.g. the band below the menu bar before child
-        // nodes start. Without this flag, ImGui paints the central
-        // node with ``DockingEmptyBg`` which doesn't honor
-        // application-side MainFrame style.
         ImGuiDockNodeFlags dockspaceFlags =
-            ImGuiDockNodeFlags_NoWindowMenuButton | ImGuiDockNodeFlags_PassthruCentralNode;
+            ImGuiDockNodeFlags_NoWindowMenuButton | ImGuiDockNodeFlags_NoCloseButton;
         ImGuiID dockspaceId = ImGui::GetID("MyDockspace");
 
         ImGui::DockSpace(dockspaceId, ImVec2(0.0f, viewport->Size.y - statusBarHeight - dockspaceTopPadding),
                          dockspaceFlags, nullptr);
 
-        uint32_t menuUnderlineColor = 0xFF262626;
-        this->getMainMenuBar()->_resolveStyleProperty(StyleColorProperty::eBorderColor, &menuUnderlineColor);
-        ImDrawList* foregroundDrawList = ImGui::GetForegroundDrawList();
-        const float underlineY0 = viewport->Pos.y + menuBarHeight + 1.0f;
-        const float underlineY1 = viewport->Pos.y + menuBarHeight + 3.0f;
-        float segmentX0 = viewport->Pos.x + 4.0f;
-        const float segmentX1 = viewport->Pos.x + viewport->Size.x - 4.0f;
-
-        ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(segmentX0, underlineY0), ImVec2(segmentX1, underlineY1),
-                                                      menuUnderlineColor);
-
-        ImGuiContext& popupContext = *ImGui::GetCurrentContext();
-        for (const ImGuiPopupData& popupData : popupContext.OpenPopupStack)
+        uint32_t menuUnderlineColor = 0;
+        if (this->getMainMenuBar()->_resolveStyleProperty(StyleColorProperty::eBorderColor, &menuUnderlineColor))
         {
-            ImGuiWindow* popupWindow = popupData.Window;
-            if (!popupWindow)
-                continue;
-            const ImRect popupRect = popupWindow->Rect();
-            if (popupRect.Max.y <= underlineY0 || popupRect.Min.y >= underlineY1 ||
-                popupRect.Max.x <= segmentX0 || popupRect.Min.x >= segmentX1)
+            ImDrawList* foregroundDrawList = ImGui::GetForegroundDrawList();
+            const float underlineY0 = viewport->Pos.y + menuBarHeight + 1.0f;
+            const float underlineY1 = viewport->Pos.y + menuBarHeight + 3.0f;
+            float segmentX0 = viewport->Pos.x + 4.0f;
+            const float segmentX1 = viewport->Pos.x + viewport->Size.x - 4.0f;
+
+            ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(segmentX0, underlineY0), ImVec2(segmentX1, underlineY1),
+                                                          menuUnderlineColor);
+
+            ImGuiContext& popupContext = *ImGui::GetCurrentContext();
+            for (const ImGuiPopupData& popupData : popupContext.OpenPopupStack)
             {
-                continue;
+                ImGuiWindow* popupWindow = popupData.Window;
+                if (!popupWindow)
+                    continue;
+                const ImRect popupRect = popupWindow->Rect();
+                if (popupRect.Max.y <= underlineY0 || popupRect.Min.y >= underlineY1 ||
+                    popupRect.Max.x <= segmentX0 || popupRect.Min.x >= segmentX1)
+                {
+                    continue;
+                }
+                if (popupRect.Min.x > segmentX0)
+                {
+                    foregroundDrawList->AddRectFilled(ImVec2(segmentX0, underlineY0),
+                                                      ImVec2(std::min(popupRect.Min.x, segmentX1), underlineY1),
+                                                      menuUnderlineColor);
+                }
+                segmentX0 = std::max(segmentX0, popupRect.Max.x);
             }
-            if (popupRect.Min.x > segmentX0)
+            if (segmentX0 < segmentX1)
             {
-                foregroundDrawList->AddRectFilled(ImVec2(segmentX0, underlineY0),
-                                                  ImVec2(std::min(popupRect.Min.x, segmentX1), underlineY1),
+                foregroundDrawList->AddRectFilled(ImVec2(segmentX0, underlineY0), ImVec2(segmentX1, underlineY1),
                                                   menuUnderlineColor);
             }
-            segmentX0 = std::max(segmentX0, popupRect.Max.x);
-        }
-        if (segmentX0 < segmentX1)
-        {
-            foregroundDrawList->AddRectFilled(ImVec2(segmentX0, underlineY0), ImVec2(segmentX1, underlineY1),
-                                              menuUnderlineColor);
         }
     }
     ImGui::End();

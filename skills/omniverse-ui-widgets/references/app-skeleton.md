@@ -77,12 +77,12 @@ class TrialApp:
         self.frame_clock = FrameClock(target_fps=float(ViewportWidget.MAX_FPS_FOREGROUND))
 
     def call_later(self, delay_secs: float, callback: Callable) -> CallbackHandle:
-        handle = CallbackHandle(time.monotonic() + delay_secs, callback)
+        handle = CallbackHandle(time.perf_counter() + delay_secs, callback)
         self._pending_callbacks.append(handle)
         return handle
 
     def _fire_pending_callbacks(self) -> None:
-        now = time.monotonic()
+        now = time.perf_counter()
         for handle in list(self._pending_callbacks):
             if handle.is_cancelled:
                 self._pending_callbacks.remove(handle)
@@ -186,7 +186,7 @@ Inspector attachment and frame-loop drain for screenshots:
 Attaching without draining is broken: `ovui-inspect` CLI commands enqueue work
 and wait for the ovui frame loop to run `drain_pending(...)`. If the app only
 calls `attach_application(self)`, screenshot, mouse, and keyboard commands
-will time out with "command timed out before the ovui frame loop drained it".
+will time out with "... command timed out before the ovui frame loop started it; it was not run".
 
 ```python
 def _setup_optional_ovuiinspect(self) -> None:
@@ -227,7 +227,7 @@ Frame rendering:
 def _render_viewport_if_due(self) -> None:
     if self.viewport_window is None:
         return
-    now = time.monotonic()
+    now = time.perf_counter()
     render_dt = self.frame_clock.should_render(now)
     if render_dt is None:
         self.viewport_window.update(0.0)
@@ -237,3 +237,9 @@ def _render_viewport_if_due(self) -> None:
     if rendered:
         self.frame_clock.commit(now)
 ```
+
+Every timestamp in the trial app must come from `time.perf_counter()`, never
+`time.monotonic()`, which resolves only to 15.625 ms on Windows — coarser than
+a 16.67 ms frame. This matches `ovui_widgets.app.application.Application`, so
+clock values the trial app produces stay comparable with the ones the reused
+widgets produce.

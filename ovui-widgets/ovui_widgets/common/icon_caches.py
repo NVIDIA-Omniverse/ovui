@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Process-wide registry of ovui-resource clears.
 
@@ -164,10 +157,9 @@ register_dict(_PROVIDER_CACHE)
 def provider(path: str) -> Any:
     """Return a cached ``omni.ui.RasterImageProvider`` for *path*.
 
-    ``omni.ui.Image(url)`` silently fails on the standalone build; only
-    the provider-backed ``omni.ui.ImageWithProvider`` renders reliably.
     Providers are cached by path so the PNG is decoded only once per
-    process.
+    process and every ``omni.ui.ImageWithProvider`` that shows the same
+    icon shares one provider.
 
     The return type is ``omni.ui.RasterImageProvider`` at runtime; the
     annotation is kept as ``Any`` so this module remains importable in

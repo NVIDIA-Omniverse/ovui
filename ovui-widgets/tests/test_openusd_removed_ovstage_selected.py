@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Step 24: OpenUSD-removal and ovstage-provider swap validation."""
 
@@ -404,17 +397,12 @@ def test_common_selection_swaps_openusd_and_ovstage_by_request_and_priority() ->
     assert registry.active_provider is ovstage_selected
 
 
-def test_ovui_widgets_app_distribution_does_not_force_openusd_provider() -> None:
-    try:
-        import tomllib
-    except ImportError:  # pragma: no cover
-        import tomli as tomllib  # type: ignore[no-redef]
-
-    path = MONOREPO_ROOT / "ovui-widgets" / "dist" / "app" / "pyproject.toml"
-    with path.open("rb") as file:
-        project = tomllib.load(file)["project"]
-
-    dependencies = tuple(project["dependencies"])
+def test_ovui_widgets_app_distribution_does_not_force_openusd_provider(
+    declared_dependencies,
+) -> None:
+    dependencies = tuple(
+        declared_dependencies(MONOREPO_ROOT / "ovui-widgets" / "dist" / "app")
+    )
     concrete_adapter_deps = [
         dep
         for dep in dependencies
@@ -422,5 +410,5 @@ def test_ovui_widgets_app_distribution_does_not_force_openusd_provider() -> None
         or dep.startswith("ovui-data-adapters-ovstage")
     ]
 
-    assert "ovui-data-adapters-common>=0.1.0" in dependencies
+    assert any(dep.startswith("ovui-data-adapters-common==") for dep in dependencies)
     assert concrete_adapter_deps == []

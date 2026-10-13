@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 // NOTE: include imgui_internal.h BEFORE the omni/ui/scene headers, which pull in
@@ -33,7 +26,10 @@
 #include <omni/ui/scene/Scene.h>
 #include <omni/ui/scene/SceneContainerScope.h>
 
+#include <algorithm>
+#include <cmath>
 #include <mutex>
+#include <stdexcept>
 
 OMNIUI_SCENE_NAMESPACE_OPEN_SCOPE
 
@@ -125,6 +121,14 @@ class SceneViewPrivate
 {
 public:
     std::mutex m_viewLock;
+    bool m_supportsDepthGroups = false;
+    bool m_supportsDistanceFade = false;
+    bool m_supportsWorldSpaceWidths = false;
+    bool m_supportsPixelDiameterWidths = false;
+    bool m_supportsMeshLighting = false;
+    // Borrowed only during synchronous collection of a dedicated offscreen view.
+    const Matrix44* m_offscreenProjection = nullptr;
+    const Matrix44* m_offscreenView = nullptr;
     // TODO: std::mutex m_projectionLock;
 };
 
@@ -172,12 +176,12 @@ SceneView::~SceneView()
 
 const Matrix44& SceneView::getProjection() const
 {
-    return m_projection;
+    return m_prv->m_offscreenProjection ? *m_prv->m_offscreenProjection : m_projection;
 }
 
 const Matrix44& SceneView::getView() const
 {
-    return m_view;
+    return m_prv->m_offscreenView ? *m_prv->m_offscreenView : m_view;
 }
 
 void SceneView::onModelUpdated(const std::shared_ptr<const AbstractManipulatorModel::AbstractManipulatorItem>& item)
@@ -301,11 +305,66 @@ MouseInput SceneView::_captureInput(float width, float height, const Matrix44& v
     return { mouse, mouseWheel, mouseOrigin, mouseDirection, modifiers, clicked, doubleClicked, released, down };
 }
 
+bool SceneView::supportsMeshLighting() const
+{
+    return m_prv->m_supportsMeshLighting;
+}
+
+void SceneView::_setSupportsMeshLighting(bool supported)
+{
+    m_prv->m_supportsMeshLighting = supported;
+}
+
+bool SceneView::supportsDepthGroups() const
+{
+    return m_prv->m_supportsDepthGroups;
+}
+
+void SceneView::_setSupportsDepthGroups(bool supported)
+{
+    m_prv->m_supportsDepthGroups = supported;
+}
+
+bool SceneView::supportsDistanceFade() const
+{
+    return m_prv->m_supportsDistanceFade;
+}
+
+void SceneView::_setSupportsDistanceFade(bool supported)
+{
+    m_prv->m_supportsDistanceFade = supported;
+}
+
+bool SceneView::supportsWorldSpaceWidths() const
+{
+    return m_prv->m_supportsWorldSpaceWidths;
+}
+
+bool SceneView::supportsPixelDiameterWidths() const
+{
+    return m_prv->m_supportsPixelDiameterWidths;
+}
+
+void SceneView::_setSupportsPixelDiameterWidths(bool supported)
+{
+    m_prv->m_supportsPixelDiameterWidths = supported;
+}
+
+void SceneView::_setSupportsWorldSpaceWidths(bool supported)
+{
+    m_prv->m_supportsWorldSpaceWidths = supported;
+}
+
 void SceneView::_drawContent(float elapsedTime)
+{
+    _collectAttachedFrame(elapsedTime, false);
+}
+
+bool SceneView::_collectAttachedFrame(float elapsedTime, bool collectEmptyScene)
 {
     if (!this->isEnabled())
     {
-        return;
+        return false;
     }
 
     OMNIUI_PROFILE_ZONE("SceneView[%s]::_drawContent", getName().c_str());
@@ -314,7 +373,7 @@ void SceneView::_drawContent(float elapsedTime)
     {
         OMNIUI_PROFILE_VERBOSE_ZONE("SceneView[%s]::_drawContent", "AbstractDrawSystem::reset");
         m_draw.reset();
-        return;
+        return false;
     }
 
     bool clearDraw = true;
@@ -358,8 +417,37 @@ void SceneView::_drawContent(float elapsedTime)
 
         // Render the buffers
         OMNIUI_PROFILE_VERBOSE_ZONE("SceneView[%s]::_drawContent - getDrawData", getName().c_str());
-        if (const DrawData& drawData = m_scene->_getDrawData())
+        const DrawData& drawData = m_scene->_getDrawData();
+        if (drawData || collectEmptyScene)
         {
+            if (drawData && m_scene->hasDepthPolicies() && !this->supportsDepthGroups())
+            {
+                OMNIUI_LOG_ERROR_ONCE("DepthGroup requires a SceneView with scoped depth support; scene drawing skipped.");
+                m_draw.reset();
+                return false;
+            }
+
+            if (drawData && m_scene->hasDistanceFades() && !this->supportsDistanceFade())
+            {
+                OMNIUI_LOG_ERROR_ONCE("DistanceFadeGroup requires a SceneView with distance fade support; scene drawing skipped.");
+                m_draw.reset();
+                return false;
+            }
+            const auto& widths = m_scene->getWidthSpaceDrawBuffers();
+            const bool worldWidths = std::any_of(widths.begin(), widths.end(), [](const WidthSpaceDrawBuffer& entry) {
+                return entry.space == StrokeWidthSpace::eWorld;
+            });
+            const bool pixelDiameters = std::any_of(widths.begin(), widths.end(), [](const WidthSpaceDrawBuffer& entry) {
+                return entry.space == StrokeWidthSpace::ePixelDiameter;
+            });
+            if ((worldWidths && !this->supportsWorldSpaceWidths()) ||
+                (pixelDiameters && !this->supportsPixelDiameterWidths()))
+            {
+                OMNIUI_LOG_ERROR_ONCE("WidthSpaceGroup requires a SceneView supporting the requested stroke mode; scene drawing skipped.");
+                m_draw.reset();
+                return false;
+            }
+
             if (!m_draw)
             {
                 OMNIUI_PROFILE_VERBOSE_ZONE("SceneView[%s]::_drawContent - createDrawSystem", getName().c_str());
@@ -367,7 +455,7 @@ void SceneView::_drawContent(float elapsedTime)
                 // Lazily creating of the draw system
                 m_draw = this->_createDrawSystem();
                 // FIXME: Work around issue where draw data with textures is incomplete and results in white objects on first frame.
-                return;
+                return false;
             }
 
             clearDraw = false;
@@ -401,10 +489,81 @@ void SceneView::_drawContent(float elapsedTime)
     {
         m_draw.reset();
     }
+    return !clearDraw;
+}
+
+bool SceneView::_collectOffscreenFrame(uint32_t width, uint32_t height, const Matrix44& projection,
+                                      const Matrix44& view, float dpiScale)
+{
+    if (getParent())
+        throw std::logic_error("Offscreen collection requires an unattached SceneView");
+    if (!width || !height || !std::isfinite(dpiScale) || dpiScale <= 0.0f)
+        throw std::invalid_argument("Offscreen collection requires positive dimensions and DPI scale");
+    for (Matrix44::length_type column = 0; column != 4; ++column)
+        for (Matrix44::length_type row = 0; row != 4; ++row)
+            if (!std::isfinite(projection[column][row]) || !std::isfinite(view[column][row]))
+                throw std::invalid_argument("Offscreen collection requires finite camera matrices");
+    if (!isEnabled() || !m_scene)
+        return false;
+    if (m_scene->getSceneView() != this)
+        throw std::logic_error("Offscreen collection requires a scene owned by this view");
+    if (m_prv->m_offscreenProjection)
+        throw std::logic_error("Offscreen collection cannot be reentered");
+    struct CameraScope
+    {
+        SceneViewPrivate& state;
+        CameraScope(SceneViewPrivate& state, const Matrix44& projection, const Matrix44& view) : state(state)
+        {
+            state.m_offscreenProjection = &projection;
+            state.m_offscreenView = &view;
+        }
+        ~CameraScope()
+        {
+            state.m_offscreenProjection = state.m_offscreenView = nullptr;
+        }
+    } cameraScope(*m_prv, projection, view);
+
+    // Dedicated capture scenes have no input. Use explicit dimensions for camera
+    // scaling/billboards instead of querying an absent widget layout or ImGui frame.
+    m_scene->preDrawContent(MouseInput{}, projection, view, width / dpiScale, height / dpiScale);
+    try
+    {
+        m_scene->drawContent(projection, view);
+    }
+    catch (...)
+    {
+        m_scene->postDrawContent(projection, view);
+        throw;
+    }
+    m_scene->postDrawContent(projection, view);
+    if ((m_scene->hasDepthPolicies() && !supportsDepthGroups()) ||
+        (m_scene->hasDistanceFades() && !supportsDistanceFade()))
+        throw std::logic_error("Offscreen scene requires unsupported depth or fade policies");
+    const auto& widths = m_scene->getWidthSpaceDrawBuffers();
+    if (std::any_of(widths.begin(), widths.end(), [this](const WidthSpaceDrawBuffer& item) {
+            return (item.space == StrokeWidthSpace::eWorld && !supportsWorldSpaceWidths()) ||
+                   (item.space == StrokeWidthSpace::ePixelDiameter && !supportsPixelDiameterWidths());
+        }))
+        throw std::logic_error("Offscreen scene requires unsupported stroke widths");
+    if (!m_draw)
+    {
+        // Preserve the existing first-collection texture initialization boundary.
+        m_draw = _createDrawSystem();
+        return false;
+    }
+    const DrawData& data = m_scene->_getDrawData();
+    m_draw->beginFrame();
+    m_draw->render(data.buffers, data.bufferCount, projection, view, float(width), float(height), dpiScale);
+    m_draw->endFrame();
+    // Empty scenes are deliberately collected too, so a removed overlay produces
+    // a transparent result instead of reusing the preceding captured geometry.
+    return true;
 }
 
 Matrix44 SceneView::getAmendedProjection() const
 {
+    if (m_prv->m_offscreenProjection)
+        return *m_prv->m_offscreenProjection;
     float width = this->getComputedContentWidth();
     float height = this->getComputedContentHeight();
 

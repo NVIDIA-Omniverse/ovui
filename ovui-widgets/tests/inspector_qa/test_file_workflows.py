@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Native-only OVStage File Open scenario plus file-ledger partition guard.
 
@@ -77,8 +70,8 @@ def _record_feature_evidence(
         evidence.check(feature_id, token, True, detail=detail)
 
 
-def test_file_new_export_and_xform_contracts_partition_ledger() -> None:
-    """Fail cheaply when file/create ledger assignments drift from provider truth."""
+def test_file_new_and_export_contracts_partition_ledger() -> None:
+    """Fail cheaply when file ledger assignments drift from provider truth."""
 
     matrix = json.loads(
         Path(__file__).with_name("feature-matrix.json").read_text(encoding="utf-8")
@@ -102,13 +95,6 @@ def test_file_new_export_and_xform_contracts_partition_ledger() -> None:
     assert file_open["support_status"] == "supported"
     assert file_open["evidence_status"] == "inspector_covered"
     assert file_open["scenarios"] == [_FILE_OPEN_SCENARIO.scenario_id]
-
-    # Native Xform creation remains supported and is proven by its own visible
-    # Create-menu scenario in test_ovstage_stage_workflows.py.
-    create_xform = by_id["create.xform"]
-    assert create_xform["support_status"] == "supported"
-    assert create_xform["evidence_status"] == "inspector_covered"
-
 
 @pytest.mark.skipif(not _enabled(), reason=f"set {_RUN_ENV}=1 to run real Inspector QA")
 def test_file_open_dialog_loads_scene_into_native_ovstage(tmp_path: Path) -> None:

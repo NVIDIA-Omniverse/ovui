@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Assert.h"
@@ -111,23 +104,15 @@ static void _moveDrawList(ImDrawList* drawList, ImVec2 delta)
 /**
  * @brief Adds the content of the source draw list to the destanation
  */
-static void _mergeDrawLists(ImDrawList* dst, ImDrawList* src)
+static void _mergeDrawLists(ImDrawList* dst, const ImDrawList* src)
 {
     if (src->CmdBuffer.empty())
     {
         return;
     }
 
-    // Remove trailing command if unused
-    ImDrawCmd& last_cmd = src->CmdBuffer.back();
-    if (last_cmd.ElemCount == 0 && last_cmd.UserCallback == NULL)
-    {
-        src->CmdBuffer.pop_back();
-        if (src->CmdBuffer.empty())
-        {
-            return;
-        }
-    }
+    // Keep the trailing command: EndChild still needs it on the live draw
+    // list, and an empty cached raster must also restore a valid command.
 
     auto vtxBufferSize = dst->VtxBuffer.size();
     auto idxBufferSize = dst->IdxBuffer.size();
@@ -326,7 +311,8 @@ bool RasterHelper::_rasterHelperBegin(float posX, float posY, float width, float
         }
 
         // The main cpature-show logic
-        const bool hoveredNeedsLiveDraw = hovered && (justEntered || mouseMoved || mouseWheel);
+        // Kit AUTO frames stay live while hovered, including stationary text editing.
+        const bool hoveredNeedsLiveDraw = hovered;
 
         if (this->_isDirtyDrawList() || justLeaved || hoveredNeedsLiveDraw || m_prv->m_mousePressedInsideFrame ||
             m_prv->m_editingMode)

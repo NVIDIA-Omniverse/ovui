@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this software, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Native renderer bootstrap that is safe to import before ``omni.ui``.
 
@@ -20,7 +13,9 @@ from __future__ import annotations
 import os
 import sys
 from importlib.metadata import entry_points
-from typing import Any
+from typing import Any, Mapping
+
+from ovui_widgets.common.error_reporter import ErrorReporter
 
 _PROVIDER_ENV_NAMES = (
     "OVUI_DATA_ADAPTER_PROVIDER",
@@ -29,6 +24,8 @@ _ADAPTER_ENTRY_POINT_GROUP = "ovui_data_adapters.adapters"
 _NATIVE_RENDERER_FACTORY_ENTRY_POINT_GROUP = (
     "ovui_data_adapters.native_renderer_factories"
 )
+_RENDERER_STARTUP_ENTRY_POINT_GROUP = "ovui_widgets.renderer_startup"
+_NATIVE_TIMING_ENTRY_POINT_GROUP = "ovui_widgets.native_timing"
 
 
 def _entry_points_for(group: str) -> tuple[Any, ...]:
@@ -89,7 +86,72 @@ def _load_native_renderer_factory(provider_name: str) -> Any:
     return factory
 
 
-def preconstruct_selected_native_renderer() -> tuple[bool, Any | None]:
+def install_native_timing_hooks() -> bool:
+    """Give the native timing table of an optional package to ``omni.ui``.
+
+    Optional packages publish a callable in the ``ovui_widgets.native_timing``
+    entry-point group. It returns a ``PyCapsule`` with the native function
+    table, or ``None``. The application calls this before ``ui.init`` so that
+    the native start-up phases (for example Vulkan Init and ImGui Init) are
+    measured too. Without such a package the native scopes stay empty.
+
+    Returns ``True`` when a table was installed.
+    """
+    points = _entry_points_for(_NATIVE_TIMING_ENTRY_POINT_GROUP)
+    if not points:
+        return False
+
+    import omni.ui as ui
+
+    set_hooks = getattr(getattr(ui, "_ui", None), "_set_native_timing_hooks", None)
+    if not callable(set_hooks):
+        return False
+    for point in points:
+        try:
+            capsule = point.load()()
+        except Exception as exc:
+            ErrorReporter.log_warning(
+                "Native Runtime Bootstrap",
+                f"native timing hook {point.name!r} failed: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            continue
+        if capsule is None:
+            continue
+        try:
+            set_hooks(capsule)
+        except Exception as exc:
+            ErrorReporter.log_warning(
+                "Native Runtime Bootstrap",
+                f"native timing hook {point.name!r} was refused: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            continue
+        return True
+    return False
+
+
+def run_renderer_startup_hooks(settings: Mapping[str, Any], renderer: Any) -> None:
+    """Call each optional component's renderer startup hook once.
+
+    Optional packages publish ``(settings, renderer)`` callables in the
+    ``ovui_widgets.renderer_startup`` entry-point group. A failed hook is
+    logged and does not stop renderer startup.
+    """
+    for point in _entry_points_for(_RENDERER_STARTUP_ENTRY_POINT_GROUP):
+        try:
+            point.load()(settings, renderer)
+        except Exception as exc:
+            ErrorReporter.log_warning(
+                "Native Runtime Bootstrap",
+                f"renderer startup hook {point.name!r} failed: "
+                f"{type(exc).__name__}: {exc}",
+            )
+
+
+def preconstruct_selected_native_renderer(
+    settings: Mapping[str, Any] | None = None,
+) -> tuple[bool, Any | None]:
     """Construct OVRTX before UI/OVStage when the ovstage provider is selected.
 
     Returns ``(attempted, renderer)``. ``attempted`` lets callers distinguish a
@@ -101,9 +163,12 @@ def preconstruct_selected_native_renderer() -> tuple[bool, Any | None]:
     if selected != "ovstage":
         return False, None
 
+    settings = settings or {}
     try:
         factory = _load_native_renderer_factory(selected)
-        return True, factory()
+        renderer = factory()
+        run_renderer_startup_hooks(settings, renderer)
+        return True, renderer
     except Exception as exc:
         raise RuntimeError(
             "OVRTX must initialize before omni.ui/OVStage for the ovstage "
@@ -115,6 +180,7 @@ def install_preconstructed_renderer(app: Any, bootstrap: tuple[bool, Any | None]
     """Transfer an early renderer (or an attempted ``None``) to Application."""
     attempted, renderer = bootstrap
     if attempted:
+        app._renderer_startup_hooks_complete = True
         bind_undo = getattr(renderer, "set_undo_manager", None)
         if callable(bind_undo):
             bind_undo(getattr(app, "undo_manager", None))

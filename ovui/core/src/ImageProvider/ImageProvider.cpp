@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/ImageProvider/ImageProvider.h>
@@ -106,6 +99,14 @@ bool ImageProvider::setImageData(GpuResource& rpRsrc, uint64_t presentationKey)
 
 void ImageProvider::prepareDraw(float widgetWidth, float widgetHeight)
 {
+}
+
+bool ImageProvider::setImageData(GpuResource& resource, uint64_t presentationKey, carb::imaging::IMetadata* metadata)
+{
+    if (!setImageData(resource, presentationKey)) return false;
+    auto* renderer = PlatformRegistry::instance().imageProviderRenderer();
+    if (metadata && renderer) renderer->getMetadataDisplayWindow(metadata, m_imageDisplayWindow);
+    return true;
 }
 
 bool ImageProvider::setImageData(GpuResource& rpRsrc)

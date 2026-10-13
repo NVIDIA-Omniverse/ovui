@@ -1,21 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Feature-neutral registry for app-owned widget instances."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import sys
+from dataclasses import dataclass
 from typing import Any, Callable, Literal
-
 
 WidgetRegistryAction = Literal["added", "removed"]
 WidgetRegistryCallback = Callable[["AppWidgetEvent"], None]
@@ -68,8 +60,11 @@ class AppWidgetSubscription:
     def cancel(self) -> None:
         if self._cancelled:
             return
-        self._cancelled = True
+        # Mark cancelled only after the unsubscribe succeeded, so a
+        # failing unsubscribe leaves this handle retryable instead of
+        # permanently claiming a release that never happened.
         self._registry._unsubscribe(self._callback)
+        self._cancelled = True
 
 
 class AppWidgetRegistry:
@@ -131,6 +126,21 @@ class AppWidgetRegistry:
             for widget in tuple(self._widgets):
                 self._invoke(callback, AppWidgetEvent("added", widget))
         return AppWidgetSubscription(self, callback)
+
+    def unsubscribe(self, callback: WidgetRegistryCallback) -> bool:
+        """Authoritatively remove ``callback`` (exact object identity).
+
+        Returns ``True`` when the callback was subscribed. Recovery path
+        for owners whose :class:`AppWidgetSubscription` handle was never
+        returned (subscribe mutated then raised) or whose cancellation
+        failed. Callers must retain the exact callback object passed to
+        :meth:`subscribe` — re-accessing a bound method creates a
+        different object that would not match by identity.
+        """
+
+        present = any(subscriber is callback for subscriber in self._subscribers)
+        self._unsubscribe(callback)
+        return present
 
     def _unsubscribe(self, callback: WidgetRegistryCallback) -> None:
         self._subscribers = [

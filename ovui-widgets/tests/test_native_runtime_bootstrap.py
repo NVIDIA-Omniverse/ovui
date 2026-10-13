@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for OVRTX construction before Application/OVStage/UI imports."""
 
@@ -41,12 +34,15 @@ def _install_entry_points(
     *,
     adapters: tuple[_EntryPoint, ...] = (),
     factories: tuple[_EntryPoint, ...] = (),
+    startup_hooks: tuple[_EntryPoint, ...] = (),
 ) -> None:
     def _entry_points(*, group: str):
         if group == bootstrap._ADAPTER_ENTRY_POINT_GROUP:
             return adapters
         if group == bootstrap._NATIVE_RENDERER_FACTORY_ENTRY_POINT_GROUP:
             return factories
+        if group == bootstrap._RENDERER_STARTUP_ENTRY_POINT_GROUP:
+            return startup_hooks
         return ()
 
     monkeypatch.setattr(bootstrap, "entry_points", _entry_points)
@@ -137,6 +133,7 @@ def test_install_binds_application_history_to_early_renderer() -> None:
 
     assert app._startup_prebuilt_renderer is renderer
     assert renderer.undo is undo_manager
+    assert app._renderer_startup_hooks_complete is True
 
 
 def test_explicit_ovstage_missing_factory_fails_closed(
@@ -212,3 +209,92 @@ def test_bootstrap_has_no_concrete_ovstage_import() -> None:
 
     assert "from ovui_data_adapters.ovstage" not in source
     assert "import ovui_data_adapters.ovstage" not in source
+
+
+def test_early_renderer_runs_startup_hooks_and_survives_a_failed_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renderer = object()
+    calls = []
+
+    def failing_hook(settings, hook_renderer):
+        raise RuntimeError("hook failed")
+
+    _install_entry_points(
+        monkeypatch,
+        factories=(_EntryPoint("ovstage", lambda: renderer),),
+        startup_hooks=(
+            _EntryPoint("failing", failing_hook),
+            _EntryPoint("working", lambda *args: calls.append(args)),
+        ),
+    )
+    monkeypatch.setenv("OVUI_DATA_ADAPTER_PROVIDER", "ovstage")
+    settings = {"example.setting": True}
+
+    assert bootstrap.preconstruct_selected_native_renderer(settings) == (True, renderer)
+    assert calls == [(settings, renderer)]
+
+
+def test_native_timing_table_is_installed_before_ui_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native start-up phases run inside ui.init, so the table must be
+    installed first. Application.run() calls this before ui.init."""
+
+    import omni.ui as ui
+
+    capsule = object()
+    installed: list[object] = []
+    monkeypatch.setattr(
+        bootstrap,
+        "entry_points",
+        lambda *, group: (
+            (_EntryPoint("tool", lambda: capsule),)
+            if group == bootstrap._NATIVE_TIMING_ENTRY_POINT_GROUP
+            else ()
+        ),
+    )
+    monkeypatch.setattr(ui._ui, "_set_native_timing_hooks", installed.append)
+
+    assert bootstrap.install_native_timing_hooks() is True
+    assert installed == [capsule]
+
+
+def test_no_native_timing_package_installs_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omni.ui as ui
+
+    monkeypatch.setattr(bootstrap, "entry_points", lambda *, group: ())
+    monkeypatch.setattr(
+        ui._ui,
+        "_set_native_timing_hooks",
+        lambda capsule: pytest.fail("no package published a timing table"),
+    )
+
+    assert bootstrap.install_native_timing_hooks() is False
+
+
+def test_a_failing_native_timing_hook_does_not_stop_start_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omni.ui as ui
+
+    def _raise():
+        raise RuntimeError("no native module")
+
+    installed: list[object] = []
+    capsule = object()
+    monkeypatch.setattr(
+        bootstrap,
+        "entry_points",
+        lambda *, group: (
+            (_EntryPoint("broken", _raise), _EntryPoint("good", lambda: capsule))
+            if group == bootstrap._NATIVE_TIMING_ENTRY_POINT_GROUP
+            else ()
+        ),
+    )
+    monkeypatch.setattr(ui._ui, "_set_native_timing_hooks", installed.append)
+
+    assert bootstrap.install_native_timing_hooks() is True
+    assert installed == [capsule]

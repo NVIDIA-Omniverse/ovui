@@ -43,6 +43,7 @@ Index of this file:
 #include "imgui.h"
 #ifndef IMGUI_DISABLE
 #include "imgui_internal.h"
+#include "imgui_kit_compat.h"
 
 // System includes
 #include <stdint.h>     // intptr_t
@@ -941,9 +942,13 @@ bool ImGui::CollapseButton(ImGuiID id, const ImVec2& pos, ImGuiDockNode* dock_no
     ImGuiWindow* window = g.CurrentWindow;
 
     ImRect bb(pos, pos + ImVec2(g.FontSize, g.FontSize));
-    bool is_clipped = !ItemAdd(bb, id);
+    ImRect bb_interact = bb;
+    // Kit titlebars include frame padding in the collapse button's hit area.
+    if (!dock_node)
+        bb_interact.Expand(g.Style.FramePadding);
+    bool is_clipped = !ItemAdd(bb_interact, id);
     bool hovered, held;
-    bool pressed = ButtonBehavior(bb, id, &hovered, &held, ImGuiButtonFlags_None);
+    bool pressed = ButtonBehavior(bb_interact, id, &hovered, &held, ImGuiButtonFlags_None);
     if (is_clipped)
         return pressed;
 
@@ -952,7 +957,12 @@ bool ImGui::CollapseButton(ImGuiID id, const ImVec2& pos, ImGuiDockNode* dock_no
     ImU32 bg_col = GetColorU32((held && hovered) ? ImGuiCol_ButtonActive : hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
     ImU32 text_col = GetColorU32(ImGuiCol_Text);
     if (hovered || held)
+    {
+        if (!dock_node)
+            window->DrawList->AddCircleFilled(bb.GetCenter() + ImVec2(0.0f, -0.5f), g.FontSize * 0.5f + 1.0f, bg_col, 12);
+        else
         window->DrawList->AddRectFilled(bb.Min, bb.Max, bg_col);
+    }
     RenderNavCursor(bb, id, ImGuiNavRenderCursorFlags_Compact);
 
     if (dock_node)
@@ -1044,8 +1054,9 @@ bool ImGui::ScrollbarEx(const ImRect& bb_frame, ImGuiID id, ImGuiAxis axis, ImS6
     const bool allow_interaction = (alpha >= 1.0f);
 
     ImRect bb = bb_frame;
-    float padding = IM_TRUNC(ImMin(style.ScrollbarPadding, ImMin(bb_frame_width, bb_frame_height) * 0.5f));
-    bb.Expand(-padding);
+    // Existing Kit scrollbars use the pre-ScrollbarPadding per-axis inset.
+    bb.Expand(ImVec2(-ImClamp(IM_TRUNC((bb_frame_width - 2.0f) * 0.5f), 0.0f, 3.0f),
+                    -ImClamp(IM_TRUNC((bb_frame_height - 2.0f) * 0.5f), 0.0f, 3.0f)));
 
     // V denote the main, longer axis of the scrollbar (= height for a vertical scrollbar)
     const float scrollbar_size_v = (axis == ImGuiAxis_X) ? bb.GetWidth() : bb.GetHeight();
@@ -1057,7 +1068,7 @@ bool ImGui::ScrollbarEx(const ImRect& bb_frame, ImGuiID id, ImGuiAxis axis, ImS6
     IM_ASSERT(ImMax(size_contents_v, size_visible_v) > 0.0f); // Adding this assert to check if the ImMax(XXX,1.0f) is still needed. PLEASE CONTACT ME if this triggers.
     const ImS64 win_size_v = ImMax(ImMax(size_contents_v, size_visible_v), (ImS64)1);
     const float grab_h_minsize = ImMin(bb.GetSize()[axis], style.GrabMinSize);
-    const float grab_h_pixels = (float)(int)ImClamp(scrollbar_size_v * ((float)size_visible_v / (float)win_size_v), grab_h_minsize, scrollbar_size_v);
+    const float grab_h_pixels = ImClamp(scrollbar_size_v * ((float)size_visible_v / (float)win_size_v), grab_h_minsize, scrollbar_size_v);
     const float grab_h_norm = grab_h_pixels / scrollbar_size_v;
 
     // As a special thing, we allow scrollbar near the edge of a screen/viewport to be reachable with mouse at the extreme edge (#9276)
@@ -2529,6 +2540,8 @@ bool ImGui::DragBehaviorT(ImGuiDataType data_type, TYPE* v, float v_speed, const
     const bool is_wrapped = is_bounded && (flags & ImGuiSliderFlags_WrapAround);
     const bool is_logarithmic = (flags & ImGuiSliderFlags_Logarithmic) != 0;
     const bool is_floating_point = (data_type == ImGuiDataType_Float) || (data_type == ImGuiDataType_Double);
+    const bool is_legacy_power = KitCompatibility::hasLegacyPower(data_type) && is_bounded && (v_max - v_min < FLT_MAX);
+    const float legacy_power = KitCompatibility::getLegacyPower();
 
     // Default tweak speed
     if (v_speed == 0.0f && is_bounded && (v_max - v_min < FLT_MAX))
@@ -2586,6 +2599,14 @@ bool ImGui::DragBehaviorT(ImGuiDataType data_type, TYPE* v, float v_speed, const
 
     float logarithmic_zero_epsilon = 0.0f; // Only valid when is_logarithmic is true
     const float zero_deadzone_halfsize = 0.0f; // Drag widgets have no deadzone (as it doesn't make sense)
+    if (is_legacy_power)
+    {
+        const FLOATTYPE previous = std::pow((FLOATTYPE)(v_cur - v_min) / (FLOATTYPE)(v_max - v_min), (FLOATTYPE)1.0f / legacy_power);
+        const FLOATTYPE next = previous + g.DragCurrentAccum / (FLOATTYPE)(v_max - v_min);
+        v_cur = v_min + (SIGNEDTYPE)std::pow(ImSaturate((float)next), legacy_power) * (v_max - v_min);
+        v_old_ref_for_accum_remainder = previous;
+    }
+    else
     if (is_logarithmic)
     {
         // When using logarithmic sliders, we need to clamp to avoid hitting zero, but our choice of clamp value greatly affects slider precision. We attempt to use the specified precision to estimate a good lower bound.
@@ -2609,6 +2630,12 @@ bool ImGui::DragBehaviorT(ImGuiDataType data_type, TYPE* v, float v_speed, const
 
     // Preserve remainder after rounding has been applied. This also allow slow tweaking of values.
     g.DragCurrentAccumDirty = false;
+    if (is_legacy_power)
+    {
+        const FLOATTYPE current = std::pow((FLOATTYPE)(v_cur - v_min) / (FLOATTYPE)(v_max - v_min), (FLOATTYPE)1.0f / legacy_power);
+        g.DragCurrentAccum -= (float)((current - v_old_ref_for_accum_remainder) * (v_max - v_min));
+    }
+    else
     if (is_logarithmic)
     {
         // Convert to parametric space, apply delta, convert back
@@ -2969,6 +2996,8 @@ bool ImGui::DragIntRange2(const char* label, int* v_current_min, int* v_current_
 template<typename TYPE, typename SIGNEDTYPE, typename FLOATTYPE>
 float ImGui::ScaleRatioFromValueT(ImGuiDataType data_type, TYPE v, TYPE v_min, TYPE v_max, float logarithmic_zero_epsilon, float zero_deadzone_halfsize)
 {
+    if constexpr (std::is_floating_point_v<TYPE>)
+        if (KitCompatibility::hasLegacyPower(data_type)) return KitCompatibility::ratio(v, v_min, v_max, KitCompatibility::getLegacyPower());
     if (v_min == v_max)
         return 0.0f;
     IM_UNUSED(data_type);
@@ -3026,6 +3055,8 @@ float ImGui::ScaleRatioFromValueT(ImGuiDataType data_type, TYPE v, TYPE v_min, T
 template<typename TYPE, typename SIGNEDTYPE, typename FLOATTYPE>
 TYPE ImGui::ScaleValueFromRatioT(ImGuiDataType data_type, float t, TYPE v_min, TYPE v_max, float logarithmic_zero_epsilon, float zero_deadzone_halfsize)
 {
+    if constexpr (std::is_floating_point_v<TYPE>)
+        if (KitCompatibility::hasLegacyPower(data_type)) return KitCompatibility::value(t, v_min, v_max, KitCompatibility::getLegacyPower());
     // We special-case the extents because otherwise our logarithmic fudging can lead to "mathematically correct"
     // but non-intuitive behaviors like a fully-left slider not actually reaching the minimum value. Also generally simpler.
     if (t <= 0.0f || v_min == v_max)
@@ -4737,8 +4768,9 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         PushStyleColor(ImGuiCol_ChildBg, style.Colors[ImGuiCol_FrameBg]);
         PushStyleVar(ImGuiStyleVar_ChildRounding, style.FrameRounding);
         PushStyleVar(ImGuiStyleVar_ChildBorderSize, style.FrameBorderSize);
-        PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0)); // Ensure no clip rect so mouse hover can reach FramePadding edges
-        bool child_visible = BeginChildEx(label, id, frame_bb.GetSize(), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoMove);
+        // Kit multiline fields retain BeginChildFrame's padded content and clipping.
+        PushStyleVar(ImGuiStyleVar_WindowPadding, style.FramePadding);
+        bool child_visible = BeginChildEx(label, id, frame_bb.GetSize(), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoMove);
         g.NavActivateId = backup_activate_id;
         PopStyleVar(3);
         PopStyleColor();
@@ -4750,7 +4782,6 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         }
         draw_window = g.CurrentWindow; // Child window
         draw_window->DC.NavLayersActiveMaskNext |= (1 << draw_window->DC.NavLayerCurrent); // This is to ensure that EndChild() will display a navigation highlight so we can "enter" into it.
-        draw_window->DC.CursorPos += style.FramePadding;
         inner_size.x -= draw_window->ScrollbarSizes.x;
 
         // FIXME: Could this be a ImGuiChildFlags to affect the SetLastItemDataForWindow() call?
@@ -4842,6 +4873,14 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         // Preserve cursor position and undo/redo stack if we come back to same widget
         // FIXME: Since we reworked this on 2022/06, may want to differentiate recycle_cursor vs recycle_undostate?
         bool recycle_state = (state->ID == id && !init_changed_specs);
+        // Kit refocuses hidden editor fields after the model may have rejected an edit.
+        // Keep the same field's cursor/selection on API focus, independently of its
+        // undo history: changed model text must still discard the old undo records.
+        const bool preserve_focus_cursor = recycle_state && !is_readonly && state->TextA.Size > state->TextLen && input_requested_by_nav && (g.NavActivateFlags & ImGuiActivateFlags_FromFocusApi);
+        // Store character positions: byte offsets can split a UTF-8 character in the replacement text.
+        const int focus_cursor = preserve_focus_cursor ? ImTextCountCharsFromUtf8(state->TextA.Data, state->TextA.Data + state->Stb->cursor) : 0;
+        const int focus_select_start = preserve_focus_cursor ? ImTextCountCharsFromUtf8(state->TextA.Data, state->TextA.Data + state->Stb->select_start) : 0;
+        const int focus_select_end = preserve_focus_cursor ? ImTextCountCharsFromUtf8(state->TextA.Data, state->TextA.Data + state->Stb->select_end) : 0;
         if (recycle_state && (state->TextLen != buf_len || (state->TextA.Data == NULL || strncmp(state->TextA.Data, buf, buf_len) != 0)))
             recycle_state = false;
 
@@ -4863,13 +4902,33 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         // Recycle existing cursor/selection/undo stack but clamp position
         // Note a single mouse click will override the cursor/position immediately by calling stb_textedit_click handler.
         if (!recycle_state)
+        {
             stb_textedit_initialize_state(state->Stb, !is_multiline);
+            if (preserve_focus_cursor)
+            {
+                const auto byte_offset = [buf, buf_len](int character_offset)
+                {
+                    const char* p = buf;
+                    while (character_offset-- > 0 && p < buf + buf_len)
+                    {
+                        unsigned int c;
+                        p += ImTextCharFromUtf8(&c, p, buf + buf_len);
+                    }
+                    return (int)(p - buf);
+                };
+                state->Stb->cursor = byte_offset(focus_cursor);
+                state->Stb->select_start = byte_offset(focus_select_start);
+                state->Stb->select_end = byte_offset(focus_select_end);
+            }
+        }
 
         if (!is_multiline)
         {
             if (flags & ImGuiInputTextFlags_AutoSelectAll)
                 select_all = true;
-            if (input_requested_by_nav && (!recycle_state || !(g.NavActivateFlags & ImGuiActivateFlags_TryToPreserveState)))
+            if (input_requested_by_nav
+                && !preserve_focus_cursor
+                && (!recycle_state || !(g.NavActivateFlags & ImGuiActivateFlags_TryToPreserveState)))
                 select_all = true;
             if (user_clicked && io.KeyCtrl)
                 select_all = true;
@@ -4977,7 +5036,8 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         const float mouse_x = (io.MousePos.x - frame_bb.Min.x - style.FramePadding.x) + state->Scroll.x;
         const float mouse_y = (is_multiline ? (io.MousePos.y - draw_window->DC.CursorPos.y) : (g.FontSize * 0.5f));
 
-        if (select_all)
+        // Kit's non-Mac 1.77 editor contract selects the whole field on double-click.
+        if (select_all || (hovered && !is_osx && io.MouseClickedCount[0] == 2))
         {
             state->SelectAll();
             state->SelectedAllMouseLock = true;
@@ -5180,6 +5240,11 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
             else
             {
                 clear_active_id = revert_edit = true;
+                // OVUI: terminal cancellation, including an unchanged scalar.
+                // Enter wins in the preceding branch. ItemAdd resets this bit
+                // per submitted item/frame; TempInput uses the scalar's item.
+                if (flags & ImGuiInputTextFlags_TempInput)
+                    g.LastItemData.StatusFlags |= ImGuiItemStatusFlags_InputTextCancelled;
                 render_cursor = render_selection = false;
             }
         }
@@ -5557,6 +5622,10 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
 
         // Draw selection
         draw_scroll.x = state->Scroll.x;
+        // Kit publishes a newly focused selection on the following frame.
+        // Keep the actual cursor/selection state available immediately.
+        if (input_requested_by_nav && (g.NavActivateFlags & ImGuiActivateFlags_FromFocusApi) && select_all)
+            render_selection = false;
         if (render_selection)
         {
             const ImU32 bg_color = GetColorU32(ImGuiCol_TextSelectedBg, render_cursor ? 1.0f : 0.6f); // FIXME: current code flow mandate that render_cursor is always true here, we are leaving the transparent one for tests.
@@ -5615,10 +5684,10 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
     {
         state->CursorAnim += io.DeltaTime;
         bool cursor_is_visible = (!g.IO.ConfigInputTextCursorBlink) || (state->CursorAnim <= 0.0f) || ImFmod(state->CursorAnim, 1.20f) <= 0.80f;
-        ImVec2 cursor_screen_pos = ImTrunc(draw_pos + cursor_offset - draw_scroll);
+        ImVec2 cursor_screen_pos = draw_pos + cursor_offset - draw_scroll;
         ImRect cursor_screen_rect(cursor_screen_pos.x, cursor_screen_pos.y - g.FontSize + 0.5f, cursor_screen_pos.x + 1.0f, cursor_screen_pos.y - 1.5f);
         if (cursor_is_visible && cursor_screen_rect.Overlaps(clip_rect))
-            draw_window->DrawList->AddLine(cursor_screen_rect.Min, cursor_screen_rect.GetBL(), GetColorU32(ImGuiCol_InputTextCursor), 1.0f * (float)(int)style._MainScale); // FIXME-DPI: Cursor thickness (#7031)
+            draw_window->DrawList->AddLine(cursor_screen_rect.Min, cursor_screen_rect.GetBL(), GetColorU32(ImGuiCol_Text));
 
         // Notify OS of text input position for advanced IME (-1 x offset so that Windows IME can cover our cursor. Bit of an extra nicety.)
         // This is required for some backends (SDL3) to start emitting character/text inputs.
@@ -5840,7 +5909,7 @@ bool ImGui::ColorEdit4(const char* label, float col[4], ImGuiColorEditFlags flag
         // RGB/HSV 0..255 Sliders
         const float w_items = w_inputs - style.ItemInnerSpacing.x * (components - 1);
         const float w_per_component = IM_TRUNC(w_items / components);
-        const bool draw_color_marker = (flags & (ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_NoColorMarkers)) == 0;
+        const bool draw_color_marker = false;
 
         const bool hide_prefix = draw_color_marker || (w_per_component <= CalcTextSize((flags & ImGuiColorEditFlags_Float) ? "M:0.000" : "M:000").x);
         static const char* ids[4] = { "##X", "##Y", "##Z", "##W" };
@@ -6381,8 +6450,8 @@ bool ImGui::ColorPicker4(const char* label, float col[4], ImGuiColorEditFlags fl
     }
 
     // Render cursor/preview circle (clamp S/V within 0..1 range because floating points colors may lead HSV values to be out of range)
-    float sv_cursor_rad = value_changed_sv ? wheel_thickness * 0.55f : wheel_thickness * 0.40f;
-    int sv_cursor_segments = draw_list->_CalcCircleAutoSegmentCount(sv_cursor_rad); // Lock segment count so the +1 one matches others.
+    float sv_cursor_rad = value_changed_sv ? 10.0f : 6.0f;
+    int sv_cursor_segments = 12;
     draw_list->AddCircleFilled(sv_cursor_pos, sv_cursor_rad, user_col32_striped_of_alpha, sv_cursor_segments);
     draw_list->AddCircle(sv_cursor_pos, sv_cursor_rad + 1, col_midgrey, sv_cursor_segments);
     draw_list->AddCircle(sv_cursor_pos, sv_cursor_rad, col_white, sv_cursor_segments);
@@ -7009,6 +7078,8 @@ bool ImGui::TreeNodeBehavior(ImGuiID id, ImGuiTreeNodeFlags flags, const char* l
     bool toggled = false;
     if (!is_leaf)
     {
+        if (IsMouseHoveringRect(interact_bb.Min, ImVec2(interact_bb.Min.x + text_offset_x, interact_bb.Max.y)) && !g.NavHighlightItemUnderNav)
+            g.LastItemData.StatusFlags |= KitCompatibility::kHoveredTreeArrow;
         if (pressed && g.DragDropHoldJustPressedId != id)
         {
             if ((flags & ImGuiTreeNodeFlags_OpenOnMask_) == 0 || (g.NavActivateId == id && !is_multi_select))
@@ -10902,11 +10973,9 @@ void ImGui::TabItemLabelAndCloseButton(ImDrawList* draw_list, const ImRect& bb, 
 
     // In Style V2 we'll have full override of all colors per state (e.g. focused, selected)
     // But right now if you want to alter text color of tabs this is what you need to do.
-#if 0
     const float backup_alpha = g.Style.Alpha;
     if (!is_contents_visible)
-        g.Style.Alpha *= 0.7f;
-#endif
+        g.Style.Alpha *= 0.554276f;
 
     // Render text label (with clipping + alpha gradient) + unsaved marker
     ImRect text_ellipsis_clip_bb(bb.Min.x + frame_padding.x, bb.Min.y + frame_padding.y, bb.Max.x - frame_padding.x, bb.Max.y);
@@ -10977,10 +11046,8 @@ void ImGui::TabItemLabelAndCloseButton(ImDrawList* draw_list, const ImRect& bb, 
     LogSetNextTextDecoration("/", "\\");
     RenderTextEllipsis(draw_list, text_ellipsis_clip_bb.Min, text_ellipsis_clip_bb.Max, ellipsis_max_x, label, NULL, &label_size);
 
-#if 0
     if (!is_contents_visible)
         g.Style.Alpha = backup_alpha;
-#endif
 
     if (out_just_closed)
         *out_just_closed = close_button_pressed;

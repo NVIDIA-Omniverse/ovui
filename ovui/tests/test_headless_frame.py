@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the high-level :mod:`omni.ui.standalone.headless_frame` wrappers.
 
@@ -30,6 +23,8 @@ import pytest
 
 from omni.ui import standalone
 from omni.ui.standalone import headless_frame
+
+from .conftest import load_cudart
 
 
 _IS_HEADLESS = os.environ.get("OMNIUI_HEADLESS", "").lower() in ("1", "true")
@@ -83,7 +78,9 @@ class TestHeadlessFrameEndToEnd(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._cudart = ctypes.CDLL("libcudart.so")
+        cls._cudart = load_cudart()
+        if cls._cudart is None:
+            raise unittest.SkipTest("no CUDA runtime available")
 
         # cudaMalloc(void**, size_t)
         cls._cudart.cudaMalloc.argtypes = [

@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -72,6 +65,10 @@ public:
     ISvgRasterizer* svgRasterizer() const { return m_svgRasterizer.get(); }
     IDynamicTextureGpu* dynamicTextureGpu() const { return m_dynamicTextureGpu.get(); }
     IRasterImageLoader* rasterImageLoader() const { return m_rasterImageLoader.get(); }
+    /// Shared owner of the raster image loader. Objects that keep the loader
+    /// after construction (RasterImageProvider) hold it with this, so reset()
+    /// cannot free a loader that they still use.
+    std::shared_ptr<IRasterImageLoader> sharedRasterImageLoader() const { return m_rasterImageLoader; }
     IUiLog* log() const { return m_log.get(); }
 
     bool isInitialized() const

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OpenUSD-specific data-adapter implementations.
 
@@ -23,23 +16,25 @@ the common adapter interfaces.
 from ovui_data_adapters.openusd.bound_camera import read_bound_camera
 from ovui_data_adapters.openusd.commands import (
     CameraPoseCommand,
+    CreatePrimCommand,
     DeletePrimCommand,
     NamespaceEditCommand,
     SetVisibilityCommand,
 )
 from ovui_data_adapters.openusd.layer_stack_adapter import UsdLayerStackAdapter
 from ovui_data_adapters.openusd.property_adapter import UsdPropertyAdapter
+from ovui_data_adapters.openusd.provider import OpenUSDProviderSession
 from ovui_data_adapters.openusd.renderer_adapter import (
     AVAILABLE,
     OvRtxRendererAdapter,
 )
-from ovui_data_adapters.openusd.provider import OpenUSDProviderSession
 from ovui_data_adapters.openusd.stage_adapter import HAS_USD, UsdStageAdapter
 from ovui_data_adapters.openusd.transform_adapter import UsdTransformAdapter
 
 __all__ = [
     "AVAILABLE",
     "CameraPoseCommand",
+    "CreatePrimCommand",
     "DeletePrimCommand",
     "HAS_USD",
     "NamespaceEditCommand",

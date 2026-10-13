@@ -89,6 +89,7 @@ self._active_menu.show_at(float(x), float(y))
 Important rules:
 
 - Keep a Python reference to the menu while it is shown.
+- Closing or hiding a parent menu clears `shown` on popup descendants and emits each closing transition. A descendant with its own visible tear-off window remains open and owns its popup state independently. Destroying the parent closes the full descendant subtree, including tear-offs.
 - Destroy or replace the previous menu before showing a new one if stale actions are dangerous.
 - Capture loop variables with default arguments in `lambda`.
 - Use `ui.Separator()` between non-empty groups.

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Base class for all OvGear dockable panel windows.
 
@@ -40,7 +33,7 @@ class ManagedWindow:
         self._window = ui.Window(
             title, dockPreference=ui.DockPreference.MAIN, width=width, height=height, **window_kwargs
         )
-        # The dark-panel background is painted via an inner ``ui.Rectangle``
+        # The themed panel background is painted via an inner ``ui.Rectangle``
         # inside :meth:`_build_frame_wrapper` so it covers the docked panel
         # content area while the dock-node tab chrome stays hidden by layout.
         self._window.frame.set_build_fn(self._build_frame_wrapper)
@@ -50,11 +43,10 @@ class ManagedWindow:
         return {}
 
     def _build_frame_wrapper(self) -> None:
-        """Build the window content with a painted dark-panel background."""
-        from omni.ui import color as cl
+        """Build the window content with the shared, theme-aware background."""
         with ui.VStack(spacing=0):
             with ui.ZStack():
-                ui.Rectangle(style={"background_color": cl.background_primary, "border_width": 0})
+                ui.Rectangle(style={"background_color": ui.color.background_primary, "border_width": 0})
                 self._build_ui()
 
     def _build_ui(self) -> None:

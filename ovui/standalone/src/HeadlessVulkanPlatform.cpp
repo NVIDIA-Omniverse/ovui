@@ -1,21 +1,17 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "HeadlessVulkanPlatform.h"
+#include "NativeFramePacing.h"
 #include "VulkanBackend.h"
+#include "VulkanByteImageGpu.h"
 #include "StandaloneGlyphManager.h"
 #include "StandaloneInit.h"
 #include "StandaloneWindowCallbackManager.h"
 #include "ImGuiKeyTranslation.h"
+#include "NativeTiming.h"
 
 #include <omni/ui/platform/PlatformRegistry.h>
 #include <omni/ui/Font.h>
@@ -108,6 +104,8 @@ static std::string findFontPath(const char* fontFile)
 
 HeadlessVulkanPlatform::~HeadlessVulkanPlatform()
 {
+    registerNativeFramePacingBackend(nullptr);
+    shutdownNativeFramePacing();
     if (m_vulkanBackend)
     {
         m_vulkanBackend.reset();
@@ -132,15 +130,19 @@ WindowId HeadlessVulkanPlatform::createWindow(const char* title, int width, int 
     m_height = height;
 
     // Initialize Vulkan in headless mode (no GLFW, no display)
-    m_vulkanBackend = std::make_unique<VulkanBackend>();
-    if (!m_vulkanBackend->initHeadless(width, height))
     {
-        fprintf(stderr, "HeadlessVulkanPlatform::createWindow: Vulkan headless init failed\n");
-        m_vulkanBackend.reset();
-        return kInvalidWindowId;
+        OVUI_PERFORMANCE_PHASE_SCOPE(vulkanInitPhase, kVulkanInitPhaseName);
+        m_vulkanBackend = std::make_unique<VulkanBackend>();
+        if (!m_vulkanBackend->initHeadless(width, height))
+        {
+            fprintf(stderr, "HeadlessVulkanPlatform::createWindow: Vulkan headless init failed\n");
+            m_vulkanBackend.reset();
+            return kInvalidWindowId;
+        }
     }
 
     // Initialize ImGui
+    OVUI_PERFORMANCE_PHASE_SCOPE(imGuiInitPhase, kImGuiInitPhaseName);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -264,6 +266,11 @@ WindowId HeadlessVulkanPlatform::createWindow(const char* title, int width, int 
 
     // Initialize ImGui Vulkan backend
     m_vulkanBackend->initImGui();
+    OVUI_PERFORMANCE_PHASE_STOP(imGuiInitPhase);
+    {
+        OVUI_PERFORMANCE_PHASE_SCOPE(ovrtxIntegrationInitPhase, kOvrtxIntegrationInitPhaseName);
+        registerNativeFramePacingBackend(m_vulkanBackend.get());
+    }
 
     m_mainWindowId = m_nextWindowId++;
     fprintf(stdout, "HeadlessVulkanPlatform: initialized (%dx%d)\n", width, height);
@@ -274,6 +281,8 @@ void HeadlessVulkanPlatform::destroyWindow(WindowId id)
 {
     if (id != m_mainWindowId)
         return;
+    registerNativeFramePacingBackend(nullptr);
+    shutdownNativeFramePacing();
     m_vulkanBackend.reset();
     ImGui::DestroyContext();
     m_mainWindowId = kInvalidWindowId;
@@ -495,6 +504,12 @@ bool HeadlessVulkanPlatform::tick()
     if (!m_vulkanBackend || !m_vulkanBackend->isInitialized())
         return false;
 
+    beginNativeFramePacingUiUpdate(m_vulkanBackend.get());
+
+    // Until this frame's draw data is submitted, it can reference textures
+    // that are released while it is built, so those releases wait.
+    m_vulkanBackend->beginFrameReleases();
+
     // Update ImGui display size (in case it changed)
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2(static_cast<float>(m_width), static_cast<float>(m_height));
@@ -527,17 +542,37 @@ bool HeadlessVulkanPlatform::tick()
     // Drain deferred queue
     drainDeferredQueue();
 
-    // Render to offscreen framebuffer
-    if (m_width > 0 && m_height > 0)
+    uint64_t pacingGeneration = 0;
+    const bool paced = submitNativeFramePacingDrawData(
+        m_vulkanBackend.get(), ImGui::GetDrawData(), m_width, m_height,
+        &pacingGeneration, static_cast<bool>(m_preSwapCallback));
+
+    // Native presentation owns Vulkan composition while active. Otherwise
+    // preserve the original one-render-per-UI-tick path exactly.
+    if (!paced && m_width > 0 && m_height > 0)
     {
-        m_vulkanBackend->beginFrame(m_width, m_height);
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), m_vulkanBackend->getCommandBuffer());
-        m_vulkanBackend->endFrame();
+        std::lock_guard<std::mutex> queueLock(m_vulkanBackend->getQueueMutex());
+        if (m_vulkanBackend->beginFrame(m_width, m_height))
+        {
+            ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), m_vulkanBackend->getCommandBuffer());
+            m_vulkanBackend->endFrame();
+        }
     }
+
+    IByteImageGpu* byteImageGpu = PlatformRegistry::instance().byteImageGpu();
+    if (byteImageGpu != nullptr)
+    {
+        VulkanByteImageGpu* vulkanByteImageGpu = static_cast<VulkanByteImageGpu*>(byteImageGpu);
+        vulkanByteImageGpu->drainDeferredDestructions();
+    }
+
+    m_vulkanBackend->endFrameReleases();
 
     // Pre-swap callback (screenshot capture)
     if (m_preSwapCallback)
     {
+        if (paced)
+            waitNativeFramePacingPresentation(pacingGeneration, 500'000'000);
         auto cb = std::move(m_preSwapCallback);
         m_preSwapCallback = nullptr;
         cb();
@@ -600,3 +635,9 @@ bool HeadlessVulkanPlatform::needsStrongWindowRefs() const { return true; }
 } // namespace standalone
 } // namespace ui
 } // namespace omni
+
+#include "ImGuiKeyTranslation.h"
+int omni::ui::standalone::HeadlessVulkanPlatform::nativeKeyCode(int key) const
+{
+    return detail::imguiKeyToGlfwKey(static_cast<ImGuiKey>(key));
+}

@@ -135,16 +135,17 @@ When `OMNIUI_LAVAPIPE=1` is active the init log shows:
 ```
 standalone::init: injecting VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
 VulkanBackend: selected device: "llvmpipe (LLVM 15.0.7, 256 bits)" (vendorID=0x10005, type=CPU (software renderer))
+VulkanBackend: device does not support VK_KHR_external_semaphore_fd, CUDA interop disabled
 ```
 
-The `type=CPU (software renderer)` suffix confirms Lavapipe was selected as the physical device.
+The `type=CPU (software renderer)` suffix confirms Lavapipe was selected as the physical device. In builds with CUDA support, the second line shows that the CUDA interop extensions were skipped because Lavapipe does not provide all of them; the UI still initializes and renders.
 
 #### Limitations
 
 | Feature | Status |
 |---|---|
-| CUDA-Vulkan interop | Not available (Lavapipe lacks `VK_KHR_external_memory_fd`) |
-| NVENC hardware encoder | Not available — if built with CUDA interop, `vkCreateDevice` fails and `init()` returns false (see Troubleshooting) |
+| CUDA-Vulkan interop | Not available (Lavapipe does not provide all the external memory/semaphore extensions it needs) |
+| NVENC hardware encoder | Not available |
 | `headless_frame` export | Not available |
 | Screenshot / `scheduleScreenshot()` | Works |
 
@@ -164,7 +165,7 @@ Or set `OMNIUI_LAVAPIPE_ICD_PATH` to the correct ICD path.
 Verify: `ls /usr/share/vulkan/icd.d/lvp_icd.x86_64.json`
 
 **`VulkanBackend: vkCreateDevice failed (-7)`**
-— The ICD was found but a required device extension is missing (common when CUDA interop extensions are requested against Lavapipe). Build without CUDA support or use a real GPU for CUDA interop tests.
+— The device rejected a requested extension. The optional CUDA interop extensions are only requested when the device provides all of them, so this points to a missing required extension (for example `VK_KHR_swapchain` in windowed mode). If `init()` fails it raises `RuntimeError`.
 
 **`standalone::init: injecting VK_DRIVER_FILES=` does not appear**
 — `OMNIUI_LAVAPIPE=1` was not exported before `init()` was called. Ensure the env var is set in the shell before running the binary.

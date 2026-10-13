@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 cmake_minimum_required(VERSION 3.22)
 
 # Allow FetchContent'd projects that specify old cmake_minimum_required
@@ -16,10 +19,18 @@ enable_testing()
 
 include(FetchContent)
 
+# Folder that contains the vendored `imgui/` tree. ovui keeps it in
+# third_party/; a host monorepo may keep the single ImGui copy elsewhere.
+set(OVUI_IMGUI_ROOT "${CMAKE_SOURCE_DIR}/third_party" CACHE PATH "Directory containing the imgui/ source tree")
 option(OMNIUI_USE_BUNDLED_FREETYPE "Build the pinned FetchContent FreeType as a static library" OFF)
 option(OMNIUI_USE_BUNDLED_GLFW "Build the pinned FetchContent GLFW as a static library" OFF)
 option(OMNIUI_REQUIRE_VULKAN "Fail configuration when the Vulkan SDK is unavailable" OFF)
 option(OMNIUI_REQUIRE_CUDA "Fail configuration when the CUDA Toolkit is unavailable" OFF)
+option(OMNIUI_BUILD_OVRTX_UI_APP "Generate the Visual Studio OVRTX application startup project" OFF)
+
+if(OMNIUI_BUILD_OVRTX_UI_APP AND NOT CMAKE_GENERATOR MATCHES "^Visual Studio")
+    message(FATAL_ERROR "OMNIUI_BUILD_OVRTX_UI_APP requires a Visual Studio generator")
+endif()
 
 # The bundled dependency mode is used by binary-wheel builds. Both upstream
 # projects honor BUILD_SHARED_LIBS, and GLFW also exposes an explicit library
@@ -104,7 +115,31 @@ if(OMNIUI_REQUIRE_CUDA AND NOT CUDAToolkit_FOUND)
     message(FATAL_ERROR "OMNIUI_REQUIRE_CUDA=ON but the CUDA Toolkit was not found")
 endif()
 if(NOT (EMSCRIPTEN AND (OMNI_UI_BUILD_PYODIDE_BINDINGS OR OMNI_UI_BUILD_WEB_RUNTIME)))
-    find_package(pybind11 QUIET)
+    if(OMNIUI_BUILD_OVRTX_UI_APP)
+        # A development solution must include the Python projects and use the
+        # same Python version as the Kit-compatible wheel builds.
+        if(PYTHON_EXECUTABLE)
+            set(Python_EXECUTABLE "${PYTHON_EXECUTABLE}")
+        endif()
+        find_package(Python 3.12 EXACT REQUIRED COMPONENTS Interpreter Development)
+        set(PYTHON_EXECUTABLE "${Python_EXECUTABLE}")
+        find_package(pybind11 2.11.1 EXACT QUIET)
+        if(NOT pybind11_FOUND)
+            # Match the wheel dependency without requiring a Python package install.
+            FetchContent_Declare(
+                pybind11
+                GIT_REPOSITORY https://github.com/pybind/pybind11.git
+                GIT_TAG        v2.11.1
+                GIT_SHALLOW    TRUE
+            )
+            FetchContent_MakeAvailable(pybind11)
+            set(pybind11_FOUND TRUE)
+            get_directory_property(pybind11_VERSION DIRECTORY "${pybind11_SOURCE_DIR}" DEFINITION pybind11_VERSION)
+        endif()
+    else()
+        # Native-only CI jobs do not require Python bindings.
+        find_package(pybind11 2.11.1 EXACT QUIET)
+    endif()
 endif()
 if(CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION} found at ${CUDAToolkit_TARGET_DIR}")
@@ -120,6 +155,8 @@ else()
         )
     endif()
 endif()
+
+include(cmake/SharedRpath.cmake)
 
 add_subdirectory(third_party)
 add_subdirectory(core)
@@ -161,6 +198,45 @@ if(OMNI_UI_BUILD_MARKDOWN_TESTS)
     add_test(NAME markdown_fuzz_tests COMMAND markdown_fuzz_tests)
 endif()
 
+option(OMNI_UI_BUILD_IMAGE_PROVIDER_TESTS "Build native image provider contract tests" ON)
+if(OMNI_UI_BUILD_IMAGE_PROVIDER_TESTS)
+    # Drives RasterImageProvider against a fake loader: no GPU, window or
+    # filesystem, so every load outcome (including the asynchronous failure the
+    # synchronous standalone loader cannot produce) is reachable and deterministic.
+    add_executable(raster_image_provider_contract_tests
+        tests/cpp/test_raster_image_provider_contract.cpp
+    )
+    target_include_directories(raster_image_provider_contract_tests
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/src
+    )
+    target_link_libraries(raster_image_provider_contract_tests PRIVATE ovui)
+    if(NOT MSVC)
+        target_compile_options(raster_image_provider_contract_tests PRIVATE -Wno-error)
+    endif()
+
+    add_test(NAME raster_image_provider_contract_tests COMMAND raster_image_provider_contract_tests)
+
+    # Drives the standalone loader's sharing contract with the loader source
+    # compiled in and a counting fake IByteImageGpu: several consumers of one
+    # file share one upload, closing one of them keeps that sharing, and a
+    # reload still reads the replaced file. No GPU or window is involved.
+    add_executable(standalone_raster_image_loader_tests
+        tests/cpp/test_standalone_raster_image_loader.cpp
+        standalone/src/StandaloneRasterImageLoader.cpp
+    )
+    target_include_directories(standalone_raster_image_loader_tests
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/src
+    )
+    target_link_libraries(standalone_raster_image_loader_tests PRIVATE ovui stb)
+    if(NOT MSVC)
+        target_compile_options(standalone_raster_image_loader_tests PRIVATE -Wno-error)
+    endif()
+
+    add_test(NAME standalone_raster_image_loader_tests COMMAND standalone_raster_image_loader_tests)
+endif()
+
 if(EMSCRIPTEN AND OMNI_UI_BUILD_WEB_RUNTIME)
     add_subdirectory(web/runtime)
 elseif(EMSCRIPTEN AND OMNI_UI_BUILD_PYODIDE_BINDINGS)
@@ -185,6 +261,16 @@ else()
     message(WARNING "pybind11 not found - Python bindings skipped")
 endif()
 
+if(OMNIUI_BUILD_OVRTX_UI_APP)
+    add_subdirectory(app)
+    set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT ovrtx_ui_app)
+endif()
+
 if(glfw3_FOUND AND OpenGL_FOUND)
     add_subdirectory(benchmarks)
+endif()
+
+# Native wheel consumers need the exact headers and link files used above.
+if(NOT EMSCRIPTEN)
+    include(cmake/WheelSdk.cmake)
 endif()

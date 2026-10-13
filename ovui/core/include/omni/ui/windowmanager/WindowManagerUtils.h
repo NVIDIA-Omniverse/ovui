@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -48,10 +41,9 @@ inline IWindowCallbackPtr createWindowCallback(IWindowCallbackManager* windowCal
                                                DockPreference dockPreference,
                                                const std::function<void(float)>& onDrawFn)
 {
-    // The listener is passed as a raw pointer; the IWindowCallbackManager implementation
-    // takes ownership (wraps it in a shared_ptr or similar).
+    // The manager retains the listener; the temporary owns the initial reference.
     return windowCallbackManager->createWindowCallback(
-        title, width, height, dockPreference, new LambdaEventListener(onDrawFn));
+        title, width, height, dockPreference, takeCallbackReference(new LambdaEventListener(onDrawFn)).get());
 }
 
 inline IWindowCallbackPtr createWindowSetCallback(WindowSet* windowSet,
@@ -63,7 +55,7 @@ inline IWindowCallbackPtr createWindowSetCallback(WindowSet* windowSet,
                                                   const std::function<void(float)>& onDrawFn)
 {
     return windowCallbackManager->createWindowSetCallback(
-        windowSet, title, width, height, dockPreference, new LambdaEventListener(onDrawFn));
+        windowSet, title, width, height, dockPreference, takeCallbackReference(new LambdaEventListener(onDrawFn)).get());
 }
 
 inline IWindowCallbackPtr createAppWindowCallback(omni::ui::AppWindowHandle appWindow,
@@ -75,7 +67,7 @@ inline IWindowCallbackPtr createAppWindowCallback(omni::ui::AppWindowHandle appW
                                                   const std::function<void(float)>& onDrawFn)
 {
     return windowCallbackManager->createAppWindowCallback(
-        appWindow, title, width, height, dockPreference, new LambdaEventListener(onDrawFn));
+        appWindow, title, width, height, dockPreference, takeCallbackReference(new LambdaEventListener(onDrawFn)).get());
 }
 
 }

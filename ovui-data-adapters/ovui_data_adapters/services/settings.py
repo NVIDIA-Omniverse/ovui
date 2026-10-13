@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Frontend-neutral settings store and observer semantics.
 
@@ -125,6 +118,22 @@ class Settings:
         self._data[key] = value
         for cb in list(self._subscribers.get(key, [])):
             cb(key, value)
+
+    def has(self, key: str) -> bool:
+        """True when ``key`` holds an authored value."""
+        return key in self._data
+
+    def keys(self) -> list[str]:
+        """Snapshot of every authored key (adapters enumerate namespaces)."""
+        return list(self._data)
+
+    def remove(self, key: str) -> None:
+        """Delete a key's authored value and notify its subscribers."""
+        if key not in self._data:
+            return
+        del self._data[key]
+        for cb in list(self._subscribers.get(key, [])):
+            cb(key, None)
 
     def get_string(self, key: str, default: str = "") -> str:
         """Return a setting as ``str``."""

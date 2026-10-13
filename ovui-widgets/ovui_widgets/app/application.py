@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Central application singleton for USD Viewer.
 
@@ -17,6 +10,7 @@ the frame loop, and call_later() deferred execution.
 
 import functools
 import inspect
+import logging
 import math
 import os
 import shutil
@@ -37,30 +31,41 @@ from ovui_data_adapters.common import (
     omniui_headless_enabled,
     select_adapter,
 )
+from ovui_data_adapters.common.instrumentation import MAIN_THREAD_SCOPE, get_instrumentation
 
 from ovui_widgets.app.components import ComponentManager
 from ovui_widgets.app.frame_clock import FrameClock
+from ovui_widgets.app.about_dialog import AboutDialog
 from ovui_widgets.app.menu_hooks import AppMenuRegistry
 from ovui_widgets.app.settings_dialog import SettingsDialog
 from ovui_widgets.app.widget_registry import AppWidgetRegistry
 from ovui_widgets.app.window_hooks import AppWindowRegistry
 from ovui_widgets.common import scheduler as _common_scheduler
+from ovui_widgets.common.keyboard import is_text_input_active as _is_text_input_active
+from ovui_widgets.common.keyboard import normalize_printable_key as _normalize_printable_key
 from ovui_widgets.common.recent_files import RecentFileList
 from ovui_widgets.common.scheduler import CallbackHandle
 from ovui_widgets.common.selection import SelectionBus
 from ovui_widgets.common.settings import (
+    DEFAULT_RENDER_FLOW_MODE,
     DEFAULT_RATE_LIMIT_FPS,
-    RATE_LIMIT_FPS_SETTING_KEY as _RATE_LIMIT_FPS_SETTING_KEY,
+    RENDER_FLOW_MODE_SETTING_KEY,
     Settings,
     Subscription,
     valid_rate_limit_fps,
 )
+from ovui_widgets.common.settings import (
+    RATE_LIMIT_FPS_SETTING_KEY as _RATE_LIMIT_FPS_SETTING_KEY,
+)
 from ovui_widgets.common.snap import GridSnapProvider, SnapSystem, SurfaceSnapProvider
 from ovui_widgets.common.undo import UndoManager
-
 _NATIVE_FAST_EXIT_ENV = "OVUI_WIDGETS_NATIVE_FAST_EXIT"
 _SHUTDOWN_TRACE_ENV = "OVUI_WIDGETS_TRACE_SHUTDOWN"
 _SETTINGS_PATH_ENV = "OVUI_WIDGETS_SETTINGS_PATH"
+_ENABLE_SECONDARY_VIEWPORT_POC = False
+_OVUI_INIT_PHASE_NAME = "OVUI Init"
+_OVUI_INIT_PHASE_INFORMATION = "application startup"
+_LOG = logging.getLogger(__name__)
 
 
 def _valid_snap_grid_size(value: Any, default: float = 1.0) -> float:
@@ -107,17 +112,23 @@ def _fast_exit_after_successful_native_shutdown() -> None:
         os._exit(0)
 
 
-def _resolve_window_size() -> tuple[int, int]:
-    """Return ``(width, height)`` for ``ui.init``, honouring env vars.
+def _resolve_window_size(settings: Settings) -> tuple[int, int]:
+    """Return the configured ``(width, height)`` for ``ui.init``.
 
     ``OVGEAR_HEADLESS_WIDTH`` / ``OVGEAR_HEADLESS_HEIGHT`` let
     ``python -m ovui_widgets.app.headless`` boot the offscreen Vulkan platform at a
-    caller-chosen size. With both unset the windowed default stays
-    ``1280×720`` (Step 2.3 regression).
+    caller-chosen size. With both unset the windowed default is
+    ``1280×720``.
     """
-    width = int(os.environ.get("OVGEAR_HEADLESS_WIDTH", 1280))
-    height = int(os.environ.get("OVGEAR_HEADLESS_HEIGHT", 720))
+    width = int(os.environ.get("OVGEAR_HEADLESS_WIDTH", settings.get("app.window.width", 1280)))
+    height = int(os.environ.get("OVGEAR_HEADLESS_HEIGHT", settings.get("app.window.height", 720)))
     return width, height
+
+
+def _resolve_window_position(settings: Settings) -> tuple[Optional[int], Optional[int]]:
+    x = settings.get("app.window.x")
+    y = settings.get("app.window.y")
+    return (None if x is None else int(x), None if y is None else int(y))
 
 
 def _ui_init_supports_kwarg(init_fn: Callable, kwarg: str) -> bool:
@@ -239,62 +250,6 @@ _KEY_ARROW_RIGHT = 262
 _KEY_ARROW_LEFT = 263
 
 
-# ImGui named-key codes. Real GLFW window input reports printable letters and
-# non-printable shortcuts as ASCII/GLFW values, while the ovui Inspector and
-# remote input bridge inject ImGuiKey values. Normalize both sources before
-# application shortcut dispatch so Delete, F2, arrows and letter chords follow
-# the same shipped UI path.
-_IMGUI_KEY_TAB = 512
-_IMGUI_KEY_LEFT_ARROW = 513
-_IMGUI_KEY_RIGHT_ARROW = 514
-_IMGUI_KEY_UP_ARROW = 515
-_IMGUI_KEY_DOWN_ARROW = 516
-_IMGUI_KEY_PAGE_UP = 517
-_IMGUI_KEY_PAGE_DOWN = 518
-_IMGUI_KEY_HOME = 519
-_IMGUI_KEY_END = 520
-_IMGUI_KEY_INSERT = 521
-_IMGUI_KEY_DELETE = 522
-_IMGUI_KEY_BACKSPACE = 523
-_IMGUI_KEY_SPACE = 524
-_IMGUI_KEY_ENTER = 525
-_IMGUI_KEY_ESCAPE = 526
-_IMGUI_KEY_0 = 536
-_IMGUI_KEY_A = 546
-_IMGUI_KEY_Z = _IMGUI_KEY_A + 25
-_IMGUI_KEY_F1 = 572
-_IMGUI_TO_GLFW_KEY = {
-    _IMGUI_KEY_TAB: 258,
-    _IMGUI_KEY_LEFT_ARROW: _KEY_ARROW_LEFT,
-    _IMGUI_KEY_RIGHT_ARROW: _KEY_ARROW_RIGHT,
-    _IMGUI_KEY_UP_ARROW: 265,
-    _IMGUI_KEY_DOWN_ARROW: 264,
-    _IMGUI_KEY_PAGE_UP: 266,
-    _IMGUI_KEY_PAGE_DOWN: 267,
-    _IMGUI_KEY_HOME: 268,
-    _IMGUI_KEY_END: 269,
-    _IMGUI_KEY_INSERT: 260,
-    _IMGUI_KEY_DELETE: _KEY_DELETE,
-    _IMGUI_KEY_BACKSPACE: _KEY_BACKSPACE,
-    _IMGUI_KEY_SPACE: ord(" "),
-    _IMGUI_KEY_ENTER: 257,
-    _IMGUI_KEY_ESCAPE: 256,
-}
-
-
-def _normalize_printable_key(key: int) -> int:
-    mapped = _IMGUI_TO_GLFW_KEY.get(key)
-    if mapped is not None:
-        return mapped
-    if _IMGUI_KEY_0 <= key < _IMGUI_KEY_0 + 10:
-        return ord("0") + (key - _IMGUI_KEY_0)
-    if _IMGUI_KEY_A <= key <= _IMGUI_KEY_Z:
-        return ord("A") + (key - _IMGUI_KEY_A)
-    if _IMGUI_KEY_F1 <= key < _IMGUI_KEY_F1 + 24:
-        return 290 + (key - _IMGUI_KEY_F1)
-    return key
-
-
 def _local_file_url_to_path(path: str) -> str:
     """Convert local ``file://`` URLs to paths accepted by USD."""
     if not path.lower().startswith("file://"):
@@ -412,6 +367,15 @@ class Application:
         # visible value is valid by construction.
         if settings_overrides:
             self._settings.apply_launch_overrides(settings_overrides)
+        self._render_flow_mode = os.environ.get(
+            "OMNIUI_RENDER_FLOW_MODE",
+            str(
+                self._settings.get(
+                    RENDER_FLOW_MODE_SETTING_KEY,
+                    DEFAULT_RENDER_FLOW_MODE,
+                )
+            ),
+        )
         self._undo_manager = UndoManager()
         self._selection_bus = SelectionBus()
         SelectionBus._instance = self._selection_bus  # register as singleton
@@ -442,13 +406,15 @@ class Application:
         self._stage_window: Optional[Any] = None
         self._property_window: Optional[Any] = None
         self._viewport_window: Optional[Any] = None
+        # TEMP: second viewport POC. It owns an independent camera and
+        # RenderProduct facade while sharing the primary native OVRTX step.
+        self._secondary_viewport_window: Optional[Any] = None
         self._content_window: Optional[Any] = None
         self._layer_window: Optional[Any] = None
 
         self._current_stage_sub: Optional[Subscription] = None
         self._stage_adapter: Optional[Any] = None
         self._layer_adapter: Optional[Any] = None
-        self._filter_capture: bool = False  # True while filter bar has remote focus
         self._stage_change_listeners: List[Callable] = []
         self._mock_prop_sub: Optional[Any] = None
         # A namespace undo/redo updates USD + OVStage synchronously but its
@@ -473,6 +439,8 @@ class Application:
         self._last_modifier_bits: int = 0
 
         self._settings_dialog = SettingsDialog(self)
+        self._about_dialog = AboutDialog()
+        self._window_title = "USD Viewer"
 
         self._snap_system = SnapSystem()
         self._grid_snap_provider = GridSnapProvider(
@@ -508,6 +476,7 @@ class Application:
         # USD file to open once the UI is up. Set by run() when a CLI arg is given.
         self._startup_usd_path: Optional[str] = None
         self._startup_prebuilt_renderer: Any = _NO_PREBUILT_RENDERER
+        self._ovui_init_phase_renderer: Any = None
 
         # Render cadence for the viewport. The clock decides when
         # :meth:`ViewportWidget.render` is allowed to run; per-tick physics
@@ -519,6 +488,10 @@ class Application:
         self._viewport_render_clock = FrameClock(
             target_fps=self._effective_rate_limit_fps(),
         )
+        self._windowed_vulkan_backend = False
+        self._viewport_visibility_paused = False
+        self._viewport_visible_present_rate: Optional[float] = None
+        self._viewport_visible_ui_rate: Optional[float] = None
 
         # Step 2.6: headless full-UI export state. Initialised by
         # :meth:`_setup_headless_export` once the run-loop starts under
@@ -582,6 +555,48 @@ class Application:
         if Application._instance is None:
             raise RuntimeError("Application not created yet")
         return Application._instance
+
+    @property
+    def window_title(self) -> str:
+        return self._window_title
+
+    def _set_window_title_for_stage(self, location: Optional[str]) -> None:
+        """Commit the native window title for the current document."""
+        title = "USD Viewer"
+        if location:
+            title = f"USD Viewer — {location}"
+        self._window_title = title
+        try:
+            import omni.ui as ui
+
+            applied = ui.standalone.set_window_title(title)
+        except (AttributeError, RuntimeError) as exc:
+            _LOG.warning("native window title update is unavailable: %s", exc)
+        else:
+            if not applied:
+                _LOG.warning("native window title update was not applied: %s", title)
+
+    def show_about_dialog(self) -> None:
+        self._about_dialog.show(self._runtime_component_versions())
+
+    def _runtime_component_versions(self) -> tuple[tuple[str, str], ...]:
+        """Read optional runtime versions through the active provider boundary."""
+        session = getattr(self, "_adapter_session", None)
+        if session is None:
+            try:
+                session = self.get_adapter_session()
+            except Exception:
+                return ()
+        read_versions = getattr(session, "runtime_component_versions", None)
+        if not callable(read_versions):
+            return ()
+        try:
+            return tuple(
+                (str(label), str(version or "Unavailable"))
+                for label, version in read_versions()
+            )
+        except Exception:
+            return ()
 
     @staticmethod
     def _requested_adapter_provider_name() -> str | None:
@@ -764,7 +779,7 @@ class Application:
 
     def call_later(self, delay_secs: float, callback: Callable) -> CallbackHandle:
         """Schedule callback to fire after delay_secs. Returns CallbackHandle."""
-        handle = CallbackHandle(time.monotonic() + delay_secs, callback)
+        handle = CallbackHandle(time.perf_counter() + delay_secs, callback)
         self._pending_callbacks.append(handle)
         return handle
 
@@ -779,8 +794,26 @@ class Application:
         """
         self._viewport_render_clock.target_fps = self._effective_rate_limit_fps()
 
-    def _effective_rate_limit_fps(self) -> float:
+    def _native_present_fps(self) -> Optional[float]:
+        """Native window presentation rate for this launch.
+
+        UI/application cadence and Vulkan presentation cadence are independent.
+        A windowed launch requests native max-throughput directly; renderer
+        timestamps remain the ordering/cadence authority without a finite
+        configured presentation target. Headless has no window to present, so
+        it keeps the synchronous path, and so does the ``fast`` render flow.
+        Ineligible renderers and backends fall back on their own, and
+        ``omni.ui.set_present_rate(0.0)`` remains the explicit way to turn
+        native pacing off.
+        """
+        if self._render_flow_mode == "fast" or omniui_headless_enabled():
+            return 0.0
+        return -1.0
+
+    def _effective_rate_limit_fps(self) -> Optional[float]:
         """Current usable FPS cap from settings, falling back to the default."""
+        if getattr(self, "_vulkan_default_max_throughput", False):
+            return None
         return valid_rate_limit_fps(
             self._settings.get(
                 self.RATE_LIMIT_FPS_SETTING_KEY, DEFAULT_RATE_LIMIT_FPS
@@ -788,7 +821,7 @@ class Application:
             default=DEFAULT_RATE_LIMIT_FPS,
         )
 
-    def _apply_rate_limit_to_ui_pump(self, fps: float) -> None:
+    def _apply_rate_limit_to_ui_pump(self, fps: Optional[float]) -> None:
         """Propagate the FPS cap to ovui's standalone run-loop pump.
 
         The ovui pump is the actual main loop (``ui.run`` ticks the UI,
@@ -807,42 +840,119 @@ class Application:
         if setter is not None:
             setter(fps)
 
+    def _on_viewport_visibility_changed(self, visible: bool) -> None:
+        """Suspend Vulkan viewport work while its product window is hidden.
+
+        ``Window > Viewport`` is a real user-reachable idle state. Native
+        pacing owns the renderer borrow, so merely hiding the ImGui window
+        does not make renderer demand disappear. Pause the coordinator and
+        restore the exact visible policy when the window returns. While
+        hidden, the UI pump preserves an explicit user-authored cap or remains
+        uncapped when no cap was authored.
+
+        This is gated by the observed backend so OpenGL and cooperative host
+        behavior is unchanged.
+        """
+        if not self._windowed_vulkan_backend:
+            return
+        if getattr(self, "_shutdown_in_progress", False) or getattr(
+            self, "_shutdown_done", False
+        ):
+            return
+        try:
+            import omni.ui as ui
+        except Exception:
+            return
+        get_present_rate = getattr(ui, "get_present_rate", None)
+        set_present_rate = getattr(ui, "set_present_rate", None)
+        get_ui_rate = getattr(ui, "get_max_frame_rate", None)
+        set_ui_rate = getattr(ui, "set_max_frame_rate", None)
+        if not all(
+            callable(fn)
+            for fn in (get_present_rate, set_present_rate, get_ui_rate, set_ui_rate)
+        ):
+            return
+
+        renderer = getattr(
+            getattr(self, "_viewport_window", None), "renderer_adapter", None
+        )
+        suspend_renderer = getattr(
+            renderer, "set_frame_pacing_suspended", None
+        )
+
+        if not visible:
+            if self._viewport_visibility_paused:
+                return
+            self._viewport_visible_present_rate = float(get_present_rate())
+            self._viewport_visible_ui_rate = get_ui_rate()
+            self._viewport_visibility_paused = True
+            set_present_rate(0.0)
+            if callable(suspend_renderer):
+                suspend_renderer(True)
+            configured_rate = valid_rate_limit_fps(
+                self._settings.get(
+                    self.RATE_LIMIT_FPS_SETTING_KEY, DEFAULT_RATE_LIMIT_FPS
+                ),
+                default=DEFAULT_RATE_LIMIT_FPS,
+            )
+            set_ui_rate(configured_rate)
+            return
+
+        if not self._viewport_visibility_paused:
+            return
+        restore_ui_rate = self._viewport_visible_ui_rate
+        restore_present_rate = self._viewport_visible_present_rate
+        self._viewport_visibility_paused = False
+        self._viewport_visible_ui_rate = None
+        self._viewport_visible_present_rate = None
+        set_ui_rate(restore_ui_rate)
+        set_present_rate(restore_present_rate)
+        if callable(suspend_renderer):
+            suspend_renderer(False)
+
     def _use_standalone_frame_pacing(self) -> None:
         """Compatibility alias for older tests/scripts."""
         self._use_viewport_frame_pacing()
 
-    def _on_frame_update(self, tick_dt: float) -> None:
-        """Called each frame. Fires call_later() callbacks, drives viewport update + render.
+    def _active_viewport_windows(self) -> tuple[Any, ...]:
+        """Return the current viewport set without transferring ownership."""
 
-        ``tick_dt`` is the wall-clock interval since the previous outer-loop
-        tick. It feeds physics that has to advance every tick regardless of
-        whether the viewport renders this frame — flight-mode keyboard
-        integration and tumble inertia decay are speed-times-seconds, not
-        per-render quantities.
+        return tuple(
+            viewport
+            for viewport in (
+                self._viewport_window,
+                self._secondary_viewport_window,
+            )
+            if viewport is not None
+        )
 
-        The viewport's render path is gated separately by
-        :attr:`_viewport_render_clock`. ``render_dt`` (returned from
-        :meth:`FrameClock.should_render`) is the time since the last *committed*
-        render — that's the value the FPS HUD wants and the value the renderer
-        sees as its own delta. Only after :meth:`ViewportWidget.render` returns
-        ``True`` does the clock get committed, so a zero-size or hidden frame
-        does not poison the cadence.
+    def _run_io_handoff_phase(self) -> None:
+        """Drain worker-owned input queues onto the UI thread.
 
-        Every callback / widget step is wrapped in try/except so a bad handler
-        can't kill the frame loop — the viewport has to keep rendering even
-        when stage notices misroute or a subscription path raises. The
-        exception is logged via :class:`ErrorReporter` for diagnosis.
+        Network and inspector workers only enqueue immutable commands. Their
+        application-facing effects remain here because they may mutate ovui
+        widgets, open stages, or inject input into the native UI backend.
         """
+
+        self._drain_remote_input()
+        if getattr(self, "_inspector_media", None):
+            self._inspector_media.drain_input()
+        self._drain_message_queue()
+        self._drain_ovinspect()
+
+    def _drain_scheduled_callbacks(self) -> None:
+        """Run due application callbacks on the UI thread."""
+
         from ovui_widgets.common.error_reporter import ErrorReporter
-        callback_now = time.monotonic()
-        render_now = time.perf_counter()
+
+        now = time.perf_counter()
         callbacks_to_drain = self._pending_callbacks
         self._pending_callbacks = []
         remaining = []
         for handle in callbacks_to_drain:
             if handle._cancelled:
                 continue
-            if callback_now >= handle._due_time:
+            if now >= handle._due_time:
                 cb = handle._callback
                 if cb is not None:
                     try:
@@ -857,33 +967,252 @@ class Application:
         if remaining:
             self._pending_callbacks = remaining + self._pending_callbacks
 
+    def _run_data_phase(self, tick_dt: float) -> None:
+        """Advance adapter-owned data state independently of rendering."""
+
+        self._component_manager.tick()
+
         self._tick_adapter_physics(tick_dt)
-        if self._viewport_window is None:
-            return
+
+    def _run_ui_phase(self, tick_dt: float) -> None:
+        """Apply data snapshots and completed render frames to ovui widgets.
+
+        This is the only phase that mutates ImGui/ovui presentation state.
+        It only consumes frames already published by the renderer thread; no
+        OVStage/OVRTX submit, poll, fetch, or output extraction runs here.
+        """
+
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        self._drain_scheduled_callbacks()
+        viewport_windows = self._active_viewport_windows()
 
         # Per-tick wall-clock update — flight + tumble physics advance every
         # tick, never gated by the render cadence. Without this the camera
         # stalls during a tumble whenever the render gate skips a frame.
-        try:
-            self._viewport_window.update(tick_dt)
-        except Exception as exc:
-            ErrorReporter.log_error(
-                "Application", "viewport update raised", exc
-            )
+        for viewport in viewport_windows:
+            try:
+                viewport.update(tick_dt)
+            except Exception as exc:
+                ErrorReporter.log_error(
+                    "Application", "viewport update raised", exc
+                )
+
+        async_viewports = tuple(
+            viewport
+            for viewport in viewport_windows
+            if viewport.supports_async_render()
+        )
+        for viewport in async_viewports:
+            try:
+                viewport.poll_render()
+            except Exception as exc:
+                ErrorReporter.log_error(
+                    "Application", "viewport render poll raised", exc
+                )
+
+    def _run_render_phase(self, render_now: float) -> None:
+        """Publish one immutable viewport batch to the renderer thread.
+
+        Camera and extent state was finalized by :meth:`_run_ui_phase`. Every
+        active viewport queues an immutable request before any shared renderer
+        coordinator submits, preserving the multi-RenderProduct batch.
+        """
+
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        viewport_windows = self._active_viewport_windows()
+        if not viewport_windows:
+            return
+
+        # Hiding the Vulkan Viewport removes renderer demand. Native pacing
+        # has already been paused/stopped by the visibility callback; do not
+        # fall through to the synchronous adapter path while the product
+        # window is absent. The uncommitted FrameClock makes the first visible
+        # frame immediately eligible when the window returns.
+        if self._viewport_visibility_paused:
+            return
 
         # Render gate — only call render() when the clock says we're due.
         render_dt = self._viewport_render_clock.should_render(render_now)
         if render_dt is None:
             return
-        try:
-            rendered = self._viewport_window.render(render_dt)
-        except Exception as exc:
-            ErrorReporter.log_error(
-                "Application", "viewport render raised", exc
-            )
-            rendered = False
+        rendered = False
+        async_viewports = []
+        for viewport in viewport_windows:
+            try:
+                if viewport.supports_async_render():
+                    async_viewports.append(viewport)
+                    rendered = viewport.enqueue_render(render_dt) or rendered
+                else:
+                    rendered = viewport.render(render_dt) or rendered
+            except Exception as exc:
+                ErrorReporter.log_error(
+                    "Application", "viewport render raised", exc
+                )
+        # Every viewport has queued its camera/extent before any renderer is
+        # asked to wake its worker, so a shared OvstageRendererAdapter can
+        # batch all active RenderProducts into one OVRTX step. The call below
+        # only signals the worker; it never enters OVStage/OVRTX on this thread.
+        for viewport in async_viewports:
+            try:
+                viewport.submit_render_batch()
+            except Exception as exc:
+                ErrorReporter.log_error(
+                    "Application", "viewport render submit raised", exc
+                )
         if rendered:
             self._viewport_render_clock.commit(render_now)
+
+    def _on_frame_update(self, tick_dt: float) -> None:
+        """Compatibility entry point that executes the separated phases."""
+
+        self._run_data_phase(tick_dt)
+        self._run_ui_phase(tick_dt)
+        self._run_render_phase(time.perf_counter())
+
+    def _on_native_pacing_frame_update(self, tick_dt: float) -> None:
+        """Run the merge-time ``origin/main`` viewport update/render flow."""
+
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        render_now = time.perf_counter()
+        callbacks_to_drain = self._pending_callbacks
+        self._pending_callbacks = []
+        remaining = []
+        for handle in callbacks_to_drain:
+            if handle._cancelled:
+                continue
+            if render_now >= handle._due_time:
+                callback = handle._callback
+                if callback is not None:
+                    try:
+                        self._profile_ovui_main_thread_call(
+                            "Application.native_pacing.callback",
+                            self._profile_ovui_main_thread_call,
+                            "Application.callback." + getattr(
+                                callback, "__qualname__", type(callback).__qualname__
+                            ),
+                            callback,
+                        )
+                    except Exception as exc:
+                        ErrorReporter.log_error(
+                            "Application", "call_later callback raised", exc
+                        )
+                handle._callback = None
+            else:
+                remaining.append(handle)
+        if remaining:
+            self._pending_callbacks = remaining + self._pending_callbacks
+
+        self._component_manager.tick()
+
+        self._profile_ovui_main_thread_call(
+            "Application.native_pacing.physics", self._tick_adapter_physics, tick_dt
+        )
+        viewport = self._viewport_window
+        if viewport is not None:
+            try:
+                self._profile_ovui_main_thread_call(
+                    "Application.native_pacing.viewport_update", viewport.update, tick_dt
+                )
+            except Exception as exc:
+                ErrorReporter.log_error(
+                    "Application", "viewport update raised", exc
+                )
+
+            if not self._viewport_visibility_paused:
+                render_dt = self._viewport_render_clock.should_render(render_now)
+                if render_dt is not None:
+                    try:
+                        rendered = self._profile_ovui_main_thread_call(
+                            "Application.native_pacing.viewport_render", viewport.render, render_dt
+                        )
+                    except Exception as exc:
+                        ErrorReporter.log_error(
+                            "Application", "viewport render raised", exc
+                        )
+                        rendered = False
+                    if rendered:
+                        self._viewport_render_clock.commit(render_now)
+
+    def _start_main_thread_scope(self) -> tuple[Any, Any] | None:
+        viewport = self._viewport_window
+        renderer = viewport.renderer_adapter if viewport is not None else None
+        if renderer is None:
+            return None
+        token = get_instrumentation().begin_scope(renderer, MAIN_THREAD_SCOPE)
+        if token is None:
+            return None
+        return renderer, token
+
+    def _start_ovui_init_phase(self) -> None:
+        renderer = self._startup_prebuilt_renderer
+        if renderer is _NO_PREBUILT_RENDERER or renderer is None:
+            return
+        if get_instrumentation().begin_phase(
+            renderer, _OVUI_INIT_PHASE_NAME, _OVUI_INIT_PHASE_INFORMATION
+        ):
+            self._ovui_init_phase_renderer = renderer
+
+    def _end_ovui_init_phase(self) -> None:
+        renderer = self._ovui_init_phase_renderer
+        self._ovui_init_phase_renderer = None
+        if renderer is None:
+            return
+        get_instrumentation().end_phase(
+            renderer, _OVUI_INIT_PHASE_NAME, _OVUI_INIT_PHASE_INFORMATION
+        )
+
+    @staticmethod
+    def _end_main_thread_scope(scope: tuple[Any, Any] | None) -> None:
+        if scope is None:
+            return
+        renderer, token = scope
+        get_instrumentation().end_scope(renderer, token)
+
+    def _start_ovui_main_thread_scope(self, function_name: str) -> tuple[Any, int] | None:
+        viewport = self._viewport_window
+        renderer = viewport.renderer_adapter if viewport is not None else None
+        if renderer is None:
+            return None
+        start_scope = getattr(renderer, "start_ovui_performance_scope", None)
+        if not callable(start_scope):
+            return None
+        try:
+            metric_uid = start_scope(function_name)
+        except Exception:
+            return None
+        if metric_uid is None:
+            return None
+        return renderer, int(metric_uid)
+
+    @staticmethod
+    def _end_ovui_main_thread_scope(scope: tuple[Any, int] | None) -> None:
+        if scope is None:
+            return
+        renderer, metric_id = scope
+        end_scope = getattr(renderer, "end_ovui_performance_scope", None)
+        if not callable(end_scope):
+            return
+        try:
+            end_scope(metric_id)
+        except Exception:
+            pass
+
+    def _profile_ovui_main_thread_call(
+        self,
+        function_name: str,
+        function: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        scope = self._start_ovui_main_thread_scope(function_name)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            self._end_ovui_main_thread_scope(scope)
 
     def _tick_adapter_physics(self, tick_dt: float) -> None:
         session = getattr(self, "_adapter_session", None)
@@ -1106,6 +1435,9 @@ class Application:
           (Step 2.5); its return value records pushed/skipped state
           but never propagates a failure here.
         """
+        if getattr(self, "_inspector_media", None) is not None and self._inspector_media.owns_export:
+            self._inspector_media.export_frame()
+            return
         if not self._headless_export_active:
             return
         tap = self._headless_tap
@@ -1255,24 +1587,14 @@ class Application:
             bridge,
             ui_native,
             on_left_click=self._on_remote_left_click,
-            on_char=self._on_remote_char,
         )
 
     def _on_remote_left_click(self, x: int, y: int) -> None:
-        """Synthesise widget focus for left-click events from the remote.
+        """Focus the Stage filter when a remote click lands in its pill.
 
-        omni.ui ``set_mouse_pressed_fn`` callbacks do not fire from ImGui
-        IO injection (they run in ovui's own event dispatch layer, not via
-        ``io.AddMouseButtonEvent``).  This method tracks whether a click
-        landed in a region whose widget requires direct model updates for
-        keyboard input to register.
-
-        The live Stage Browser filter widget supplies its actual screen rect;
-        a fixed layout fallback is used only before layout has completed.
-        A click in that rect arms ``_filter_capture`` so that subsequent
-        printable-key events update the filter model directly via
-        :meth:`_on_remote_char`.  A click outside the filter bar disarms
-        it so accidental keypresses elsewhere do not corrupt the filter.
+        Text is delivered through native ImGui input only. A previous click
+        must not keep routing characters to the filter after Tab, Escape,
+        or another widget takes keyboard focus.
         """
         widget = getattr(getattr(self, "_stage_window", None), "_widget", None)
         border = getattr(widget, "_filter_border_rect", None)
@@ -1293,40 +1615,10 @@ class Application:
                 0 <= x < SIDE_PANEL_WIDTH
                 and MENU_BAR_HEIGHT <= y < MENU_BAR_HEIGHT + 30
             )
-        self._filter_capture = bool(in_filter and widget is not None)
-        if self._filter_capture:
+        if in_filter and widget is not None:
             focus = getattr(widget, "_focus_filter_field", None)
             if callable(focus):
                 focus()
-
-    def _on_remote_char(self, ch: str) -> None:
-        """Route a printable character from the remote to the focused widget.
-
-        When the Stage Browser filter bar is armed (``_filter_capture``),
-        each synthesised character is appended directly to the filter
-        model.  ``StringField.model.set_value`` triggers the
-        ``add_value_changed_fn`` chain, which hides the placeholder label
-        and re-runs the tree filter — producing an immediate visible state
-        change without requiring ImGui keyboard focus to be set.
-        """
-        if not self._filter_capture:
-            return
-        if self._stage_window is None:
-            return
-        widget = getattr(self._stage_window, "_widget", None)
-        if widget is None:
-            return
-        field = getattr(widget, "_filter_field", None)
-        if field is None:
-            return
-        # Modern ovui builds deliver injected ImGui text to a focused
-        # StringField. The direct-model path is only a compatibility fallback;
-        # using both would duplicate every character.
-        border = getattr(widget, "_filter_border_rect", None)
-        if str(getattr(border, "name", "")) == "focused":
-            return
-        current = field.model.get_value_as_string()
-        field.model.set_value(current + ch)
 
     def _drain_message_queue(self) -> None:
         """Pre-tick drain of the Tier 3 custom-message queue.
@@ -1388,6 +1680,25 @@ class Application:
                     file=sys.stderr,
                 )
 
+    def _detach_inspector_commands(self):
+        """Stop dispatch and retain cancelled tasks until their cleanup finishes."""
+        pending = set(getattr(self, "_inspector_command_cleanup", ()))
+        inspector = getattr(self, "_ovinspect_module", None)
+        if inspector is not None:
+            # Detach once: a failed detach must not be retried by shutdown().
+            self._ovinspect_module = None
+            detach = getattr(inspector, "detach_application", None)
+            if callable(detach):
+                pending.update(detach(self) or ())
+        self._inspector_command_cleanup = {task for task in pending if not task.done()}
+        return tuple(self._inspector_command_cleanup)
+
+    async def _finish_inspector_commands(self):
+        from ovui_widgets.common.inspector_runtime import await_inspector_tasks
+
+        await await_inspector_tasks(self._detach_inspector_commands())
+        self._inspector_command_cleanup.clear()
+
     def _drain_ovinspect(self) -> None:
         """Drain pending inspector actions onto the ovui frame loop."""
         inspector = self._ovinspect_module
@@ -1409,19 +1720,36 @@ class Application:
             )
 
     def get_inspector_state(self) -> dict[str, Any]:
-        """Return a read-only provider/adapter/UI snapshot for automated QA.
+        """Return a read-only USD/OVStage/UI snapshot for automated QA.
 
         The ovui Inspector marshals this call onto the application's frame
         loop.  User actions still arrive exclusively through Inspector mouse
         and keyboard endpoints; this method only supplies independent evidence
-        that the visible action reached the active provider's scene state
-        (native OVStage, or the OpenUSD provider's stage when that provider
-        is selected) and the widget adapter hierarchy.
+        that the visible action reached backing USD, OVStage, and the widget
+        adapter hierarchy.
         """
 
         from ovui_widgets.app.inspector_state import capture_application_state
 
         return capture_application_state(self)
+
+    def get_inspector_commands(self):
+        """Expose the same viewport vocabulary as other inspected ovui hosts."""
+        from ovui_widgets.viewport.inspector import ViewportInspector
+        from ovui_widgets.app.media_inspector import media_commands
+
+        return ViewportInspector(
+            lambda: {"primary": self._viewport_window} if self._viewport_window else {},
+            lambda: self.selection_bus,
+        ).commands() + media_commands(self.get_media)
+
+    def get_media(self):
+        """Lazily adopt shared media control without a second export owner."""
+        if getattr(self, "_inspector_media", None) is None:
+            from ovui_widgets.app.media import Media, ReferenceMediaHost
+
+            self._inspector_media = Media(ReferenceMediaHost(self))
+        return self._inspector_media
 
     def _do_resize(self, width: int, height: int) -> bool:
         """Apply a Step 3.7 ``changeResolutionRequest``.
@@ -1540,7 +1868,16 @@ class Application:
         ):
             self._startup_prebuilt_renderer = self._preconstruct_ovrtx_renderer()
 
+        self._start_ovui_init_phase()
+
         import omni.ui as ui
+
+        # Before ui.init, so that the native start-up phases are measured.
+        from ovui_widgets.app.native_runtime_bootstrap import (
+            install_native_timing_hooks,
+        )
+
+        install_native_timing_hooks()
 
         from ovui_widgets.app.layout import write_split_ini
         from ovui_widgets.app.style import apply_global_styles, set_theme
@@ -1559,14 +1896,19 @@ class Application:
         # catch would also swallow internal init failures from a new OVUI
         # build that does accept the keyword — silently retrying init with a
         # legacy signature would mask the real bug.
-        win_width, win_height = _resolve_window_size()
+        win_width, win_height = _resolve_window_size(self._settings)
         if _ui_init_supports_kwarg(ui.init, "max_fps"):
-            ui.init(
-                "USD Viewer",
-                width=win_width,
-                height=win_height,
-                max_fps=self._effective_rate_limit_fps(),
-            )
+            init_kwargs: dict[str, Any] = {
+                "width": win_width,
+                "height": win_height,
+                "max_fps": self._effective_rate_limit_fps(),
+            }
+            if _ui_init_supports_kwarg(ui.init, "present_fps"):
+                init_kwargs["present_fps"] = self._native_present_fps()
+            ui.init("USD Viewer", **init_kwargs)
+            status_getter = getattr(ui, "get_frame_pacing_status", None)
+            status = status_getter() if callable(status_getter) else {}
+            self._windowed_vulkan_backend = status.get("backend") == "vulkan"
             self._use_viewport_frame_pacing()
         else:
             from ovui_widgets.common.error_reporter import ErrorReporter
@@ -1577,6 +1919,11 @@ class Application:
                 "run-loop tick rate itself is uncapped.",
             )
             ui.init("USD Viewer", width=win_width, height=win_height)
+        window_x, window_y = _resolve_window_position(self._settings)
+        if window_x is not None and window_y is not None:
+            from omni.ui.standalone import set_window_position
+
+            set_window_position(window_x, window_y)
         # Write the canonical split layout AFTER ui.init so the GLFW
         # platform has reported the monitor's content scale and
         # ``Workspace.get_dpi_scale`` returns the real value. Writing
@@ -1598,6 +1945,7 @@ class Application:
             ui.run(self._frame_sub)
         finally:
             self._running = False
+            self._end_ovui_init_phase()
         if self._run_exception is not None:
             raise self._run_exception
         if not getattr(self, "_shutdown_done", False):
@@ -1632,11 +1980,9 @@ class Application:
         try:
             # Cooperative/shared hosts (``_main_async``) reach here without
             # :meth:`run`'s ``ui.init(max_fps=...)`` bootstrap, so the
-            # embedder's already-initialized pump may still carry a
-            # different cap (ovui's library default is 60). Install the
-            # current effective settings-derived cap before the first
-            # controlled tick. On the windowed path this re-asserts the
-            # value run() already passed to ui.init — a harmless no-op.
+            # embedder's already-initialized pump may carry a host-selected
+            # policy. Install USD Viewer's policy before the first controlled
+            # tick: uncapped by default, or the explicit finite user value.
             self._apply_rate_limit_to_ui_pump(self._effective_rate_limit_fps())
             # Cache the C-binding submodule so :meth:`_drain_remote_input`
             # doesn't re-resolve it every frame. Installed before any panel
@@ -1665,6 +2011,27 @@ class Application:
                 on_drop_fn=lambda event: self._on_drop(event, target="viewport"),
                 stage_adapter_provider=self._get_stage_adapter,
             )
+            self._secondary_viewport_window = None
+            if _ENABLE_SECONDARY_VIEWPORT_POC:
+                self._secondary_viewport_window = ViewportWidget(
+                    services=self,
+                    renderer=None,
+                    on_drop_fn=lambda event: self._on_drop(event, target="viewport"),
+                    stage_adapter_provider=self._get_stage_adapter,
+                    viewport_id="secondary",
+                )
+                # Keep a distinct visible tab label while preserving the stable
+                # ImGui identity supplied by viewport_id.
+                self._secondary_viewport_window.window.title = (
+                    "Viewport 2###secondary"
+                )
+            viewport_ui_window = getattr(self._viewport_window, "window", None)
+            set_visibility_changed_fn = getattr(
+                viewport_ui_window, "set_visibility_changed_fn", None
+            )
+            if callable(set_visibility_changed_fn):
+                set_visibility_changed_fn(self._on_viewport_visibility_changed)
+                self._on_viewport_visibility_changed(self._viewport_window.visible)
             # Share the render cadence gate: event-driven direct renders
             # (resize / resolution refresh) go through the same FrameClock
             # as the frame loop, so repeated events cannot exceed the
@@ -1672,6 +2039,10 @@ class Application:
             self._viewport_window.set_shared_render_clock(
                 self._viewport_render_clock
             )
+            if self._secondary_viewport_window is not None:
+                self._secondary_viewport_window.set_shared_render_clock(
+                    self._viewport_render_clock
+                )
             # Step 11.4/13: pass the open-file callback explicitly so
             # ``FileBrowserWidget._on_file_item_double_clicked`` no
             # longer reaches into ``Application.instance().open_file``.
@@ -1690,10 +2061,12 @@ class Application:
                 self._stage_window,
                 self._property_window,
                 self._viewport_window,
+                self._secondary_viewport_window,
                 self._content_window,
                 self._layer_window,
             ):
-                self._widget_registry.add(widget)
+                if widget is not None:
+                    self._widget_registry.add(widget)
 
             # Wire mock property adapter for selections when no USD stage is loaded.
             self._mock_prop_sub = self._selection_bus.subscribe(self._on_mock_selection)
@@ -1727,6 +2100,18 @@ class Application:
                 apply_default_layout()
                 show_panel_dock_tab_bars()
 
+            # TEMP: split the main viewport dock and place the second viewport
+            # immediately to its right.
+            if (
+                self._viewport_window is not None
+                and self._secondary_viewport_window is not None
+            ):
+                self._secondary_viewport_window.window.dock_in(
+                    self._viewport_window.window,
+                    ui.DockPosition.RIGHT,
+                    ratio=0.5,
+                )
+
             # If a USD path was passed on the command line, open it now that the
             # panels exist. open_file() wires real adapters and swaps the renderer.
             if self._startup_usd_path:
@@ -1742,38 +2127,61 @@ class Application:
             # ``OMNIUI_HEADLESS=1`` and ``OVGEAR_LIVESTREAM`` are both set.
             # No-op in windowed mode.
             self._setup_headless_export()
+            self._end_ovui_init_phase()
 
             last_tick = time.perf_counter()
             while self._running and not _should_close():
-                # Step 3.3 — Tier 3 input drain. Runs BEFORE
-                # ``next_frame`` so injected events feed into this
-                # tick's ``applyInjectedInput`` pass
-                # (``HeadlessVulkanPlatform.cpp:485``, before
-                # ``ImGui::NewFrame`` at ``:487``). No-op when no
-                # remote bridge is registered.
-                self._drain_remote_input()
-                # Step 3.7 — Tier 3 custom-message drain. Runs on the
-                # main thread so application/UI mutations
-                # (``open_file``, ``set_window_size``) never happen on
-                # the ovstream worker thread that fires
-                # ``Server.on_message``.
-                self._drain_message_queue()
-                # Optional inspector input drain. When the ovui-inspector
-                # skill is on PYTHONPATH, this runs before ``next_frame`` so
-                # injected mouse/keyboard events are visible to the same tick.
-                self._drain_ovinspect()
-                # Discard the FrameInfo return value. We re-derive
-                # tick_dt from time.perf_counter() so this loop works against
-                # both new and legacy OVUI builds without branching.
-                await ui.next_frame()
-                # Step 2.6 hook runs after the frame is rendered and before
-                # _on_frame_update so the streamed frame is the most recent
-                # ovui tick. No-op when headless export isn't active.
-                self._run_headless_export_hook()
                 now = time.perf_counter()
                 tick_dt = max(0.0, now - last_tick)
                 last_tick = now
-                self._on_frame_update(tick_dt)
+                # Data/IO handoff and all ovui model mutations finish before
+                # ImGui builds this frame. Worker threads never touch widgets;
+                # they publish queue entries or detached snapshots consumed by
+                # these phases.
+                main_thread_scope = self._start_main_thread_scope()
+                ui_thread_development_scope = self._start_ovui_main_thread_scope("UI Thread")
+                try:
+                    frame_scope = None
+                    if self._render_flow_mode == "nativePacing":
+                        frame_scope = self._start_ovui_main_thread_scope(
+                            "Application.native_pacing_frame"
+                        )
+                    try:
+                        self._run_io_handoff_phase()
+                        if self._render_flow_mode == "fast":
+                            self._run_data_phase(tick_dt)
+                            self._run_ui_phase(tick_dt)
+                        # Discard the FrameInfo return value. We re-derive tick_dt
+                        # from time.perf_counter() so this loop works against both
+                        # new and legacy OVUI builds without branching.
+                        # The native standalone tick owns an independent Render
+                        # Thread root. This child records how long the Python UI
+                        # coroutine is suspended waiting for that frame; it does
+                        # not attach native rendering work to the UI Thread root.
+                        next_frame_scope = self._start_ovui_main_thread_scope(
+                            "Application.await_ui_next_frame"
+                        )
+                        try:
+                            await ui.next_frame()
+                        finally:
+                            self._end_ovui_main_thread_scope(next_frame_scope)
+                        # The completed ovui frame can now be exported. OVRTX work
+                        # is submitted afterwards and overlaps the next UI
+                        # iteration; completion is consumed by the next UI phase.
+                        self._run_headless_export_hook()
+                        if self._render_flow_mode == "fast":
+                            self._run_render_phase(time.perf_counter())
+                        else:
+                            self._profile_ovui_main_thread_call(
+                                "Application.native_pacing.data_update",
+                                self._on_native_pacing_frame_update,
+                                tick_dt,
+                            )
+                    finally:
+                        self._end_ovui_main_thread_scope(frame_scope)
+                finally:
+                    self._end_ovui_main_thread_scope(ui_thread_development_scope)
+                    self._end_main_thread_scope(main_thread_scope)
                 # Main-loop pacing is NOT done here: the ovui pump that
                 # drives ``ui.next_frame`` enforces rateLimitFrequency for
                 # the whole iteration (ui.init max_fps +
@@ -1790,6 +2198,31 @@ class Application:
             # outer wrapper here just keeps a late-breaking exception
             # out of asyncio's "Task exception was never retrieved"
             # chatter, NOT for retry purposes.
+            # Commands may retain the media host, adapters or USD stage across
+            # an await. Complete their cancellation before releasing any owner.
+            # A failed detach or a cancelled host must not skip the teardown
+            # below; cancellation propagates only after it has completed.
+            inspector_failure = None
+            try:
+                await self._finish_inspector_commands()
+            except BaseException as detach_exc:  # noqa: BLE001
+                inspector_failure = detach_exc
+                if isinstance(detach_exc, Exception):
+                    ErrorReporter.log_error(
+                        "Application", "Inspector detach raised", detach_exc
+                    )
+                    if self._run_exception is None:
+                        self._run_exception = detach_exc
+                    inspector_failure = None
+            try:
+                if getattr(self, "_inspector_media", None):
+                    await self._inspector_media.close()
+            except Exception as media_exc:
+                if self._run_exception is None:
+                    self._run_exception = media_exc
+            except BaseException as media_cancel:  # noqa: BLE001
+                # A repeated cancellation must not skip scene shutdown below.
+                inspector_failure = inspector_failure or media_cancel
             try:
                 ErrorReporter._clear_status_bar()
             except Exception:
@@ -1814,6 +2247,8 @@ class Application:
                     )
                 except Exception:
                     pass
+            if inspector_failure is not None:
+                raise inspector_failure
 
     def _register_shortcuts(self) -> None:
         """Wire keyboard shortcuts on every panel window.
@@ -1833,6 +2268,7 @@ class Application:
             self._stage_window,
             self._property_window,
             self._viewport_window,
+            self._secondary_viewport_window,
             self._content_window,
             self._layer_window,
         ):
@@ -2022,16 +2458,19 @@ class Application:
         # Stage and content selections are independent models, so both
         # are notified — Del fires wherever the user's selection lives.
         elif key in (_KEY_DELETE, _KEY_BACKSPACE):
-            # When the Stage Browser filter text field owns keyboard input, a
-            # Backspace/Delete belongs to that field's inline text editing and
-            # must not also fire the destructive selection-delete fan-out
-            # (Layers prim-spec / Stage prim / Content Browser). When the filter
-            # is not editing, the intentional delete shortcut runs unchanged.
+            # When a text input owns keyboard input (a Property Inspector
+            # number or text field in keyboard-edit mode, the Stage Browser
+            # filter, any other field), a Backspace/Delete belongs to that
+            # field's inline text editing and must not also fire the
+            # destructive selection-delete fan-out (Layers prim-spec / Stage
+            # prim / Content Browser). When no field is editing, the
+            # intentional delete shortcut runs unchanged.
             filter_editing = (
                 self._stage_window is not None
                 and self._stage_window.is_filter_editing()
             )
-            if not filter_editing and not self._delete_selected_prim_specs_in_layers():
+            text_editing = filter_editing or _is_text_input_active()
+            if not text_editing and not self._delete_selected_prim_specs_in_layers():
                 self._delete_selected()
                 if self._content_window is not None:
                     self._content_window.delete_selected()
@@ -2114,7 +2553,32 @@ class Application:
             return
         # Uppercase the key so lowercase 'w'/'e'/'r' also dispatches.
         upper = key - 32 if ord("a") <= key <= ord("z") else key
-        tool_registry.handle_key_event(upper, modifiers, True)
+        if tool_registry.handle_key_event(upper, modifiers, True):
+            # W/E/R is an explicit tool choice: show a gizmo hidden by an
+            # Inspector viewport_tool "select" request.
+            show = getattr(self._viewport_window, "set_transform_manipulator_visible", None)
+            if callable(show):
+                show(True)
+
+    def register_shortcut_window(self, window: Any) -> None:
+        """Attach the shared shortcut dispatcher to a late-created window.
+
+        ``ui.Window::_updateWindow`` only invokes ``key_pressed_fn`` on the
+        currently FOCUSED window (see :meth:`_register_shortcuts`), so a
+        optional panel window created after startup
+        window a user opens from the Window menu — must join the same
+        dispatcher, or Ctrl+Z / Ctrl+Y (and every other app shortcut) go
+        dead the moment the user clicks into that window. Accepts either a
+        managed-window wrapper or the underlying ``ui.Window``.
+        """
+
+        win = (
+            getattr(window, "window", None)
+            or getattr(window, "_window", None)
+            or window
+        )
+        if win is not None and hasattr(win, "set_key_pressed_fn"):
+            win.set_key_pressed_fn(self._on_key_pressed)
 
     def _run_history_action(self, action: Callable[[], Any]) -> Any:
         """Run undo/redo and reconcile selection after deferred RESYNCs.
@@ -2274,13 +2738,13 @@ class Application:
         self._undo_manager.end_group()
 
     def _persist_layer_state_before_save(self) -> bool:
-        """Persist layer-window state for providers that support it.
+        """Persist layer-window state into the active backing USD stage.
 
         The OpenUSD layer adapter stores the current authoring-layer identifier
-        and advisory lock map in root-layer ``customLayerData``. The hook is
-        provider-optional: adapters without it — including the native OVStage
-        provider, which has no backing USD stage or layer persistence — retain
-        their existing save behavior.
+        and advisory lock map in root-layer ``customLayerData``. OVStage's
+        adapter forwards this call to that exact backing stage and synchronizes
+        the metadata change. Adapters without this optional hook retain their
+        existing save behavior.
 
         ``False`` means the save must stop: writing source layers after a
         failed metadata update would produce an artifact that silently forgets
@@ -2767,6 +3231,7 @@ class Application:
             self._orphaned_adapters = orphans
         self._stage_adapter = None
         self._current_file_path = None
+        self._set_window_title_for_stage(None)
         self._document_epoch = None
         # Commands of the destroyed document must not stay undoable.
         undo_manager = getattr(self, "_undo_manager", None)
@@ -2787,7 +3252,12 @@ class Application:
         if layer_window is not None:
             _step(lambda: layer_window.set_adapter(None))
         viewport_window = getattr(self, "_viewport_window", None)
-        if viewport_window is not None:
+        secondary_viewport_window = getattr(
+            self, "_secondary_viewport_window", None
+        )
+        for viewport_window in (viewport_window, secondary_viewport_window):
+            if viewport_window is None:
+                continue
             _step(lambda: viewport_window.set_renderer(None))
             attach = getattr(viewport_window, "attach_stage", None)
             if callable(attach):
@@ -2896,6 +3366,7 @@ class Application:
             self._recent_files.add(path)
             self._settings.set(
                 "ui.recent_files", self._recent_files.get_ordered())
+            self._set_window_title_for_stage(path)
         except BaseException as primary:
             failures = [self._abort_stage_transition(
                 getattr(self, "_stage_adapter", None))]
@@ -2915,6 +3386,8 @@ class Application:
     def open_stage(self, stage: Any) -> None:
         """Headless/test variant: accepts an in-memory Usd.Stage directly."""
         self._load_stage(stage, title="(in-memory)")
+        self._current_file_path = None
+        self._set_window_title_for_stage(None)
 
     @_owns_lifecycle_attempt
     def new_stage(self) -> bool:
@@ -2962,7 +3435,7 @@ class Application:
             # ALREADY-ATTACHED renderer in place rather than constructing a
             # second one. Constructing a second renderer after UI
             # initialization while the first is still frame-ticked can wedge
-            # the first attached step call as RenderSettings repeatedly fails
+            # the first attached step call as native state repeatedly fails
             # to resolve the borrowed Stage ID — the observed accumulated-
             # state File > New freeze. Cold start (no reusable viewport
             # renderer yet) still consumes the standalone-launcher's
@@ -3011,6 +3484,7 @@ class Application:
                 self._note_secondary_failures(
                     primary, self._enter_no_document_state())
                 raise
+            self._set_window_title_for_stage(None)
             return True
         elif prebuilt is not None and not renderer_is_reused:
             try:
@@ -3118,6 +3592,7 @@ class Application:
             )
             return False
         self._current_file_path = save_path
+        self._set_window_title_for_stage(save_path)
         self._recent_files.add(save_path)
         self._settings.set("ui.recent_files", self._recent_files.get_ordered())
         return True
@@ -3194,6 +3669,7 @@ class Application:
         new_sub: Any = None
         new_layer_adapter: Any = None
         transform_adapter: Any = None
+        secondary_transform_adapter: Any = None
         new_renderer: Any = _NO_PREBUILT_RENDERER  # sentinel: not built
 
         def _discard_replacement() -> list:
@@ -3262,6 +3738,8 @@ class Application:
             new_layer_adapter.attach_stage(call_later=self.call_later)
             transform_factory = self._require_factory("transforms")
             transform_adapter = transform_factory(stage)
+            if self._secondary_viewport_window is not None:
+                secondary_transform_adapter = transform_factory(stage)
             if self._viewport_window is not None:
                 # A build failure propagates to the abort path below with
                 # the old document — INCLUDING its published renderer —
@@ -3514,9 +3992,8 @@ class Application:
                 )
                 self._property_window.set_property_adapter_factory(factory)
                 self._property_window.set_stage_adapter(self._stage_adapter, self._undo_manager)
-            # LAYERS-PLAN Step 9: the layer-stack adapter was prepared and
-            # attached before commit; hand it to the window so Phase C can
-            # rebuild its tree model once the window is populated.
+            # The layer-stack adapter was prepared and attached before
+            # commit; hand it to the window for tree-model rebuilds.
             if self._layer_window is not None and self._layer_adapter is not None:
                 try:
                     self._layer_window.set_adapter(self._layer_adapter)
@@ -3529,15 +4006,21 @@ class Application:
             layer_menu_invalidate = getattr(getattr(self, "_layer_menu", None), "invalidate", None)
             if callable(layer_menu_invalidate):
                 layer_menu_invalidate()
-            # Wire the transform gizmo (Step C.2) — the viewport widget owns a
-            # ``PrimTransformModel`` that needs these adapters (prepared
-            # before commit) to drive the translate gizmo's drag math + undo
-            # pipeline. Step C.5 will fold the selection-bus subscription
-            # into the model itself.
+            # Wire the transform gizmo. The viewport widget owns a
+            # ``PrimTransformModel`` that needs these prepared adapters to
+            # drive translate-gizmo drag math and the undo pipeline.
             if self._viewport_window is not None:
                 self._viewport_window.set_scene_name(title)
                 self._viewport_window.attach_stage(
                     transform_adapter=transform_adapter,
+                    stage_adapter=self._stage_adapter,
+                    undo_manager=self._undo_manager,
+                    snap_system=self._snap_system,
+                )
+            if self._secondary_viewport_window is not None:
+                self._secondary_viewport_window.set_scene_name(title)
+                self._secondary_viewport_window.attach_stage(
+                    transform_adapter=secondary_transform_adapter,
                     stage_adapter=self._stage_adapter,
                     undo_manager=self._undo_manager,
                     snap_system=self._snap_system,
@@ -3593,9 +4076,9 @@ class Application:
                     elif active_renderer is not None:
                         self._viewport_window.set_renderer(None)
                 self._viewport_window.update_prim_count(self._get_prim_count())
-                # Step 16: pose-based seam. Ask the stage adapter for any
-                # authored ``boundCamera`` pose; apply it to the viewport
-                # via the new value-object API. Bbox framing is the
+                # Ask the stage adapter for any authored ``boundCamera`` pose
+                # and apply it to the viewport through the value-object API.
+                # Bounding-box framing is the
                 # fallback when no pose is authored or the apply fails
                 # (preserves the prior "always frame something safe"
                 # rule). The widget no longer receives a raw
@@ -3604,6 +4087,35 @@ class Application:
                 pose = self._stage_adapter.read_bound_camera()
                 if pose is None or not self._viewport_window.apply_camera_pose(pose):
                     self._viewport_window.frame_paths(["/"])
+            if self._secondary_viewport_window is not None:
+                create_secondary_renderer = getattr(
+                    new_renderer,
+                    "create_secondary_viewport_renderer",
+                    None,
+                )
+                secondary_renderer = (
+                    create_secondary_renderer()
+                    if callable(create_secondary_renderer)
+                    else None
+                )
+                installed = self._secondary_viewport_window.set_renderer(
+                    secondary_renderer
+                )
+                if installed is False:
+                    raise RuntimeError(
+                        "Secondary viewport refused renderer installation"
+                    )
+                self._secondary_viewport_window.update_prim_count(
+                    self._get_prim_count()
+                )
+                pose = self._stage_adapter.read_bound_camera()
+                if (
+                    pose is None
+                    or not self._secondary_viewport_window.apply_camera_pose(
+                        pose
+                    )
+                ):
+                    self._secondary_viewport_window.frame_paths(["/"])
         except BaseException as primary:
             failures = self._enter_no_document_state()
             failures.append(_reclaim_unoffered_fresh_renderer())
@@ -3665,7 +4177,8 @@ class Application:
         # Panels and chrome converge too: completion may never be
         # reported while an undestroyed window still owns document UI.
         for attr in (
-            "_stage_window", "_property_window", "_viewport_window",
+            "_stage_window", "_property_window",
+            "_viewport_window", "_secondary_viewport_window",
             "_content_window", "_layer_window", "_main_win",
             "_menu_underline_win", "_status_win", "_status_bar",
         ):
@@ -3691,8 +4204,8 @@ class Application:
         _step(self._drain_orphaned_stage_subs)
         return [f for f in failures if f is not None]
 
-    def _shutdown_ownership_clear(self) -> bool:
-        """True only when no live document/panel ownership remains."""
+    def _shutdown_noncomponent_ownership_clear(self) -> bool:
+        """True only when no live document or panel ownership remains."""
         if getattr(self, "_orphaned_adapters", None):
             return False  # unrevoked provider registrations remain owned
         for name in (
@@ -3713,9 +4226,57 @@ class Application:
         owners = (
             "_stage_adapter", "_current_stage_sub", "_layer_adapter",
             "_stage_window", "_property_window", "_viewport_window",
+            "_secondary_viewport_window",
             "_content_window", "_layer_window", "_main_win",
         )
         return all(getattr(self, name, None) is None for name in owners)
+
+    def _shutdown_ownership_clear(self) -> bool:
+        """True only after every application owner has been released."""
+        component_manager = getattr(self, "_component_manager", None)
+        if hasattr(component_manager, "unresolved_names"):
+            if component_manager.unresolved_names:
+                return False
+            if getattr(self, "_component_shutdown_pending", False):
+                return False
+            if not getattr(self, "_component_shutdown_finalized", False):
+                return False
+        return self._shutdown_noncomponent_ownership_clear()
+
+    def _finalize_component_shutdown(self) -> bool:
+        """Release shared services after every component has unloaded.
+
+        A component with retryable teardown keeps the registries and process
+        services that its recovery path was registered against. Finalization
+        is therefore deferred until the manager no longer owns any unresolved
+        component, and is performed at most once.
+        """
+        if getattr(self, "_component_shutdown_finalized", False):
+            return True
+        component_manager = getattr(self, "_component_manager", None)
+        unresolved = getattr(component_manager, "unresolved_names", ())
+        if unresolved:
+            self._component_shutdown_pending = True
+            print(
+                "[ovui_widgets.app] shutdown incomplete: unresolved "
+                f"component unload(s) {unresolved} still own "
+                "registrations; shared registries, process services, "
+                "and the application owner are retained. Retry via "
+                "components.unload(name) or call shutdown() again.",
+                file=sys.stderr,
+            )
+            return False
+        for name in ("_widget_registry", "_window_registry", "_menu_registry"):
+            registry = getattr(self, name, None)
+            clear = getattr(registry, "clear", None)
+            if callable(clear):
+                clear()
+        _common_scheduler.set_call_later(None)
+        Settings.set_instance(None)
+        RecentFileList.set_instance(None)
+        self._component_shutdown_pending = False
+        self._component_shutdown_finalized = True
+        return True
 
     def _reusable_document_renderer(self) -> Any:
         """Return the viewport's live renderer when it can transition to a
@@ -3724,7 +4285,7 @@ class Application:
 
         Two live GPU renderers — the still-attached one being frame-ticked
         plus a freshly constructed one loading a new native scene — contend
-        for native scene / RenderSettings resolution and can freeze the frame
+        for native scene resolution and can freeze the frame
         loop mid-replacement (observed after a full edit/reload session on
         File > New). The renderer's own ``load_stage`` transaction preserves
         an authoritative complete OLD-or-NEW identity; cleanup debt may still
@@ -3838,7 +4399,13 @@ class Application:
             ErrorReporter.show_warning(f"ovrtx renderer unavailable ({reason})")
             return None
         try:
-            return session.create_renderer()
+            renderer = session.create_renderer()
+            if not getattr(self, "_renderer_startup_hooks_complete", False):
+                from ovui_widgets.app.native_runtime_bootstrap import run_renderer_startup_hooks
+
+                run_renderer_startup_hooks(self._settings, renderer)
+                self._renderer_startup_hooks_complete = True
+            return renderer
         except Exception as exc:
             ErrorReporter.log_error("Application", "ovrtx renderer failed", exc)
             if renderer_required:
@@ -3965,13 +4532,18 @@ class Application:
                     self._reconcile_selection_after_resync(event)
         for cb in self._stage_change_listeners:
             cb(event)
-        if self._viewport_window is not None:
+        for viewport_window in (
+            self._viewport_window,
+            self._secondary_viewport_window,
+        ):
+            if viewport_window is None:
+                continue
             # Let the renderer refresh its cache for any edit (including
             # INFO_CHANGE from Property Inspector writes) so the viewport shows
             # the new state on the next frame.
-            self._viewport_window.notify_stage_changed(event)
+            viewport_window.notify_stage_changed(event)
             if event.event_type is ChangeEventType.RESYNC:
-                self._viewport_window.update_prim_count(self._get_prim_count())
+                viewport_window.update_prim_count(self._get_prim_count())
         if event.event_type is ChangeEventType.RESYNC and self._layer_window is not None:
             refresh = getattr(self._layer_window, "refresh_layer_contents", None)
             if callable(refresh):
@@ -4196,8 +4768,10 @@ class Application:
         * Panel UI teardown continues across independent windows. A panel
           whose ``destroy()`` refuses remains referenced and the exact first
           refusal propagates, because it may still own a retryable renderer.
-        * ``_shutdown_done`` is set after every block has been
-          *attempted*; subsequent calls are short-circuited.
+        * ``_shutdown_done`` is set only after every retryable owner has
+          been released; subsequent calls are short-circuited. Component
+          cleanup that remains pending retains its shared registries and
+          process services for a later retry.
           ``_shutdown_in_progress`` short-circuits a recursive call from
           within a destroy() callback.
         * Native scene shutdown is the one fail-closed exception: if a BORROW
@@ -4223,7 +4797,10 @@ class Application:
         # and fully usable; the caller retries after the in-flight
         # operation completes. For a native provider, ``shutdown_scene``
         # below may already destroy the current scene — a later refusal
-        # could never restore that.
+        # could never restore that. The same refusal also guards the
+        # deferred component-shutdown resume below: its retry unloads
+        # components, which must not run over unresolved in-notification
+        # adapter ownership either.
         adapter = getattr(self, "_stage_adapter", None)
         if adapter is not None and (
             getattr(adapter, "ownership_busy", False) is True
@@ -4234,6 +4811,36 @@ class Application:
                 "inside an active authoring notification and its "
                 "ownership is unresolved; retry after the in-flight "
                 "operation completes"
+            )
+        if (
+            getattr(self, "_component_shutdown_pending", False)
+            and self._shutdown_noncomponent_ownership_clear()
+        ):
+            # A prior pass released every non-component owner. Retry only the
+            # retained component and the shared services it still needs; the
+            # rest of teardown must not be performed twice.
+            self._shutdown_in_progress = True
+            try:
+                self._component_manager.unload_all()
+                if self._finalize_component_shutdown():
+                    try:
+                        if SelectionBus._instance is getattr(
+                            self, "_selection_bus", None
+                        ):
+                            SelectionBus._instance = None
+                        if Application._instance is self:
+                            Application._instance = None
+                    except Exception:
+                        pass
+                    self._shutdown_done = self._shutdown_ownership_clear()
+            finally:
+                self._shutdown_in_progress = False
+            return
+        if self._detach_inspector_commands():
+            self.request_exit()
+            raise RuntimeError(
+                "Application shutdown is waiting for Inspector command cleanup; "
+                "await the application loop or _finish_inspector_commands() before retrying"
             )
         # The adapter's delivery obligations SETTLE HERE — before the
         # provider scene, sessions, singletons, or any adapter detach.
@@ -4325,6 +4932,9 @@ class Application:
                     self._abort_stage_transition(
                         getattr(self, "_stage_adapter", None))
                     raise
+            close_session = getattr(session, "close", None)
+            if callable(close_session):
+                close_session()
             self._adapter_session = None
             self._adapter_factories = None
             self._adapter_provider = None
@@ -4344,29 +4954,6 @@ class Application:
                     self._running = False
                     self._pending_callbacks = []
                     self._component_manager.unload_all()
-                    self._widget_registry.clear()
-                    self._window_registry.clear()
-                    self._menu_registry.clear()
-                    # Clear the process-wide common.scheduler backend so any
-                    # widget call_later issued after shutdown raises
-                    # RuntimeError (matches Rev 8 §5.5 expected post-shutdown
-                    # behavior; existing widget try/except guards continue
-                    # to fall back synchronously where applicable).
-                    _common_scheduler.set_call_later(None)
-                    # Step 10/13: clear the common-side Settings /
-                    # RecentFileList singletons so widget reads after
-                    # shutdown fall back to the lazy-default constructor
-                    # path (same pattern as the scheduler clear above).
-                    Settings.set_instance(None)
-                    RecentFileList.set_instance(None)
-                    if self._ovinspect_module is not None:
-                        detach = getattr(self._ovinspect_module, "detach_application", None)
-                        if callable(detach):
-                            try:
-                                detach(self)
-                            except Exception:
-                                pass
-                        self._ovinspect_module = None
                 except Exception:
                     pass
                 # A prebuilt renderer can exist before a stage is loaded. Drop it
@@ -4583,7 +5170,8 @@ class Application:
                 #     renderer refusal deliberately keeps this Python owner.
                 panel_shutdown_primary = None
                 for attr in ("_stage_window", "_property_window",
-                             "_viewport_window", "_content_window",
+                             "_viewport_window",
+                             "_secondary_viewport_window", "_content_window",
                              "_layer_window"):
                     w = getattr(self, attr, None)
                     if w is None:
@@ -4615,10 +5203,9 @@ class Application:
                     self._scratch_stage_dirs = []
                 except Exception:
                     pass
-                # ── transient SettingsDialog (Step 4b lands its destroy()
-                #     method; until then the attribute simply gets nulled).
-                #     try/except/finally so the attribute clears regardless
-                #     of whether destroy() exists or raises.
+                # ── optional SettingsDialog ──────────────────────────────
+                # Clear the attribute regardless of whether destroy is absent
+                # or raises so the application cannot retain a torn-down window.
                 try:
                     sd = getattr(self, "_settings_dialog", None)
                     if sd is not None:
@@ -4632,20 +5219,35 @@ class Application:
                         self._settings_dialog = None
                     except Exception:
                         pass
-                # ── module-scope provider holders (Steps 2/3/4 add the
-                #     icon_caches module and its registrations). Until then
-                #     this is a guarded no-op via ImportError catch — the
-                #     ordering is preserved so when Step 4 lands
-                #     no further edit to shutdown() is needed.
+                # ── optional AboutDialog ────────────────────────────────────
+                try:
+                    about = getattr(self, "_about_dialog", None)
+                    if about is not None:
+                        about.destroy()
+                except Exception:
+                    pass
+                finally:
+                    self._about_dialog = None
+                # ── module-scope provider holders ────────────────────────
+                # Clear optional icon-provider caches after their windows have
+                # been released. Builds without the module remain supported.
                 try:
                     from ovui_widgets.common.icon_caches import clear_all  # noqa: WPS433
                     clear_all()
                 except Exception:
                     pass
+                component_shutdown_finalized = (
+                    self._finalize_component_shutdown()
+                )
                 # ── singletons reset (LAST, before flag set) ─────────────
                 try:
-                    SelectionBus._instance = None
-                    Application._instance = None
+                    if component_shutdown_finalized:
+                        if SelectionBus._instance is getattr(
+                            self, "_selection_bus", None
+                        ):
+                            SelectionBus._instance = None
+                        if Application._instance is self:
+                            Application._instance = None
                 except Exception:
                     pass
 
@@ -4726,9 +5328,12 @@ class Application:
         clock.
         """
         fps = valid_rate_limit_fps(value, default=None)
-        if fps is None:
+        if value is not None and fps is None:
             return
+        self._vulkan_default_max_throughput = fps is None
         self._viewport_render_clock.target_fps = fps
+        if self._viewport_visibility_paused:
+            self._viewport_visible_ui_rate = fps
         self._apply_rate_limit_to_ui_pump(fps)
 
     def _on_theme_changed(self, key: str, value: str) -> None:
@@ -4741,6 +5346,7 @@ class Application:
             self._stage_window,
             self._property_window,
             self._viewport_window,
+            self._secondary_viewport_window,
             self._content_window,
             self._layer_window,
         ):

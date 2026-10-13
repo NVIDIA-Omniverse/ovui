@@ -1,10 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 recursive-include resources/fonts *.ttf *.txt *.md
 recursive-include resources/glyphs *.svg
 recursive-include core *.cpp *.h
 recursive-include standalone *.cpp *.h
 recursive-include bindings *.cpp *.h
 include third_party/CMakeLists.txt
+recursive-include third_party/md4c *
 recursive-include third_party/imgui *
 include third_party/glad_extensions.txt
 include CMakeLists.txt
 recursive-include python *.py
+include python/ovui_imgui_preload.pth
+recursive-include cmake *.cmake
+
+recursive-include tools/sdk *.md
+

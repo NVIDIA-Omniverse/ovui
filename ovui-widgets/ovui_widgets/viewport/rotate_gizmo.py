@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Rotate gizmo — axis rings with drag + hover highlight.
 
@@ -237,6 +230,9 @@ class PrimRotateChangedGesture(TransformGestureBase):
         if not paths:
             self._active = False
             return
+        if not self._acquire_drag():
+            self._active = False
+            return
         angle = self._payload_angle(sender, self)
         self._start_angle = angle if angle is not None else 0.0
         self._delta_angle = 0.0
@@ -244,6 +240,7 @@ class PrimRotateChangedGesture(TransformGestureBase):
             self._model.on_drag_start(label=self._UNDO_LABEL)
         except Exception:
             self._active = False
+            self._release_drag()
             return
         self._active = True
 
@@ -274,6 +271,8 @@ class PrimRotateChangedGesture(TransformGestureBase):
             self._model.on_drag_ended()
         except Exception:
             pass
+        finally:
+            self._release_drag()
 
 
 # ---------------------------------------------------------------------------

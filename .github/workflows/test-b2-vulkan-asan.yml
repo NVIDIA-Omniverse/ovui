@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-License-Identifier: Apache-2.0
 #
 # B2 — native C++ tests under AddressSanitizer (no pytest, no Python).
 #
@@ -18,8 +18,12 @@
 #   * Configures the project with -fsanitize=address via CMake directly
 #     (NOT via pip install — no Python interpreter is involved).
 #   * Builds the native test binaries (markdown_model_tests,
-#     markdown_fuzz_tests). These are pure-CPU C++ executables that
-#     exercise the markdown parser/renderer/syntax-highlighter — the
+#     markdown_fuzz_tests, raster_image_provider_contract_tests,
+#     standalone_raster_image_loader_tests). These are pure-CPU C++
+#     executables that exercise the markdown
+#     parser/renderer/syntax-highlighter, the RasterImageProvider
+#     load and lifetime contract against a fake loader, and the
+#     standalone loader's texture sharing against a fake GPU — the
 #     class of code where ASan-class bugs (UAF, OOB, double-free)
 #     actually live in this repo.
 #   * Runs them via ctest. libasan initializes cleanly because the
@@ -99,7 +103,8 @@ jobs:
       - name: Build native test targets
         run: |
           cmake --build build/asan \
-            --target markdown_model_tests markdown_fuzz_tests \
+            --target markdown_model_tests markdown_fuzz_tests raster_image_provider_contract_tests \
+            standalone_raster_image_loader_tests \
             --parallel $(nproc)
 
       - name: Verify ASan is linked into the test binaries
@@ -108,7 +113,9 @@ jobs:
         # misconfiguration before we silently run un-instrumented tests.
         run: |
           set -e
-          for bin in build/asan/markdown_model_tests build/asan/markdown_fuzz_tests; do
+          for bin in build/asan/markdown_model_tests build/asan/markdown_fuzz_tests \
+                     build/asan/raster_image_provider_contract_tests \
+                     build/asan/standalone_raster_image_loader_tests; do
             echo "=== ldd $bin ==="
             ldd "$bin"
             if ! ldd "$bin" | grep -qi "libasan"; then
@@ -130,7 +137,7 @@ jobs:
           set -o pipefail
           ulimit -c 0
           ctest --test-dir build/asan \
-            -R "^(markdown_model_tests|markdown_fuzz_tests)$" \
+            -R "^(markdown_model_tests|markdown_fuzz_tests|raster_image_provider_contract_tests|standalone_raster_image_loader_tests)$" \
             --output-on-failure 2>&1 | tee /tmp/ctest-b2.log
 
       - name: Upload ctest log

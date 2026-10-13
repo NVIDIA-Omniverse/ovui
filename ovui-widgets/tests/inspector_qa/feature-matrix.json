@@ -38,13 +38,6 @@
       "stage.visibility",
       "stage.default_prim_identity",
       "stage.composition_badges",
-      "create.geometry_meshes",
-      "create.geometry_shapes",
-      "create.lights",
-      "create.camera",
-      "create.scope",
-      "create.xform",
-      "create.material",
       "property.scalar_edit",
       "property.vector_edit",
       "property.token_edit",
@@ -402,105 +395,6 @@
       "contract_evidence": [
         "ovui-data-adapters/tests/ovstage/test_stage_topology.py::test_badge_and_item_flags_are_truthfully_inert_without_composition_data"
       ]
-    },
-    {
-      "id": "create.geometry_meshes",
-      "surface": "Create",
-      "required_evidence": [
-        "menu_each_family",
-        "native_types",
-        "ovstage_paths",
-        "viewport",
-        "undo_redo"
-      ],
-      "release_tier": "ovui_0_1_baseline",
-      "support_status": "supported",
-      "evidence_status": "open_evidence",
-      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
-    },
-    {
-      "id": "create.geometry_shapes",
-      "surface": "Create",
-      "required_evidence": [
-        "menu_each_family",
-        "native_types",
-        "ovstage_paths",
-        "viewport",
-        "undo_redo"
-      ],
-      "release_tier": "ovui_0_1_baseline",
-      "support_status": "supported",
-      "evidence_status": "open_evidence",
-      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
-    },
-    {
-      "id": "create.lights",
-      "surface": "Create",
-      "required_evidence": [
-        "menu_each_type",
-        "native_types",
-        "ovstage_paths",
-        "viewport"
-      ],
-      "release_tier": "ovui_0_1_baseline",
-      "support_status": "supported",
-      "evidence_status": "open_evidence",
-      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
-    },
-    {
-      "id": "create.camera",
-      "surface": "Create",
-      "required_evidence": [
-        "menu_click",
-        "camera_schema",
-        "ovstage_path",
-        "camera_choice"
-      ],
-      "release_tier": "ovui_0_1_baseline",
-      "support_status": "supported",
-      "evidence_status": "open_evidence",
-      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
-    },
-    {
-      "id": "create.scope",
-      "surface": "Create",
-      "required_evidence": [
-        "menu_click",
-        "scope_schema",
-        "ovstage_path"
-      ],
-      "release_tier": "ovui_0_1_baseline",
-      "support_status": "supported",
-      "evidence_status": "open_evidence",
-      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
-    },
-    {
-      "id": "create.xform",
-      "surface": "Create",
-      "required_evidence": [
-        "menu_click",
-        "xform_schema",
-        "ovstage_path"
-      ],
-      "release_tier": "ovui_0_1_baseline",
-      "support_status": "supported",
-      "evidence_status": "inspector_covered",
-      "scenarios": [
-        "test_ovstage_stage_workflows.py::test_create_xform_through_visible_menu_populates_native_ovstage"
-      ]
-    },
-    {
-      "id": "create.material",
-      "surface": "Create",
-      "required_evidence": [
-        "menu_click",
-        "material_network",
-        "ovstage_path"
-      ],
-      "release_tier": "ovui_0_1_baseline",
-      "support_status": "supported",
-      "evidence_status": "open_evidence",
-      "scope_note": "The Create menu remains available through the built-in application Create menu; the previous real-runtime Inspector parity scenario was retired with its optional distribution, so evidence is open again."
     },
     {
       "id": "property.scalar_edit",
@@ -1079,12 +973,9 @@
       ],
       "release_tier": "ovui_0_1_baseline",
       "support_status": "supported",
-      "evidence_status": "inspector_covered",
+      "evidence_status": "contract_covered",
       "contract_evidence": [
         "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_point_pick_empty_space_near_geometry_reports_miss"
-      ],
-      "scenarios": [
-        "test_renderer_feature_workflows.py::test_camera_point_miss_and_marquee_use_real_borrow_renderer"
       ]
     },
     {
@@ -1097,14 +988,11 @@
       ],
       "release_tier": "ovui_0_1_baseline",
       "support_status": "supported",
-      "evidence_status": "inspector_covered",
+      "evidence_status": "contract_covered",
       "contract_evidence": [
         "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_marquee_pick_dedupes_scene_paths_and_drops_runtime_paths",
         "ovui-widgets/tests/test_viewport_selection_sync.py::test_marquee_pick_validates_paths_and_common_bus_clears_highlight",
         "ovui-widgets/tests/test_viewport_resolution_coordinates.py::test_marquee_rect_is_clipped_to_aspect_fit_display_rect"
-      ],
-      "scenarios": [
-        "test_renderer_feature_workflows.py::test_camera_point_miss_and_marquee_use_real_borrow_renderer"
       ]
     },
     {
@@ -1118,29 +1006,13 @@
       "release_tier": "ovui_0_1_baseline",
       "support_status": "supported",
       "evidence_status": "contract_covered",
-      "scope_note": "Per-prim selection outlines follow viewport/stage selection via the renderer-owned membership API (ovrtx 0.4); no writes enter the borrowed OVStage data plane.",
+      "scope_note": "Per-prim selection outlines follow viewport/stage selection through renderer-owned presentation state; no writes enter the renderer's scene data plane.",
       "contract_evidence": [
-        "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_outline_lifecycle_set_move_clear_with_single_activation",
-        "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_selection_highlight_degrades_honestly_without_outline_api",
+        "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_dedicated_outline_membership_resets_after_each_change",
+        "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_selection_highlight_reserved_attribute_transport_on_installed_runtime",
+        "ovui-data-adapters/tests/ovstage/test_renderer_interaction.py::test_selection_highlight_degrades_honestly_without_any_transport",
         "ovui-data-adapters/tests/ovstage/test_renderer_borrow_contract.py::test_ovrtx_renderer_calls_remain_presentation_only"
       ]
-    },
-    {
-      "id": "renderer.settings",
-      "surface": "Viewport tools",
-      "required_evidence": [
-        "settings_edit",
-        "usd_setting",
-        "render_change",
-        "reset"
-      ],
-      "release_tier": "post_0_1_usd_extension",
-      "support_status": "accepted_unsupported",
-      "evidence_status": "contract_covered",
-      "contract_evidence": [
-        "ovui-data-adapters/tests/ovstage/test_renderer_feature_parity.py::test_render_settings_fail_closed_without_native_authoring"
-      ],
-      "scope_note": "Native OVStage render-setting discovery and authoring are not available; the catalog is empty and read/validate/apply/reset are rejected as unsupported instead of authoring backing USD."
     },
     {
       "id": "livestream.headless_full_ui",
@@ -1170,7 +1042,7 @@
       ],
       "release_tier": "ovui_0_1_baseline",
       "support_status": "supported",
-      "evidence_status": "inspector_covered",
+      "evidence_status": "contract_covered",
       "contract_evidence": [
         "ovui-data-adapters/tests/ovstage/test_renderer_livestream.py::test_init_gates_provider_neutral_livestream_and_exposes_property",
         "ovui-data-adapters/tests/ovstage/test_renderer_livestream.py::test_zero_copy_ui_and_livestream_share_one_cuda_mapping",
@@ -1178,10 +1050,7 @@
         "ovui-data-adapters/tests/ovstage/test_renderer_livestream.py::test_livestream_cuda_failure_falls_back_to_cpu_output",
         "ovui-data-adapters/tests/ovstage/test_renderer_livestream.py::test_shutdown_closes_livestream_once_and_releases_renderer"
       ],
-      "scope_note": "The renderer-owned tap tees the mapped presentation output; it does not query or author OVRTX scene data. External-client reconnect evidence remains a validation enhancement, not an implementation gap.",
-      "scenarios": [
-        "test_renderer_feature_workflows.py::test_windowed_livestream_tees_borrowed_frame_and_shuts_down_cleanly"
-      ]
+      "scope_note": "The renderer-owned tap tees the mapped presentation output; it does not query or author scene data. External-client reconnect evidence remains a validation enhancement, not an implementation gap."
     },
     {
       "id": "physics.enable_play_stop",

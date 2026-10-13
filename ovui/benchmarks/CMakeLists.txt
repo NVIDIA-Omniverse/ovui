@@ -1,8 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # ==============================================================================
 # benchmarks/CMakeLists.txt - GL vs Vulkan performance benchmark
 # ==============================================================================
 
-set(IMGUI_BACKEND_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui/backends)
+set(IMGUI_BACKEND_DIR ${OVUI_IMGUI_ROOT}/imgui/backends)
 
 set(BENCHMARK_IMGUI_SOURCES
     ${IMGUI_BACKEND_DIR}/imgui_impl_glfw.cpp
@@ -36,8 +39,8 @@ endif()
 
 target_include_directories(vk_gl_benchmark PRIVATE
     ${CMAKE_SOURCE_DIR}/standalone/src
-    ${CMAKE_SOURCE_DIR}/third_party/imgui
-    ${CMAKE_SOURCE_DIR}/third_party/imgui/backends
+    ${OVUI_IMGUI_ROOT}/imgui
+    ${OVUI_IMGUI_ROOT}/imgui/backends
 )
 
 target_compile_definitions(vk_gl_benchmark PRIVATE

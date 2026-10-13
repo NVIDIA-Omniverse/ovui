@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for menu_bar and __main__ modules — OvGear Step 9."""
 
@@ -279,6 +272,7 @@ class TestMenuBarProductIdentity:
     class _FakeUi:
         def __init__(self):
             self.events = []
+            self.labels = []
 
         def Spacer(self, **kwargs):
             self.events.append(("Spacer", None, kwargs))
@@ -294,6 +288,9 @@ class TestMenuBarProductIdentity:
 
         def Label(self, text, **kwargs):
             self.events.append(("Label", text, kwargs))
+            label = SimpleNamespace(text=text, **kwargs)
+            self.labels.append(label)
+            return label
 
         def Rectangle(self, **kwargs):
             self.events.append(("Rectangle", None, kwargs))
@@ -306,6 +303,7 @@ class TestMenuBarProductIdentity:
 
         def MenuItem(self, label, **kwargs):
             self.events.append(("MenuItem", label, kwargs))
+            return SimpleNamespace(set_checked_changed_fn=lambda fn: None)
 
         def Separator(self, **kwargs):
             self.events.append(("Separator", None, kwargs))
@@ -315,12 +313,14 @@ class TestMenuBarProductIdentity:
 
         fake_ui = self._FakeUi()
         sentinel_provider = object()
+        app = MagicMock()
+        app.window_title = "USD Viewer — /tmp/scene.usda"
         original_ui = mb.ui
         original_get_logo_provider = mb._get_logo_provider
         try:
             mb.ui = fake_ui
             mb._get_logo_provider = lambda: sentinel_provider
-            mb.build_menu_bar(MagicMock())
+            mb.build_menu_bar(app)
         finally:
             mb.ui = original_ui
             mb._get_logo_provider = original_get_logo_provider
@@ -346,6 +346,7 @@ class TestMenuBarProductIdentity:
         assert fake_ui.events[5][2]["height"] == mb._LOGO_BOTTOM_PADDING
         assert mb._LOGO_TOP_PADDING == mb._LOGO_BOTTOM_PADDING
         assert fake_ui.events[8][1] == mb.PRODUCT_LABEL
+        assert fake_ui.labels[0].text == mb.PRODUCT_LABEL
 
         top_level_menus = [
             label
@@ -547,6 +548,9 @@ class TestWindowMenuLayers:
                         "checked": checked,
                     }
 
+            def set_checked_changed_fn(self, fn):
+                self.checked_changed_fn = fn
+
         class FakeSeparator:
             def __init__(self, *a, **kw):
                 pass
@@ -655,6 +659,9 @@ class TestWindowMenuIncludesContentBrowser:
             def __init__(self, label, *a, **kw):
                 recorded_labels.append(label)
 
+            def set_checked_changed_fn(self, fn):
+                self.checked_changed_fn = fn
+
         class _FakeContext:
             def __init__(self, *a, **kw):
                 pass
@@ -706,6 +713,9 @@ class TestWindowMenuIncludesContentBrowser:
             def __init__(self, label, *a, **kw):
                 labels.append(label)
 
+            def set_checked_changed_fn(self, fn):
+                self.checked_changed_fn = fn
+
         class _FakeContext:
             def __init__(self, *a, **kw):
                 pass
@@ -736,10 +746,11 @@ class TestWindowMenuIncludesContentBrowser:
             mb.ui = original
             mb._get_logo_provider = original_logo
 
-        # Locate index of each window-menu label; Viewport must precede Content Browser.
+        # The core menu has no item between them: optional packages add
+        # their items through menu hooks only.
         vp_idx = labels.index("Viewport")
         cb_idx = labels.index("Content Browser")
-        assert cb_idx == vp_idx + 1
+        assert labels[vp_idx:cb_idx + 1] == ["Viewport", "Content Browser"]
 
     def test_content_browser_toggle_calls_toggle_window(self):
         """Clicking the Content Browser menu entry must flip the content
@@ -1530,6 +1541,9 @@ class TestFileMenuIncludesSaveItems:
                 if active_menu and active_menu[-1] == "File":
                     file_items.append({"label": label, **kw})
 
+            def set_checked_changed_fn(self, fn):
+                self.checked_changed_fn = fn
+
         fake_ui = types.SimpleNamespace(
             Menu=_FakeMenu,
             MenuBar=_FakeMenu,
@@ -1834,6 +1848,9 @@ class TestFileMenuContributions:
         class _FakeMenuItem:
             def __init__(self, label, *a, **kw):
                 menu_items.append({"path": tuple(active_menu), "label": label, **kw})
+
+            def set_checked_changed_fn(self, fn):
+                self.checked_changed_fn = fn
 
         fake_ui = types.SimpleNamespace(
             Menu=_FakeMenu,

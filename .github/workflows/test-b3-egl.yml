@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-License-Identifier: Apache-2.0
 #
 # B3 — pytest under headless EGL surfaceless (no GPU, no display server).
 # Runs the Python test suite against the EGL-backed standalone build using

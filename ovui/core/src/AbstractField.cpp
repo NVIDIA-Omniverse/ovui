@@ -1,17 +1,11 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Assert.h"
 #include "platform/Log.h"
+#include <cstring>
 #include <limits>
 #include <imgui/imgui.h>
 #include <imgui/imgui_internal.h>
@@ -314,35 +308,24 @@ int32_t AbstractField::_onInputTextActive(void* data)
             // We are here because ImGui::InputTextEx has the keyboard cursor in it and it ignores input data. The only
             // way to change the content is using ImGuiInputTextFlags_CallbackAlways.
 
-            // If we do `imGuiData->Buf = fieldData.m_textBuffer.data()`, ImGui's assertion is failed because ImGui expects
-            // the new data is written to the provided buffer. The buffer size should be good because when InputTextEx
-            // has keyboard cursor in it, it ignores buf, not buf_size. We passed the correct buf_size to InputTextEx
-            // and here we should have correct size.
-            OMNIUI_ASSERT(imGuiData->BufSize >= static_cast<int32_t>(fieldData.m_textBuffer.size()));
-
-            // Find actual string length in source buffer (up to null terminator)
+            // The new text must go into ImGui's edit buffer (imGuiData->Buf). That buffer was allocated when the field
+            // was activated, and BufSize reports the buf_size passed this frame, which grows with our text buffer and can
+            // exceed the allocation. Replace the text through DeleteChars/InsertChars: with CallbackResize, InsertChars
+            // grows the edit buffer as needed instead of writing past it.
             const char* src = fieldData.m_textBuffer.data();
-            const size_t maxSrcLen = fieldData.m_textBuffer.size();
-            const size_t maxDestLen = static_cast<size_t>(std::max(0, imGuiData->BufSize - 1)); // Reserve space for null terminator
+            const size_t srcLen = strnlen(src, fieldData.m_textBuffer.size());
 
-            size_t actualStrLen = 0;
-            while (actualStrLen < maxSrcLen && actualStrLen < maxDestLen && src[actualStrLen] != '\0')
-            {
-                actualStrLen++;
-            }
+            // InsertChars collapses the selection; keep the one the field had (e.g. select-all on focus).
+            const int32_t selectionStart = imGuiData->SelectionStart;
+            const int32_t selectionEnd = imGuiData->SelectionEnd;
 
-            // Copy only the actual string content (not garbage beyond null terminator)
-            for (size_t i = 0; i < actualStrLen; ++i)
-            {
-                imGuiData->Buf[i] = src[i];
-            }
-
-            // Null-terminate and set length
-            imGuiData->Buf[actualStrLen] = '\0';
-            imGuiData->BufTextLen = static_cast<int32_t>(actualStrLen);
+            imGuiData->DeleteChars(0, imGuiData->BufTextLen);
+            imGuiData->InsertChars(0, src, src + srcLen);
 
             imGuiData->BufDirty = true;
             imGuiData->CursorPos = imGuiData->BufTextLen;
+            imGuiData->SelectionStart = std::min(selectionStart, imGuiData->BufTextLen);
+            imGuiData->SelectionEnd = std::min(selectionEnd, imGuiData->BufTextLen);
             fieldData.m_forceContentChange = false;
         }
     }

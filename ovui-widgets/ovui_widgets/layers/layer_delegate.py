@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Cell delegate for the Layers ``ui.TreeView`` (LAYERS-PLAN Step 17-22).
 
@@ -160,6 +153,8 @@ def _chevron_provider(path: str) -> "ui.RasterImageProvider":
 RightClickCallback = Callable[[LayerItem, float, float], None]
 RowLeftClickCallback = Callable[[Any, int], None]
 ExpandToggleCallback = Callable[[Any, bool], None]
+NameHoverCallback = Callable[[LayerItem, bool, Any], None]
+ActionHoverCallback = Callable[[LayerItem, str, bool, Any], None]
 
 
 class LayerDelegate(ui.AbstractItemDelegate):
@@ -195,6 +190,8 @@ class LayerDelegate(ui.AbstractItemDelegate):
     # target.
     on_left_click: Optional[RowLeftClickCallback] = None
     on_toggle_expand: Optional[ExpandToggleCallback] = None
+    on_name_hover: Optional[NameHoverCallback] = None
+    on_action_hover: Optional[ActionHoverCallback] = None
 
     # Column IDs — kept symbolic so the cell dispatch reads as intent.
     # Mirrors LAYERS-WINDOW-ARCHITECTURE §20.5 one-to-one.
@@ -528,11 +525,18 @@ class LayerDelegate(ui.AbstractItemDelegate):
             return
         if not isinstance(item, LayerItem):
             return
+        name_hit_target: Any = None
         with ui.ZStack() as cell_stack:
             # Dispatch table matches LAYERS-WINDOW-ARCHITECTURE §20.5
             # column IDs.
             if column_id == self.COL_NAME:
-                self._build_name_widget(model, item)
+                with ui.Frame(
+                    width=ui.Fraction(1),
+                    height=ui.Pixel(16),
+                    horizontal_clipping=True,
+                ) as name_hit_target:
+                    self._build_name_widget(model, item)
+                name_hit_target.opaque_for_mouse_events = False
             elif column_id == self.COL_SAVE:
                 self._build_save_widget(model, item)
             elif column_id == self.COL_LOCAL_MUTE:
@@ -572,6 +576,14 @@ class LayerDelegate(ui.AbstractItemDelegate):
             controller = getattr(model, "drop_visual", None)
             if controller is not None and controller.rejection_reason:
                 cell_stack.tooltip = controller.rejection_reason
+        if name_hit_target is not None and self.on_name_hover is not None:
+            name_hover_cb = self.on_name_hover
+            name_hit_target.set_mouse_hovered_fn(
+                lambda hovered, _item=item, _cb=name_hover_cb,
+                _target=name_hit_target: _cb(
+                    _item, bool(hovered), _target
+                )
+            )
         # Step 38 — wire the per-cell right-click to the window-level
         # context menu. Attached to the outer ZStack (after the
         # ``with`` block so the handler binding reaches every cell,
@@ -614,6 +626,22 @@ class LayerDelegate(ui.AbstractItemDelegate):
             cell_stack.set_mouse_pressed_fn(
                 _on_cell_pressed
             )
+
+    def _bind_action_tooltip(
+        self,
+        item: LayerItem,
+        target: Any,
+        text: str,
+    ) -> None:
+        """Route a row action's hover to the window-owned tooltip popup."""
+
+        if self.on_action_hover is None:
+            return
+        action_hover_cb = self.on_action_hover
+        target.set_mouse_hovered_fn(
+            lambda hovered, _item=item, _text=text, _cb=action_hover_cb,
+            _target=target: _cb(_item, _text, bool(hovered), _target)
+        )
 
     # Specifier-code → 3-letter tag shown next to prim-spec rows
     # (Step 48). Kept as a class-level mapping so tests can assert
@@ -846,7 +874,7 @@ class LayerDelegate(ui.AbstractItemDelegate):
             text = ""
             role = ""
         icon_state = self._leading_icon_state(item)
-        with ui.HStack(spacing=4) as name_stack:
+        with ui.HStack(spacing=4):
             self._build_leading_icon(icon_state)
             # Step 27 — missing layers get a small red "X" badge slotted
             # between the leading icon and the label. The badge paints
@@ -861,14 +889,6 @@ class LayerDelegate(ui.AbstractItemDelegate):
                 style_type_name_override="Layers.NameLabel",
                 alignment=ui.Alignment.LEFT_CENTER,
             )
-        # Step 62 — row-level tooltip surfaces the full layer identifier
-        # so users can read the long path (pulled from
-        # :attr:`LayerItem.identifier`) even when the display name is
-        # truncated by the name column's width. Attaching on the
-        # HStack covers hover anywhere along the icon + label strip so
-        # the cue fires wherever the user lands in the cell.
-        name_stack.tooltip = item.identifier
-
     def _build_leading_icon(self, state: str) -> None:
         """Paint the name-column leading icon (Step 25).
 
@@ -992,9 +1012,10 @@ class LayerDelegate(ui.AbstractItemDelegate):
             display = item.display_name
         except Exception:
             display = ""
-        save_stack.tooltip = (
+        tooltip = (
             f"Save '{display}' to disk" if display else self.SAVE_TOOLTIP
         )
+        self._bind_action_tooltip(item, save_stack, tooltip)
 
         def _on_pressed(
             x: float,
@@ -1050,6 +1071,11 @@ class LayerDelegate(ui.AbstractItemDelegate):
         # ZStack centres the glyph inside the 24-px cell; the inner
         # HStack/VStack pair pins the primitive to the geometric centre
         # without letting ovui stretch a Circle/Rectangle to fill.
+        tooltip = (
+            self.LOCAL_MUTE_TOOLTIP_MUTED
+            if muted
+            else self.LOCAL_MUTE_TOOLTIP_UNMUTED
+        )
         with ui.ZStack() as stack:
             ui.Spacer()
             with ui.HStack():
@@ -1080,33 +1106,22 @@ class LayerDelegate(ui.AbstractItemDelegate):
                         )
                     ui.Spacer()
                 ui.Spacer()
-        # ``set_mouse_pressed_fn`` captures ``value_model`` via a
-        # default-arg closure so every row binds to its own model.
-        # Binding to the outer stack rather than the inner primitive
-        # means the user's 24-px cell — not just the 10-px glyph — is
-        # the clickable hit target, which matches the hover-highlight
-        # footprint applied by ``Layers.TreeView:hovered``.
-        def _on_mute_pressed(
-            x: float,
-            y: float,
-            btn: int,
-            mod: int,
+            hit_target = ui.InvisibleButton(
+                width=ui.Pixel(24),
+                height=ui.Pixel(16),
+            )
+
+        # The visual slit is only two pixels high in the muted state. Keep
+        # it purely decorative and put a real button over the complete
+        # 24-pixel column cell so mute and unmute share one stable target.
+        def _on_mute_clicked(
             vm: LocalMuteValueModel = value_model,
         ) -> None:
-            if btn != 0:
-                return
             current = vm.get_value_as_bool()
             vm.set_value(not current)
 
-        stack.set_mouse_pressed_fn(_on_mute_pressed)
-        # Step 62 — tooltip on the mute column. Phrases the gesture
-        # around the row's current state so the cue explains what the
-        # click will do, not just which column this is.
-        stack.tooltip = (
-            self.LOCAL_MUTE_TOOLTIP_MUTED
-            if muted
-            else self.LOCAL_MUTE_TOOLTIP_UNMUTED
-        )
+        hit_target.set_clicked_fn(_on_mute_clicked)
+        self._bind_action_tooltip(item, hit_target, tooltip)
 
     def _build_lock_widget(self, model: Any, item: LayerItem) -> None:
         """Column 6 — padlock indicator + click-to-toggle (Step 21).
@@ -1233,11 +1248,12 @@ class LayerDelegate(ui.AbstractItemDelegate):
             # otherwise the tip phrases the gesture around the row's
             # current locked / unlocked state.
             if item.is_read_only:
-                stack.tooltip = self.READONLY_OVERLAY_TOOLTIP
+                tooltip = self.READONLY_OVERLAY_TOOLTIP
             elif locked:
-                stack.tooltip = self.LOCK_TOOLTIP_LOCKED
+                tooltip = self.LOCK_TOOLTIP_LOCKED
             else:
-                stack.tooltip = self.LOCK_TOOLTIP_UNLOCKED
+                tooltip = self.LOCK_TOOLTIP_UNLOCKED
+            self._bind_action_tooltip(item, stack, tooltip)
 
     # ── Step 22 placeholder builders ─────────────────────────────────
 

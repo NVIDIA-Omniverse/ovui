@@ -1,19 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Native OVStage population coverage for every supported 0.1 Create action."""
 
 from __future__ import annotations
 
 import pytest
-from ovui_data_adapters.common import CreateRequest
+from ovui_data_adapters.common import CreateMaterialRequest, CreateRequest
 from ovui_data_adapters.ovstage.provider import (
     PROVIDER_ENTRY_POINT_VALUE,
     PROVIDER_NAME,
@@ -143,17 +136,15 @@ def test_atomic_material_create_and_bind_repopulates_existing_native_source(
     box_path = "/World/Hierarchy/GroupA/BoxA"
     try:
         adapter = create_stage_adapter(scene, UndoManager())
-        # The legacy core-materials API fails closed on the native adapter;
-        # atomic create-and-bind is a first-class native create action.
-        action = adapter.list_create_actions(selection_paths=(box_path,)).action(
-            "create.material.usd-preview-surface.bind"
-        )
-        assert action is not None and action.is_available
-        result = adapter.create_prim(
-            CreateRequest(
-                action.action_id,
+        catalog = adapter.list_core_materials(selection_paths=(box_path,))
+        material = catalog.material("core_material.usd_preview_surface")
+        assert material is not None and material.is_available and material.can_bind
+        result = adapter.create_and_bind_material(
+            CreateMaterialRequest(
+                material.material_id,
                 requested_name="NativeBoundPreview",
                 selection_paths=(box_path,),
+                bind_to_selection=True,
             )
         )
 
@@ -163,6 +154,6 @@ def test_atomic_material_create_and_bind_repopulates_existing_native_source(
             int(scene.current_ordinal),
             box_path,
             "material:binding",
-        ) == (result.primary_path,)
+        ) == (result.created_material_path,)
     finally:
         session.shutdown_scene()

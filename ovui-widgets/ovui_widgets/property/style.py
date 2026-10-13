@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Property Inspector domain-scoped styles (property inspector style behavior, §22.2).
 
@@ -60,10 +53,10 @@ PROPERTY_STYLES = {
     "Property.ComboBoxChevron": {
         "color": cl.text_secondary,
     },
-    # The design-review NO-GO rejects boxed/differently-coloured Property
-    # collapsible frames. Keep the built-in collapse behaviour but make the
-    # frame chrome disappear into the panel; hierarchy comes from the
-    # uppercase header, row rhythm, and surrounding spacing.
+    # The design reference rejects boxed/differently-coloured Property collapsible
+    # frames. Keep the built-in collapse behaviour but make the frame chrome
+    # disappear into the panel; hierarchy comes from the uppercase header,
+    # row rhythm, and surrounding spacing.
     "Property.GroupFrame:hovered": {
         "background_color": cl.background_primary,
         "secondary_color": cl.background_primary,
@@ -149,6 +142,7 @@ PROPERTY_STYLES = {
     "Property.ValueField": {
         "background_color": cl.background_value_field,
         "color": cl.text_value,
+        "background_selected_color": cl.field_text_selection,
         "secondary_color": cl.background_value_field,
         "font_size": fl.font_size_value,
         "border_radius": fl.radius_small,
@@ -181,6 +175,10 @@ PROPERTY_STYLES = {
     "Property.DropdownValueField": {
         "background_color": cl.background_value_field,
         "color": cl.text_value,
+        # Popup row highlight. Undefined, this fell through to the dark-tuned
+        # global ImGuiCol_Header, painting a near-black bar behind dark text in
+        # the light theme.
+        "selected_color": cl.menu_selection,
         "secondary_color": cl.background_value_field,
         "font_size": fl.font_size_value,
         "border_radius": fl.radius_small,

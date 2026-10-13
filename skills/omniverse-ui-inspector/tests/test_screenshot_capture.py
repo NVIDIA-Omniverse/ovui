@@ -1,18 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -357,4 +351,45 @@ def test_timed_out_request_scoped_capture_is_cancelled(tmp_path: Path) -> None:
     _advance_command(command, ui_native, None)
 
     assert ui_native.cancelled == [91]
-    assert command.result == {"success": False, "error": "screenshot command timed out"}
+    assert command.result == {
+        "success": False,
+        "error": "screenshot command timed out before it started; it was not run",
+    }
+
+
+def test_screenshot_waits_until_the_application_has_a_cpu_image(tmp_path: Path) -> None:
+    output = tmp_path / "prepared.png"
+    command = _Command("screenshot", {"path": str(output)}, 1.0)
+    ui_native = _ScreenshotUi()
+    # The application renders on its own cadence: the CPU image arrives after two UI frames.
+    needs_frame = [True, True, False]
+    application = SimpleNamespace(prepare_inspector_screenshot=lambda: needs_frame.pop(0))
+
+    _advance_screenshot(command, ui_native, application)
+    _advance_screenshot(command, ui_native, application)
+    assert not command.scheduled
+
+    _advance_screenshot(command, ui_native, application)
+    assert needs_frame == [] and command.scheduled
+
+
+def test_screenshot_schedules_at_once_when_nothing_needs_preparing(tmp_path: Path) -> None:
+    command = _Command("screenshot", {"path": str(tmp_path / "now.png")}, 1.0)
+    application = SimpleNamespace(prepare_inspector_screenshot=lambda: False)
+    _advance_screenshot(command, _ScreenshotUi(), application)
+    assert command.scheduled
+
+
+def test_checkpoint_waits_until_the_application_has_a_cpu_image(tmp_path: Path) -> None:
+    command = _Command("checkpoint", {"path": str(tmp_path / "checkpoint.png")}, 1.0)
+    needs_frame = [True, False]
+    application = SimpleNamespace(
+        prepare_inspector_screenshot=lambda: needs_frame.pop(0),
+        get_inspector_state=lambda: {"frame": 2 - len(needs_frame)},
+    )
+
+    _advance_checkpoint(command, _ScreenshotUi(), application)
+    assert not command.scheduled and "_checkpoint_state" not in command.payload
+
+    _advance_checkpoint(command, _ScreenshotUi(), application)
+    assert command.scheduled and command.payload["_checkpoint_state"] == {"frame": 2}

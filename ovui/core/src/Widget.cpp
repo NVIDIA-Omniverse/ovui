@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Assert.h"
@@ -30,9 +23,10 @@
 #include <omni/ui/ZStack.h>
 
 #include "WidgetData.h"
-#include "ImGuiKeyTranslation.h"
+#include "platform/IUiPlatform.h"
 
 #include <algorithm>
+#include <cfloat>
 #include <iterator>
 #include <unordered_set>
 
@@ -59,6 +53,9 @@ std::string Widget::normalizeIdentifier(const std::string& inStr)
 
 Widget::Widget(WidgetData* data ) : m_data(data ? data : new WidgetData)
 {
+    // The screen origin is a valid previous mouse position. Use an invalid position until the first observation.
+    m_data->m_mouseX = -FLT_MAX;
+
     // Recompute the style when it's changed.
     this->setParentChangedFn(std::bind(&This::cascadeStyle, this));
     this->setStyleChangedFn(std::bind(&This::cascadeStyle, this));
@@ -345,14 +342,15 @@ void Widget::draw(float elapsedTime)
             // PR7: ImGui 1.92.7 tightened IsItemHovered() checks:
             //  - AllowWhenOverlappedByItem: Our Dummy item (line 297) gets overlapped
             //    by _drawContent() items drawn on top of it each frame.
-            //  - AllowWhenOverlappedByWindow: The widget's Dummy lives in a child
-            //    window, but g.HoveredWindow may point to a parent/sibling window.
-            //    Without this flag, IsItemHovered returns false even when the mouse
-            //    is inside the Dummy rect, breaking all mouse callbacks.
-            m_data->m_isHovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem |
-                                                   ImGuiHoveredFlags_AllowWhenBlockedByPopup |
-                                                   ImGuiHoveredFlags_AllowWhenOverlappedByItem |
-                                                   ImGuiHoveredFlags_AllowWhenOverlappedByWindow);
+            //  - AllowWhenOverlappedByWindow: Only allow parent/sibling child
+            //    windows in the same root. Popups and unrelated windows must
+            //    still block mouse callbacks on the widgets underneath them.
+            ImGuiHoveredFlags hoverFlags = ImGuiHoveredFlags_AllowWhenBlockedByActiveItem |
+                                           ImGuiHoveredFlags_AllowWhenBlockedByPopup |
+                                           ImGuiHoveredFlags_AllowWhenOverlappedByItem;
+            if (ctx->HoveredWindow && ctx->HoveredWindow->RootWindow == window->RootWindow)
+                hoverFlags |= ImGuiHoveredFlags_AllowWhenOverlappedByWindow;
+            m_data->m_isHovered = ImGui::IsItemHovered(hoverFlags);
 
             m_data->m_isWindowHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup);
 
@@ -435,7 +433,7 @@ void Widget::draw(float elapsedTime)
                 // m_data->m_mouseMovedFn, it will definitely be the bottleneck in performance. However, sometimes we need to
                 // use m_data->m_mouseMovedFn for the drag and drop. That's why m_data->m_mouseMovedFn is called for the widgets the
                 // user starts dragging. This limits the number of callbacks and allows us to keep good performance.
-                if (this->hasMouseMovedFn() && (m_data->m_mouseX != 0.0f || m_data->m_mouseY != 0.0f) &&
+                if (this->hasMouseMovedFn() && m_data->m_mouseX != -FLT_MAX &&
                     (m_data->m_isHovered || this->isDragging()) && (m_data->m_isPressed[0] || m_data->m_isPressed[1] || m_data->m_isPressed[2]))
                 {
                     if (this->isOpaqueForMouseEvents())
@@ -515,8 +513,8 @@ void Widget::draw(float elapsedTime)
             // ImGui 1.87+ named keys live in [ImGuiKey_NamedKey_BEGIN, _END);
             // iterating 0..256 (the legacy native range) never fires because
             // IsKeyPressed((ImGuiKey)0..255) matches nothing with
-            // IMGUI_DISABLE_OBSOLETE_FUNCTIONS. Translate back to GLFW codes
-            // so Python callbacks stay on the historical code space.
+            // IMGUI_DISABLE_OBSOLETE_FUNCTIONS. The platform bridge maps named keys to the
+            // native code space expected by host callbacks.
             if (m_data->m_isHovered)
             {
                 for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k)
@@ -524,9 +522,10 @@ void Widget::draw(float elapsedTime)
                     ImGuiKey key = static_cast<ImGuiKey>(k);
                     if (ImGui::IsKeyPressed(key, false))
                     {
-                        int glfw = detail::imguiKeyToGlfwKey(key);
-                        if (glfw != 0)
-                            this->callKeyPressedFn(glfw, modifiers, true);
+                        auto* inputPlatform = PlatformRegistry::instance().platform();
+                        const int nativeKey = inputPlatform ? inputPlatform->nativeKeyCode(key) : 0;
+                        if (nativeKey != 0)
+                            this->callKeyPressedFn(nativeKey, modifiers, true);
                     }
                 }
                 for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k)
@@ -534,9 +533,10 @@ void Widget::draw(float elapsedTime)
                     ImGuiKey key = static_cast<ImGuiKey>(k);
                     if (ImGui::IsKeyReleased(key))
                     {
-                        int glfw = detail::imguiKeyToGlfwKey(key);
-                        if (glfw != 0)
-                            this->callKeyPressedFn(glfw, modifiers, false);
+                        auto* inputPlatform = PlatformRegistry::instance().platform();
+                        const int nativeKey = inputPlatform ? inputPlatform->nativeKeyCode(key) : 0;
+                        if (nativeKey != 0)
+                            this->callKeyPressedFn(nativeKey, modifiers, false);
                     }
                 }
             }
@@ -703,7 +703,7 @@ void Widget::draw(float elapsedTime)
                 ctx->MouseViewport->Size.y += cache_correction_y;
             }
 
-            ImGui::BeginTooltipEx(ImGuiWindowFlags_None, ImGuiTooltipFlags_OverridePrevious);
+            ImGui::BeginTooltipEx(ImGuiTooltipFlags_OverridePrevious, ImGuiWindowFlags_None);
             m_data->m_tooltipFrame->draw(elapsedTime);
             ImGui::EndTooltip();
 
@@ -806,7 +806,9 @@ void Widget::setComputedWidth(float width)
     {
         OMNIUI_PROFILE_VERBOSE_ZONE(
             "[%s] setComputedContentWidth '%s'", this->getTypeName().c_str(), this->getName().c_str());
+        m_data->m_widthEvaluated = false;
         this->setComputedContentWidth(width - margin);
+        m_data->m_widthEvaluated = true;
     }
 }
 
@@ -854,7 +856,9 @@ void Widget::setComputedHeight(float height)
     {
         OMNIUI_PROFILE_VERBOSE_ZONE(
             "[%s] setComputedContentHeight '%s'", this->getTypeName().c_str(), this->getName().c_str());
+        m_data->m_heightEvaluated = false;
         this->setComputedContentHeight(height - margin);
+        m_data->m_heightEvaluated = true;
     }
 }
 
@@ -1041,16 +1045,20 @@ void Widget::forceWidthDirty(SizeDirtyReason reason)
         return;
     }
 
-    if (m_data->m_dirtyWidth != SizeDirtyReason::eNone)
+    // A property change (including revealing a hidden child) must reach the
+    // parent even when this widget has an unevaluated child invalidation.
+    if (m_data->m_dirtyWidth != SizeDirtyReason::eNone && !m_data->m_widthEvaluated &&
+        reason != SizeDirtyReason::eSizeChanged)
     {
         return;
     }
 
+    m_data->m_widthEvaluated = false;
     auto parent = this->getParent();
-    // Guard: if the ImGui context has been destroyed (e.g. Python GC runs widget
-    // destructors after standalone shutdown), propagating dirty notifications up
-    // the widget tree would dereference a partially-destroyed parent and crash.
-    if (parent && ImGui::GetCurrentContext())
+    // Python edits also run between ImGui frames, when no context is current.
+    // The platform lifetime distinguishes that normal state from late GC after
+    // shutdown, when propagating to a partially destroyed parent is unsafe.
+    if (parent && PlatformRegistry::instance().platform())
     {
         parent->forceWidthDirty(SizeDirtyReason::eChildDirty);
     }
@@ -1066,14 +1074,16 @@ void Widget::forceHeightDirty(SizeDirtyReason reason)
         return;
     }
 
-    if (m_data->m_dirtyHeight != SizeDirtyReason::eNone)
+    if (m_data->m_dirtyHeight != SizeDirtyReason::eNone && !m_data->m_heightEvaluated &&
+        reason != SizeDirtyReason::eSizeChanged)
     {
         return;
     }
 
+    m_data->m_heightEvaluated = false;
     auto parent = this->getParent();
     // Guard: same as forceWidthDirty — skip parent propagation during shutdown.
-    if (parent && ImGui::GetCurrentContext())
+    if (parent && PlatformRegistry::instance().platform())
     {
         parent->forceHeightDirty(SizeDirtyReason::eChildDirty);
     }
@@ -1229,12 +1239,13 @@ bool Widget::_hasAcceptedDrop() const
 
 void Widget::_undirtyWidthAndHeight(bool force)
 {
-    // If the size is in pixels, it will not be changed even if the size of parent is changed.
-    if (m_data->m_dirtyWidth != SizeDirtyReason::eNone)
+    // Keep invalidations raised after layout (for example by an earlier sibling's draw callback).
+    // Size assignments remain dirty throughout layout so its later passes can readjust them.
+    if (force || m_data->m_widthEvaluated)
     {
         m_data->m_dirtyWidth = SizeDirtyReason::eNone;
     }
-    if (m_data->m_dirtyHeight != SizeDirtyReason::eNone)
+    if (force || m_data->m_heightEvaluated)
     {
         m_data->m_dirtyHeight = SizeDirtyReason::eNone;
     }

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Provider-owned ovstage scene lifecycle."""
 
@@ -16,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from importlib import import_module
+import math
 import os
 from pathlib import Path
 import struct
@@ -96,10 +90,6 @@ _KIT_INTERNAL_ATTRS = frozenset(
     {
         "_worldVisibility",
         "usd-prim-type",
-        # Public query/read exposes these Fabric/renderer bookkeeping columns,
-        # but they are not user scene properties for the common inspector.
-        "omni:fabric:resetXformStack",
-        "omni:rtx:skip",
     }
 )
 # numpy dtype kind -> DLPack type code (matches property_adapter's expectations).
@@ -118,6 +108,8 @@ def _kit_exposed_attr_name(stored_name: str) -> str | None:
     for common, fabric in _KIT_MATRIX_ALIASES.items():
         if stored_name == fabric:
             return common
+    if stored_name.startswith("omni:"):
+        return None
     return stored_name
 
 
@@ -180,11 +172,13 @@ class OvstageScene:
         source_path: str,
         initial_ordinal: int,
         root_paths: tuple[str, ...],
+        native_dirty_worker: Any = None,
     ) -> None:
         self._stage = stage
         self._source_path = source_path
         self._initial_ordinal = int(initial_ordinal)
         self._root_paths = tuple(str(path) for path in root_paths)
+        self._native_dirty_worker = native_dirty_worker
         self._change_stream = None
         self._hierarchy = None
         self._physics_controls = None
@@ -217,17 +211,44 @@ class OvstageScene:
         stage = self._stage
         if stage is None:
             return None
-        return int(stage.current_ordinal)
+        return _reconcile_native_write_floor(stage)
 
     @property
     def topology_revision(self) -> int:
-        """Monotonic revision for adapter-owned native topology changes."""
+        """Monotonic revision for local or polled hierarchy/type/schema changes."""
 
         return self._topology_revision
 
     @property
     def root_paths(self) -> tuple[str, ...]:
         return self._root_paths
+
+    @property
+    def native_stage(self) -> Any:
+        """Live caller-borrowed native Stage; invalid after scene shutdown."""
+
+        stage = self._stage
+        if stage is None or not self.is_open:
+            raise RuntimeError("the OVStage scene is closed")
+        return stage
+
+    def stored_render_settings(self) -> dict[str, Any]:
+        """The scene's stored ``customLayerData['renderSettings']``.
+
+        Read from the stage metadata that population put on ``/``, keyed as
+        Kit serializes them (``rtx:post:tonemap:op``). Empty when the scene
+        stores none or this ovstage cannot populate stage metadata.
+        """
+
+        from ovui_data_adapters.ovstage._native import read_path_attribute_records
+
+        records = read_path_attribute_records(self.native_stage, "/")
+        prefix = STORED_RENDER_SETTINGS_PREFIX
+        return {
+            name[len(prefix):]: record.value
+            for name, record in records.items()
+            if name.startswith(prefix) and len(name) > len(prefix)
+        }
 
     @property
     def is_open(self) -> bool:
@@ -697,6 +718,36 @@ class OvstageScene:
 
         self._attached_renderers.add(renderer)
 
+    def profile_ovui_call(
+        self,
+        function_name: str,
+        function: Any,
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run a call inside the attached renderer's OVUI development scope."""
+
+        for renderer in tuple(self._attached_renderers):
+            start_scope = getattr(
+                renderer,
+                "start_ovui_performance_scope",
+                None,
+            )
+            end_scope = getattr(
+                renderer,
+                "end_ovui_performance_scope",
+                None,
+            )
+            if not callable(start_scope) or not callable(end_scope):
+                continue
+            metric_uid = start_scope(function_name)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                end_scope(metric_uid)
+        return function(*args, **kwargs)
+
     @property
     def presentation_root_paths(self) -> tuple[str, ...]:
         """Private population prefixes still composed into this scene."""
@@ -785,9 +836,13 @@ def open_scene_from_file(
     *,
     runtime: LoadedRuntimes,
     path: str | os.PathLike[str],
+    population_domains: int | None = None,
+    native_dirty_worker: Any = None,
 ) -> OvstageScene:
-    """Create an ovstage scene and populate it from a scene file."""
-    scene_path = str(Path(path).expanduser().resolve())
+    """Create an ovstage scene from a local path or HTTP(S) identifier."""
+    scene_path = str(path)
+    if not scene_path.lower().startswith(("http://", "https://")):
+        scene_path = str(Path(scene_path).expanduser().resolve())
     stage_module = runtime.module("ovstage")
     population_module = _load_population_module(stage_module)
     stage = None
@@ -801,13 +856,23 @@ def open_scene_from_file(
         _install_frame_lifecycle_compat(stage)
         ordinal = int(stage.begin_frame())
         frame_open = True
-        _populate_from_file(population_module, stage, scene_path, ordinal)
+        _populate_from_file(
+            population_module,
+            stage,
+            scene_path,
+            ordinal,
+            population_domains=population_domains,
+        )
         # Mark the frame consumed before calling end_frame: the compatibility
         # implementation releases its frame lock in a finally block even when
         # advancing the public write floor raises, so a second end attempt would
         # be both incorrect and potentially non-idempotent.
         frame_open = False
         stage.end_frame(ordinal)
+        if _is_kit_stage_api(stage) or _has_kit_stage_bridge(stage):
+            stage._ovui_hierarchy_child_paths_ordinal = int(
+                getattr(stage, "current_ordinal", ordinal)
+            )
         root_paths = _root_paths_from_stage(stage)
     except Exception as exc:
         cleanup_errors: list[tuple[str, BaseException]] = []
@@ -832,6 +897,7 @@ def open_scene_from_file(
         source_path=scene_path,
         initial_ordinal=ordinal,
         root_paths=root_paths,
+        native_dirty_worker=native_dirty_worker,
     )
 
 
@@ -861,7 +927,39 @@ def _populate_from_file(
     stage: Any,
     scene_path: str,
     ordinal: int,
+    *,
+    population_domains: int | None = None,
 ) -> None:
+    if _populate_with_stage_metadata(
+        population_module,
+        stage,
+        scene_path,
+        ordinal,
+        population_domains=population_domains,
+    ):
+        return
+    if population_domains is not None:
+        domains = int(population_domains)
+        open_usd_async = getattr(population_module, "open_usd_async", None)
+        if callable(open_usd_async):
+            wait_operation(
+                open_usd_async(
+                    stage,
+                    scene_path,
+                    ordinal,
+                    domains=domains,
+                )
+            )
+            return
+        open_usd = getattr(population_module, "open_usd", None)
+        if callable(open_usd):
+            open_usd(stage, scene_path, ordinal, domains=domains)
+            return
+        raise RuntimeError(
+            "explicit population domains require ovstage population "
+            "open_usd_async or open_usd"
+        )
+
     populate_from_file_async = getattr(
         population_module,
         "populate_from_file_async",
@@ -883,6 +981,51 @@ def _populate_from_file(
         open_usd(stage, scene_path, ordinal)
         return
     raise RuntimeError("ovstage population module exposes no supported open function")
+
+
+#: Stage metadata populated onto the root prim ``/`` with the scene. A scene
+#: saved by Kit stores its render settings here, and Kit applies them when it
+#: opens the scene. ovstage publishes each value as
+#: ``usd-metadata:customLayerData:renderSettings:<key>``.
+POPULATED_STAGE_METADATA_PATHS: tuple[str, ...] = ("customLayerData:renderSettings",)
+STORED_RENDER_SETTINGS_PREFIX = "usd-metadata:customLayerData:renderSettings:"
+
+
+def _populate_with_stage_metadata(
+    population_module: ModuleType,
+    stage: Any,
+    scene_path: str,
+    ordinal: int,
+    *,
+    population_domains: int | None = None,
+) -> bool:
+    """Populate through a description that also asks for the stage metadata.
+
+    A description carrying only ``domains`` is exactly ``open_usd``, so the
+    domains stay the ones the plain call would use. Returns ``False`` without
+    touching the stage when this ovstage has no description API.
+    """
+
+    desc_type = getattr(population_module, "Desc", None)
+    open_with_desc = getattr(population_module, "open_usd_with_desc_async", None)
+    descs_available = getattr(population_module, "descs_available", None)
+    domain_type = getattr(population_module, "PopulationDomain", None)
+    if not (callable(desc_type) and callable(open_with_desc)):
+        return False
+    if callable(descs_available) and not descs_available():
+        return False
+    if population_domains is not None:
+        domains = int(population_domains)
+    elif domain_type is not None and hasattr(domain_type, "RENDERING"):
+        domains = int(domain_type.RENDERING)
+    else:
+        return False
+    desc = desc_type(
+        domains=domains,
+        stage_metadata_paths=POPULATED_STAGE_METADATA_PATHS,
+    )
+    wait_operation(open_with_desc(stage, scene_path, ordinal, math.nan, [desc]))
+    return True
 
 
 def _release_scene_resource(resource: Any, label: str) -> None:
@@ -932,6 +1075,9 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
     """Add v1-style frame helpers when running against ovstage api_v2."""
     update_write_floor = getattr(stage, "update_write_floor", None)
     advance_write_floor = getattr(stage, "advance_write_floor", None)
+    render_flow_mode = os.environ.get(
+        "OMNIUI_RENDER_FLOW_MODE", "nativePacing"
+    )
 
     if not hasattr(stage, "current_ordinal"):
         stage.current_ordinal = 0
@@ -946,6 +1092,15 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
             frame_lock = self._ovui_frame_lock
             frame_lock.acquire()
             try:
+                before_publication = None
+                if render_flow_mode == "nativePacing":
+                    before_publication = getattr(
+                        self,
+                        "_ovui_before_frame_publication",
+                        None,
+                    )
+                    if callable(before_publication):
+                        before_publication()
                 current = int(getattr(self, "current_ordinal", 0) or 0)
                 write_floor = _native_write_floor(self)
                 ordinal = max(
@@ -955,25 +1110,49 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
                     write_floor + 1,
                 )
                 self._ovui_next_ordinal = ordinal
+                if render_flow_mode == "nativePacing":
+                    snapshots = getattr(
+                        self,
+                        "_ovui_frame_path_metadata_snapshots",
+                        None,
+                    )
+                    if not isinstance(snapshots, dict):
+                        snapshots = {}
+                        self._ovui_frame_path_metadata_snapshots = snapshots
+                    snapshots[ordinal] = _snapshot_recorded_path_metadata(self)
                 return ordinal
             except BaseException:
                 frame_lock.release()
                 raise
 
         stage.begin_frame = MethodType(begin_frame, stage)
+        # The attached-stage frame-pacing adapter may install a pre-frame
+        # ownership callback only when this exact compatibility wrapper is
+        # the sequencer that invokes it. Native/foreign begin_frame variants
+        # fail closed until they provide an equivalent handoff seam.
+        if render_flow_mode == "nativePacing":
+            stage._ovui_before_frame_publication_supported = True
 
     if not callable(getattr(stage, "abort_frame", None)) and hasattr(
         stage,
         "_ovui_frame_lock",
     ):
         def abort_frame(self: Any, ordinal: int) -> None:
-            del ordinal
-            frame_lock = getattr(self, "_ovui_frame_lock", None)
-            if frame_lock is not None:
-                try:
-                    frame_lock.release()
-                except RuntimeError:
-                    pass
+            try:
+                if render_flow_mode == "nativePacing":
+                    snapshot = _pop_recorded_path_metadata_snapshot(
+                        self,
+                        int(ordinal),
+                    )
+                    if snapshot is not None:
+                        _restore_recorded_path_metadata(self, snapshot)
+            finally:
+                frame_lock = getattr(self, "_ovui_frame_lock", None)
+                if frame_lock is not None:
+                    try:
+                        frame_lock.release()
+                    except RuntimeError:
+                        pass
 
         stage.abort_frame = MethodType(abort_frame, stage)
 
@@ -982,6 +1161,7 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
     ):
         def end_frame(self: Any, ordinal: int) -> None:
             ordinal = int(ordinal)
+            committed = False
             try:
                 update = getattr(self, "update_write_floor", None)
                 if callable(update):
@@ -992,6 +1172,7 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
                     wait = getattr(op, "wait", None)
                     if callable(wait):
                         wait()
+                committed = True
                 try:
                     self.current_ordinal = max(
                         ordinal,
@@ -1000,6 +1181,10 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
                 except AttributeError:
                     pass
             finally:
+                if render_flow_mode == "nativePacing":
+                    snapshot = _pop_recorded_path_metadata_snapshot(self, ordinal)
+                    if not committed and snapshot is not None:
+                        _restore_recorded_path_metadata(self, snapshot)
                 frame_lock = getattr(self, "_ovui_frame_lock", None)
                 if frame_lock is not None:
                     try:
@@ -1022,6 +1207,7 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
                 tuple((prim_path, str(prim_type)) for prim_path in prim_paths),
                 ordinal=int(ordinal),
             )
+            _ensure_recorded_path_metadata_snapshot(self, int(ordinal))
             _record_created_paths(
                 self,
                 tuple((prim_path, str(prim_type)) for prim_path in prim_paths),
@@ -1041,6 +1227,7 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
                 tuple(str(path) for path in paths),
                 ordinal=int(ordinal),
             )
+            _ensure_recorded_path_metadata_snapshot(self, int(ordinal))
             _record_deleted_paths(self, tuple(str(path) for path in paths))
 
         stage.delete_prims = MethodType(delete_prims, stage)
@@ -1050,7 +1237,11 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
             return _native_child_paths(self, parent_path)
 
         stage.get_child_paths = MethodType(get_child_paths, stage)
-        stage._ovui_get_child_paths_source = "native query(parent_in)"
+        stage._ovui_get_child_paths_source = (
+            "native hierarchy(children)/query(usd-parent)"
+            if _is_kit_stage_api(stage)
+            else "native query(parent_in)"
+        )
 
     if not callable(getattr(stage, "get_parent_path", None)):
         def get_parent_path(self: Any, path: str) -> str:
@@ -1066,7 +1257,7 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
     if not callable(getattr(stage, "get_topology_version", None)):
         def get_topology_version(self: Any) -> int:
             try:
-                return int(getattr(self, "current_ordinal"))
+                return _reconcile_native_write_floor(self)
             except Exception:
                 return 0
 
@@ -1105,6 +1296,14 @@ def _native_write_floor(stage: Any) -> int:
                     wait()
             except Exception:
                 pass
+
+
+def _reconcile_native_write_floor(stage: Any) -> int:
+    current = int(getattr(stage, "current_ordinal", 0) or 0)
+    committed = max(current, _native_write_floor(stage))
+    if committed > current:
+        stage.current_ordinal = committed
+    return committed
 
 
 def _native_child_paths(stage: Any, parent_path: str) -> tuple[str, ...]:
@@ -1269,12 +1468,31 @@ class _KitStageBridgeCache:
     ) -> None:
         self.ordinal = int(ordinal)
         self.path_order = path_order
+        self._path_set = frozenset(self.path_order)
         self.attrs = attrs
         self.types = types
         # (path, exposed_attr_name) -> DLPack (code, bits, lanes). Only attrs we
         # can describe are present, so query_prims / read_column stay aligned
         # with what the Property Inspector can actually decode.
         self.dtypes = dtypes or {}
+        attribute_names_by_path: dict[str, list[str]] = defaultdict(list)
+        for path, name in self.dtypes:
+            attribute_names_by_path[path].append(name)
+        self._attribute_names_by_path = {
+            path: tuple(sorted(names))
+            for path, names in attribute_names_by_path.items()
+        }
+        child_paths_by_parent: dict[str, list[str]] = defaultdict(list)
+        for raw_path in self.path_order:
+            path = str(raw_path).rstrip("/")
+            if not path.startswith("/") or path == "/":
+                continue
+            parent = path.rsplit("/", 1)[0] or "/"
+            child_paths_by_parent[parent].append(path)
+        self._child_paths_by_parent = {
+            parent: tuple(sorted(dict.fromkeys(paths)))
+            for parent, paths in child_paths_by_parent.items()
+        }
         # Required to distinguish ordinary uint64 columns from token,
         # relationship-path, and connection-path identifier columns.
         self.semantics = semantics or {}
@@ -1295,8 +1513,15 @@ class _KitStageBridgeCache:
         return self._handles.get(int(handle), ())
 
     def attribute_names_for_path(self, path: str) -> tuple[str, ...]:
-        names = sorted(name for (p, name) in self.dtypes if p == path)
-        return tuple(names)
+        return self._attribute_names_by_path.get(path, ())
+
+    def child_paths_for_parent(self, parent_path: str) -> tuple[str, ...]:
+        parent = str(parent_path or "").rstrip("/") or "/"
+        return tuple(
+            path
+            for path in self._child_paths_by_parent.get(parent, ())
+            if _is_user_scene_path(path)
+        )
 
     def column_dtype(self, handle: int, attr_name: str) -> tuple[int, int, int] | None:
         for path in self.paths_for_handle(handle):
@@ -1383,12 +1608,228 @@ class _KitStageBridgeCache:
         }
 
 
+class _KitTopologySnapshot:
+    def __init__(
+        self,
+        ordinal: int,
+        path_order: tuple[str, ...],
+        *,
+        readable: bool = True,
+    ) -> None:
+        self.ordinal = int(ordinal)
+        # ``False`` means no whole-stage surface answered, so ``path_order``
+        # is the last topology that did read rather than this ordinal's.
+        # Consumers must not mistake it for a stage that became empty.
+        self.readable = bool(readable)
+        self.path_order = tuple(path_order)
+        self._path_set = frozenset(self.path_order)
+        children: dict[str, list[str]] = defaultdict(list)
+        for path in self.path_order:
+            parent = path.rsplit("/", 1)[0] or "/"
+            children[parent].append(path)
+        self._children = {
+            parent: tuple(sorted(dict.fromkeys(paths)))
+            for parent, paths in children.items()
+        }
+
+    def child_paths_for_parent(self, parent: str) -> tuple[str, ...]:
+        return self._children.get(str(parent).rstrip("/") or "/", ())
+
+
+@dataclass(frozen=True)
+class _KitTypeRecordsSnapshot:
+    ordinal: int
+    records: dict[str, tuple[str, tuple[str, ...]]]
+
+
+def _kit_topology_snapshot(stage: Any, ordinal: int) -> _KitTopologySnapshot:
+    cached = getattr(stage, "_ovui_kit_topology_snapshot", None)
+    if isinstance(cached, _KitTopologySnapshot) and cached.ordinal == int(ordinal):
+        return cached
+    # This ordinal has already been probed and no whole-stage surface answered.
+    # Probing again for every consumer repeats that same failed whole-stage
+    # read once per expanded parent — thousands of times for one tree — so hand
+    # back what the failed probe concluded.  The poll owns the retry and drops
+    # this held result before asking again.
+    held = getattr(stage, "_ovui_kit_topology_unreadable", None)
+    if isinstance(held, _KitTopologySnapshot) and held.ordinal == int(ordinal):
+        return held
+
+    ovstage_module = import_module("ovstage")
+    path_dictionary_type = getattr(ovstage_module, "PathDictionary")
+    ordinal_range_type = getattr(ovstage_module, "OrdinalRange")
+    query = None
+    read = None
+    path_order: list[str] = []
+    seen_paths: set[str] = set()
+    with path_dictionary_type(stage) as paths:
+        path_token = paths.intern_token("usd-path")
+        try:
+            query = stage.query(None, [path_token])
+            wait_operation(query)
+            read = stage.read_attributes(
+                query,
+                [path_token],
+                ordinal_range_type.latest(int(ordinal)),
+            )
+            wait_operation(read)
+            while True:
+                group = stage.fetch_read_next(read)
+                if group is None:
+                    break
+                try:
+                    group_paths = tuple(
+                        str(path)
+                        for path in paths.get_path_strings(group.prim_list)
+                    )
+                    _remember_paths(path_order, seen_paths, group_paths)
+                finally:
+                    try:
+                        stage.release_group(group)
+                    except Exception:
+                        pass
+        finally:
+            if read is not None:
+                try:
+                    release_read = getattr(read, "release", None)
+                    if callable(release_read):
+                        wait_operation(release_read())
+                    else:
+                        wait_operation(stage.release_read(read))
+                except Exception:
+                    pass
+            if query is not None:
+                try:
+                    release_query = getattr(query, "release", None)
+                    if callable(release_query):
+                        wait_operation(release_query())
+                    else:
+                        wait_operation(stage.release_query(query))
+                except Exception:
+                    pass
+
+    if not path_order:
+        # OVStage 0.1 builds before 0.1.0.346039 advertise ``usd-path`` on the
+        # unfiltered query but materialize no rows for it, so an empty read is
+        # not proof of an empty stage.  At the population ordinal the native
+        # hierarchy walk is both authoritative and cheap, and unlike any
+        # attribute column it also reports typeless, attributeless prims.
+        # Past that ordinal it no longer reflects committed edits, so the
+        # bridge cache — this adapter's pre-``usd-path`` topology source — is
+        # the only remaining whole-stage authority.
+        walked = None
+        if int(ordinal) == int(
+            getattr(stage, "_ovui_hierarchy_child_paths_ordinal", -1)
+        ):
+            walked = _hierarchy_kit_path_order(stage, int(ordinal))
+        if walked is None:
+            walked = list(_kit_stage_cache(stage, int(ordinal)).path_order)
+        if not walked:
+            # An empty whole-stage read is only an empty stage if the
+            # hierarchy surface agrees.  It tracks deletions, so it reports no
+            # root once the prims really are gone; a root it still reports
+            # (or no answer at all) means a source is down, not that the
+            # stage emptied.  Publishing that would cache "no prims" as the
+            # authoritative topology, so consumers would report every prim
+            # removed and nothing would re-read at this ordinal.  Carry the
+            # last topology that did read, marked unreadable and left
+            # unpublished, so the Stage keeps its hierarchy and this ordinal
+            # is retried.
+            roots = _hierarchy_kit_child_paths(stage, "/", int(ordinal))
+            if roots is None or roots:
+                # The per-parent filter is a different query and can answer
+                # while this one does not, so ask it once about a parent the
+                # hierarchy just said has children.  Saying nothing about a
+                # populated parent is the one reading that means the surface
+                # itself is down; anything else leaves it serving every parent.
+                # Only the poll reaches this point, so this is one read per
+                # poll, and it is retaken there rather than held for an ordinal.
+                stage._ovui_kit_parent_filter_silent_ordinal = (
+                    int(ordinal)
+                    if roots and not _filtered_kit_child_paths(stage, "/", int(ordinal))
+                    else -1
+                )
+                published = getattr(stage, "_ovui_kit_topology_snapshot", None)
+                unreadable = _KitTopologySnapshot(
+                    int(ordinal),
+                    published.path_order
+                    if isinstance(published, _KitTopologySnapshot)
+                    else (),
+                    readable=False,
+                )
+                stage._ovui_kit_topology_unreadable = unreadable
+                return unreadable
+        path_order = walked
+
+    snapshot = _KitTopologySnapshot(
+        int(ordinal),
+        tuple(path for path in path_order if _is_user_scene_path(path)),
+    )
+    stage._ovui_kit_topology_snapshot = snapshot
+    stage._ovui_kit_topology_unreadable = None
+    stage._ovui_kit_child_paths_cache = None
+    return snapshot
+
+
+def _kit_type_records(
+    stage: Any,
+    ordinal: int,
+) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Copy only hierarchy type/schema metadata from a Kit OVStage."""
+
+    cached = getattr(stage, "_ovui_kit_type_records_snapshot", None)
+    if isinstance(cached, _KitTypeRecordsSnapshot) and cached.ordinal == int(ordinal):
+        return dict(cached.records)
+
+    ovstage_module = import_module("ovstage")
+    path_dictionary_type = getattr(ovstage_module, "PathDictionary")
+    ordinal_range_type = getattr(ovstage_module, "OrdinalRange")
+    attrs: dict[tuple[str, str], bytes] = {}
+    path_order: list[str] = []
+    seen_paths: set[str] = set()
+    with path_dictionary_type(stage) as paths:
+        attr_tokens = {
+            name: paths.intern_token(name)
+            for name in ("usd-path", "usd-prim-type", "usd-schemas")
+        }
+        _merge_kit_read_groups(
+            stage,
+            paths,
+            attr_tokens=list(attr_tokens.values()),
+            ordinal_range=ordinal_range_type.latest(int(ordinal)),
+            attrs=attrs,
+            dtypes={},
+            semantics={},
+            arrays={},
+            path_order=path_order,
+            seen_paths=seen_paths,
+        )
+        types = _copy_kit_prim_types(paths, path_order, attrs)
+        schemas = _copy_kit_applied_schemas(paths, path_order, attrs)
+
+    records = {
+        path: (types.get(path, ""), schemas.get(path, ()))
+        for path in path_order
+        if _is_user_scene_path(path)
+    }
+    stage._ovui_kit_type_records_snapshot = _KitTypeRecordsSnapshot(
+        int(ordinal),
+        records,
+    )
+    return dict(records)
+
+
 def _kit_stage_cache(stage: Any, ordinal: int) -> _KitStageBridgeCache:
     cache = getattr(stage, "_ovui_kit_stage_bridge_cache", None)
     if isinstance(cache, _KitStageBridgeCache) and cache.ordinal == int(ordinal):
         return cache
     cache = _build_kit_stage_cache(stage, int(ordinal))
-    stage._ovui_kit_stage_bridge_cache = cache
+    # A build that found no prim is either an empty stage or a read that did
+    # not answer, and the two are indistinguishable here.  Memoizing it would
+    # make the second reading stick for the whole ordinal, so only a cache
+    # that actually saw the stage is kept.
+    if cache.path_order:
+        stage._ovui_kit_stage_bridge_cache = cache
     return cache
 
 
@@ -1404,12 +1845,19 @@ def _merge_kit_read_groups(
     arrays: dict[tuple[str, str], bool],
     path_order: list[str],
     seen_paths: set[str],
+    prim_paths: tuple[str, ...] | None = None,
 ) -> None:
     """Merge one public OVStage query/read pass into the bridge cache."""
 
-    query = stage.query(None, attr_tokens)
+    path_list = None
+    query = None
     read = None
     try:
+        if prim_paths is None:
+            query = stage.query(None, attr_tokens)
+        else:
+            path_list = paths.create_path_list_from_strings(prim_paths)
+            query = stage.query_from_path_list(path_list)
         wait_operation(query)
         read = stage.read_attributes(query, attr_tokens, ordinal_range)
         wait_operation(read)
@@ -1447,20 +1895,24 @@ def _merge_kit_read_groups(
                 )
             except Exception:
                 pass
-        release_query = getattr(query, "release", None)
-        if callable(release_query):
+        if query is not None:
+            release_query = getattr(query, "release", None)
             try:
-                wait_operation(release_query())
+                if callable(release_query):
+                    wait_operation(release_query())
+                else:
+                    wait_operation(stage.release_query(query))
             except Exception:
                 pass
-        else:
-            try:
-                wait_operation(stage.release_query(query))
-            except Exception:
-                pass
+        if path_list is not None:
+            paths.destroy_path_list(path_list)
 
 
-def _build_kit_stage_cache(stage: Any, ordinal: int) -> _KitStageBridgeCache:
+def _build_kit_stage_cache(
+    stage: Any,
+    ordinal: int,
+    prim_paths: tuple[str, ...] | None = None,
+) -> _KitStageBridgeCache:
     ovstage_module = import_module("ovstage")
     path_dictionary_type = getattr(ovstage_module, "PathDictionary")
     ordinal_range_type = getattr(ovstage_module, "OrdinalRange")
@@ -1470,41 +1922,24 @@ def _build_kit_stage_cache(stage: Any, ordinal: int) -> _KitStageBridgeCache:
     arrays: dict[tuple[str, str], bool] = {}
     path_order: list[str] = []
     seen_paths: set[str] = set()
-    requested_attr_names = _requested_kit_attr_names(stage)
+    # Read selected prims one at a time: one path-list read over prims with
+    # different attribute sets can return no values for any of them.
+    path_groups = (
+        [None] if prim_paths is None else [(path,) for path in prim_paths]
+    )
 
     native_types: dict[str, str] = {}
     with path_dictionary_type(stage) as paths:
-        attr_tokens = {
-            name: paths.intern_token(name)
-            for name in requested_attr_names
-        }
         ordinal_range = ordinal_range_type.latest(ordinal)
-        _merge_kit_read_groups(
-            stage,
-            paths,
-            attr_tokens=list(attr_tokens.values()),
-            ordinal_range=ordinal_range,
-            attrs=attrs,
-            dtypes=dtypes,
-            semantics=semantics,
-            arrays=arrays,
-            path_order=path_order,
-            seen_paths=seen_paths,
-        )
-
-        # Kit OVStage 0.1 can omit eRelationship groups when
-        # ``material:binding`` shares one read with the bridge's broad value
-        # set, even though the same public query/read succeeds when the
-        # relationship is the only requested attribute. Merge that narrow
-        # pass unconditionally: it covers every bound prim and harmlessly
-        # replaces identical cache entries when a runtime returns the group in
-        # both reads.
-        material_binding_token = attr_tokens.get("material:binding")
-        if material_binding_token is not None:
+        for group_paths in path_groups:
+            attr_tokens = {
+                name: paths.intern_token(name)
+                for name in _requested_kit_attr_names(stage, group_paths)
+            }
             _merge_kit_read_groups(
                 stage,
                 paths,
-                attr_tokens=[material_binding_token],
+                attr_tokens=list(attr_tokens.values()),
                 ordinal_range=ordinal_range,
                 attrs=attrs,
                 dtypes=dtypes,
@@ -1512,11 +1947,40 @@ def _build_kit_stage_cache(stage: Any, ordinal: int) -> _KitStageBridgeCache:
                 arrays=arrays,
                 path_order=path_order,
                 seen_paths=seen_paths,
+                prim_paths=group_paths,
             )
+
+            # Kit OVStage 0.1 can omit eRelationship groups when
+            # ``material:binding`` shares one read with the bridge's broad
+            # value set, even though the same public query/read succeeds when
+            # the relationship is the only requested attribute. Merge that
+            # narrow pass unconditionally: it covers every bound prim and
+            # harmlessly replaces identical cache entries when a runtime
+            # returns the group in both reads.
+            material_binding_token = attr_tokens.get("material:binding")
+            if material_binding_token is not None:
+                _merge_kit_read_groups(
+                    stage,
+                    paths,
+                    attr_tokens=[material_binding_token],
+                    ordinal_range=ordinal_range,
+                    attrs=attrs,
+                    dtypes=dtypes,
+                    semantics=semantics,
+                    arrays=arrays,
+                    path_order=path_order,
+                    seen_paths=seen_paths,
+                    prim_paths=group_paths,
+                )
 
         native_types = _copy_kit_prim_types(paths, path_order, attrs)
 
-    visible_paths = tuple(path for path in path_order if _is_user_scene_path(path))
+    selected_paths = None if prim_paths is None else frozenset(prim_paths)
+    visible_paths = tuple(
+        path for path in path_order
+        if _is_user_scene_path(path)
+        and (selected_paths is None or path in selected_paths)
+    )
     types = {path: native_types.get(path, "") for path in visible_paths}
     visible_dtypes = {
         key: dtype for key, dtype in dtypes.items() if _is_user_scene_path(key[0])
@@ -1542,8 +2006,14 @@ def _build_kit_stage_cache(stage: Any, ordinal: int) -> _KitStageBridgeCache:
     )
 
 
-def _requested_kit_attr_names(stage: Any) -> tuple[str, ...]:
-    discovered = _discover_kit_attr_names(stage)
+def _requested_kit_attr_names(
+    stage: Any, prim_paths: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    discovered = (
+        _discover_kit_attr_names(stage)
+        if prim_paths is None
+        else _discover_kit_attr_names(stage, prim_paths)
+    )
     names = list(_KIT_ATTR_NAMES)
     for name in discovered:
         if name not in names:
@@ -1576,11 +2046,46 @@ def _copy_kit_prim_types(
     return result
 
 
-def _discover_kit_attr_names(stage: Any) -> tuple[str, ...]:
+def _copy_kit_applied_schemas(
+    paths: Any,
+    path_order: Iterable[str],
+    attrs: dict[tuple[str, str], bytes],
+) -> dict[str, tuple[str, ...]]:
+    """Copy public ``usd-schemas`` token arrays to Python-owned strings."""
+
+    result: dict[str, tuple[str, ...]] = {}
+    for path in path_order:
+        payload = attrs.get((path, "usd-schemas"), b"")
+        if not payload or len(payload) % 8:
+            continue
+        schemas: list[str] = []
+        for token_id in struct.unpack(f"<{len(payload) // 8}Q", payload):
+            if token_id == 0:
+                continue
+            try:
+                schema = str(paths.token_to_string(token_id))
+            except Exception:
+                continue
+            if schema and schema not in schemas:
+                schemas.append(schema)
+        if schemas:
+            result[path] = tuple(schemas)
+    return result
+
+
+def _discover_kit_attr_names(
+    stage: Any, prim_paths: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
     path_dictionary_type = getattr(import_module("ovstage"), "PathDictionary")
     with path_dictionary_type(stage) as paths:
-        query = stage.query(None, None)
+        path_list = None
+        query = None
         try:
+            if prim_paths is None:
+                query = stage.query(None, None)
+            else:
+                path_list = paths.create_path_list_from_strings(prim_paths)
+                query = stage.query_from_path_list(path_list)
             wait_operation(query)
             result = query.result()
             return tuple(
@@ -1594,6 +2099,8 @@ def _discover_kit_attr_names(stage: Any) -> tuple[str, ...]:
                     wait_operation(release_query())
                 except Exception:
                     pass
+            if path_list is not None:
+                paths.destroy_path_list(path_list)
 
 
 def _remember_paths(
@@ -1818,25 +2325,281 @@ def _kit_type_matches(type_name: str, required: set[str]) -> bool:
     return usd_name in required
 
 
-def _kit_child_paths(stage: Any, parent_path: str) -> tuple[str, ...]:
-    cache = _kit_stage_cache(stage, int(getattr(stage, "current_ordinal", 0)))
-    parent = str(parent_path or "").rstrip("/")
-    if parent == "/":
-        parent = ""
-    prefix = f"{parent}/" if parent else "/"
-    children: list[str] = []
+def _hierarchy_kit_child_paths(
+    stage: Any,
+    parent_path: str,
+    ordinal: int,
+) -> tuple[str, ...] | None:
+    """Read direct children through OVStage's native hierarchy API."""
+
+    ovstage_module = import_module("ovstage")
+    relation_type = getattr(ovstage_module, "HierarchyRelation", None)
+    path_dictionary_type = getattr(ovstage_module, "PathDictionary", None)
+    get_hierarchy = getattr(stage, "get_hierarchy", None)
+    if (
+        relation_type is None
+        or path_dictionary_type is None
+        or not callable(get_hierarchy)
+    ):
+        return None
+
+    parent = str(parent_path or "").rstrip("/") or "/"
+    with path_dictionary_type(stage) as paths:
+        path_list = paths.create_path_list_from_strings([parent])
+        try:
+            result = get_hierarchy(
+                path_list,
+                int(ordinal),
+                relation_type.CHILDREN,
+            )
+            items = tuple(getattr(result, "items", ()))
+            if len(items) != 1 or not bool(getattr(items[0], "ok", False)):
+                return None
+
+            children: list[str] = []
+            for raw_path in getattr(items[0], "paths", ()):
+                if isinstance(raw_path, str):
+                    value = raw_path
+                else:
+                    value = str(paths.path_to_string(int(raw_path)))
+                if _is_user_scene_path(value):
+                    children.append(value)
+            return tuple(sorted(dict.fromkeys(children)))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        finally:
+            paths.destroy_path_list(path_list)
+
+
+def _hierarchy_kit_path_order(stage: Any, ordinal: int) -> list[str] | None:
+    """Enumerate the whole stage through OVStage's native hierarchy API.
+
+    ``None`` means at least one read did not answer, so the walk is unusable.
+    That is distinct from a childless parent and from a stage with no user
+    prims, which both report an empty child tuple.  A partial walk is never
+    returned: it would hide the unread subtree behind a complete-looking
+    result that the caller would then publish as authoritative.
+    """
+
+    root_children = _hierarchy_kit_child_paths(stage, "/", ordinal)
+    if root_children is None:
+        return None
+
+    path_order: list[str] = []
     seen: set[str] = set()
-    for path in cache.path_order:
-        if not path.startswith(prefix):
-            continue
-        rest = path[len(prefix):]
-        if not rest or "/" in rest:
-            continue
+    pending = list(root_children)
+    while pending:
+        path = pending.pop(0)
         if path in seen:
             continue
         seen.add(path)
-        children.append(path)
+        path_order.append(path)
+        children = _hierarchy_kit_child_paths(stage, path, ordinal)
+        if children is None:
+            return None
+        pending.extend(children)
+    return path_order
+
+
+def _filtered_kit_child_paths(
+    stage: Any,
+    parent_path: str,
+    ordinal: int,
+) -> tuple[str, ...] | None:
+    """Read direct children through OVStage's native ``usd-parent`` filter."""
+
+    ovstage_module = import_module("ovstage")
+    filter_type = getattr(ovstage_module, "Filter", None)
+    filter_op_type = getattr(ovstage_module, "FilterOp", None)
+    ordinal_range_type = getattr(ovstage_module, "OrdinalRange", None)
+    path_dictionary_type = getattr(ovstage_module, "PathDictionary", None)
+    predicate_type = getattr(ovstage_module, "Predicate", None)
+    if not all(
+        value is not None
+        for value in (
+            filter_type,
+            filter_op_type,
+            ordinal_range_type,
+            path_dictionary_type,
+            predicate_type,
+        )
+    ):
+        return None
+
+    parent = str(parent_path or "").rstrip("/") or "/"
+    query = None
+    read = None
+    children: list[str] = []
+    with path_dictionary_type(stage) as paths:
+        path_token = paths.intern_token("usd-path")
+        filter_value = filter_type(
+            [predicate_type("usd-parent", filter_op_type.IN, [parent])]
+        )
+        try:
+            query = stage.query(filter_value, [path_token])
+            wait_operation(query)
+            read = stage.read_attributes(
+                query,
+                [path_token],
+                ordinal_range_type.latest(int(ordinal)),
+            )
+            wait_operation(read)
+            while True:
+                group = stage.fetch_read_next(read)
+                if group is None:
+                    break
+                try:
+                    children.extend(
+                        str(path)
+                        for path in paths.get_path_strings(group.prim_list)
+                        if _is_user_scene_path(str(path))
+                    )
+                finally:
+                    try:
+                        stage.release_group(group)
+                    except Exception:
+                        pass
+        finally:
+            if read is not None:
+                try:
+                    release_read = getattr(read, "release", None)
+                    if callable(release_read):
+                        wait_operation(release_read())
+                    else:
+                        wait_operation(stage.release_read(read))
+                except Exception:
+                    pass
+            if query is not None:
+                try:
+                    release_query = getattr(query, "release", None)
+                    if callable(release_query):
+                        wait_operation(release_query())
+                    else:
+                        wait_operation(stage.release_query(query))
+                except Exception:
+                    pass
+    return tuple(sorted(dict.fromkeys(children)))
+
+
+def _merge_authored_kit_child_paths(
+    stage: Any,
+    parent_path: str,
+    native_children: Iterable[str],
+    *,
+    authoritative_paths: frozenset[str] | None = None,
+) -> tuple[str, ...]:
+    """Overlay adapter-authored children missing from OVStage 0.1 metadata."""
+
+    parent = str(parent_path or "").rstrip("/") or "/"
+    children = {
+        str(path)
+        for path in native_children
+        if _is_user_scene_path(str(path))
+    }
+    authored_types = getattr(stage, "_ovui_authored_prim_types", None)
+    if isinstance(authored_types, dict):
+        for raw_path in authored_types:
+            path = str(raw_path)
+            authored_parent = path.rsplit("/", 1)[0] or "/"
+            if (
+                authored_parent == parent
+                and _is_user_scene_path(path)
+                and (
+                    authoritative_paths is None
+                    or path in authoritative_paths
+                )
+            ):
+                children.add(path)
     return tuple(sorted(children))
+
+
+def _kit_child_paths(stage: Any, parent_path: str) -> tuple[str, ...]:
+    # The poll/topology-version boundary owns native-floor reconciliation.
+    # Parent expansion must remain a cache lookup, not a blocking floor read.
+    ordinal = int(getattr(stage, "current_ordinal", 0) or 0)
+    parent = str(parent_path or "").rstrip("/")
+    topology = getattr(stage, "_ovui_kit_topology_snapshot", None)
+    bridge_cache = getattr(stage, "_ovui_kit_stage_bridge_cache", None)
+    child_cache = getattr(stage, "_ovui_kit_child_paths_cache", None)
+    if not (
+        isinstance(child_cache, tuple)
+        and len(child_cache) == 2
+        and child_cache[0] == ordinal
+        and isinstance(child_cache[1], dict)
+    ):
+        child_cache = (ordinal, {})
+        stage._ovui_kit_child_paths_cache = child_cache
+
+    if isinstance(topology, _KitTopologySnapshot) and topology.ordinal == ordinal:
+        result = _merge_authored_kit_child_paths(
+            stage,
+            parent,
+            topology.child_paths_for_parent(parent),
+            authoritative_paths=topology._path_set,
+        )
+        child_cache[1][parent] = result
+        return result
+
+    if (
+        isinstance(bridge_cache, _KitStageBridgeCache)
+        and bridge_cache.ordinal == ordinal
+    ):
+        result = _merge_authored_kit_child_paths(
+            stage,
+            parent,
+            bridge_cache.child_paths_for_parent(parent),
+            authoritative_paths=bridge_cache._path_set,
+        )
+        child_cache[1][parent] = result
+        return result
+
+    if parent in child_cache[1]:
+        return child_cache[1][parent]
+
+    hierarchy_ordinal = int(
+        getattr(stage, "_ovui_hierarchy_child_paths_ordinal", ordinal)
+    )
+    native_lookups = (
+        (_hierarchy_kit_child_paths, _filtered_kit_child_paths)
+        if ordinal == hierarchy_ordinal
+        else (_filtered_kit_child_paths, _hierarchy_kit_child_paths)
+    )
+    if int(getattr(stage, "_ovui_kit_parent_filter_silent_ordinal", -1)) == ordinal:
+        # The poll found this surface saying nothing about a parent that has
+        # children, so asking it here would repeat that failed read once per
+        # row of the tree, and settle at the same held topology the loop below
+        # falls through to anyway.  The poll retakes that reading, so a surface
+        # that comes back is used again without waiting for anything else.
+        native_lookups = ()
+    for lookup in native_lookups:
+        native_children = lookup(stage, parent, ordinal)
+        if native_children is None:
+            continue
+        if not native_children:
+            # An OVStage 0.1 build that does not implement this native surface
+            # answers successfully with zero rows, which is indistinguishable
+            # from a genuinely childless parent.  Neither reading is proof, so
+            # settle it against the whole-stage snapshot rather than publishing
+            # an empty hierarchy or trusting the other lookup, which this
+            # ordinal ordering already ranks lower.
+            break
+        result = _merge_authored_kit_child_paths(
+            stage,
+            parent,
+            native_children,
+        )
+        child_cache[1][parent] = result
+        return result
+
+    # Publishing the snapshot clears the per-parent cache, so do not memoize
+    # here: the next expansion takes the snapshot branch above and caches there.
+    topology = _kit_topology_snapshot(stage, ordinal)
+    return _merge_authored_kit_child_paths(
+        stage,
+        parent,
+        topology.child_paths_for_parent(parent),
+        authoritative_paths=topology._path_set,
+    )
 
 
 def _native_path_exists(stage: Any, path: str) -> bool:
@@ -1939,18 +2702,80 @@ def _record_created_paths(
         births[path] = int(ordinal)
 
 
+def _snapshot_recorded_path_metadata(
+    stage: Any,
+) -> tuple[dict[str, str] | None, dict[str, int] | None]:
+    authored_types = getattr(stage, "_ovui_authored_prim_types", None)
+    births = getattr(stage, "_ovui_path_birth_ordinals", None)
+    return (
+        dict(authored_types) if isinstance(authored_types, dict) else None,
+        dict(births) if isinstance(births, dict) else None,
+    )
+
+
+def _ensure_recorded_path_metadata_snapshot(stage: Any, ordinal: int) -> None:
+    """Capture topology metadata only before its first mutation in a frame."""
+
+    snapshots = getattr(stage, "_ovui_frame_path_metadata_snapshots", None)
+    if not isinstance(snapshots, dict):
+        snapshots = {}
+        stage._ovui_frame_path_metadata_snapshots = snapshots
+    key = int(ordinal)
+    if key not in snapshots:
+        snapshots[key] = _snapshot_recorded_path_metadata(stage)
+
+
+def _pop_recorded_path_metadata_snapshot(
+    stage: Any,
+    ordinal: int,
+) -> tuple[dict[str, str] | None, dict[str, int] | None] | None:
+    snapshots = getattr(stage, "_ovui_frame_path_metadata_snapshots", None)
+    if not isinstance(snapshots, dict):
+        return None
+    return snapshots.pop(int(ordinal), None)
+
+
+def _restore_recorded_path_metadata(
+    stage: Any,
+    snapshot: tuple[dict[str, str] | None, dict[str, int] | None],
+) -> None:
+    for attribute_name, saved in zip(
+        ("_ovui_authored_prim_types", "_ovui_path_birth_ordinals"),
+        snapshot,
+        strict=True,
+    ):
+        current = getattr(stage, attribute_name, None)
+        if isinstance(current, dict):
+            current.clear()
+            if saved is not None:
+                current.update(saved)
+        elif saved is not None:
+            setattr(stage, attribute_name, dict(saved))
+
+
 def _record_deleted_paths(stage: Any, paths: Iterable[str]) -> None:
-    roots = tuple(dict.fromkeys(str(path) for path in paths))
+    roots = frozenset(str(path) for path in paths)
+    if not roots:
+        return
     authored_types = getattr(stage, "_ovui_authored_prim_types", None)
     births = getattr(stage, "_ovui_path_birth_ordinals", None)
     for mapping in (authored_types, births):
         if not isinstance(mapping, dict):
             continue
         for existing in tuple(mapping):
-            if any(
-                existing == root or existing.startswith(root + "/")
-                for root in roots
-            ):
+            # A hash lookup for each syntactic ancestor preserves root-subtree
+            # deletion without comparing every metadata key to every root.
+            candidate = str(existing)
+            remove = candidate in roots
+            while not remove:
+                separator = candidate.rfind("/")
+                if separator <= 0:
+                    break
+                candidate = candidate[:separator]
+                remove = candidate in roots
+            if not remove and "" in roots and str(existing).startswith("/"):
+                remove = True
+            if remove:
                 mapping.pop(existing, None)
 
 

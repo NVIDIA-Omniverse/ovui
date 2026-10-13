@@ -10,7 +10,22 @@ GET /status
 ```
 
 Both return JSON with `status`, `version`, `app_attached`, `queue_depth`,
-`state_enabled`, `execute_enabled`, and recent error fields.
+`state_enabled`, `execute_enabled`, and recent error fields. `last_error` is the
+most recent failed request (any client, including readiness polls) and
+`last_error_at` its wall-clock time; neither affects `status`.
+
+## Errors and timeouts
+
+A failed request returns HTTP 400 with `detail` as one line
+(`ExceptionType: message`) and, for commands that report coded errors, an
+`errors` list. The traceback is written to the application's
+log; only `/execute` returns it (as `traceback`), since it describes the caller's
+own code. A request
+that times out says whether the frame loop had started it: "timed out before
+the ovui frame loop started it; it was not run", or "timed out after it
+started; it may still complete". A timed-out drag, click or combo releases any
+button or key it pressed. Input endpoints (`/mouse/*`, `/keyboard/*`) accept `?timeout=` like `/commands`;
+the CLI input verbs take `--timeout`.
 
 ## Read-only application state
 
@@ -25,57 +40,14 @@ geometry, so do not enable it for an ordinary Inspector session.
 
 The state request is marshalled onto the ovui frame loop and calls the attached
 application's `get_inspector_state()` method. It returns a JSON-safe snapshot
-under the `state` key. The USD Viewer snapshot includes the selected paths,
-undo/redo edge, renderer ownership data, the active provider's scene state
-(native OVStage for the `ovstage` provider; the `usd` section carries data
-only when the OpenUSD provider is selected), the provider-neutral adapter and
-UI views, and an explicit consistency (`parity`) result across the views that
-exist.
-
-The `parity` object identifies its authority explicitly:
-
-- `parity.baseline` names the authoritative scene view the adapter/UI
-  hierarchy was compared against — `"usd"` when the USD view is available,
-  `"ovstage"` for a native-only session, or `null` when no authoritative view
-  exists.
-- `parity.comparable` is `false` — and `parity.ok` is always `false`, with
-  `parity.indeterminate_reason` set — when neither view exists; parity is
-  indeterminate, never affirmed. Any adapter/UI hierarchy present in that
-  state is surfaced in `parity.unverified_adapter_paths` instead of being
-  silently discarded.
-- `parity.adapter_matches_baseline` is the provider-neutral comparison result
-  that feeds `parity.ok`.
-- `parity.topology` compares the adapter/UI hierarchy against the
-  authoritative baseline: with `baseline: "usd"`, prim types and user-child
-  ordering are checked against the USD view (and against the native view when
-  one also exists); with `baseline: "ovstage"`, adapter prim types and child
-  ordering — including the pseudo-root's ordered top-level children, captured
-  through the native root query convention — are checked against the native
-  scene's own records for every shared path, so equal-path type drift,
-  child-order drift, and root-order drift fail rather than passing vacuously.
-  In native mode the result also carries the child-enumeration authority
-  state: `topology.child_topology_available` is `false` and
-  `topology.authority_errors` lists the exact failures when native child
-  enumeration is absent, throws, returns malformed/non-iterable output, or
-  yields semantically invalid child paths (relative, empty, root,
-  non-canonical, wrong direct parent, or duplicates — including mixed
-  valid/invalid lists), and `topology.matches` (and therefore `parity.ok`)
-  is then always `false` — enumeration failure is never converted into an
-  empty child list, and enumerated children unknown to the adapter surface
-  as drift rather than being discarded. User-facing versus provider-owned
-  native content is decided by the production OVStage adapter's own
-  scene-specific ownership rule (scene-registered presentation roots plus
-  the authored-`/Render` exception, exposed in
-  `topology`-adjacent `child_topology.presentation_roots` and per-prim
-  `user_facing` flags): renderer-owned presentation content hidden by the
-  adapter is not drift, while user-facing content — including user-authored
-  `/Render` — missing from the adapter is. Mismatch records name the
-  baseline side (`usd` or `ovstage`) next to the `adapter` side.
-- **Deprecated:** `parity.adapter_matches_usd` and
-  `parity.ovstage_matches_expected_usd` keep their original USD-baseline
-  meaning and are `null` (not applicable) whenever no USD view exists — for
-  example for the native `ovstage` provider. Consumers must not treat `null`
-  as a match; migrate to `parity.baseline` + `parity.adapter_matches_baseline`.
+under the `state` key. The inspector does not define that payload: the
+application does, and the snapshot's shape therefore belongs to the
+application's own documentation. The USD Viewer snapshot is described in
+`omniverse-ui-widgets/references/inspector-commands.md`, including the
+`state.provider` name, the per-provider scene sections, and the `parity`
+object's authority model (`parity.baseline`,
+`parity.adapter_matches_baseline`, `parity.topology`, and the deprecated
+USD-baseline fields).
 
 This endpoint is read-only;
 it must not replace mouse or keyboard actions in a QA scenario. A workflow
@@ -203,3 +175,19 @@ POST /shutdown
 `/execute` is disabled unless the app was launched with
 `OVUIINSPECT_ENABLE_EXECUTE=1`. The namespace exposes `app` and `application` as
 the attached `Application` instance.
+
+## Contributed application commands
+
+```text
+GET /commands
+POST /commands/{name}?timeout=30
+```
+
+The catalog provides descriptions and JSON argument schemas for the current app.
+POST a direct JSON arguments object; success returns `success` and `result`.
+CLI equivalents are `ovui-inspect commands` and `ovui-inspect call NAME
+--arguments JSON`. These endpoints use the same queue as existing input,
+screenshot and execute requests. They are available only for commands the host
+explicitly registers. See [application-commands.md](application-commands.md) for
+registration, async handlers, cancellation, shared viewport commands and the
+optional persistent namespace/result extension to `/execute`.

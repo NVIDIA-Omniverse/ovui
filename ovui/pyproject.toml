@@ -1,16 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
-requires = ["setuptools>=68.0", "wheel", "cmake>=3.22", "pybind11>=2.11", "conan>=2.14", "cyclonedx-python-lib>=5.0.0,<6"]
+requires = ["setuptools>=84.0.0", "wheel", "cmake>=3.22", "pybind11==2.11.1", "conan>=2.14", "cyclonedx-python-lib>=5.0.0,<6"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui"
-# readme is dynamic: the PyPI long description is the repository root
-# README.md (the product overview), not ovui/README.md (the in-repo
-# framework guide). setup.py supplies it — see _read_long_description().
-dynamic = ["version", "readme"]
+dynamic = ["version"]
 description = "ovui — GPU-accelerated Python UI toolkit"
+readme = "README.md"
 requires-python = ">=3.12"
-license = {text = "NVIDIA Proprietary"}
+license = {text = "Apache-2.0"}
 authors = [
     {name = "NVIDIA Corporation"},
 ]
@@ -26,7 +27,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/NVIDIA-Omniverse/ovui"
+# Homepage = "${OVUI_PROJECT_URL}"  # filled in by the release staging filter
 
 [project.scripts]
 ovui-skill = "ovui_agent_skills:main"

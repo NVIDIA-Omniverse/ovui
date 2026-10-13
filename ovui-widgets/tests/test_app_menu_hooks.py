@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for optional app menu contributions."""
 
@@ -344,3 +337,52 @@ def test_menu_hooks_stay_generic_and_backend_free():
     assert "CreateAction" not in source
     assert "prim_kind" not in source
     assert "Usd" not in source
+
+
+def test_menu_registration_ownership_is_identity_bound():
+    """same-ID foreign contributions are rejected,
+    and a stale handle no-ops on an independent replacement."""
+    import pytest
+
+    app = object()
+    registry = AppMenuRegistry(app)
+    original = AppMenuContribution(
+        id="tools.export", label="Export", parent_path=("Tools",)
+    )
+    handle = registry.add(original)
+
+    foreign = AppMenuContribution(
+        id="tools.export", label="Foreign Export", parent_path=("Tools",)
+    )
+    with pytest.raises(ValueError, match="already registered"):
+        registry.add(foreign)
+
+    # Original removed, independent replacement installed: the stale
+    # handle no-ops and the replacement survives.
+    assert registry.remove("tools.export") is True
+    registry.add(foreign)
+    assert handle.remove() is False
+    assert registry.remove_if_matches("tools.export", original) is False
+    assert registry.remove_if_matches("tools.export", foreign) is True
+
+
+def test_menu_handle_is_generation_bound_across_same_object_readd():
+    """removing and re-adding the very same contribution
+    starts a new generation; the stale handle no-ops on it."""
+    registry = AppMenuRegistry(object())
+    contribution = AppMenuContribution(
+        id="tools.gen", label="Gen", parent_path=("Tools",)
+    )
+    stale = registry.add(contribution)
+    assert registry.remove("tools.gen") is True
+    fresh = registry.add(contribution)
+
+    assert stale.remove() is False
+    assert "tools.gen" in registry._entries
+    assert fresh.remove() is True
+    assert "tools.gen" not in registry._entries
+    # A second handle for the same live generation shares its token.
+    first = registry.add(contribution)
+    second = registry.add(contribution)
+    assert second.remove() is True
+    assert first.remove() is False

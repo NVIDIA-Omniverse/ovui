@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Per-target render-cadence helper.
 
@@ -52,19 +45,30 @@ class FrameClock:
     turns a 60 FPS target into a steady 50 FPS cadence. Preserving the
     scheduled phase lets the clock alternate 10/20 ms gaps as needed and
     settle around the requested rate.
+
+    Every ``now`` passed to :meth:`should_render` and :meth:`commit` must come
+    from ``time.perf_counter``; the gate silently misbehaves if callers mix
+    clocks.
     """
 
-    def __init__(self, target_fps: float = 60.0) -> None:
-        self._target_fps = float(target_fps)
+    def __init__(self, target_fps: Optional[float] = None) -> None:
+        self._target_fps = self._normalize_target(target_fps)
         self._last_committed_time: Optional[float] = None
         self._next_due_time: Optional[float] = None
+
+    @staticmethod
+    def _normalize_target(value: Optional[float]) -> float:
+        if value is None:
+            return 0.0
+        value = float(value)
+        return value if math.isfinite(value) and value > 0.0 else 0.0
 
     @property
     def target_fps(self) -> float:
         return self._target_fps
 
     @target_fps.setter
-    def target_fps(self, value: float) -> None:
+    def target_fps(self, value: Optional[float]) -> None:
         """Change the cadence target, re-anchoring the pending deadline.
 
         A live cap change must affect the very next scheduling decision:
@@ -73,7 +77,7 @@ class FrameClock:
         lowering it lengthens the current wait — the old period's deadline
         is never honored after the change.
         """
-        value = float(value)
+        value = self._normalize_target(value)
         if value == self._target_fps:
             return
         self._target_fps = value

@@ -27,8 +27,8 @@ the result but do not prove that the target was discoverable in the image. For
 strict screenshot-first proof, choose every target from the latest screenshot
 and use application state only after the action for semantic verification.
 
-The application interpreter must have both component distributions installed,
-not merely their source directories on `PYTHONPATH`:
+The application interpreter must have the native component distribution installed,
+not merely its source directory on `PYTHONPATH`:
 
 ```bash
 "$OVUI_INSPECTOR_APP_PYTHON" -m pip install -e \
@@ -39,7 +39,10 @@ That distribution registers `ovstage_physics_controls`. The harness fails as
 soon as the first real frame is ready if the entry point is absent or a
 component failed to load.
 
-Required environment variables are portable paths, never host-specific values:
+This source-build workflow requires access to the Kit source checkout
+(`omniverse-kit`) and its rendering projects. An installed Kit runtime alone
+does not provide the paths below. Required environment variables use portable
+placeholder paths:
 
 ```bash
 export REPO_ROOT=/path/to/ovui

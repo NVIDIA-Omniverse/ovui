@@ -1,25 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-widgets-app"
-dynamic = ["version"]
+license = {text = "Apache-2.0"}
+# Dependencies are in setup.py: first-party packages are pinned to VERSION.md.
+dynamic = ["version", "dependencies"]
 description = "ovui-widgets core: Application, ABCs, style, settings, dialogs, undo, selection"
-readme = "README.md"
+readme = {content-type = "text/markdown", text = """
+# ovui-widgets-app
+
+Runnable USD Viewer application package for ovui-widgets. It owns application
+startup, menu and status chrome, settings, recent files, theme application,
+selection, undo, frame timing, file open routing, and the wiring that connects
+the Stage Browser, Layers panel, Content Browser, Property Inspector, Viewport,
+and data adapters.
+
+Console scripts include `ovui-widgets`, `ovui-widgets-headless`, and compatibility
+aliases for the former `ovgear` entry points.
+"""}
 requires-python = ">=3.10"
-dependencies = [
-    "ovui>=0.1.0",
-    "ovui-widgets-common[testing]>=0.1.0",
-    "ovui-widgets-stage>=0.1.0",
-    "ovui-widgets-layers>=0.1.0",
-    "ovui-widgets-content>=0.1.0",
-    "ovui-widgets-property>=0.1.0",
-    "ovui-widgets-viewport>=0.1.0",
-    "ovui-data-adapters-common>=0.1.0",
-]
 
 [project.optional-dependencies]
+media = ["ovstream", "imageio-ffmpeg>=0.6", "numpy>=1.26"]
 # dev: ovui_widgets.app.testing/mock_backend.py has a hard import from
 # ovui_widgets.content.backends — install ovui-widgets-content before running tests
 # that use MockBackend.

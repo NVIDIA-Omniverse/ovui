@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for Step 29, Step 60 and Step 5.2: PropertyWindow filter, debounce,
 and the :class:`UiDisplayGroup`-driven nested-frame build pipeline."""
@@ -384,7 +377,7 @@ class TestPropertyWindowDebounce:
     def test_debounce_delay_is_150ms(self, reset_app):
         import time
         w = _make_headless()
-        before = time.monotonic()
+        before = time.perf_counter()
         w._on_filter_changed(_make_model_mock("tr"))
         delay = w._pending_filter_handle._due_time - before
         assert abs(delay - 0.15) < 0.05

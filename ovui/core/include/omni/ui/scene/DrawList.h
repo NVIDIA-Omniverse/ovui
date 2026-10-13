@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -78,6 +71,10 @@ public:
                         const void* const* textures = nullptr,
                         const void* const* resources = nullptr);
 
+    void addAntialiasedPolygonLines(const Vector3* points, const Color4* colors, const float* thicknesses,
+                                   const uint32_t* vertexIndices, const uint32_t* vertexCounts,
+                                   const uint32_t* flags, size_t vertexCountSize, float antialiasingWidth);
+
     void addPolygonMesh(const Vector3* points,
                         const Color4* colors,
                         const uint32_t* vertexIndices,
@@ -86,6 +83,8 @@ public:
                         const Vector2* uvs = nullptr,
                         const void* const* textures = nullptr,
                         const void* const* resources = nullptr);
+    void addHeadlightPolygonMesh(const Vector3* points, const Color4* colors, const Vector3* normals,
+                                const uint32_t* indices, const uint32_t* counts, size_t countSize);
 
     void addPoints(const Vector4* positions, const Color4* colors, const float* sizes, size_t pointCount);
     void addPoints(const Vector4* positions, const Color4& color, float size, size_t pointCount);
@@ -116,6 +115,7 @@ public:
     void setDrawBufferCacheState(DrawBufferIndex& drawBufferIndex);
 
 private:
+    friend class Scene;
     size_t _getBufferIndex(DrawBuffer::BufferType bufferType);
 
     std::vector<DrawBufferIndex> m_currentBufferStack;

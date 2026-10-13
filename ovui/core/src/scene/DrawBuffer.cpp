@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/platform/Assert.h>
@@ -121,6 +114,23 @@ static DrawBuffer::DirtyBits _hashIt(size_t& hash, std::vector<T> const& vectorT
     return 0;
 }
 
+namespace
+{
+struct LineRasterData : DrawBuffer::Lines
+{
+    std::vector<float> antialiasingWidths;
+    size_t antialiasingWidthsHash = 0;
+};
+
+// Private storage preserves the published Polys ABI. A zero w denotes an
+// ordinary unlit vertex when shaded and unshaded meshes share a draw buffer.
+struct PolygonLightingData : DrawBuffer::Polys
+{
+    std::vector<Vector4> normals;
+    size_t normalsHash = 0;
+};
+}
+
 DrawBuffer::DrawBuffer() = default;
 
 DrawBuffer::DrawBuffer(DrawBuffer&&) = default;
@@ -161,6 +171,7 @@ void DrawBuffer::beginFrame()
         buffer->m_vertexCounts.clear();
         buffer->m_vertexIndices.clear();
         buffer->m_flags.clear();
+        static_cast<LineRasterData*>(buffer)->antialiasingWidths.clear();
     }
     break;
     case BufferType::ePolys:
@@ -169,6 +180,7 @@ void DrawBuffer::beginFrame()
         buffer->m_vertexCounts.clear();
         buffer->m_vertexIndices.clear();
         buffer->m_uvs.clear();
+        static_cast<PolygonLightingData*>(buffer)->normals.clear();
         buffer->m_resources.clear();
         buffer->m_textures.clear();
     }
@@ -267,16 +279,17 @@ void DrawBuffer::addPolygonLines(const Vector3* points,
 
     uint32_t firstIndex = static_cast<uint32_t>(buffer->m_positions.size());
 
-    std::transform(points, points + pointSize, std::back_inserter(buffer->m_positions), [](const Vector3& a) {
+    buffer->m_positions.resize(buffer->m_positions.size() + pointSize);
+    std::transform(points, points + pointSize, buffer->m_positions.begin() + firstIndex, [](const Vector3& a) {
         return Vector4{ a, 1.0 };
     });
-    std::copy(colors, colors + vertexIndexSize, std::back_inserter(buffer->m_colors));
-    std::copy(thicknesses, thicknesses + vertexIndexSize, std::back_inserter(buffer->m_thicknesses));
-    std::copy(vertexCounts, vertexCounts + vertexCountSize, std::back_inserter(buffer->m_vertexCounts));
+    buffer->m_colors.insert(buffer->m_colors.end(), colors, colors + vertexIndexSize);
+    buffer->m_thicknesses.insert(buffer->m_thicknesses.end(), thicknesses, thicknesses + vertexIndexSize);
+    buffer->m_vertexCounts.insert(buffer->m_vertexCounts.end(), vertexCounts, vertexCounts + vertexCountSize);
 
     if (flags)
     {
-        std::copy(flags, flags + vertexCountSize, std::back_inserter(buffer->m_flags));
+        buffer->m_flags.insert(buffer->m_flags.end(), flags, flags + vertexCountSize);
     }
     else
     {
@@ -290,6 +303,28 @@ void DrawBuffer::addPolygonLines(const Vector3* points,
     for (size_t i = 0; i < vertexIndexSize; ++i)
     {
         buffer->m_vertexIndices.push_back(firstIndex + vertexIndices[i]);
+    }
+}
+
+const std::vector<float>& DrawBuffer::getLineAntialiasingWidths() const
+{
+    static const std::vector<float> empty;
+    return m_bufferType == BufferType::eLines ?
+        static_cast<const LineRasterData*>(m_buffer.get())->antialiasingWidths : empty;
+}
+
+void DrawBuffer::addAntialiasedPolygonLines(const Vector3* points, const Color4* colors, const float* thicknesses,
+                                           const uint32_t* vertexIndices, const uint32_t* vertexCounts,
+                                           const uint32_t* flags, size_t vertexCountSize, float antialiasingWidth)
+{
+    auto& data = *static_cast<LineRasterData*>(m_buffer.get());
+    const size_t first = data.m_vertexIndices.size();
+    addPolygonLines(points, colors, thicknesses, vertexIndices, vertexCounts, flags, vertexCountSize);
+    // Ordinary lines sharing this buffer retain zero/default coverage settings.
+    if (antialiasingWidth > 0.0f || !data.antialiasingWidths.empty())
+    {
+        data.antialiasingWidths.resize(first, 0.0f);
+        data.antialiasingWidths.resize(data.m_vertexIndices.size(), antialiasingWidth);
     }
 }
 
@@ -329,6 +364,9 @@ void DrawBuffer::addRect(Float width, Float height, const Color4& color, const v
     buffer->m_uvs.emplace_back(0.0, 1.0);
 
     buffer->m_textures.push_back(texture);
+    auto& normals = static_cast<PolygonLightingData*>(buffer)->normals;
+    if (!normals.empty())
+        normals.resize(buffer->m_positions.size(), Vector4(0.0));
 }
 
 static Vector4 toVector4(const Vector4& v)
@@ -391,6 +429,10 @@ void DrawBuffer::_addPolygonMesh(const PointsType* points,
         }
     }
 
+    auto& normals = static_cast<PolygonLightingData*>(buffer)->normals;
+    if (!normals.empty())
+        normals.resize(buffer->m_positions.size(), Vector4(0.0));
+
     // Transforming vertexIndices to the new merged buffer
     _ensureCapacity(buffer->m_vertexIndices, buffer->m_vertexIndices.size() + vertexIndexSize);
     for (uint32_t i = 0; i < vertexIndexSize; ++i)
@@ -451,6 +493,25 @@ void DrawBuffer::addPolygonMesh(const Vector3* points,
 {
     _addPolygonMesh(points, colors, vertexIndices, vertexCounts,
                     vertexCountSize, transform, uvs, textures, resources);
+}
+
+const std::vector<Vector4>& DrawBuffer::getHeadlightNormals() const
+{
+    static const std::vector<Vector4> empty;
+    return m_buffer && m_bufferType == BufferType::ePolys ?
+        static_cast<const PolygonLightingData*>(m_buffer.get())->normals : empty;
+}
+
+void DrawBuffer::addHeadlightPolygonMesh(const Vector3* points, const Color4* colors, const Vector3* normals,
+                                       const uint32_t* indices, const uint32_t* counts, size_t countSize)
+{
+    addPolygonMesh(points, colors, indices, counts, countSize);
+    auto& data = *static_cast<PolygonLightingData*>(m_buffer.get());
+    const size_t count = calVertexIndexSize(counts, countSize);
+    const size_t first = data.m_positions.size() - count;
+    data.normals.resize(data.m_positions.size(), Vector4(0.0));
+    for (size_t i = 0; i < count; ++i)
+        data.normals[first + i] = Vector4(normals[indices[i]], 1.0);
 }
 
 size_t DrawBuffer::calVertexIndexSize(const uint32_t* vertexCounts, size_t vertexCountSize)
@@ -659,10 +720,10 @@ void DrawBuffer::setBufferType(BufferType bufferType)
         m_buffer = std::make_unique<Points>();
         break;
     case BufferType::eLines:
-        m_buffer = std::make_unique<Lines>();
+        m_buffer = std::make_unique<LineRasterData>();
         break;
     case BufferType::ePolys:
-        m_buffer = std::make_unique<Polys>();
+        m_buffer = std::make_unique<PolygonLightingData>();
         break;
     case BufferType::eTexts:
         m_buffer = std::make_unique<Texts>();
@@ -725,6 +786,8 @@ DrawBuffer::DirtyBits DrawBuffer::getDirtyBits() const
         dirty |= _hashIt(buffer->m_vertexCountsHash, buffer->m_vertexCounts, Lines::kDirtyBitVertexCounts);
         dirty |= _hashIt(buffer->m_vertexIndicesHash, buffer->m_vertexIndices, Lines::kDirtyBitVertexIndices);
         dirty |= _hashIt(buffer->m_flagsHash, buffer->m_flags, Lines::kDirtyBitFlags);
+        auto& raster = *static_cast<LineRasterData*>(buffer);
+        dirty |= _hashIt(raster.antialiasingWidthsHash, raster.antialiasingWidths, kDirtyBitLineAntialiasing);
         if (dirty == Lines::kDirtyBitAll)
         {
             dirty = Buffer::kDirtyBitAll;
@@ -743,6 +806,8 @@ DrawBuffer::DirtyBits DrawBuffer::getDirtyBits() const
         {
             dirty = Buffer::kDirtyBitAll;
         }
+        auto& lighting = *static_cast<PolygonLightingData*>(buffer);
+        dirty |= _hashIt(lighting.normalsHash, lighting.normals, kDirtyBitHeadlightNormals);
 
         break;
     }

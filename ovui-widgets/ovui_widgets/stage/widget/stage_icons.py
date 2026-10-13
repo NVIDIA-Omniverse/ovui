@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """StageIcons — single lookup surface for stage-row icons.
 
@@ -31,11 +24,17 @@ from ovui_widgets.common.icon_caches import provider
 from ovui_widgets.common.style.urls import _STYLE_ICON_PATHS
 
 _TYPE_ICON_NAME: dict[str, str] = {
-    "Mesh":   "prim_mesh",
-    "Light":  "prim_light",
+    "Mesh": "prim_mesh",
+    "Light": "prim_light",
+    "DistantLight": "prim_light_distant",
+    "DomeLight": "prim_light_dome",
+    "SphereLight": "prim_light_sphere",
+    "RectLight": "prim_light_rect",
+    "DiskLight": "prim_light_disk",
+    "CylinderLight": "prim_light_cylinder",
     "Camera": "prim_camera",
-    "Scope":  "prim_scope",
-    "Xform":  "prim_xform",
+    "Scope": "prim_scope",
+    "Xform": "prim_xform",
 }
 
 

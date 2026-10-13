@@ -1,15 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 import os
 import sys
+import threading
 import types
 from unittest.mock import MagicMock, patch
 
@@ -103,8 +97,8 @@ def _make_cudart_mock(events, ptrs=None):
         return next(ptrs)
 
     cudart.malloc.side_effect = _malloc
-    cudart.d2d.side_effect = lambda dst, src, nbytes: events.append(("d2d", dst, src, nbytes))
-    cudart.d2h.side_effect = lambda host, src, nbytes: events.append(("d2h", src, nbytes, host.shape))
+    cudart.d2d.side_effect = lambda dst, src, nbytes, **_: events.append(("d2d", dst, src, nbytes))
+    cudart.d2h.side_effect = lambda host, src, nbytes, **_: events.append(("d2h", src, nbytes, host.shape))
     cudart.free.side_effect = lambda ptr: events.append(("free", ptr))
     cudart.device_synchronize.side_effect = lambda: events.append(("sync",))
     return cudart
@@ -335,8 +329,8 @@ def test_scratch_alloc_failure_does_not_wedge(monkeypatch):
 
     cudart = MagicMock()
     cudart.malloc.side_effect = _malloc
-    cudart.d2d.side_effect = lambda dst, src, n: events.append(("d2d", dst, src, n))
-    cudart.d2h.side_effect = lambda host, src, n: events.append(("d2h", src, n))
+    cudart.d2d.side_effect = lambda dst, src, n, **_: events.append(("d2d", dst, src, n))
+    cudart.d2h.side_effect = lambda host, src, n, **_: events.append(("d2h", src, n))
     cudart.free.side_effect = lambda ptr: events.append(("free", ptr))
     cudart.device_synchronize.side_effect = lambda: events.append(("sync",))
     monkeypatch.setattr(tap_mod, "_Cudart", lambda: cudart)
@@ -595,6 +589,25 @@ def _ports_from_drive(monkeypatch, env_overrides):
     return captured
 
 
+@pytest.mark.parametrize("width, encoded", [(650, 648), (640, 640)])
+def test_encoder_config_frames_and_extent_agree_on_the_aligned_width(monkeypatch, width, encoded):
+    """NVENC encodes 8-aligned widths; the server, every frame and the reported
+    extent must use the same width, or ovstream rejects every frame."""
+    ovstream, server = _install_mock_ovstream(monkeypatch, connected=True)
+    cudart = _make_cudart_mock([], ptrs=iter(range(0x100, 0x200, 0x10)))
+    monkeypatch.setattr(tap_mod, "_Cudart", lambda: cudart)
+    with patch.dict(os.environ, _TEST_ENV, clear=True):
+        tap = tap_mod.LivestreamTap.maybe_create()
+
+    assert tap.tee_to_ovstream(_mapping(width, 360, ptr=0x1111), width, 360) is True
+
+    config = ovstream.ServerConfig.call_args.kwargs
+    frame = server.stream_video.call_args.args[0]
+    assert (config["width"], frame.width, tap.extent) == (encoded, encoded, (encoded, 360))
+    # Rows keep the source pitch, so the dropped columns are simply skipped.
+    assert frame.pitch_bytes == width * 4
+
+
 def test_default_ports_match_kit_standard(monkeypatch):
     """No port env vars set → ``ServerConfig`` is constructed with the
     Kit-standard signaling port 49100 and the ovstream-default media
@@ -677,6 +690,22 @@ def test_format_fix_on_invokes_kernel_between_d2d_and_stream_video(monkeypatch):
     _tag, dev, w, h, pitch = swap_event
     assert dev == 0xAA  # the first scratch ring slot
     assert (w, h, pitch) == (3, 2, 12)
+
+
+def test_format_fix_off_streams_through_the_synchronous_tee(monkeypatch):
+    """The asynchronous copy always swaps R/B; with the format fix off frames must not take it."""
+    _install_mock_ovstream(monkeypatch, connected=True)
+    monkeypatch.setattr(tap_mod, "_Cudart", lambda: _make_cudart_mock([], ptrs=iter([0xAA, 0xBB])))
+    swaps = []
+    monkeypatch.setattr(tap_mod._swap_kernel, "copy_swap_rb", lambda *args, **kwargs: swaps.append(args))
+    with patch.dict(os.environ, _with_test_env({tap_mod._FORMAT_FIX_ENV_VAR: "0"}), clear=True):
+        tap = tap_mod.LivestreamTap.maybe_create()
+    try:
+        assert tap.async_enabled is False
+        assert tap.tee_async(_channel_last_mapping(4, 2), 4, 2) is None
+        assert swaps == []
+    finally:
+        tap.close()
 
 
 def test_format_fix_off_skips_kernel(monkeypatch):
@@ -1080,8 +1109,8 @@ def _make_pitched_cudart_mock(events, ptrs=None, pitch_returns=None):
 
     cudart.malloc.side_effect = _malloc
     cudart.malloc_pitch.side_effect = _malloc_pitch
-    cudart.d2d.side_effect = lambda dst, src, nbytes: events.append(("d2d", dst, src, nbytes))
-    cudart.d2h.side_effect = lambda host, src, nbytes: events.append(("d2h", src, nbytes, host.shape))
+    cudart.d2d.side_effect = lambda dst, src, nbytes, **_: events.append(("d2d", dst, src, nbytes))
+    cudart.d2h.side_effect = lambda host, src, nbytes, **_: events.append(("d2h", src, nbytes, host.shape))
     cudart.free.side_effect = lambda ptr: events.append(("free", ptr))
     cudart.device_synchronize.side_effect = lambda: events.append(("sync",))
     cudart.stream_synchronize.side_effect = lambda stream=0: events.append(("stream_sync", stream))
@@ -1585,3 +1614,61 @@ def test_renderer_tap_created_when_not_headless(monkeypatch):
         assert _headless_ui is False
         should_create_tap = adapter_mod._livestream_env_enabled() and not _headless_ui
         assert should_create_tap is True
+
+
+def test_explicit_start_passes_producer_context_and_propagates_failure(monkeypatch):
+    ovstream, server = _install_mock_ovstream(monkeypatch, start_side_effect=RuntimeError('port occupied'))
+    cudart = _make_cudart_mock([], ptrs=iter([0xAA, 0xBB]))
+    cudart.current_device.return_value = 2
+    monkeypatch.setattr(tap_mod, '_Cudart', lambda: cudart)
+    tap = tap_mod.LivestreamTap(cuda_context=0x1234)
+    with pytest.raises(RuntimeError, match='port occupied'):
+        tap.start(640, 360)
+    assert ovstream.ServerConfig.call_args.kwargs['cuda_context'] == 0x1234
+    assert ovstream.ServerConfig.call_args.kwargs['cuda_device'] == 2
+    assert tap._server is None
+    assert tap._scratch_ring == []
+    server.close.assert_called_once()
+    tap.close()
+
+
+def test_close_still_destroys_server_when_stop_raises(monkeypatch):
+    _ovstream, server = _install_mock_ovstream(monkeypatch)
+    monkeypatch.setattr(tap_mod, '_Cudart', lambda: _make_cudart_mock([], ptrs=iter([0xAA, 0xBB])))
+    tap = tap_mod.LivestreamTap()
+    tap.start(640, 360)
+    server.stop.side_effect = RuntimeError('already stopped')
+    tap.close()
+    tap.close()
+    server.close.assert_called_once()
+    assert tap._server is None
+
+
+def test_server_without_a_client_starts_no_publisher_thread(monkeypatch):
+    """A tap whose server starts but never streams leaves no thread running, even unclosed."""
+    _install_mock_ovstream(monkeypatch, connected=False)
+    monkeypatch.setattr(tap_mod, "_Cudart", lambda: _make_cudart_mock([], ptrs=iter([0xAA, 0xBB])))
+    switch_interval = sys.getswitchinterval()
+    before = {t for t in threading.enumerate() if t.name == "ovui-stream-publisher"}
+    tap = tap_mod.LivestreamTap()
+    try:
+        tap.start(640, 360)
+        tap.tee_async(_channel_last_mapping(640, 360), 640, 360)
+        started = {t for t in threading.enumerate() if t.name == "ovui-stream-publisher"} - before
+        assert not started
+        assert sys.getswitchinterval() == switch_interval
+    finally:
+        tap.close()
+
+
+def test_externally_managed_sdk_is_not_initialized_or_shut_down_by_the_tap(monkeypatch):
+    ovstream, _server = _install_mock_ovstream(monkeypatch)
+    monkeypatch.setattr(tap_mod, '_Cudart', lambda: _make_cudart_mock([], ptrs=iter([0xAA])))
+    borrowed = tap_mod.LivestreamTap(manage_sdk=False)
+    borrowed.close()
+    ovstream.initialize.assert_not_called()
+    ovstream.shutdown.assert_not_called()
+    owned = tap_mod.LivestreamTap()
+    owned.close()
+    ovstream.initialize.assert_called_once()
+    ovstream.shutdown.assert_called_once()

@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-License-Identifier: Apache-2.0
 #
 # CI lane for EGL no-GPU headless path (issue #24, step C2).
 # Runs on ubuntu-22.04 with no GPU; uses EGL_MESA_platform_surfaceless.

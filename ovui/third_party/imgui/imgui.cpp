@@ -5506,7 +5506,12 @@ void ImGui::UpdateMouseMovingWindowEndFrame()
 
     // Click on empty space to focus window and start moving
     // (after we're done with all our widgets, so e.g. clicking on docking tab-bar which have set HoveredId already and not get us here!)
-    if (g.IO.MouseClicked[0])
+    // A double-click callback can create an input and request focus before it can be hovered.
+    // Let that resolved request activate next frame instead of cancelling it with window focus/move.
+    const bool input_focus_pending = g.IO.MouseDoubleClicked[0] && g.NavMoveSubmitted &&
+        (g.NavMoveFlags & ImGuiNavMoveFlags_FocusApi) &&
+        g.NavMoveResultLocal.ID != 0 && (g.NavMoveResultLocal.ItemFlags & ImGuiItemFlags_Inputable);
+    if (g.IO.MouseClicked[0] && !input_focus_pending)
     {
         // Handle the edge case of a popup being closed while clicking in its empty space.
         // If we try to focus it, FocusWindow() > ClosePopupsOverWindow() will accidentally close any parent popups because they are not linked together any more.
@@ -6445,7 +6450,9 @@ ImVec2 ImGui::CalcTextSize(const char* text, const char* text_end, bool hide_tex
     // FIXME: Investigate using ceilf or e.g.
     // - https://git.musl-libc.org/cgit/musl/tree/src/math/ceilf.c
     // - https://embarkstudios.github.io/rust-gpu/api/src/libm/math/ceilf.rs.html
-    text_size.x = IM_TRUNC(text_size.x + 0.99999f);
+    // Retain Kit's rounding tolerance: the newer epsilon rounds an exact
+    // 256-pixel float width up to 257, changing public layout and scroll extents.
+    text_size.x = IM_TRUNC(text_size.x + 0.95f);
 
     return text_size;
 }
@@ -7570,6 +7577,15 @@ void ImGui::RenderWindowDecorations(ImGuiWindow* window, const ImRect& title_bar
         if (window->DockIsActive)
             window->DockNode->IsBgDrawnThisFrame = true;
 
+        // Preserve the existing Kit WindowShadow style contract.
+        if (style.WindowShadowSize > 0.0f && (!(flags & ImGuiWindowFlags_ChildWindow) || (flags & ImGuiWindowFlags_Popup)) &&
+            style.Colors[ImGuiCol_WindowShadow].w > 0.0f)
+        {
+            const ImVec2 shadow_offset = ImVec2(ImCos(style.WindowShadowOffsetAngle), ImSin(style.WindowShadowOffsetAngle)) * style.WindowShadowOffsetDist;
+            window->DrawList->AddShadowRect(window->Pos, window->Pos + window->Size, GetColorU32(ImGuiCol_WindowShadow),
+                style.WindowShadowSize, shadow_offset, ImDrawShadowFlags_CutOutShapeBackground, window->WindowRounding);
+        }
+
         // Title bar
         // (when docked, DockNode are drawing their own title bar. Individual windows however do NOT set the _NoTitleBar flag,
         // in order for their pos/size to be matching their undocking state.)
@@ -7708,10 +7724,6 @@ void ImGui::RenderWindowTitleBarContents(ImGuiWindow* window, const ImRect& titl
 
     // As a nice touch we try to ensure that centered title text doesn't get affected by visibility of Close/Collapse button,
     // while uncentered title text will still reach edges correctly.
-    if (pad_l > style.FramePadding.x)
-        pad_l += g.Style.ItemInnerSpacing.x;
-    if (pad_r > style.FramePadding.x)
-        pad_r += g.Style.ItemInnerSpacing.x;
     if (style.WindowTitleAlign.x > 0.0f && style.WindowTitleAlign.x < 1.0f)
     {
         float centerness = ImSaturate(1.0f - ImFabs(style.WindowTitleAlign.x - 0.5f) * 2.0f); // 0.0f on either edges, 1.0f on center
@@ -7843,7 +7855,8 @@ bool ImGui::Begin(const char* name, bool* p_open, ImGuiWindowFlags flags)
     if (first_begin_of_the_frame)
     {
         UpdateWindowInFocusOrderList(window, window_just_created, flags);
-        window->Appearing = window_just_activated_by_user;
+        // Kit's ImGui 1.77 contract reapplies Appearing conditions after sizing a hidden popup.
+        window->Appearing = window_just_activated_by_user || window->HiddenFramesCannotSkipItems > 0;
         if (window->Appearing)
             SetWindowConditionAllowFlags(window, ImGuiCond_Appearing, true);
         window->FlagsPreviousFrame = window->Flags;
@@ -8223,7 +8236,14 @@ bool ImGui::Begin(const char* name, bool* p_open, ImGuiWindowFlags flags)
 
         const bool window_pos_with_pivot = (window->SetWindowPosVal.x != FLT_MAX && window->HiddenFramesCannotSkipItems == 0);
         if (window_pos_with_pivot)
-            SetWindowPos(window, window->SetWindowPosVal - window->Size * window->SetWindowPosPivot, 0); // Position given a pivot (e.g. for centering)
+        {
+            // Keep ordinary windows inside the padded work area. A window that fills
+            // the entire work area must start at its origin to avoid clipping its edges.
+            const ImRect work_rect = window->Viewport->GetWorkRect();
+            const bool fills_work_area = window->Size.x == work_rect.GetWidth() && window->Size.y == work_rect.GetHeight();
+            const ImVec2 min_pos = work_rect.Min + (fills_work_area ? ImVec2(0, 0) : style.DisplayWindowPadding);
+            SetWindowPos(window, ImMax(min_pos, window->SetWindowPosVal - window->Size * window->SetWindowPosPivot), 0);
+        }
         else if ((flags & ImGuiWindowFlags_ChildMenu) != 0)
             window->Pos = FindBestWindowPosForPopup(window);
         else if ((flags & ImGuiWindowFlags_Popup) != 0 && !window_pos_set_by_api && window_just_appearing_after_hidden_for_resize)
@@ -8286,12 +8306,11 @@ bool ImGui::Begin(const char* name, bool* p_open, ImGuiWindowFlags flags)
 
         // Lock window rounding for the frame (so that altering them doesn't cause inconsistencies)
         // Large values tend to lead to variety of artifacts and are not recommended.
-        if ((flags & ImGuiWindowFlags_ChildWindow) && !window->DockIsActive)
-            window->WindowRounding = style.ChildRounding;
-        else if (window->RootWindowDockTree->ViewportOwned)
+        // Kit's docked windows meet at square edges, including their outer corners.
+        if (window->ViewportOwned || window->DockIsActive)
             window->WindowRounding = 0.0f;
         else
-            window->WindowRounding = ((flags & ImGuiWindowFlags_Popup) && !(flags & ImGuiWindowFlags_Modal)) ? style.PopupRounding : style.WindowRounding;
+            window->WindowRounding = (flags & ImGuiWindowFlags_ChildWindow) ? style.ChildRounding : ((flags & ImGuiWindowFlags_Popup) && !(flags & ImGuiWindowFlags_Modal)) ? style.PopupRounding : style.WindowRounding;
 
         // For windows with title bar or menu bar, we clamp to FrameHeight(FontSize + FramePadding.y * 2.0f) to completely hide artifacts.
         //if ((window->Flags & ImGuiWindowFlags_MenuBar) || !(window->Flags & ImGuiWindowFlags_NoTitleBar))
@@ -8339,7 +8358,7 @@ bool ImGui::Begin(const char* name, bool* p_open, ImGuiWindowFlags flags)
         else
             resize_grip_count = g.IO.ConfigWindowsResizeFromEdges ? 2 : 1; // Allow resize from lower-left if we have the mouse cursor feedback for it.
 
-        const float resize_grip_draw_size = IM_TRUNC(ImMax(g.FontSize * 1.10f, window->WindowRounding + 1.0f + g.FontSize * 0.2f));
+        const float resize_grip_draw_size = ImFloor(ImMax(g.FontSize * 1.35f, window->WindowRounding + 1.0f + g.FontSize * 0.2f));
         if (handle_borders_and_resize_grips && !window->Collapsed)
             if (int auto_fit_mask = UpdateWindowManualResize(window, &border_hovered, &border_held, resize_grip_count, &resize_grip_col[0], visibility_rect))
             {
@@ -8446,10 +8465,11 @@ bool ImGui::Begin(const char* name, bool* p_open, ImGuiWindowFlags flags)
         // Try to match the fact that our border is drawn centered over the window rectangle, rather than inner.
         // This is why we do a *0.5f here. We don't currently even technically support large values for WindowBorderSize,
         // see e.g #7887 #7888, but may do after we move the window border to become an inner border (and then we can remove the 0.5f here).
-        window->InnerClipRect.Min.x = ImFloor(0.5f + window->InnerRect.Min.x + window->WindowBorderSize * 0.5f);
-        window->InnerClipRect.Min.y = ImFloor(0.5f + window->InnerRect.Min.y + top_border_size * 0.5f);
-        window->InnerClipRect.Max.x = ImFloor(window->InnerRect.Max.x - window->WindowBorderSize * 0.5f);
-        window->InnerClipRect.Max.y = ImFloor(window->InnerRect.Max.y - window->WindowBorderSize * 0.5f);
+        // Preserve Kit window-content clipping at the existing public border/padding boundary.
+        window->InnerClipRect.Min.x = ImFloor(0.5f + window->InnerRect.Min.x + ImMax(ImFloor(window->WindowPadding.x * 0.5f), window->WindowBorderSize));
+        window->InnerClipRect.Min.y = ImFloor(0.5f + window->InnerRect.Min.y + top_border_size);
+        window->InnerClipRect.Max.x = ImFloor(0.5f + window->InnerRect.Max.x - ImMax(ImFloor(window->WindowPadding.x * 0.5f), window->WindowBorderSize));
+        window->InnerClipRect.Max.y = ImFloor(0.5f + window->InnerRect.Max.y - window->WindowBorderSize);
         window->InnerClipRect.ClipWithFull(host_rect);
 
         // SCROLLING
@@ -9683,6 +9703,13 @@ void ImGui::SetCurrentFont(ImFont* font, float font_size_before_scaling, float f
         ImFontAtlas* atlas = font->OwnerAtlas;
         g.DrawListSharedData.FontAtlas = atlas;
         g.DrawListSharedData.Font = font;
+        // Kit also pushes fonts from externally owned, prebuilt atlases which
+        // are not registered in DrawListSharedDatas. Bind their primitive UVs
+        // along with the font texture, without taking ownership of the atlas.
+        g.DrawListSharedData.TexUvWhitePixel = atlas->TexUvWhitePixel;
+        g.DrawListSharedData.TexUvLines = atlas->TexUvLines;
+        g.DrawListSharedData.ShadowRectIds = atlas->ShadowRectIds;
+        g.DrawListSharedData.ShadowRectUvs = atlas->ShadowRectUvs;
         ImFontAtlasUpdateDrawListsSharedData(atlas);
         if (g.CurrentWindow != NULL)
             g.CurrentWindow->DrawList->_SetTexture(atlas->TexRef);
@@ -9721,7 +9748,10 @@ void ImGui::UpdateCurrentFontSize(float restore_font_size_after_scaling)
     // Round font size
     // - We started rounding in 1.90 WIP (18991) as our layout system currently doesn't support non-rounded font size well yet.
     // - We may support it better later and remove this rounding.
-    final_size = GetRoundedFontSize(final_size);
+    // Kit Canvas fonts scale a locked, high-resolution bake continuously.
+    // Keep that legacy draw size while ordinary fonts retain current rounding.
+    if (g.Font == NULL || !(g.Font->Flags & ImFontFlags_LockBakedSizes))
+        final_size = GetRoundedFontSize(final_size);
     final_size = ImClamp(final_size, 1.0f, IMGUI_FONT_SIZE_MAX);
     if (g.Font != NULL && (g.IO.BackendFlags & ImGuiBackendFlags_RendererHasTextures))
         g.Font->CurrentRasterizerDensity = g.FontRasterizerDensity;
@@ -12136,7 +12166,7 @@ void ImGui::SetCursorScreenPos(const ImVec2& pos)
 {
     ImGuiWindow* window = GetCurrentWindow();
     window->DC.CursorPos = pos;
-    //window->DC.CursorMaxPos = ImMax(window->DC.CursorMaxPos, window->DC.CursorPos);
+    window->DC.CursorMaxPos = ImMax(window->DC.CursorMaxPos, window->DC.CursorPos);
     window->DC.IsSetPos = true;
 }
 
@@ -12164,7 +12194,7 @@ void ImGui::SetCursorPos(const ImVec2& local_pos)
 {
     ImGuiWindow* window = GetCurrentWindow();
     window->DC.CursorPos = window->Pos - window->Scroll + local_pos;
-    //window->DC.CursorMaxPos = ImMax(window->DC.CursorMaxPos, window->DC.CursorPos);
+    window->DC.CursorMaxPos = ImMax(window->DC.CursorMaxPos, window->DC.CursorPos);
     window->DC.IsSetPos = true;
 }
 
@@ -12172,7 +12202,7 @@ void ImGui::SetCursorPosX(float x)
 {
     ImGuiWindow* window = GetCurrentWindow();
     window->DC.CursorPos.x = window->Pos.x - window->Scroll.x + x;
-    //window->DC.CursorMaxPos.x = ImMax(window->DC.CursorMaxPos.x, window->DC.CursorPos.x);
+    window->DC.CursorMaxPos.x = ImMax(window->DC.CursorMaxPos.x, window->DC.CursorPos.x);
     window->DC.IsSetPos = true;
 }
 
@@ -12180,7 +12210,7 @@ void ImGui::SetCursorPosY(float y)
 {
     ImGuiWindow* window = GetCurrentWindow();
     window->DC.CursorPos.y = window->Pos.y - window->Scroll.y + y;
-    //window->DC.CursorMaxPos.y = ImMax(window->DC.CursorMaxPos.y, window->DC.CursorPos.y);
+    window->DC.CursorMaxPos.y = ImMax(window->DC.CursorMaxPos.y, window->DC.CursorPos.y);
     window->DC.IsSetPos = true;
 }
 
@@ -13352,19 +13382,30 @@ ImVec2 ImGui::FindBestWindowPosForPopupEx(const ImVec2& ref_pos, const ImVec2& s
             const float avail_w = (dir == ImGuiDir_Left ? r_avoid.Min.x : r_outer.Max.x) - (dir == ImGuiDir_Right ? r_avoid.Max.x : r_outer.Min.x);
             const float avail_h = (dir == ImGuiDir_Up ? r_avoid.Min.y : r_outer.Max.y) - (dir == ImGuiDir_Down ? r_avoid.Max.y : r_outer.Min.y);
 
-            // If there's not enough room on one axis, there's no point in positioning on a side on this axis (e.g. when not enough width, use a top/bottom position to maximize available width)
-            if (avail_w < size.x && (dir == ImGuiDir_Left || dir == ImGuiDir_Right))
-                continue;
-            if (avail_h < size.y && (dir == ImGuiDir_Up || dir == ImGuiDir_Down))
-                continue;
+            if (policy == ImGuiPopupPositionPolicy_Default)
+            {
+                if (avail_w < size.x || avail_h < size.y)
+                    continue;
+            }
+            else
+            {
+                // Choose the side with enough room on its positioning axis.
+                if (avail_w < size.x && (dir == ImGuiDir_Left || dir == ImGuiDir_Right))
+                    continue;
+                if (avail_h < size.y && (dir == ImGuiDir_Up || dir == ImGuiDir_Down))
+                    continue;
+            }
 
             ImVec2 pos;
             pos.x = (dir == ImGuiDir_Left) ? r_avoid.Min.x - size.x : (dir == ImGuiDir_Right) ? r_avoid.Max.x : base_pos_clamped.x;
             pos.y = (dir == ImGuiDir_Up) ? r_avoid.Min.y - size.y : (dir == ImGuiDir_Down) ? r_avoid.Max.y : base_pos_clamped.y;
 
-            // Clamp top-left corner of popup
-            pos.x = ImMax(pos.x, r_outer.Min.x);
-            pos.y = ImMax(pos.y, r_outer.Min.y);
+            if (policy != ImGuiPopupPositionPolicy_Default)
+            {
+                // Clamp top-left corner of popup.
+                pos.x = ImMax(pos.x, r_outer.Min.x);
+                pos.y = ImMax(pos.y, r_outer.Min.y);
+            }
 
             *last_dir = dir;
             return pos;
@@ -13427,7 +13468,11 @@ ImVec2 ImGui::FindBestWindowPosForPopup(ImGuiWindow* window)
     }
     if (window->Flags & ImGuiWindowFlags_Popup)
     {
-        return FindBestWindowPosForPopupEx(window->Pos, window->Size, &window->AutoPosLastDirection, r_outer, ImRect(window->Pos, window->Pos), ImGuiPopupPositionPolicy_Default); // Ideally we'd disable r_avoid here
+        // Preserve Kit's one-pixel avoidance of the popup opening position.
+        const float opening_margin = (window->Flags & ImGuiWindowFlags_Modal) ? 0.0f : 1.0f;
+        const ImRect r_avoid(window->Pos.x - opening_margin, window->Pos.y - opening_margin,
+                             window->Pos.x + opening_margin, window->Pos.y + opening_margin);
+        return FindBestWindowPosForPopupEx(window->Pos, window->Size, &window->AutoPosLastDirection, r_outer, r_avoid, ImGuiPopupPositionPolicy_Default);
     }
     if (window->Flags & ImGuiWindowFlags_Tooltip)
     {
@@ -13456,7 +13501,10 @@ ImVec2 ImGui::FindBestWindowPosForPopup(ImGuiWindow* window)
             r_avoid = ImRect(ref_pos.x - 16, ref_pos.y - 8, ref_pos.x + 24 * scale, ref_pos.y + 24 * scale); // FIXME: Hard-coded based on mouse cursor shape expectation. Exact dimension not very important.
         //GetForegroundDrawList()->AddRect(r_avoid.Min, r_avoid.Max, IM_COL32(255, 0, 255, 255));
 
-        return FindBestWindowPosForPopupEx(tooltip_pos, window->Size, &window->AutoPosLastDirection, r_outer, r_avoid, ImGuiPopupPositionPolicy_Tooltip);
+        ImVec2 pos = FindBestWindowPosForPopupEx(ref_pos, window->Size, &window->AutoPosLastDirection, r_outer, r_avoid, ImGuiPopupPositionPolicy_Default);
+        if (window->AutoPosLastDirection == ImGuiDir_None)
+            pos = ref_pos + ImVec2(2, 2);
+        return pos;
     }
     IM_ASSERT(0);
     return window->Pos;
@@ -13674,9 +13722,10 @@ void ImGui::FocusWindow(ImGuiWindow* window, ImGuiFocusRequestFlags flags)
         g.NavIdIsAlive = false;
         g.NavLastValidSelectionUserData = ImGuiSelectionUserData_Invalid;
 
-        // Close popups if any
-        ClosePopupsOverWindow(window, false);
     }
+    // Programmatic focus may have already selected the navigation window.
+    // Preserve Kit's dismissal of unrelated popups in that case too.
+    ClosePopupsOverWindow(window, false);
 
     // Move the root window to the top of the pile
     IM_ASSERT(window == NULL || window->RootWindowDockTree != NULL);
@@ -14386,7 +14435,7 @@ static ImVec2 ImGui::NavCalcPreferredRefPos(ImGuiWindowFlags window_type)
         // The +1.0f offset when stored by OpenPopupEx() allows reopening this or another popup (same or another mouse button) while not moving the mouse, it is pretty standard.
         // In theory we could move that +1.0f offset in OpenPopupEx()
         ImVec2 p = IsMousePosValid(&g.IO.MousePos) ? g.IO.MousePos : g.MouseLastValidPos;
-        return ImVec2(p.x + 1.0f, p.y);
+        return p;
     }
     else
     {
@@ -18886,7 +18935,9 @@ static void ImGui::DockNodeUpdateFlagsAndCollapse(ImGuiDockNode* node)
         }
 
         // FIXME-DOCKING: Missing policies for conflict resolution, hence the "Experimental" tag on this.
-        //node->LocalFlagsInWindow &= ~window->WindowClass.DockNodeFlagsOverrideClear;
+        // Preserve the legacy clear-before-set operation on the dock node itself.
+        node->LocalFlags &= ~window->WindowClass.KitDockNodeFlagsOverrideClear;
+        node->LocalFlagsInWindows &= ~window->WindowClass.KitDockNodeFlagsOverrideClear;
         node->LocalFlagsInWindows |= window->WindowClass.DockNodeFlagsOverrideSet;
     }
     node->UpdateMergedFlags();
@@ -19237,11 +19288,7 @@ static void ImGui::DockNodeUpdate(ImGuiDockNode* node)
     if (node->IsRootNode() && host_window)
     {
         DockNodeTreeUpdatePosSize(node, host_window->Pos, host_window->Size);
-        PushStyleColor(ImGuiCol_Separator, g.Style.Colors[ImGuiCol_Border]);
-        PushStyleColor(ImGuiCol_SeparatorActive, g.Style.Colors[ImGuiCol_ResizeGripActive]);
-        PushStyleColor(ImGuiCol_SeparatorHovered, g.Style.Colors[ImGuiCol_ResizeGripHovered]);
         DockNodeTreeUpdateSplitter(node);
-        PopStyleColor(3);
     }
 
     // Draw empty node background (currently can only be the Central Node)
@@ -19427,7 +19474,11 @@ static void ImGui::DockNodeUpdateTabBar(ImGuiDockNode* node, ImGuiWindow* host_w
     // Decide if we should use a focused title bar color
     bool is_focused = false;
     ImGuiDockNode* root_node = DockNodeGetRootNode(node);
-    if (IsDockNodeTitleBarHighlighted(node, root_node))
+    // Keep the host title highlight while one of its popup menus owns navigation.
+    if (g.NavWindowingTarget)
+        is_focused = (g.NavWindowingTarget->DockNode == node);
+    else if (g.NavWindow && g.NavWindow->RootWindowForTitleBarHighlight == host_window->RootWindow &&
+             root_node->LastFocusedNodeId == node->ID)
         is_focused = true;
 
     // Hidden tab bar will show a triangle on the upper-left (in Begin)
@@ -19786,7 +19837,6 @@ static void ImGui::DockNodeCalcTabBarLayout(const ImGuiDockNode* node, ImRect* o
     r.Max.x -= style.WindowBorderSize;
 
     float button_sz = g.FontSize;
-    r.Min.x += style.FramePadding.x;
     r.Max.x -= style.FramePadding.x;
     ImVec2 window_menu_button_pos = ImVec2(r.Min.x, r.Min.y + style.FramePadding.y);
     if (node->HasCloseButton)
@@ -20386,7 +20436,8 @@ void ImGui::DockNodeTreeUpdateSplitter(ImGuiDockNode* node)
             float cur_size_1 = child_1->Size[axis];
             float min_size_0 = resize_limits[0] - child_0->Pos[axis];
             float min_size_1 = child_1->Pos[axis] + child_1->Size[axis] - resize_limits[1];
-            ImU32 bg_col = GetColorU32(ImGuiCol_WindowBg);
+            // Preserve Kit's transparent idle separator over the host background.
+            ImU32 bg_col = 0;
             if (SplitterBehavior(bb, GetID("##Splitter"), axis, &cur_size_0, &cur_size_1, min_size_0, min_size_1, g.WindowsBorderHoverPadding, WINDOWS_RESIZE_FROM_EDGES_FEEDBACK_TIMER, bg_col))
             {
                 if (touching_nodes[0].Size > 0 && touching_nodes[1].Size > 0)

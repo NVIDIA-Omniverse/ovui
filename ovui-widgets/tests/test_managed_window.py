@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for ManagedWindow base class and stub panel windows — OvGear Step 10."""
 
@@ -46,6 +39,19 @@ _skip_no_window = pytest.mark.skipif(
 
 
 class TestManagedWindowImport:
+    def test_panel_background_uses_shared_theme_token(self, monkeypatch):
+        from contextlib import nullcontext
+        from ovui_widgets.common import managed_window
+
+        rectangles = []
+        monkeypatch.setattr(managed_window.ui, "VStack", lambda **kwargs: nullcontext())
+        monkeypatch.setattr(managed_window.ui, "ZStack", lambda **kwargs: nullcontext())
+        monkeypatch.setattr(managed_window.ui, "Rectangle", lambda **kwargs: rectangles.append(kwargs))
+        instance = managed_window.ManagedWindow.__new__(managed_window.ManagedWindow)
+        instance._build_ui = lambda: None
+        instance._build_frame_wrapper()
+        assert rectangles[0]["style"]["background_color"] == "background_primary"
+
     def test_can_import_module(self):
         import ovui_widgets.app
         import ovui_widgets.common.managed_window  # noqa: F401

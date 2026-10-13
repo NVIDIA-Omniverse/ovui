@@ -50,8 +50,10 @@ wheelhouse you built from this source tree), install from that directory; the
 plain PyPI commands apply once the 0.2 distributions are published:
 
 ```bash
-# From a directory of wheels you have access to:
-python -m pip install --find-links /path/to/wheels \
+# From a directory of wheels you have access to. `--pre` is necessary while
+# the version in VERSION.md is a release candidate: without it pip takes the
+# 0.2.0 final release from PyPI and ignores the wheels in the directory.
+python -m pip install --pre --find-links /path/to/wheels \
     ovui-widgets-app "ovui-data-adapters-openusd[standalone]" ovrtx
 # Directly from PyPI (applies once the 0.2 distributions are published):
 python -m pip install ovui-widgets-app "ovui-data-adapters-openusd[standalone]" ovrtx
@@ -59,6 +61,14 @@ python -m pip install ovui-widgets-app "ovui-data-adapters-openusd[standalone]" 
 python -m ovui_widgets.app path/to/scene.usda
 ```
 
+- **Upgrade from 0.2** — include the application package in the upgrade
+  command, for example
+  `python -m pip install --upgrade --pre --find-links /path/to/wheels ovui-widgets-app "ovui-data-adapters-openusd[standalone]"`.
+  From 0.3, each first-party package requires the other first-party packages
+  at its own version, so pip also upgrades `ovui`,
+  `ovui-data-adapters-common` and the other libraries. Do not upgrade only
+  the libraries: the 0.2.0 `ovui-widgets-app` accepts any library version, and
+  it does not start with 0.3 libraries.
 - **OpenUSD provider (standalone)** — the `standalone` extra installs the
   supported `usd-core==25.11` runtime. If your environment already provides
   a compatible `pxr`, install the plain `ovui-data-adapters-openusd` wheel
@@ -182,8 +192,9 @@ python3.12 -c "from pxr import Usd; print(Usd.GetVersion())"
 
 ## Setting Up the Venv
 
-The `omni.ui` standalone (`ovui`) lives in its own sibling repo at
-`~/dev/ovui`. USD Viewer installs it editable so both repos can evolve together.
+The `omni.ui` standalone (`ovui`) is the `ovui/` project of this repository.
+This recipe uses `~/dev/ovui` for the repository root, so the native project
+is `~/dev/ovui/ovui`. USD Viewer installs it editable so both evolve together.
 
 ### 1. Create `_venv312`
 
@@ -199,19 +210,27 @@ pip install -U pip setuptools wheel
 ```bash
 # Point CMake at the Vulkan headers installed above
 Vulkan_INCLUDE_DIR=$HOME/.local/include \
-    pip install -e ~/dev/ovui
+    pip install -e ~/dev/ovui/ovui
 ```
 
 `setup.py` forwards `PYTHON_EXECUTABLE` from the active venv, so the C++
 bindings are built against the Python 3.12 ABI automatically. Output lands
-in `~/dev/ovui/python/omni/ui/` and `~/dev/ovui/python/omni/ui_scene/`.
+in `~/dev/ovui/ovui/python/omni/ui/` and
+`~/dev/ovui/ovui/python/omni/ui_scene/`.
 
 ### 3. Install USD Viewer in editable mode
 
 The historical top-level `.[dev,usd]` extras no longer exist; the current
-distributions live under `ovui-widgets/dist/` and are installed per project:
+distributions live under `ovui-widgets/dist/` and are installed per project.
+First-party packages require each other at the same version, so install the
+data adapters that `ovui-widgets-common` requires first. The paths are
+relative to the repository root, so go there first (step 1 left the shell in
+`ovui-widgets/`):
 
 ```bash
+cd ~/dev/ovui
+pip install -e ovui-data-adapters/dist/common
+pip install -e ovui-data-adapters/dist/services
 pip install -e ovui-widgets/dist/common
 pip install -e ovui-widgets/dist/content
 pip install -e ovui-widgets/dist/stage
@@ -232,8 +251,8 @@ historical recipe.
 pip install ovrtx
 ```
 
-(The pinned internal pre-release `ovrtx==0.2.0.280040` this recipe was
-originally validated against is historical; ovrtx is now published.)
+(This historical recipe was validated against an earlier ovrtx pre-release;
+use a compatible published runtime for current packaged-app workflows.)
 
 ## Building `libovstream.so` from `kit-livestream`
 
@@ -626,7 +645,7 @@ stream_text = snapshot.hud.stream_text
 
 Catalogs that are unavailable in the current backend are reported as empty
 tuples or `None`; the snapshot does not fabricate render targets, RenderVars,
-render-progress, or PathTracing telemetry.
+render-progress, or backend-specific telemetry.
 
 ### Summary table
 
@@ -671,4 +690,4 @@ See `CHANGELOG.md` for the full known-limitations list.
 
 ## License
 
-Copyright (c) NVIDIA Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0. See the [`LICENSE`](../LICENSE) file for the full license text. Copyright (c) NVIDIA Corporation. All rights reserved.

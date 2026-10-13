@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the Step C.1 ``TransformManipulator`` scaffold.
 
@@ -28,6 +21,7 @@ from __future__ import annotations
 import pytest
 from omni.ui_scene import scene as sc
 
+from ovui_widgets.viewport.pick_gesture import GizmoAwarePickManager
 from ovui_widgets.viewport.prim_transform_model import PrimTransformModel
 from ovui_widgets.viewport.transform_manipulator import (
     AXIS_COLOR_X,
@@ -243,8 +237,229 @@ class TestOnBuild:
         manipulator.on_model_updated(None)  # no exception
 
 
+class TestNearPlaneGate:
+    def test_gate_hides_selected_gizmo_behind_near_plane(
+        self,
+        scene_view,
+        selected_model,
+    ):
+        with scene_view.scene:
+            manipulator = TransformManipulator(
+                model=selected_model,
+                pivot_fn=lambda: (1.0, 2.0, 3.0),
+                front_fn=lambda _pivot: False,
+            )
+            manipulator.on_build()
+
+        assert manipulator._pivot_transform is None
+        assert manipulator._scale_transform is None
+        assert manipulator.translate_handles is None
+
+    def test_gate_transition_invalidates_for_geometry_rebuild(
+        self,
+        scene_view,
+        selected_model,
+        monkeypatch,
+    ):
+        visible = True
+
+        def pivot_is_visible(_pivot):
+            return visible
+
+        with scene_view.scene:
+            manipulator = TransformManipulator(
+                model=selected_model,
+                pivot_fn=lambda: (1.0, 2.0, 3.0),
+                front_fn=pivot_is_visible,
+            )
+            manipulator.on_build()
+
+        invalidations = []
+        monkeypatch.setattr(
+            manipulator,
+            "invalidate",
+            lambda: invalidations.append(None),
+        )
+        visible = False
+
+        manipulator.refresh_transform()
+
+        assert invalidations == [None]
+
+    def test_gate_transition_cancels_drag_and_releases_next_pick(
+        self,
+        scene_view,
+        selected_model,
+        monkeypatch,
+    ):
+        visible = True
+        cancellations = []
+        drag_ref = []
+        events = []
+
+        def record_cancellation():
+            cancellations.append(None)
+            events.append("cancel")
+
+        monkeypatch.setattr(
+            selected_model,
+            "on_drag_cancelled",
+            record_cancellation,
+        )
+
+        with scene_view.scene:
+            manipulator = TransformManipulator(
+                model=selected_model,
+                pivot_fn=lambda: (1.0, 2.0, 3.0),
+                front_fn=lambda _pivot: visible,
+                cancel_drag_fn=lambda: drag_ref[0].cancel_active_drag(),
+            )
+            manipulator.on_build()
+
+        drag = manipulator._translate_drags[0]
+        drag_ref.append(drag)
+        drag._active = True
+        drag._drag_ended_this_cycle = False
+        pick_manager = GizmoAwarePickManager()
+        pick_manager.set_gizmo_gestures([drag])
+        invalidations = []
+        monkeypatch.setattr(
+            manipulator,
+            "invalidate",
+            lambda: (invalidations.append(None), events.append("invalidate")),
+        )
+
+        visible = False
+        manipulator.refresh_transform()
+
+        assert cancellations == [None]
+        assert drag.is_active is False
+        assert invalidations == [None]
+        assert events == ["cancel", "invalidate"]
+        assert pick_manager.has_live_gizmo_drag() is True
+
+        pick_manager.reset_drag_end_tracker()
+
+        assert pick_manager.has_live_gizmo_drag() is False
+
+    def test_gate_transition_rebuilds_when_pivot_returns_in_front(
+        self,
+        scene_view,
+        selected_model,
+        monkeypatch,
+    ):
+        visible = False
+
+        with scene_view.scene:
+            manipulator = TransformManipulator(
+                model=selected_model,
+                pivot_fn=lambda: (1.0, 2.0, 3.0),
+                front_fn=lambda _pivot: visible,
+            )
+            manipulator.on_build()
+
+        invalidations = []
+        monkeypatch.setattr(
+            manipulator,
+            "invalidate",
+            lambda: invalidations.append(None),
+        )
+
+        visible = True
+        manipulator.refresh_transform()
+
+        assert invalidations == [None]
+
+    def test_gate_errors_fail_open(
+        self,
+        scene_view,
+        selected_model,
+    ):
+        def failing_gate(_pivot):
+            raise RuntimeError("camera state unavailable")
+
+        with scene_view.scene:
+            manipulator = TransformManipulator(
+                model=selected_model,
+                front_fn=failing_gate,
+            )
+            manipulator.on_build()
+
+        assert manipulator.translate_handles is not None
+
+
 # -- helper math ----------------------------------------------------------
 
+
+
+class TestViewAlignedShafts:
+    """A shaft along the view ray cannot be hit-tested, so it gets no gestures."""
+
+    @staticmethod
+    def _build(scene_view, model, tool, view_dir):
+        with scene_view.scene:
+            manipulator = TransformManipulator(
+                model=model,
+                tool=tool,
+                view_dir_fn=lambda _pivot: view_dir,
+            )
+            manipulator.on_build()
+        return manipulator
+
+    @pytest.mark.parametrize("tool", [TOOL_TRANSLATE, TOOL_SCALE])
+    def test_shaft_along_view_ray_has_no_gestures(self, scene_view, selected_model, tool):
+        manipulator = self._build(scene_view, selected_model, tool, (0.0, -1.0, 0.0))
+        handles = (
+            manipulator.translate_handles if tool == TOOL_TRANSLATE else manipulator.scale_handles
+        )
+        x_shaft, y_shaft, z_shaft = handles.shafts
+        assert list(y_shaft.gestures) == []
+        assert len(x_shaft.gestures) == 2
+        assert len(z_shaft.gestures) == 2
+
+    def test_oblique_view_keeps_every_shaft_interactive(self, scene_view, selected_model):
+        manipulator = self._build(scene_view, selected_model, TOOL_TRANSLATE, (0.3, -1.0, -0.2))
+        assert all(len(shaft.gestures) == 2 for shaft in manipulator.translate_handles.shafts)
+
+    def test_aligned_shaft_cannot_win_a_later_mouse_down(self, scene_view, selected_model):
+        with scene_view.scene:
+            manipulator = TransformManipulator(
+                model=selected_model,
+                view_dir_fn=lambda _pivot: (0.0, 1.0, 0.0),
+            )
+        y_drag = manipulator._translate_drags[1]
+        # A hover that began before the view became aligned never ends once
+        # the shaft loses its gestures; the rebuild must drop it.
+        manipulator._gesture_manager.set_hovered(y_drag, True)
+        with scene_view.scene:
+            manipulator.on_build()
+
+        assert y_drag not in manipulator._gesture_manager._hovered_drags
+
+    def test_alignment_change_rebuilds_unless_dragging(
+        self, scene_view, selected_model, monkeypatch,
+    ):
+        view_dir = (0.3, -1.0, -0.2)
+        with scene_view.scene:
+            manipulator = TransformManipulator(
+                model=selected_model,
+                view_dir_fn=lambda _pivot: view_dir,
+            )
+            manipulator.on_build()
+        invalidations = []
+        monkeypatch.setattr(manipulator, "invalidate", lambda: invalidations.append(None))
+
+        manipulator.refresh_transform()
+        assert invalidations == []
+
+        view_dir = (0.0, -1.0, 0.0)
+        manipulator._gesture_manager._active_drag = manipulator._translate_drags[0]
+        manipulator.refresh_transform()
+        assert invalidations == []
+
+        manipulator._gesture_manager._active_drag = None
+        manipulator.refresh_transform()
+        assert invalidations == [None]
 
 class TestMatrixHelpers:
     def test_scale_matrix_is_16_floats(self):

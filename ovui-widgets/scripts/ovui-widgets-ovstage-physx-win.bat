@@ -1,4 +1,6 @@
 @echo off
+REM SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+REM SPDX-License-Identifier: Apache-2.0
 REM Windows launcher for USD Viewer with ovstage, ovphysx, and ovrtx 0.3.
 REM Pass a USD file path as the first argument, or omit it to open the falling-cube demo.
 

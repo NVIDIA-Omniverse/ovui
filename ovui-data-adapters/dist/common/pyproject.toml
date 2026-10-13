@@ -1,12 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-data-adapters-common"
+license = {text = "Apache-2.0"}
 dynamic = ["version"]
 description = "Provider-neutral UI data-adapter contracts and shared helpers."
-readme = "README.md"
+readme = {content-type = "text/markdown", text = """
+# ovui-data-adapters-common
+
+Pure-Python adapter contracts and records shared by ovui-widgets and backend
+implementations. This distribution defines stage, property, transform,
+renderer, selection, command, subscription, undo, camera-pose, and GPU-frame
+interfaces without requiring OpenUSD, ovrtx, ovstream, or GPU runtimes. NumPy
+supports the shipped provider-neutral livestream frame conversion helper;
+ovstream remains a lazy, externally supplied runtime used only when streaming
+is enabled.
+
+Use these contracts when connecting ovui-widgets to OpenUSD, mock data, or a
+project-specific backend.
+"""}
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.20"]
 

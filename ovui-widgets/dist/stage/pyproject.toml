@@ -1,17 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-widgets-stage"
-dynamic = ["version"]
+license = {text = "Apache-2.0"}
+# Dependencies are in setup.py: first-party packages are pinned to VERSION.md.
+dynamic = ["version", "dependencies"]
 description = "ovui-widgets Stage Browser"
-readme = "README.md"
+readme = {content-type = "text/markdown", text = """
+# ovui-widgets-stage
+
+Stage Browser package for ovui-widgets. It turns scene hierarchy data into a
+searchable, expandable tree with type labels, visibility controls, badges,
+rename support, selection synchronization, lazy child loading, and drag/drop
+reparent feedback.
+
+The widget reads through `StageAdapter`, so a backend can provide OpenUSD,
+mock, or project-specific hierarchy data while reusing the same browser UI.
+"""}
 requires-python = ">=3.10"
-dependencies = [
-    "ovui-widgets-common>=0.1.0",
-    "ovui-data-adapters-common>=0.1.0",
-]
 
 [tool.setuptools.packages.find]
 namespaces = true

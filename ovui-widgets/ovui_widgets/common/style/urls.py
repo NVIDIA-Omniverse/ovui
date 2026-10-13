@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Icon and image URL constants (OvGear design system, design-system style rules).
 
@@ -126,6 +119,12 @@ def register_urls() -> None:
     _prim_icons = [
         ("prim_mesh",    "prim_mesh.png"),
         ("prim_light",   "prim_light.png"),
+        ("prim_light_distant", "prim_light_distant.png"),
+        ("prim_light_dome", "prim_light_dome.png"),
+        ("prim_light_sphere", "prim_light_sphere.png"),
+        ("prim_light_rect", "prim_light_rect.png"),
+        ("prim_light_disk", "prim_light_disk.png"),
+        ("prim_light_cylinder", "prim_light_cylinder.png"),
         ("prim_camera",  "prim_camera.png"),
         ("prim_scope",   "prim_scope.png"),
         ("prim_xform",   "prim_xform.png"),

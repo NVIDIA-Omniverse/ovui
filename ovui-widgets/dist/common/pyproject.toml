@@ -1,17 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-widgets-common"
-dynamic = ["version"]
+license = {text = "Apache-2.0"}
+# Dependencies are in setup.py: first-party packages are pinned to VERSION.md.
+dynamic = ["version", "dependencies"]
 description = "ovui-widgets shared library: WidgetServices protocol, types, adapters, settings, selection, undo, scheduler, error reporter, icon caches, managed window, dialogs, snap, mock adapters (numpy in [testing] extra)"
-readme = "README.md"
+readme = {content-type = "text/markdown", text = """
+# ovui-widgets-common
+
+Shared Python infrastructure for the ovui-widgets package family. This
+distribution provides app service protocols, common types, settings, selection,
+undo, scheduled callbacks, error reporting, managed windows, dialogs, snap
+support, icon resources, style helpers, and test-friendly mock adapters.
+
+Widget packages depend on this package for shared state and common services
+instead of importing sibling widget packages directly.
+"""}
 requires-python = ">=3.10"
-dependencies = [
-    "ovui>=0.1.0",
-    "ovui-data-adapters-common>=0.1.0",
-]
 
 [project.optional-dependencies]
 # numpy is required only by ovui_widgets.common.testing.mock_renderer (runtime)

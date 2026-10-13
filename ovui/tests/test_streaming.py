@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the streaming API lifecycle."""
 
@@ -173,6 +166,18 @@ class TestStreamingLifecycle(unittest.TestCase):
         # Re-init should work
         standalone.init_streaming(800, 600)
         self.assertEqual(standalone.get_streaming_size(), (800, 600))
+
+    def test_init_after_init_streaming_uses_active_backend(self):
+        """init() after init_streaming() must reuse the backend, not raise."""
+        if standalone._initialized:
+            self.skipTest("a backend started by init() is already active")
+        standalone.init_streaming(320, 240)
+        try:
+            standalone.init("streaming", 320, 240)
+            self.assertTrue(standalone.streaming_tick())
+        finally:
+            standalone.shutdown_streaming()
+            standalone.shutdown()
 
     def test_resize_without_init(self):
         """resize_streaming without init should raise."""

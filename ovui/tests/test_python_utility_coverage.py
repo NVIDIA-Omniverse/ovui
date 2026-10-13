@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Unit tests for pure-Python ovui utility layers."""
 
@@ -197,6 +190,7 @@ class _FakeUiInput:
         self.poll_result = True
         self.fallback_result = False
         self.raise_schedule_attribute = False
+        self.screenshot_result = {"status": "succeeded", "done": True, "success": True}
 
     def _inject_mouse_move(self, x, y):
         self.calls.append(("move", x, y))
@@ -228,6 +222,9 @@ class _FakeUiInput:
     def _poll_screenshot_done(self):
         self.calls.append(("poll",))
         return self.poll_result
+
+    def _get_screenshot_result(self):
+        return dict(self.screenshot_result)
 
     def _capture_screenshot(self, filepath):
         self.calls.append(("capture", filepath))
@@ -302,6 +299,11 @@ class TestTestingHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("schedule", "/tmp/shot.png"), self.fake_ui.calls)
         self.assertIn(("poll",), self.fake_ui.calls)
 
+        # A capture that completed but could not write the file is a failure.
+        self.fake_ui.screenshot_result = {"status": "failed", "done": True, "success": False}
+        with mock.patch("omni.ui.standalone._tick_one_frame"):
+            self.assertFalse(ui_testing.capture_screenshot("/tmp/no_such_dir/shot.png"))
+
         self.fake_ui.calls.clear()
         self.fake_ui.schedule_result = False
         self.fake_ui.fallback_result = True
@@ -352,12 +354,14 @@ class _FakeStandaloneBackend:
         self.window_size = (640, 480)
         self.cursor_enabled = False
         self.should_close_values = [True]
+        self.init_result = True
         self.init_streaming_result = True
         self.streaming_tick_result = True
         self.resize_streaming_result = True
 
     def _standalone_init(self, title, width, height):
         self.calls.append(("init", title, width, height))
+        return self.init_result
 
     def _standalone_shutdown(self):
         self.calls.append(("shutdown",))
@@ -486,6 +490,16 @@ class TestStandaloneHelpers(unittest.TestCase):
         self.assertEqual(ui_standalone._frame_index, 0)
         self.assertIsNone(ui_standalone._last_tick_time)
 
+    def test_init_raises_when_native_init_fails(self):
+        self.fake_ui.init_result = False
+        with mock.patch("atexit.register") as register:
+            with self.assertRaises(RuntimeError):
+                ui_standalone.init("Demo", 300, 200)
+            with self.assertRaises(RuntimeError):
+                ui_standalone._ensure_initialized_for_run()
+        self.assertFalse(ui_standalone._initialized)
+        register.assert_not_called()
+
     def test_tick_resolves_futures_and_remaining_budget(self):
         loop = asyncio.new_event_loop()
         self.addCleanup(loop.close)
@@ -496,7 +510,7 @@ class TestStandaloneHelpers(unittest.TestCase):
         # ``_initialized`` under the native lock and skips after teardown.
         ui_standalone._initialized = True
         self.addCleanup(setattr, ui_standalone, "_initialized", False)
-        with mock.patch.object(ui_standalone.time, "monotonic", side_effect=[10.0, 10.01, 10.02]):
+        with mock.patch.object(ui_standalone.time, "perf_counter", side_effect=[10.0, 10.01, 10.02]):
             first = ui_standalone._tick_one_frame()
             remaining = ui_standalone._max_fps_remaining_since(10.0)
 

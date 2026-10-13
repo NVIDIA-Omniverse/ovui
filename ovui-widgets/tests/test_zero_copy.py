@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the tier-2 zero-copy state machine and ImageBridge GPU dispatch."""
 
@@ -16,16 +9,16 @@ from unittest.mock import MagicMock
 import pytest
 from ovui_data_adapters.common import GpuFrame, ZeroCopyState, _Mode
 
+import ovui_widgets.viewport.image_bridge as image_bridge
 from ovui_widgets.viewport.image_bridge import ImageBridge
 
 
 class TestZeroCopyStateFromEnv:
-    def test_disabled_when_env_unset(self, monkeypatch):
+    def test_probing_when_env_unset(self, monkeypatch):
         monkeypatch.delenv("OVGEAR_ZERO_COPY", raising=False)
         s = ZeroCopyState.from_env()
-        assert s.mode is _Mode.DISABLED
-        assert s.disabled is True
-        assert s.gpu_pending is False
+        assert s.mode is _Mode.PROBING
+        assert s.gpu_pending is True
 
     def test_disabled_when_env_zero(self, monkeypatch):
         monkeypatch.setenv("OVGEAR_ZERO_COPY", "0")
@@ -104,7 +97,8 @@ class TestImageBridgeGpuDispatch:
         )
         mapping.__exit__.assert_called_once()
 
-    def test_probe_detects_standalone_no_op_and_falls_back(self):
+    def test_probe_detects_standalone_no_op_and_falls_back(self, monkeypatch):
+        monkeypatch.setattr(image_bridge, "_has_gpu_byte_image", lambda: True)
         state = ZeroCopyState(_Mode.PROBING)
         bridge = ImageBridge(8, 8, state=state)
 
@@ -120,13 +114,15 @@ class TestImageBridgeGpuDispatch:
         assert "fromGpu not supported" in (state.fallback_reason or "")
         mapping.__exit__.assert_called_once()
 
-    def test_probe_marks_enabled_when_no_warning(self):
+    def test_probe_marks_enabled_when_no_warning(self, monkeypatch):
+        monkeypatch.setattr(image_bridge, "_has_gpu_byte_image", lambda: True)
         state = ZeroCopyState(_Mode.PROBING)
         bridge = ImageBridge(8, 8, state=state)
         bridge._provider = MagicMock()  # no stderr emission
         frame = GpuFrame(ptr=0x2000, width=8, height=8, mapping=MagicMock())
         bridge.update(frame)
         assert state.mode is _Mode.ENABLED
+
 
     def test_mapping_closed_even_when_provider_raises(self):
         state = ZeroCopyState(_Mode.ENABLED)

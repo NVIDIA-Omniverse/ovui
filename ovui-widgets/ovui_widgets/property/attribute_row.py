@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Attribute row widgets for the Property Inspector (property inspector style behavior).
 
@@ -34,7 +27,9 @@ forwarder remains so existing tests that import ``build_attribute_row``
 directly keep passing.
 """
 
+import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
 import omni.ui as ui
 from omni.ui import color as cl
@@ -1352,6 +1347,29 @@ def is_relative_path(path: str) -> bool:
     return True
 
 
+def _join_asset_picker_path(dirname: str, filename: str) -> str:
+    """Join the file picker's URL/path parts without changing its scheme."""
+    if not dirname:
+        return filename
+    base = dirname if dirname.lower() in {"file://", "file:///"} else dirname.rstrip("/\\")
+    if not base:
+        return filename
+    if base.endswith(("/", "\\")):
+        return f"{base}{filename}"
+    separator = "/" if base.lower().startswith("file://") or "/" in base else os.sep
+    return f"{base}{separator}{filename}"
+
+
+def _asset_picker_url_to_path(url: str) -> str:
+    """Convert a local ``file://`` picker URL to a native USD asset path."""
+    if not url.lower().startswith("file://"):
+        return url
+    path = unquote(url[len("file://") :])
+    if os.name == "nt" and len(path) >= 3 and path[0] == "/" and path[2] == ":":
+        path = path[1:]
+    return path
+
+
 class AssetPathAttributeRow:
     """Label + ``ui.StringField`` + folder button for a USD ``asset`` attribute.
 
@@ -1363,10 +1381,9 @@ class AssetPathAttributeRow:
     * Renders the authored path inside an editable
       :class:`omni.ui.StringField` (same edit pattern as
       :class:`StringAttributeRow` — commit on ``end_edit``);
-    * Shows a small folder button on the right. Clicking it is a no-op
-      in Step 3.6 — the
-      :mod:`omni.kit.window.file_importer` hook lands in a later phase
-      per the property inspector behavior;
+    * Shows a small folder button on the right. Clicking it opens the
+      product's shared file picker and authors the chosen file through
+      the row's undo-aware attribute model;
     * Surfaces ``adapter.get_resolved_asset_path`` as a tooltip on the
       StringField when the adapter resolves the authored path to an
       absolute filesystem location (Kit's
@@ -1432,9 +1449,6 @@ class AssetPathAttributeRow:
                         self._widget.tooltip = tooltip
                     self._widget.model.add_begin_edit_fn(self._on_begin_edit)
                     self._widget.model.add_end_edit_fn(self._on_end_edit)
-                    # Step 3.6: the folder button is a no-op placeholder; the
-                    # file-picker hook lands with ``omni.kit.window.file_importer``
-                    # integration in a later phase.
                     self._folder_button = ui.Button(
                         "...",
                         width=22,
@@ -1454,11 +1468,43 @@ class AssetPathAttributeRow:
         _wire_row_context_menu(row_hstack, self)
 
     def _on_folder_clicked(self) -> None:
-        """No-op in Step 3.6. The file-picker integration (property inspector implementation /
-        the property inspector behavior) will wire this to
-        :mod:`omni.kit.window.file_importer` in a later phase.
-        """
-        return None
+        """Open the shared picker and commit one supported asset selection."""
+        from ovui_widgets.content.file_importer import FileImporterHelper
+
+        current = self._model.get_value()
+
+        def _on_import(filename: str, dirname: str, selections: List[str]) -> None:
+            picked = selections[0] if selections else _join_asset_picker_path(dirname, filename)
+            asset_path = _asset_picker_url_to_path(picked)
+            if not asset_path:
+                return
+            self._model.begin_edit()
+            try:
+                self._model.set_value(asset_path)
+            except BaseException as primary:  # noqa: BLE001 - preserve edit contract
+                try:
+                    self._model.cancel_edit()
+                except BaseException as secondary:  # noqa: BLE001
+                    add_note = getattr(primary, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            "edit cancellation also failed: "
+                            f"{type(secondary).__name__}: {secondary}"
+                        )
+                raise
+            self._model.end_edit()
+
+        FileImporterHelper.instance().show(
+            title=f"Choose {self._prop.display_name}",
+            import_button_label="Choose",
+            file_extension_types=[
+                ("*.exr, *.hdr, *.png, *.jpg, *.jpeg, *.tif, *.tiff", "Texture Files"),
+                ("*.*", "All files"),
+            ],
+            import_handler=_on_import,
+            filename_url=str(current) if current else None,
+            allow_multi_files_selection=False,
+        )
 
     def _on_begin_edit(self, widget_model: Any) -> None:
         _set_value_field_focused(self._widget, True)

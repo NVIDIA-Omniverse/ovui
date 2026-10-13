@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this software, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Runtime-free regressions for native OVStage write-journal delivery."""
 
@@ -17,7 +10,7 @@ from typing import Any
 
 import numpy as np
 from ovui_data_adapters.common import ChangeEventType
-from ovui_data_adapters.ovstage import _stage_write, change_stream
+from ovui_data_adapters.ovstage import _scene, _stage_write, change_stream
 from ovui_data_adapters.ovstage._stage_write import (
     StageWriteBatch,
     recorded_stage_writes,
@@ -61,6 +54,12 @@ class _Read:
 class _PathDictionary:
     def __init__(self, stage: "_NativeStage") -> None:
         self._stage = stage
+
+    def __enter__(self) -> "_PathDictionary":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.destroy()
 
     def create_path_list_from_strings(self, paths: Any) -> tuple[str, ...]:
         return tuple(str(path) for path in paths)
@@ -119,10 +118,31 @@ class _NativeStage:
     def query_prims(self, ordinal: int) -> dict[str, tuple[Any, ...]]:
         return {"groups": ()}
 
-    def query(self, *, filter: Any = None) -> _Query:
-        return _Query((self.intern_token("focalLength"),))
+    def query(
+        self,
+        filter: Any = None,
+        attributes: Any = None,
+    ) -> _Query:
+        return _Query(
+            tuple(attributes)
+            if attributes is not None
+            else (self.intern_token("focalLength"),)
+        )
 
     def read_attributes(self, query: Any, attributes: Any, ordinal_range: Any) -> _Read:
+        requested_names = tuple(
+            self.token_to_string(attribute)
+            for attribute in attributes
+        )
+        if requested_names == ("usd-path",):
+            return _Read(
+                (
+                    _ReadGroup(
+                        self.intern_token("usd-path"),
+                        self._read_paths,
+                    ),
+                )
+            )
         return _Read(
             (
                 _ReadGroup(
@@ -132,8 +152,8 @@ class _NativeStage:
             )
         )
 
-    def fetch_read_next(self, read: Any) -> None:
-        return None
+    def fetch_read_next(self, read: Any) -> _ReadGroup | None:
+        return read.fetch_next()
 
     def get_attribute_write_floor(self, attribute: Any) -> int:
         return 0
@@ -162,7 +182,8 @@ def _fake_ovstage_module(stage: _NativeStage) -> Any:
     return SimpleNamespace(
         PathDictionary=lambda _stage: _PathDictionary(stage),
         OrdinalRange=SimpleNamespace(
-            between=lambda first, last: (int(first), int(last))
+            between=lambda first, last: (int(first), int(last)),
+            latest=lambda ordinal: (int(ordinal), int(ordinal)),
         ),
         make_dltensor=lambda array, **kwargs: (array, kwargs),
         numpy_to_dldatatype=lambda dtype, *, lanes=1: (str(dtype), int(lanes)),
@@ -184,6 +205,28 @@ def test_user_change_filter_preserves_source_collision_and_hides_dynamic_root() 
     )
 
 
+def test_python_dirty_query_tracks_equal_count_membership_changes(monkeypatch):
+    stage = _NativeStage()
+    module = _fake_ovstage_module(stage)
+    membership = [101, 102]
+    dictionary = _PathDictionary(stage)
+    dictionary.get_paths = lambda _handle: list(membership)
+    module.PathDictionary = lambda _stage: dictionary
+    monkeypatch.setattr(change_stream, "import_module", lambda _name: module)
+
+    query = _Query((stage.intern_token("focalLength"),))
+    query.result = lambda: SimpleNamespace(
+        attributes=query._attributes, all_handle=1, total_prim_count=2,
+    )
+    monkeypatch.setattr(stage, "query", lambda **_kwargs: query)
+    for current, expected_revision in [(1, 1), (2, 1), (3, 2)]:
+        if current == 3:
+            membership[:] = [101, 103]
+        _dirty, complete = change_stream._native_dirty_paths_by_attribute(stage, current - 1, current)
+        assert complete
+        assert stage._ovui_kit_dirty_topology == (current, 2, expected_revision)
+
+
 def test_private_journal_rows_never_reach_events_and_public_rows_are_deduped(
     monkeypatch,
 ) -> None:
@@ -191,6 +234,7 @@ def test_private_journal_rows_never_reach_events_and_public_rows_are_deduped(
     module = _fake_ovstage_module(stage)
     monkeypatch.setattr(_stage_write, "import_module", lambda _name: module)
     monkeypatch.setattr(change_stream, "import_module", lambda _name: module)
+    monkeypatch.setattr(_scene, "import_module", lambda _name: module)
     stream = OvstageChangeStream(_Scene(stage))
 
     with StageWriteBatch(

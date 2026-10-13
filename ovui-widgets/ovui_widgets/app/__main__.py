@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 import argparse
 import sys
@@ -38,7 +31,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         epilog=(
             "Settings overrides: any --/path/to/key=value argument sets the "
             "corresponding dotted setting at launch (e.g. --/ui/theme=light "
-            "sets ui.theme). Overrides take precedence over persisted settings."
+            "sets ui.theme). Overrides take precedence over persisted settings. "
+            "Startup examples: --/app/window/width=2560 "
+            "--/app/window/height=1820 --/app/window/x=100 "
+            "--/app/window/y=100 --/app/renderer/backend=vk "
+            "--/app/renderer/flowMode=fast "
+            "--/app/viewport/width=1024 --/app/viewport/height=1024."
         ),
     )
     parser.add_argument(
@@ -61,12 +59,18 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> None:
     """Launch OvGear. Used by both `python -m ovui_widgets.app` and the `ovui-widgets` console script."""
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+    from ovui_widgets.app.cli_settings import apply_early_setting_overrides
+
+    try:
+        apply_early_setting_overrides(args.settings_overrides)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     from ovui_widgets.app.native_runtime_bootstrap import (
         install_preconstructed_renderer,
         preconstruct_selected_native_renderer,
     )
 
-    bootstrap = preconstruct_selected_native_renderer()
+    bootstrap = preconstruct_selected_native_renderer(args.settings_overrides)
     from ovui_widgets.app.application import Application
 
     app = Application(settings_overrides=args.settings_overrides)

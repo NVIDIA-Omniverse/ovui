@@ -1,19 +1,13 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
 
 #include "Api.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -88,7 +82,10 @@ public:
      * FontAtlasTexture object associated with the specified font and size.
      */
     OMNIUI_API
-    std::shared_ptr<FontAtlasTexture> getAtlas(const char* fontName, float fontSize, bool mipMaps = false, bool extendedGlyphs = false);
+    std::shared_ptr<FontAtlasTexture> getAtlas(const char* fontName, float fontSize, bool mipMaps = false);
+
+    OMNIUI_API
+    std::shared_ptr<FontAtlasTexture> getAtlas(const char* fontName, float fontSize, bool mipMaps, bool extendedGlyphs);
 
 private:
     friend class Inspector;

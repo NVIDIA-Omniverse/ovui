@@ -1,6 +1,6 @@
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # OVUI 0.2 temporary Kit development runtime
@@ -21,6 +21,10 @@ covers Windows ovui/loader mechanics, but it does not yet reproduce this OVUI
 > native validation has not been completed.
 
 ## 1. Build and path contract
+
+These development commands require access to the Kit source tree
+(`omniverse-kit`) and its rendering projects. An installed Kit runtime alone
+does not provide this source/build layout.
 
 Define checkout paths once:
 
@@ -143,11 +147,9 @@ neither needs nor uses `pxr`.
 3. Renderer-only presentation data (private viewport camera,
    RenderProduct/RenderVar wiring, fallback lighting) remains provider-owned
    and never becomes part of the user's durable scene data.
-4. OVRTX is initialized early, attaches in native BORROW mode (the public
-   `ovrtx.AttachMode.BORROW` symbol is passed only when a build exposes it;
-   current runtimes default to BORROW), and renders the committed ordinal with
-   `step(..., ordinal=...)`. It does not receive a USD file, a replicated
-   scene, or any OVRTX data writes.
+4. OVRTX is initialized early, attaches with `AttachMode.BORROW`, and renders
+   the committed ordinal with `step(..., ordinal=...)`. It does not receive a
+   USD file, a replicated scene, or any OVRTX data writes.
 5. Shutdown detaches OVRTX before native OVStage destruction; the provider
    retains the scene/session chain until disposal is proven.
 
@@ -212,7 +214,7 @@ Copying only the two Python packages is insufficient.
 | A save/export/layer operation reports unsupported | Expected: the native provider does not implement those durable workflows. Use the standalone `openusd` provider. |
 | OVRTX rejects a scene write/query/repopulation call | Expected in BORROW mode. Scene-data work belongs on the native OVStage adapter path; do not add a replication fallback. The parameterless renderer `reset()` remains allowed only to invalidate presentation state after an OVStage-owned resolution change. |
 | Wrong module version/path | A stale wheel or checkout shadowed the explicit public Python roots. Inspect the module paths in §2. |
-| Selection is logical but the outline is absent | The selected ovrtx build does not expose the renderer-owned outline-membership API (attach-capable ovrtx 0.4 provides it); selection still synchronizes and the outline degrades honestly. Do not compensate with an OVRTX data API. |
+| Selection is logical but the outline is absent | Current external-attach selection callback forwarding is incomplete. Do not compensate with an OVRTX data API. |
 
 For full architecture and troubleshooting details, return to
 [`kit-runtime.md`](./kit-runtime.md).

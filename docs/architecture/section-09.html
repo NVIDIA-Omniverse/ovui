@@ -1,4 +1,6 @@
 <!doctype html>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -164,6 +166,8 @@
 
     <section>
       <h2>From ovrtx to the viewport image</h2>
+      <p>The native OVStage adapter creates its private viewport product with <code>omni:rtx:quality = 0</code>: frames refine progressively instead of synchronously warming up initial quality after resets. Sampling targets and Eco mode are unchanged. Capture callers can use <code>OvstageRendererAdapter(viewport_quality=100)</code> (also available through the OVStage renderer factories) to request the native full initial-quality budget. This default never overwrites authored render products or later explicit setting edits; another product in the same step may still request a quality wait. The OpenUSD provider is unchanged.</p>
+      <p>Resetting the private product's quality setting restores the adapter instance's configured <code>viewport_quality</code> through the existing undoable authoring path. Its descriptor reports that value as the default, so resetting does not silently reinstate the native quality wait. Authored products and other settings keep their existing reset behavior. This explicit setting reset is separate from renderer resets and simulation Reset.</p>
       <p>The viewport is a handoff point, not a second renderer. ovrtx renders the current stage from the current camera view, then <code>ViewportWidget</code> asks the renderer adapter for the next image that matches that view. <code>ImageBridge</code> hands the result to ovui in the form the image widget can display, and the viewport keeps camera input, picking, and selection feedback attached to the image the user sees.</p>
       <ul>
         <li>ovrtx owns the render work: it receives the stage and camera state and produces the frame image.</li>
@@ -289,6 +293,7 @@
         <li><code>RendererAdapter</code> answers the pick using the same stage, camera view, and RenderProduct that produced the rendered frame.</li>
         <li>The viewport publishes the renderer's answer to <code>SelectionBus</code>, so the stage browser and property inspector follow the pick.</li>
         <li>Selection feedback is renderer-owned: <code>set_selection_highlight()</code> configures native ovrtx selection group styling and writes selection-outline group deltas only for paths whose state changed.</li>
+        <li>With native OVRTX 0.5 or newer, the OVStage adapter retains one activation reset after the first successfully applied non-empty selection. <code>load_stage()</code> arms activation without directly resetting the renderer. Once the outline pass is active, completed dedicated membership writes update the outline on the next render step without another membership reset, including replacement and clear/reselect. First selection can still incur renderer-reset latency. Resolution-change resets remain unchanged; resizing with no applied outline re-arms activation for the next non-empty selection. The gate uses the loaded native <code>Renderer.version</code>. Older or unknown native runtimes and legacy transports, including reserved-attribute writes, retain their existing compatibility reset behavior. Native pixel QA must check first selection in a fresh cube/sphere scene before any camera movement, then replacement, clear/reselect, and clear &rarr; resize &rarr; select.</li>
       </ul>
       <p>The loop stays readable because each part owns one visible result. The bus owns what is selected, the renderer owns the image, pick answers, highlight, and native selection outline, and the viewport owns the user gesture that starts the change. New selection tools can join by publishing a selection change through the same path.</p>
     </section>

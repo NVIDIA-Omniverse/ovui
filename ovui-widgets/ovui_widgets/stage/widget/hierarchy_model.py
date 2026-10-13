@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """HierarchyItem and HierarchyModel — tree model for the Stage Browser TreeView.
 
@@ -16,6 +9,7 @@ omni.ui.AbstractItemModel for display in a ui.TreeView.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Any
 
 import omni.ui as ui
@@ -449,6 +443,18 @@ class HierarchyModel(ui.AbstractItemModel):
         except RuntimeError:
             reparent_after_drop()
 
+    def profile_call(self, name: str, function: Any, /, *args: Any) -> Any:
+        """Use the native scene's existing development scopes when available."""
+        # A static lookup: an adapter double's __getattr__ must not replace
+        # the call with its own result.
+        scene = inspect.getattr_static(self._adapter, "_scene", None)
+        profile_fn = None
+        if inspect.getattr_static(scene, "profile_ovui_call", None) is not None:
+            profile_fn = getattr(scene, "profile_ovui_call", None)
+        if callable(profile_fn):
+            return profile_fn(name, function, *args)
+        return function(*args)
+
     def get_item_children(self, item: Any) -> list[HierarchyItem]:
         """If item is None, return [root]. Otherwise lazy-load children."""
         if self._root is None or self._adapter is None:
@@ -458,7 +464,9 @@ class HierarchyModel(ui.AbstractItemModel):
         if not isinstance(item, HierarchyItem):
             return []
         if item._children is None:
-            item._children = self._load_children(item)
+            item._children = self.profile_call(
+                "StageBrowser.load_children", self._load_children, item
+            )
         return item._children
 
     def resolve_path(self, path: str) -> "HierarchyItem | None":
@@ -483,6 +491,15 @@ class HierarchyModel(ui.AbstractItemModel):
             return self._root
         cached = self._path_cache.get(path)
         if cached is not None:
+            # A cached item outlives topology revisions, but the adapter item
+            # it holds does not: loading children through a superseded one
+            # reports none. Re-anchor to the adapter's current item — and drop
+            # the entry outright when the path is gone — so a cache hit is
+            # never staler than the walk below.
+            current = self._adapter.get_item_at_path(path)
+            if current is None:
+                return None
+            cached.adapter_item = current
             return cached
         if self._adapter.get_item_at_path(path) is None:
             return None
@@ -510,7 +527,10 @@ class HierarchyModel(ui.AbstractItemModel):
     def can_item_have_children(self, item: Any) -> bool:
         if not isinstance(item, HierarchyItem):
             return False
-        return bool(self._adapter.get_children(item.adapter_item))
+        return bool(self.profile_call(
+            "StageBrowser.can_item_have_children",
+            self._adapter.get_children, item.adapter_item,
+        ))
 
     def get_item_value_model_count(self, item: Any) -> int:
         return self.NUM_COLUMNS
@@ -917,6 +937,12 @@ class HierarchyModel(ui.AbstractItemModel):
                 continue
             item._type_model = None
             item.mark_dirty()
+        # ``_reset_children`` only walks items still linked under the root, so
+        # one detached from the graph during this rebuild keeps whatever it
+        # last loaded — including children read while the adapter could not
+        # answer. Cached items are reused by path, so clear them all.
+        for item in list(self._path_cache.values()):
+            item._children = None
         self._reset_children(self._root)
         self._pending_expand_paths.clear()
         # Best-effort prune: drop cache entries for paths the adapter no

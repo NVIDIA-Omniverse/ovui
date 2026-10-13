@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Session-layer USD authoring helpers for the ovrtx viewport integration.
 
@@ -48,6 +41,17 @@ PICK_RENDER_PRODUCT_DEVICE_IDS: Tuple[int, ...] = (0,)
 
 # Fallback dome light intensity. 1000 matches the planet-system example.
 _DEFAULT_DOME_INTENSITY = 1000.0
+
+
+def strip_session_root(layer: Sdf.Layer) -> bool:
+    """Remove renderer scaffolding from an export copy, never the live stage."""
+    spec = layer.GetPrimAtPath("/OvGearSession")
+    if spec is None:
+        return False
+    if str(getattr(layer, "defaultPrim", "")) == spec.name:
+        layer.ClearDefaultPrim()
+    del layer.rootPrims[spec.name]
+    return True
 
 
 def _session_edit(stage: Usd.Stage) -> Usd.EditContext:

@@ -1,17 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-widgets-property"
-dynamic = ["version"]
+license = {text = "Apache-2.0"}
+# Dependencies are in setup.py: first-party packages are pinned to VERSION.md.
+dynamic = ["version", "dependencies"]
 description = "ovui-widgets Property Inspector"
-readme = "README.md"
+readme = {content-type = "text/markdown", text = """
+# ovui-widgets-property
+
+Property Inspector package for ovui-widgets. It follows app selection, asks a
+property adapter for selected-object attributes and metadata, and builds
+type-dispatched editors for scalar values, vectors, colors, tokens,
+relationships, assets, matrices, arrays, and specialized property sections.
+
+The inspector supports multi-selection ambiguity, reset behavior, edit
+begin/set/end calls, and extension through the property scheme registry.
+"""}
 requires-python = ">=3.10"
-dependencies = [
-    "ovui-widgets-common>=0.1.0",
-    "ovui-data-adapters-common>=0.1.0",
-]
 
 [tool.setuptools.packages.find]
 namespaces = true

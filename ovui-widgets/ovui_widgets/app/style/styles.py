@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Global omni.ui style dictionary for all OvGear widgets (design-system style rules).
 
@@ -51,6 +44,20 @@ GLOBAL_STYLES: dict = {
     "Button:disabled": {
         "background_color": cl.interactive_disabled,
         "color": cl.button_disabled_text,
+    },
+    # Shared options gear (Kit's omni.kit.widget.options_button identity):
+    # the fixed-slot hit surface behind the gear glyph, used beside
+    # Shared search-field pattern.
+    "OptionsButton": {
+        "background_color": cl.transparent,
+        "border_width": 0,
+        "border_radius": fl.radius_small,
+    },
+    "OptionsButton:hovered": {
+        "background_color": cl.interactive_hovered,
+    },
+    "OptionsButton:pressed": {
+        "background_color": cl.interactive_pressed,
     },
     "Button:checked": {
         "background_color": cl.accent_primary,
@@ -206,6 +213,7 @@ GLOBAL_STYLES: dict = {
     "StringField": {
         "background_color": cl.background_field,
         "color": cl.text_value,
+        "background_selected_color": cl.field_text_selection,
         "border_radius": fl.radius_small,
         "border_color": cl.border_default,
         "border_width": 1,
@@ -281,6 +289,7 @@ GLOBAL_STYLES: dict = {
     "FloatDrag": {
         "background_color": cl.background_field,
         "color": cl.text_value,
+        "background_selected_color": cl.field_text_selection,
         "secondary_color": cl.background_field,
         "border_radius": fl.radius_small,
         "border_color": cl.border_default,
@@ -303,6 +312,7 @@ GLOBAL_STYLES: dict = {
     "IntDrag": {
         "background_color": cl.background_field,
         "color": cl.text_value,
+        "background_selected_color": cl.field_text_selection,
         "secondary_color": cl.background_field,
         "border_radius": fl.radius_small,
         "border_color": cl.border_default,
@@ -328,6 +338,7 @@ GLOBAL_STYLES: dict = {
     "ComboBox": {
         "background_color": cl.background_field,
         "color": cl.text_value,
+        "selected_color": cl.menu_selection,
         "secondary_color": cl.background_field,
         "border_radius": fl.radius_small,
         "border_color": cl.border_default,
@@ -701,28 +712,31 @@ GLOBAL_STYLES: dict = {
     # -----------------------------------------------------------------------
     # Viewport HUD — corner overlays using the Step 18 label/value pattern.
     # -----------------------------------------------------------------------
+    "ViewportWidget.Background": {
+        "background_color": cl.viewport_background,
+    },
     "Viewport.HUD": {
         "background_color": cl.transparent,
-        "color": cl.text_secondary,
+        "color": cl.viewport_overlay_text_secondary,
         "padding": 0,
         "margin": 0,
         "font_size": fl.font_size_small,
     },
     "Viewport.HUD.Label": {
-        "color": cl.text_secondary,
+        "color": cl.viewport_overlay_text_secondary,
         "font_size": fl.font_size_small,
     },
     "Viewport.HUD.Value": {
-        "color": cl.text_value,
+        "color": cl.viewport_overlay_text_value,
         "font_size": fl.font_size_small,
     },
     "Viewport.HUD.Separator": {
-        "color": cl.text_disabled,
+        "color": cl.viewport_overlay_text_disabled,
         "font_size": fl.font_size_small,
     },
     "Viewport.Toolbar": {
         "background_color": cl.transparent,
-        "color": cl.text_primary,
+        "color": cl.viewport_overlay_text_primary,
         "border_color": cl.transparent,
         "border_width": 0,
         "border_radius": fl.radius_none,
@@ -731,7 +745,7 @@ GLOBAL_STYLES: dict = {
     },
     "Viewport.Toolbar.Button": {
         "background_color": cl.transparent,
-        "color": cl.text_secondary,
+        "color": cl.viewport_overlay_text_secondary,
         "border_color": cl.transparent,
         "border_width": 0,
         "border_radius": fl.radius_small,
@@ -742,7 +756,7 @@ GLOBAL_STYLES: dict = {
     "Viewport.Toolbar.Button:hovered": {
         "background_color": cl.hud_background,
         "border_color": cl.transparent,
-        "color": cl.text_primary,
+        "color": cl.viewport_overlay_text_primary,
     },
     "Viewport.Toolbar.Button:pressed": {
         "background_color": cl.hud_background,
@@ -752,16 +766,16 @@ GLOBAL_STYLES: dict = {
         "background_color": cl.hud_background,
         "border_color": cl.accent_primary,
         "border_width": 1,
-        "color": cl.text_primary,
+        "color": cl.viewport_overlay_text_primary,
     },
     "Viewport.Toolbar.Button::active": {
         "background_color": cl.hud_background,
         "border_color": cl.accent_primary,
         "border_width": 1,
-        "color": cl.text_primary,
+        "color": cl.viewport_overlay_text_primary,
     },
     "Viewport.Toolbar.Icon": {
-        "color": cl.text_primary,
+        "color": cl.viewport_overlay_text_primary,
         "padding": 0,
         "margin": 0,
     },
@@ -785,4 +799,13 @@ GLOBAL_STYLES: dict = {
         "background_color": cl.status_success,
         "color": cl.text_on_accent,
     },
+}
+
+# Keep native plot styles centralized alongside the standard widget defaults.
+GLOBAL_STYLES["Plot"] = {
+    "background_color": cl.background_field,
+    "color": cl.plot_line,
+    "border_width": 0,
+    "border_radius": fl.radius_small,
+    "padding": fl.spacing_small,
 }

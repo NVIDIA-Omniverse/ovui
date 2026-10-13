@@ -1,16 +1,11 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
+
+#include "PlatformBindings.h"
 
 #include <omni/ui/Frame.h>
 #include <omni/ui/Window.h>
@@ -78,10 +73,10 @@ void wrapWindow(module& m)
              }),
              arg("title"), arg("dockPreference") = Window::DockPreference::eDisabled, windowConstructorDoc)
         .def("destroy", &Window::destroy, OMNIUI_PYBIND_DOC_Window_destroy)
-        .def("notify_app_window_change", &Window::notifyAppWindowChange, OMNIUI_PYBIND_DOC_Window_notifyAppWindowChange)
+        .def("notify_app_window_change", [](Window& self, pybind11::object window) { self.notifyAppWindowChange(appWindowFromPython(window)); }, OMNIUI_PYBIND_DOC_Window_notifyAppWindowChange)
         .def("get_window_callback", &Window::getWindowCallback, OMNIUI_PYBIND_DOC_Window_getWindowCallback,
              pybind11::return_value_policy::reference)
-        .def("move_to_app_window", &Window::moveToAppWindow, OMNIUI_PYBIND_DOC_Window_moveToAppWindow)
+        .def("move_to_app_window", [](Window& self, pybind11::object window) { self.moveToAppWindow(appWindowFromPython(window)); }, OMNIUI_PYBIND_DOC_Window_moveToAppWindow)
         .def("set_top_modal", &Window::setTopModal, OMNIUI_PYBIND_DOC_Window_setTopModal)
         .def_property("visible", &Window::isVisible, &Window::setVisible, OMNIUI_PYBIND_DOC_Window_visible)
         .def_property("title", &Window::getTitle, &Window::setTitle, OMNIUI_PYBIND_DOC_Window_title)
@@ -105,7 +100,7 @@ void wrapWindow(module& m)
         .def_property_readonly("menu_bar", &Window::getMenuBar)
         .def_property_readonly("focused", &Window::getFocused, OMNIUI_PYBIND_DOC_Window_focused)
         .def_property("focus_policy", &Window::getFocusPolicy, &Window::setFocusPolicy, OMNIUI_PYBIND_DOC_Window_focusPolicy)
-        .def_property_readonly("app_window", &Window::getAppWindow)
+        .def_property_readonly("app_window", [](const Window& self) { return appWindowToPython(self.getAppWindow()); })
         .def_property("raster_policy", &Window::getRasterPolicy, &Window::setRasterPolicy, OMNIUI_PYBIND_DOC_Window_getRasterPolicy)
         .def_property("fill_app_window", &Window::getFillAppWindow, &Window::setFillAppWindow, OMNIUI_PYBIND_DOC_Window_fillAppWindow)
         .def("set_active", &Window::setActive, arg("active"), "Set whether the Window is in an active state")

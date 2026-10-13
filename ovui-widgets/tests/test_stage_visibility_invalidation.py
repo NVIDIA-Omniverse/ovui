@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Per-item Stage Browser invalidation from notice-derived visibility events.
 
@@ -1069,6 +1062,7 @@ class TestReplacementDeliveryDebtRefusal:
         app.call_later = lambda *a, **k: None
         app._require_factory = lambda name: stage_factory
         app._viewport_window = None
+        app._secondary_viewport_window = None
         return app, factory_calls, cancelled, cleared
 
     def test_load_stage_refuses_before_any_mutation(self):
@@ -1551,6 +1545,7 @@ class TestTwoPhaseReplacementTransition:
         app.call_later = lambda *a, **k: None
         app._startup_prebuilt_renderer = None
         app._current_file_path = "old.usda"
+        app._secondary_viewport_window = None
         return app
 
     def test_failed_provider_open_keeps_document_fully_armed(self):

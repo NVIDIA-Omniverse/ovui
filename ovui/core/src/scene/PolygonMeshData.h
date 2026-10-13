@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -33,6 +26,8 @@ struct PolygonMesh::PolygonMeshData : public AbstractShapeData
     std::vector<Vector2> m_cachedUvs;
     std::vector<void*> m_cachedTextures;
     bool m_cacheIsDirty = true;
+    std::vector<Vector3> m_normals;
+    Lighting m_lighting = Lighting::eUnlit;
 
     bool m_intersectionThicknessExplicitlyChanged = false;
 };

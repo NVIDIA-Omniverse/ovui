@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Testing utilities for ovui - programmatic input injection.
 
@@ -191,7 +184,14 @@ def capture_screenshot(filepath: str) -> bool:
                 loop.run_forever()
             except RuntimeError:
                 pass
-            return _ui._poll_screenshot_done()
+            if not _ui._poll_screenshot_done():
+                return False
+            # "Done" includes a capture that finished by failing (e.g. the
+            # file could not be written); report the request's real outcome.
+            get_result = getattr(_ui, "_get_screenshot_result", None)
+            if get_result is None:
+                return True
+            return bool(get_result().get("success", False))
     except AttributeError:
         pass
     # Fallback to direct capture (may return blank due to buffer timing)

@@ -5,13 +5,22 @@ description: |
   ovstage, or both data adapters. Use when creating a clean virtual
   environment from published wheels, selecting the adapter configuration, or
   launching ovui_widgets.app against a USD file.
-license: "LicenseRef-NVIDIA"
+license: "Apache-2.0"
 metadata:
   python-distribution: ovui-widgets-app
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # ovui-widgets application
+
+## Choose the application workflow
+
+The Windows CMake-generated `ovrtx_ui_app` project is a development-checkout
+workflow. Its build target prepares the application packages; do not apply the
+manual wheel installation commands below to repair that build-owned
+environment.
+
+The following sections describe the packaged-wheel workflow.
 
 Use a separate virtual environment for each configuration. **Availability:**
 as of this writing only the `ovui` core wheel is published on public PyPI;

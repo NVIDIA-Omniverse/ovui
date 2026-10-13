@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -83,13 +76,6 @@ _REQUIRED_OVUI_0_1_BASELINE_IDS = (
     "stage.visibility",
     "stage.default_prim_identity",
     "stage.composition_badges",
-    "create.geometry_meshes",
-    "create.geometry_shapes",
-    "create.lights",
-    "create.camera",
-    "create.scope",
-    "create.xform",
-    "create.material",
     "property.scalar_edit",
     "property.vector_edit",
     "property.token_edit",
@@ -141,7 +127,6 @@ _WORKFLOW_MODULE_NAMES = (
     "test_file_workflows",
     "test_ovstage_stage_workflows",
     "test_property_transform_workflows",
-    "test_renderer_feature_workflows",
     "test_stage_browser_workflows",
 )
 
@@ -364,9 +349,8 @@ def test_exact_ovui_0_1_baseline_manifest_has_no_omissions_or_extras() -> None:
     assert ledger_ids == _REQUIRED_OVUI_0_1_BASELINE_IDS
     # The native-only OVStage provider accepts these limitations instead of
     # emulating them through the removed OpenUSD bridge: document creation,
-    # save, and export; the entire logical USD layer stack; render settings;
-    # clear-to-default; authored child order; and composition/default-prim
-    # identity metadata.
+    # save, and export; the entire logical USD layer stack; clear-to-default;
+    # authored child order; and composition/default-prim identity metadata.
     assert {
         feature["id"]
         for feature in matrix["features"]
@@ -398,7 +382,6 @@ def test_exact_ovui_0_1_baseline_manifest_has_no_omissions_or_extras() -> None:
         "layers.save_layer_as",
         "layers.transfer_layer_content",
         "property.clear_reset",
-        "renderer.settings",
         "stage.composition_badges",
         "stage.default_prim_identity",
         "stage.usd_child_order",

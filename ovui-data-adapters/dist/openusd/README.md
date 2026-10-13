@@ -1,68 +1,82 @@
-# NVIDIA ovui-data-adapters-openusd
+# ovui-data-adapters-openusd
 
-## 1. What is ovui-data-adapters-openusd?
+`ovui-data-adapters-openusd` is the concrete OpenUSD data-adapter wheel. It
+implements the existing OpenUSD-backed stage, property, layer, transform, and
+renderer adapter behavior behind the common adapter registry.
 
-**ovui-data-adapters-openusd** is the OpenUSD provider of ovui-data-adapters, the backend boundary of the **[ovui](https://pypi.org/project/ovui/)** scene-tooling family — NVIDIA's standalone distribution of the Omniverse `omni.ui` UI framework. It implements the provider-neutral adapter contracts from `ovui-data-adapters-common` on top of the OpenUSD (`pxr`) API, giving ovui-widgets applications a complete standalone USD backend: **no Omniverse Kit installation required**.
+## What It Provides
 
-The provider owns its own `Usd.Stage` opened from the scene file you pass it. The `pxr` runtime comes either from the optional `standalone` extra (which installs the supported `usd-core` wheel) or from an environment that already supplies a compatible `pxr`, so the same wheel serves both standalone and embedded deployments.
+- OpenUSD provider registration in `ovui_data_adapters.openusd.register`.
+- Concrete factories for OpenUSD-backed adapters.
+- OpenUSD scene and authoring behavior for applications that select the
+  `openusd` provider.
 
-> *ovui is pre-release software and is not enterprise-supported.*
----
+## Entry Points
 
-## 2. What functionalities are available, and who are the target users?
+The wheel registers one adapter provider entry point:
 
-**What you can do with it:**
-
-- **Drive every widget from USD** — stage hierarchy, property, transform, and layer/composition adapters behind the common contracts.
-- **Author with undo** — undoable USD-mutation commands (visibility, delete, namespace edits, camera pose, prim creation) plus session-layer authoring support.
-- **Present rendered viewports** — a renderer adapter with camera handling, picking, and selection highlighting; rendered output uses an external renderer such as ovrtx resolved from the active environment or `OVRTX_ROOT`.
-- **Stream frames (optional)** — the `livestream` extra adds `ovstream` for livestream frame delivery.
-- **Register automatically** — installing the wheel registers the `openusd` provider through the `ovui_data_adapters.adapters` entry-point group.
-
-**Who benefits:**
-
-- **USD tool & application developers** — a working, production-shaped USD backend for the ovui-widgets USD Viewer and custom apps.
-- **Teams embedding into existing USD environments** — reuse the environment's own `pxr` runtime by installing the plain wheel without the `standalone` extra.
-
-**Installation:**
-
-```bash
-python -m pip install "ovui-data-adapters-openusd[standalone]"
+```toml
+[project.entry-points."ovui_data_adapters.adapters"]
+openusd = "ovui_data_adapters.openusd.register:register"
 ```
 
-Install the plain wheel (`python -m pip install ovui-data-adapters-openusd`) when the environment already provides a compatible `pxr` runtime; do not combine the `standalone` extra with an environment-supplied `pxr`. Select the provider explicitly with `OVUI_DATA_ADAPTER_PROVIDER=openusd`, or let the common registry selection rules choose it.
+The application discovers this entry point through
+`ovui_data_adapters.common.discover_adapter_modules`.
 
----
+## Installation
 
-## 3. Documentation and reference links
+Editable install from the repository:
 
-- **Quickstart & install:** <https://github.com/NVIDIA-Omniverse/ovui#readme>
-- **Data adapters guide:** <https://github.com/NVIDIA-Omniverse/ovui/blob/main/ovui-data-adapters/README.md>
-- **Architecture overview:** <https://github.com/NVIDIA-Omniverse/ovui/tree/main/docs>
-- **Core toolkit (PyPI):** <https://pypi.org/project/ovui/>
-- **Source (GitHub):** <https://github.com/NVIDIA-Omniverse/ovui>
-- **Support:** [Issues](https://github.com/NVIDIA-Omniverse/ovui/issues)
+```bash
+python -m pip install -e ovui-data-adapters/dist/openusd
+```
 
----
+This plain install requires a compatible `pxr` runtime to already be available,
+as it is in Kit or a custom OpenUSD environment.
 
-## 4. System requirements
+For a separate standalone-OpenUSD environment that does not use Kit OVStage:
 
-- **Python 3.10+**
-- Declared dependencies: `ovui-data-adapters-common>=0.1.0`, `numpy>=1.20`
-- Optional extras: `standalone` installs `usd-core==25.11`; `livestream` installs `ovstream`
-- A `pxr` runtime is required at run time — from the `standalone` extra or supplied by the environment
-- **NVIDIA RTX-capable GPU + compatible driver** for rendered viewport output via ovrtx; ovrtx is external to this package (resolved from the active environment or `OVRTX_ROOT`), and non-rendered adapter paths work without it
+```bash
+python -m pip install -e 'ovui-data-adapters/dist/openusd[standalone]'
+```
 
----
+Wheel build from the repository:
 
-## 5. Licensing
+```bash
+python -m pip install build
+python -m build --wheel ovui-data-adapters/dist/openusd
+```
 
-- Governed by the **[NVIDIA Software License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/)** and the **[Product Specific Terms for NVIDIA Omniverse](https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-omniverse/)**.
-- Source-available for inspection; pre-release versions are provided **AS-IS** and are **not currently open to external contributions**.
-- The `standalone` extra installs the third-party open-source `usd-core` package — review its license terms before use.
+The `pyproject.toml` uses `where = ["../.."]` so the wheel sources resolve to
+`ovui-data-adapters/ovui_data_adapters/openusd`.
 
-> **Note:** ovui is pre-release Early Access software and is not enterprise-supported. APIs may change before the 1.0 release.
+## Dependencies
 
----
+Runtime dependencies declared by the wheel (in `setup.py`):
 
-*ovui-data-adapters-openusd · standalone OpenUSD backend for the ovui scene-tooling family · Copyright (c) 2025 NVIDIA Corporation.*
+- `ovui-data-adapters-common`, pinned to the version of this wheel
+- `numpy>=1.20`
+
+The optional `standalone` extra installs `usd-core==25.11`; the optional
+`livestream` extra installs `ovstream`. Do not install the standalone extra in
+the OVUI 0.2 hybrid OVStage runtime: Kit supplies the matching `pxr` stage cache
+used to recover OVStage's exact backing stage.
+
+`ovrtx` is optional and external to the package metadata. The renderer first
+uses `ovrtx` from the active environment when it is importable. If it is not
+importable there, it tries an external install pointed to by `OVRTX_ROOT`,
+checking `$OVRTX_ROOT/public/python`, `$OVRTX_ROOT/python`, and then
+`$OVRTX_ROOT`.
+
+## Usage
+
+Select the OpenUSD provider explicitly:
+
+```bash
+export OVUI_DATA_ADAPTER_PROVIDER=openusd
+python -m ovui_widgets.app path/to/scene.usd
+```
+
+If no provider is selected, the application uses the common registry selection
+rules. Deployments that do not want the OpenUSD provider can omit this wheel or
+remove its `ovui_data_adapters.adapters` entry point.

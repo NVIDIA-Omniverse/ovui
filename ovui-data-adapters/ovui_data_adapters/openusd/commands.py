@@ -1,17 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """USD-specific undo Commands for UsdStageAdapter mutations.
 
-SetVisibilityCommand and NamespaceEditCommand implement the Command ABC so
-UsdStageAdapter can push all mutations through UndoManager.
+SetVisibilityCommand, NamespaceEditCommand and CreatePrimCommand implement
+the Command ABC so UsdStageAdapter can push all mutations through UndoManager.
 """
 
 from __future__ import annotations
@@ -20,13 +13,12 @@ import contextlib
 from typing import Any
 
 try:
-    from pxr import Sdf, UsdGeom
+    from pxr import Sdf, Tf, Usd, UsdGeom
     _HAS_USD = True
 except ImportError:
     _HAS_USD = False
 
 from ovui_data_adapters.common import Command, CommandCancelled
-
 
 _CAMERA_POSE_PROPERTY_NAMES = frozenset(
     {
@@ -861,6 +853,354 @@ class NamespaceEditCommand(Command):
         batch = Sdf.BatchNamespaceEdit()
         batch.Add(self._new_path, self._old_path)
         self._layer.Apply(batch)
+
+
+def _create_copy_values(*_args: Any) -> bool:
+    """Value filter for ``Sdf.CopySpec``: take every field of the one spec."""
+    return True
+
+
+def _create_skip_children(*_args: Any) -> bool:
+    """Children filter for ``Sdf.CopySpec``: never take child specs."""
+    return False
+
+
+def _create_depth_order(paths: Any) -> tuple:
+    """Spec paths, parents before their children."""
+    return tuple(sorted(
+        paths, key=lambda path: (len(path.GetPrefixes()), path.pathString)
+    ))
+
+
+def _create_changed_fields(before: Any, after: Any, path: Any) -> tuple:
+    """Names of the fields whose authored value at ``path`` differs.
+
+    ``ListInfoKeys`` holds no children field, so a prim spec keeps its
+    children and its properties out of this comparison. They are compared one
+    by one as specs of their own.
+    """
+    before_spec = before.GetObjectAtPath(path)
+    after_spec = after.GetObjectAtPath(path)
+    before_keys = set(before_spec.ListInfoKeys())
+    after_keys = set(after_spec.ListInfoKeys())
+    changed = []
+    for key in sorted(before_keys | after_keys):
+        if (key in before_keys) != (key in after_keys):
+            changed.append(key)
+            continue
+        try:
+            same = bool(before_spec.GetInfo(key) == after_spec.GetInfo(key))
+        except Exception:  # noqa: BLE001 - unknown value type: count it as changed
+            same = False
+        if not same:
+            changed.append(key)
+    return tuple(changed)
+
+
+def _create_sync_fields(source: Any, layer: Any, path: Any, fields: tuple) -> None:
+    """Take only ``fields`` of one spec from ``source``.
+
+    ``Sdf.CopySpec`` calls the value filter for every field of both specs, so
+    a field that ``source`` does not hold is cleared. Every other field, and
+    every child, stays as it is. The values move inside OpenUSD, so a field
+    without a Python converter is handled too.
+    """
+    if layer.GetObjectAtPath(path) is None or source.GetObjectAtPath(path) is None:
+        return
+    wanted = frozenset(fields)
+
+    def _copy_wanted(_spec_type: Any, field: Any, *_rest: Any) -> bool:
+        return field in wanted
+
+    if not Sdf.CopySpec(source, path, layer, path, _copy_wanted, _create_skip_children):
+        raise RuntimeError(f"Cannot put the create undo state of {path} back")
+
+
+def _create_copy_one_spec(source: Any, target: Any, path: Any) -> None:
+    """Copy one spec, without its children, into ``target``."""
+    prim_path = path.GetPrimPath()
+    if prim_path != Sdf.Path.absoluteRootPath:
+        Sdf.CreatePrimInLayer(target, prim_path)
+    if not Sdf.CopySpec(
+        source, path, target, path, _create_copy_values, _create_skip_children
+    ):
+        raise RuntimeError(f"Cannot copy the create undo state of {path}")
+
+
+def _create_spec_has_children(spec: Any) -> bool:
+    for name in ("nameChildren", "properties", "variantSets", "variants"):
+        children = getattr(spec, name, None)
+        if children is not None and len(children):
+            return True
+    return False
+
+
+def _create_field_is_from_create(spec: Any, created: Any, key: str) -> bool:
+    """Whether ``key`` on ``spec`` still holds the value the create gave it.
+
+    ``created`` is the copy of the spec as the create left it. A field that
+    the create did not author, or that a later edit changed, belongs to the
+    user and is not the create's to take off.
+    """
+    if created is None:
+        return True
+    if key not in set(created.ListInfoKeys()):
+        return False
+    try:
+        return bool(spec.GetInfo(key) == created.GetInfo(key))
+    except Exception:  # noqa: BLE001 - unknown value type: count it as a later edit
+        return False
+
+
+def _create_later_fields(spec: Any, created: Any) -> tuple:
+    """Names of the fields on ``spec`` that a later edit left behind."""
+    return tuple(
+        key for key in spec.ListInfoKeys()
+        if not _create_field_is_from_create(spec, created, key)
+    )
+
+
+def _create_neutralize_spec(spec: Any, created: Any = None) -> None:
+    """Take the create's own authored fields off a spec that is still needed.
+
+    A prim spec with no authored field and the ``over`` specifier adds
+    nothing to the composed stage. It is the nearest state to "no spec" that
+    keeps the specs which later edits authored below it. A field that a later
+    edit authored or changed stays, so the undo takes back only the create.
+    """
+    for key in list(spec.ListInfoKeys()):
+        if not _create_field_is_from_create(spec, created, key):
+            continue
+        if key == "specifier":
+            spec.SetInfo(key, Sdf.SpecifierOver)
+            continue
+        spec.ClearInfo(key)
+
+
+def _create_remove_spec(layer: Any, path: Any, created: Any = None) -> None:
+    """Take one spec of the create back out of ``layer``.
+
+    ``created`` is the copy of the spec as the create left it, for a spec
+    that the create added. The spec goes away whole only when nothing of a
+    later edit would go with it: no child spec, and no field that a later
+    edit authored or changed.
+    """
+    spec = layer.GetObjectAtPath(path)
+    if spec is None:
+        return
+    if _create_spec_has_children(spec) or _create_later_fields(spec, created):
+        _create_neutralize_spec(spec, created)
+        return
+    batch = Sdf.BatchNamespaceEdit()
+    batch.Add(path, Sdf.Path.emptyPath)
+    if not layer.Apply(batch):
+        raise RuntimeError(f"Cannot remove {path} for the create undo")
+
+
+def _create_outer_paths(roots: tuple) -> tuple:
+    """The pseudo-root and every ancestor of every root.
+
+    A create also authors ancestor specs (``Sdf.CreatePrimInLayer``). These
+    specs are above the walked subtrees. The pseudo-root is the end of every
+    ancestor chain; its own fields are left out of the comparison.
+    """
+    paths = {Sdf.Path.absoluteRootPath}
+    for root in roots:
+        paths.update(root.GetPrefixes())
+    return _create_depth_order(paths)
+
+
+def _create_undo_roots(edit_target: Any, stage_paths: list) -> tuple:
+    """Spec paths in the edit target that bound the search for changes.
+
+    The pseudo-root is the safe answer: it walks the whole layer. The
+    comparison stays exact either way, only the walk is longer.
+    """
+    roots: set = set()
+    for stage_path in stage_paths:
+        path = edit_target.MapToSpecPath(stage_path)
+        if path.isEmpty or path.GetPrimPath() == Sdf.Path.absoluteRootPath:
+            return (Sdf.Path.absoluteRootPath,)
+        roots.add(path)
+    if not roots:
+        return (Sdf.Path.absoluteRootPath,)
+    prim_roots = [path for path in roots if path.IsPrimPath()]
+    return _create_depth_order(
+        path for path in roots
+        if not any(
+            other != path and path.HasPrefix(other) for other in prim_roots
+        )
+    )
+
+
+class _CreateLayerDelta:
+    """The exact difference that one create made to the edit-target layer.
+
+    The difference is held spec by spec and field by field: which specs the
+    create added, which it removed, and which single fields it changed. An
+    undo or a redo applies only this difference, so a later edit to another
+    field, to an existing child or to a sibling stays as the user left it.
+    """
+
+    def __init__(self, before: Any, after: Any, roots: tuple) -> None:
+        added: set = set()
+        removed: set = set()
+        changed: dict = {}
+
+        def _classify(path: Any) -> None:
+            in_before = before.GetObjectAtPath(path) is not None
+            in_after = after.GetObjectAtPath(path) is not None
+            if in_before and in_after:
+                fields = _create_changed_fields(before, after, path)
+                if fields:
+                    changed[path] = fields
+            elif in_after:
+                added.add(path)
+            elif in_before:
+                removed.add(path)
+
+        for root in roots:
+            after.Traverse(root, _classify)
+            before.Traverse(root, _classify)
+        for path in _create_outer_paths(roots):
+            _classify(path)
+        # Layer metadata lives on the pseudo-root. No create action authors
+        # it, and some of its fields have no Python converter.
+        changed.pop(Sdf.Path.absoluteRootPath, None)
+
+        self._added = _create_depth_order(added)
+        self._removed = _create_depth_order(removed)
+        self._changed = _create_depth_order(changed)
+        self._fields = dict(changed)
+        self._before_specs = _CreateSpecCopies(
+            before, (*self._removed, *self._changed)
+        )
+        self._after_specs = _CreateSpecCopies(
+            after, (*self._added, *self._changed)
+        )
+
+    def undo(self, layer: Any) -> None:
+        for path in reversed(self._added):
+            self._after_specs.remove(layer, path)
+        for path in self._removed:
+            self._before_specs.restore(layer, path)
+        for path in self._changed:
+            self._before_specs.sync_fields(layer, path, self._fields[path])
+
+    def redo(self, layer: Any) -> None:
+        for path in reversed(self._removed):
+            _create_remove_spec(layer, path)
+        for path in self._added:
+            self._after_specs.restore_fields(layer, path)
+        for path in self._changed:
+            self._after_specs.sync_fields(layer, path, self._fields[path])
+
+
+class _CreateSpecCopies:
+    """Single-spec copies, kept so a spec can be put back as it was."""
+
+    def __init__(self, layer: Any, paths: tuple) -> None:
+        self._holder = Sdf.Layer.CreateAnonymous("ovui-create-undo")
+        for path in paths:
+            if layer.GetObjectAtPath(path) is None:
+                continue
+            _create_copy_one_spec(layer, self._holder, path)
+
+    def restore(self, layer: Any, path: Any) -> None:
+        if self._holder.GetObjectAtPath(path) is None:
+            return
+        _create_copy_one_spec(self._holder, layer, path)
+
+    def remove(self, layer: Any, path: Any) -> None:
+        """Take a spec of this copy back out of ``layer``.
+
+        The copy says which fields the create itself authored, so a field
+        that a later edit authored or changed stays.
+        """
+        _create_remove_spec(layer, path, self._holder.GetObjectAtPath(path))
+
+    def restore_fields(self, layer: Any, path: Any) -> None:
+        """Author the create's own fields of one spec again.
+
+        A spec that the undo took out whole comes back whole. A spec that the
+        undo only neutralized still holds the fields of a later edit, so only
+        the fields this copy holds are taken.
+        """
+        source = self._holder.GetObjectAtPath(path)
+        if source is None:
+            return
+        if layer.GetObjectAtPath(path) is None:
+            _create_copy_one_spec(self._holder, layer, path)
+            return
+        _create_sync_fields(self._holder, layer, path, tuple(source.ListInfoKeys()))
+
+    def sync_fields(self, layer: Any, path: Any, fields: tuple) -> None:
+        _create_sync_fields(self._holder, layer, path, fields)
+
+
+class CreatePrimCommand(Command):
+    """Undo/redo for one create action on the edit-target layer.
+
+    do() calls ``author`` and records the stage paths it changes. On failure
+    it puts the layer back and raises. Undo and redo apply only the specs and
+    the fields that the create itself authored.
+    """
+
+    affects_namespace = True
+
+    def __init__(self, stage: Any, label: str, author: Any) -> None:
+        self._stage = stage
+        self._label = label
+        self._author = author
+        self._edit_target = stage.GetEditTarget()
+        self._layer = self._edit_target.GetLayer()
+        self._delta: _CreateLayerDelta | None = None
+        self.result: Any = None
+
+    @property
+    def label(self) -> str:
+        return self._label
+
+    def do(self) -> None:
+        layer = self._layer
+        before = Sdf.Layer.CreateAnonymous("ovui-create-before")
+        before.TransferContent(layer)
+        changed: list = []
+
+        def _on_objects_changed(notice: Any, _sender: Any) -> None:
+            changed.extend(notice.GetResyncedPaths())
+            changed.extend(notice.GetChangedInfoOnlyPaths())
+
+        listener = Tf.Notice.Register(
+            Usd.Notice.ObjectsChanged, _on_objects_changed, self._stage
+        )
+        try:
+            self.result = self._author()
+        except BaseException:
+            listener.Revoke()
+            layer.TransferContent(before)
+            raise
+        listener.Revoke()
+        self._delta = _CreateLayerDelta(
+            before, layer, _create_undo_roots(self._edit_target, changed)
+        )
+
+    def undo(self) -> None:
+        self._replay(lambda layer: self._delta.undo(layer))
+
+    def redo(self) -> None:
+        self._replay(lambda layer: self._delta.redo(layer))
+
+    def _replay(self, apply_delta: Any) -> None:
+        if self._delta is None:
+            return
+        rollback = Sdf.Layer.CreateAnonymous("ovui-create-rollback")
+        rollback.TransferContent(self._layer)
+        try:
+            apply_delta(self._layer)
+        except BaseException:
+            self._layer.TransferContent(rollback)
+            raise
 
 
 class CameraPoseCommand(Command):

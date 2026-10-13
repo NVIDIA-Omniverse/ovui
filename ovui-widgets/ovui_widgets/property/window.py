@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Property inspector window.
 
@@ -38,13 +31,15 @@ for the five thin delegates below (``_compute_display_group`` /
 existing callers (principally ``tests/test_property_filter.py`` and
 ``tests/test_group_context_menu.py`` which exercise the group build
 through the window surface) and will be removed once the test
-harnesses migrate to the widget API. The registry-produced widgets
-are ephemeral: a fresh :class:`AttributesWidget` is constructed per
-rebuild, bound to ``self`` via :meth:`AttributesWidget.set_window`,
-and discarded after ``build_items``. Shared state (adapter, filter,
-group-collapse map) lives on the window so the ephemerality is harmless.
+harnesses migrate to the widget API. Registry-produced widgets are
+constructed fresh per rebuild, bound to ``self`` via
+:meth:`AttributesWidget.set_window`, retained on ``_scheme_widgets``,
+and destroyed at the start of the next rebuild (or window teardown) so
+scheme widgets get a deterministic subscription boundary. Shared state
+(adapter, filter, group-collapse map) lives on the window.
 """
 
+from collections import deque
 from typing import Any, Dict, List, NamedTuple, Optional
 
 import omni.ui as ui
@@ -120,6 +115,11 @@ class PropertyWindow(ManagedWindow):
     # reach ``_on_bus_selection_changed`` via ``set_selection`` only)
     # compatible without every factory having to seed the attribute.
     _pending_selection_rebuild_handle: Optional[Any] = None
+    # A USD write-through edit can emit renderer-visible notices before the
+    # pointer is released. Rebuilding the panel for that notice would destroy
+    # the active drag widget, so affected refreshes coalesce behind this handle
+    # until no attribute row is editing.
+    _pending_edit_rebuild_handle: Optional[Any] = None
     # Bug 12: set to ``True`` for the duration of
     # :meth:`_on_bus_selection_changed` so :meth:`set_selection` knows
     # to defer the content rebuild out of the synchronous bus publish
@@ -127,7 +127,17 @@ class PropertyWindow(ManagedWindow):
     # :meth:`set_selection` never flip this, so they keep the
     # pre-Bug-12 synchronous-rebuild contract.
     _in_bus_callback: bool = False
-
+    # Bounded ledger of event tokens whose rebuild submission SUCCEEDED
+    # (scheduling completed or the synchronous fallback rebuilt).
+    # Same-token requests collapse to the first successful one even on
+    # the synchronous no-scheduler fallback, where the pending-handle
+    # coalescing cannot help, and even when other events interleave
+    # (one last-token slot would forget event A after event B). A token
+    # is recorded only AFTER success, so a failed cancel/schedule/
+    # rebuild leaves the event retryable by the next presentation
+    # owner. Class-level default (lazily replaced per instance) keeps
+    # headless bypass-``__init__`` tests compatible.
+    _accepted_rebuild_tokens: Any = None
     def __init__(self) -> None:
         self._adapter: Optional[PropertyAdapter] = None
         self._selection: List[str] = []
@@ -183,6 +193,22 @@ class PropertyWindow(ManagedWindow):
         # (e.g. third-party code that wants a window-scoped widget
         # without taking a slot in the global registry).
         self._widgets: List[PropertyWidget] = []
+        # Scheme-neutral seam: registry-produced widgets from the most
+        # recent rebuild, retained so the next rebuild (and window
+        # teardown) can call :meth:`PropertyWidget.destroy` before the
+        # instances are replaced. Widgets without subscriptions are
+        # unaffected (their ``destroy`` is a no-op); widgets that
+        # subscribe to adapter changes get a deterministic teardown
+        # boundary instead of leaking across rebuilds.
+        self._scheme_widgets: List[PropertyWidget] = []
+        # Scheme-neutral contribution slots (empty for the ordinary
+        # inspector): a zero-height stack above the filter bar and a
+        # zero-width stack beside the filter pill. Registry widgets fill
+        # them through :meth:`PropertyWidget.build_pre_filter_items` /
+        # :meth:`PropertyWidget.build_filter_accessory_items` during
+        # :meth:`_build_registered_widgets`.
+        self._pre_filter_container: Optional[Any] = None
+        self._filter_accessory_container: Optional[Any] = None
         # Step 6.2: the default catch-all attributes widget is still
         # constructed here so the five thin delegate methods below
         # (``_compute_display_group`` etc. — preserved for tests in
@@ -211,6 +237,7 @@ class PropertyWindow(ManagedWindow):
         # :meth:`destroy` and reschedules in :meth:`_schedule_deferred_rebuild`
         # never accidentally create a write that only lives on the class.
         self._pending_selection_rebuild_handle = None
+        self._pending_edit_rebuild_handle = None
         super().__init__("Property Inspector", width=350, height=600)
         self._bus_sub = SelectionBus.instance().subscribe(self._on_bus_selection_changed)
         self._default_attributes = AttributesWidget(self)
@@ -363,6 +390,12 @@ class PropertyWindow(ManagedWindow):
                                 ui.Spacer()
                             ui.Spacer(width=8)
                     ui.Spacer()
+                # Scheme-neutral accessory slot beside the filter pill.
+                # ``width=0`` keeps the empty container at zero footprint
+                # so the ordinary inspector's filter bar is unchanged;
+                # scheme widgets that contribute here size their own
+                # content (see PropertyWidget.build_filter_accessory_items).
+                self._filter_accessory_container = ui.HStack(width=0)
                 ui.Spacer(width=6)
         self._set_filter_chrome_state(bool(self._filter_text))
 
@@ -418,6 +451,7 @@ class PropertyWindow(ManagedWindow):
         adapter is built lazily inside :meth:`_create_adapter_for_paths`
         from the factory installed via :meth:`set_property_adapter_factory`.
         """
+        self._cancel_pending_edit_rebuild()
         if self._stage_change_sub is not None:
             self._stage_change_sub.cancel()
             self._stage_change_sub = None
@@ -450,7 +484,60 @@ class PropertyWindow(ManagedWindow):
             for sel in selected_set
         )
         if affected:
-            self._rebuild_content()
+            if self._has_active_attribute_edit():
+                self._schedule_post_edit_rebuild()
+            else:
+                self._refresh_selected_adapter()
+
+    def _has_active_attribute_edit(self) -> bool:
+        rows = getattr(self, "_inspector_attribute_rows", None) or {}
+        return any(
+            bool(getattr(getattr(row, "_model", None), "editing", False))
+            for row in rows.values()
+        )
+
+    def _schedule_post_edit_rebuild(self) -> None:
+        """Coalesce selected-property notices until the live edit finishes."""
+        if self._pending_edit_rebuild_handle is not None:
+            return
+        try:
+            from ovui_widgets.common import scheduler as _scheduler
+            self._pending_edit_rebuild_handle = _scheduler.call_later(
+                0.0,
+                self._fire_post_edit_rebuild,
+            )
+        except RuntimeError:
+            # A headless window with no application scheduler cannot have a
+            # real pointer edit; retain the current rows rather than tearing
+            # down a model that nevertheless advertises an active edit.
+            self._pending_edit_rebuild_handle = None
+
+    def _fire_post_edit_rebuild(self) -> None:
+        self._pending_edit_rebuild_handle = None
+        if self._has_active_attribute_edit():
+            self._schedule_post_edit_rebuild()
+            return
+        self._refresh_selected_adapter()
+
+    def _refresh_selected_adapter(self) -> None:
+        """Re-enumerate selected properties before rebuilding their rows.
+
+        A value-only notice can reuse the same USD attributes, but transform
+        manipulation may replace an authored xform stack (for example,
+        ``translate``/``rotate``/``scale`` with one matrix op). Rebuilding
+        against the old adapter would leave removed rows visible and omit the
+        new matrix row. The factory is already the supported selection-to-
+        adapter boundary, so use it for every settled selected-prim notice.
+        """
+        if self._stage_adapter is not None:
+            self._adapter = self._create_adapter_for_paths(self._selection)
+        self._rebuild_content()
+
+    def _cancel_pending_edit_rebuild(self) -> None:
+        handle = self._pending_edit_rebuild_handle
+        self._pending_edit_rebuild_handle = None
+        if handle is not None:
+            handle.cancel()
 
     def set_selection(self, paths: List[str]) -> None:
         """Update selected prim paths and rebuild content.
@@ -467,6 +554,7 @@ class PropertyWindow(ManagedWindow):
         new_paths = list(paths)
         if new_paths == self._selection:
             return
+        self._cancel_pending_edit_rebuild()
         self._selection = new_paths
         # Step 7.4: a real selection change resets the large-selection
         # override so the next payload hits the gate again. The earlier
@@ -534,10 +622,20 @@ class PropertyWindow(ManagedWindow):
         self._rebuild_content()
 
     def _cancel_pending_selection_rebuild(self) -> None:
+        """Detach then cancel the pending handle.
+
+        The field is nulled *before* ``cancel()`` runs so a failing
+        cancellation never leaves a callback-capable handle attached to
+        the window: repeated cleanup after a failure is a no-op instead
+        of retrying (and re-raising from) the same dead handle. When
+        called from :meth:`_schedule_deferred_rebuild`, a cancellation
+        failure aborts the new scheduling with the old handle already
+        detached, so there is never duplicate handle ownership.
+        """
         handle = self._pending_selection_rebuild_handle
+        self._pending_selection_rebuild_handle = None
         if handle is not None:
             handle.cancel()
-            self._pending_selection_rebuild_handle = None
 
     def register_widget(self, widget: PropertyWidget) -> None:
         """Append ``widget`` to the stack and request a rebuild."""
@@ -566,6 +664,8 @@ class PropertyWindow(ManagedWindow):
         # Bug 12: a deferred-rebuild handle that fires after destroy would
         # call :meth:`_rebuild_content` on a torn-down window.
         self._cancel_pending_selection_rebuild()
+        self._cancel_pending_edit_rebuild()
+        self._dispose_scheme_widgets()
         for widget in self._widgets:
             widget.destroy()
         self._widgets.clear()
@@ -614,6 +714,7 @@ class PropertyWindow(ManagedWindow):
     def _rebuild_content(self) -> None:
         if self._content is None:
             return
+        self._dispose_scheme_widgets()
         # Step 7.3: snapshot the current scroll position before we blow
         # away the content stack. The preserver reads ``scroll_y`` off
         # the outer scrolling frame now; the matching restore call below
@@ -641,9 +742,16 @@ class PropertyWindow(ManagedWindow):
             return
         # Step 7.4: build the payload once so the large-selection gate
         # and the scroll-preserver restore share a single construction.
-        payload = PropertyPayload(paths=self._selection)
+        payload = self._make_payload()
         with self._content:
             self._build_selection_header()
+            # Scheme-neutral pre-filter slot: zero-height while empty, so
+            # the ordinary inspector layout is unchanged. Scheme widgets
+            # fill it via PropertyWidget.build_pre_filter_items during
+            # _build_registered_widgets.
+            self._pre_filter_container = ui.VStack(
+                spacing=0, height=FIT_CONTENT_HEIGHT
+            )
             self._build_filter_bar()
             if (
                 payload.is_large_selection(self._large_selection_threshold)
@@ -690,15 +798,129 @@ class PropertyWindow(ManagedWindow):
         registry only; nothing mirrors them into :attr:`_widgets`, so
         the same widget class cannot double-render.
         """
-        payload = PropertyPayload(paths=self._selection)
+        self._dispose_scheme_widgets()
+        payload = self._make_payload()
         registry_widgets = PropertySchemeRegistry.instance().get_widgets_for_payload(
             payload.get_scheme(), payload
         )
+        self._scheme_widgets = list(registry_widgets)
+        accepted: List[PropertyWidget] = []
         for widget in list(registry_widgets) + list(self._widgets):
             if hasattr(widget, "set_window"):
                 widget.set_window(self)
             if widget.on_new_payload(payload):
-                widget.build_items()
+                accepted.append(widget)
+        self._build_widget_contributions(accepted)
+        for widget in accepted:
+            widget.build_items()
+
+    def _make_payload(self) -> PropertyPayload:
+        """Build the payload for the current selection with the adapter's scheme.
+
+        Scheme-neutral seam: the adapter is the authoritative scheme
+        source (matching :class:`SchemaPropertyWidget`'s gating
+        contract), so the payload now carries ``adapter.get_scheme()``
+        into :class:`PropertySchemeRegistry` dispatch. ``"default"``
+        remains the universal scheme, so adapters reporting backend
+        identifiers with no registered widgets or delegates (``"usd"``,
+        ``"ovstage"``, mocks) resolve to exactly the same widget set as
+        before. Adapters without a usable ``get_scheme`` fall back to
+        ``"default"``.
+        """
+        scheme = "default"
+        get_scheme = getattr(self._adapter, "get_scheme", None)
+        if callable(get_scheme):
+            try:
+                scheme = str(get_scheme() or "default")
+            except Exception:
+                scheme = "default"
+        return PropertyPayload(paths=self._selection, scheme=scheme)
+
+    def _dispose_scheme_widgets(self) -> None:
+        """Destroy registry-produced widgets retained from the prior rebuild.
+
+        Gives scheme widgets a deterministic subscription
+        boundary: instances live exactly from one content rebuild to the
+        next (including rebuilds that take the empty-selection or
+        large-selection branch) or to :meth:`destroy`. The retained list
+        is swapped out before destruction so re-entrant or repeated
+        calls can never double-destroy a widget. Widgets registered through the
+        per-window :meth:`register_widget` compat list are not touched —
+        their lifetime stays owner-managed via :meth:`unregister_widget`.
+        """
+        widgets = getattr(self, "_scheme_widgets", None) or []
+        self._scheme_widgets = []
+        for widget in widgets:
+            widget.destroy()
+
+    def request_content_rebuild(self, event_token: Any = None) -> bool:
+        """Schedule one coalesced full content rebuild (widget-facing seam).
+
+        Scheme-neutral: any :class:`PropertyWidget` whose backing data
+        changed may ask its host window for a complete content rebuild —
+        selection header, contribution slots, filter bar, and group
+        stack together — instead of rebuilding only its own frame.
+        Reuses the deferred-rebuild scheduling that bus-driven selection
+        changes already use, so rapid successive requests coalesce into
+        a single rebuild and window teardown cancels a pending request.
+
+        ``event_token`` makes SUCCESSFUL submission event-idempotent:
+        callers that share one upstream presentation event pass the
+        same token, and repeated same-token requests collapse to the
+        first request that actually succeeded — including on the
+        synchronous no-scheduler fallback, where the deferred pending
+        handle cannot coalesce and each call would otherwise run a full
+        teardown/rebuild cycle. The token is committed to the bounded
+        accepted ledger only AFTER scheduling succeeded or the
+        synchronous rebuild completed; a failing pending-handle cancel,
+        scheduler submission, or synchronous rebuild propagates WITHOUT
+        recording the token, so the same event stays retryable by a
+        fallback owner. Tokens are compared by object identity, survive
+        other events interleaving (a bounded ledger, not one
+        last-token slot), and ``None`` (the default) keeps the
+        unconditional request behavior.
+
+        Returns ``True`` when the request was accepted — freshly
+        submitted, or already successfully submitted for this event.
+        Failures raise instead of returning.
+        """
+        tokens = self._accepted_rebuild_tokens
+        if tokens is None:
+            # Lazily replace the class-level default so bypass-__init__
+            # instances get their own ledger on first use.
+            tokens = deque(maxlen=8)
+            self._accepted_rebuild_tokens = tokens
+        if event_token is not None and any(
+            accepted is event_token for accepted in tokens
+        ):
+            return True
+        self._schedule_deferred_rebuild()
+        if event_token is not None:
+            tokens.append(event_token)
+        return True
+
+    def _build_widget_contributions(self, widgets: List[PropertyWidget]) -> None:
+        """Route widget chrome contributions into the reserved slots.
+
+        Both containers were emitted earlier in the rebuild (above and
+        beside the filter bar); each accepted widget's contribution hook
+        runs with the matching container as the ambient ``with`` scope.
+        Widgets inheriting the default no-op hooks leave the containers
+        empty and both slots keep zero footprint.
+        """
+        pre_filter = getattr(self, "_pre_filter_container", None)
+        accessory = getattr(self, "_filter_accessory_container", None)
+        for widget in widgets:
+            if pre_filter is not None:
+                pre_hook = getattr(widget, "build_pre_filter_items", None)
+                if callable(pre_hook):
+                    with pre_filter:
+                        pre_hook()
+            if accessory is not None:
+                accessory_hook = getattr(widget, "build_filter_accessory_items", None)
+                if callable(accessory_hook):
+                    with accessory:
+                        accessory_hook()
 
     def _build_group_stack(self) -> None:
         ui.Spacer(height=_FILTER_TO_FIRST_GROUP_SPACING)

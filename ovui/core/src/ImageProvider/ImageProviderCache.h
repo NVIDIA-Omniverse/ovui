@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -122,12 +115,12 @@ public:
         auto it = gpuResources.find(key);
         if (it != gpuResources.end())
         {
-            it->second.counter++;
             if (!it->second.imageProvider)
             {
                 OMNIUI_LOG_INFO("omni::ui::GpuResourcesCache: uninitialized cached GPU resource");
                 return nullptr;
             }
+            it->second.counter++;
             return it->second.imageProvider;
         }
         else

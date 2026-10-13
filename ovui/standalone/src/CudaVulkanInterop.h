@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -121,9 +114,9 @@ private:
 
     // Vulkan handles (not owned — belong to VulkanBackend)
     VkDevice                 m_vkDevice      = VK_NULL_HANDLE;
+    VkQueue                  m_vkQueue       = VK_NULL_HANDLE;
     VkSemaphore              m_vkSemVkDone   = VK_NULL_HANDLE;
     VkSemaphore              m_vkSemCuDone   = VK_NULL_HANDLE;
-    VkQueue                  m_vkQueue       = VK_NULL_HANDLE;
 
     int                      m_width         = 0;
     int                      m_height        = 0;
@@ -150,12 +143,22 @@ struct CudaImageImport
 /// cudaMipmappedArray. Returns true on success; outImport's fields are
 /// populated. On failure, outImport is left zeroed.
 ///
-/// `physicalDevice` is required so the helper can match the Vulkan
-/// device's UUID (VkPhysicalDeviceIDProperties::deviceUUID) against
-/// CUDA's enumerated devices and cudaSetDevice on the matching one
-/// before importing memory. Without this the import targets whatever
-/// CUDA device happens to be current — which is wrong on multi-GPU
-/// hosts where Vulkan and CUDA may not agree on "device 0".
+/// `physicalDevice` is required so the helper can find the CUDA device that
+/// is the same adapter and cudaSetDevice on it before importing memory. The
+/// identity the two APIs share is platform-specific: on Windows it is the
+/// LUID together with the node mask within a linked adapter
+/// (VkPhysicalDeviceIDProperties::deviceLUID/deviceNodeMask against
+/// cudaDeviceProp::luid/luidDeviceNodeMask); elsewhere it is the device UUID.
+/// Without this the import targets whatever CUDA device happens to be
+/// current — which is wrong on multi-GPU hosts where Vulkan and CUDA may not
+/// agree on "device 0".
+/// Index of the CUDA device that is the same physical adapter as
+/// `physicalDevice`, or -1 when there is none. Returns -1 when no CUDA device
+/// is visible at all, so a caller can distinguish "CUDA compiled in" from
+/// "a usable CUDA/Vulkan pair exists". Matches on UUID, or on LUID plus node
+/// mask on Windows where the UUIDs are not comparable.
+OMNIUI_STANDALONE_API int matchCudaDeviceForVulkan(VkPhysicalDevice physicalDevice);
+
 OMNIUI_STANDALONE_API bool importVkImageMemoryToCuda(VkDevice device,
                                                      VkPhysicalDevice physicalDevice,
                                                      VkDeviceMemory memory,

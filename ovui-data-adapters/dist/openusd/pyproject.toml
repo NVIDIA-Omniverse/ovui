@@ -1,17 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-data-adapters-openusd"
-dynamic = ["version"]
+license = {text = "Apache-2.0"}
+# Dependencies are in setup.py: first-party packages are pinned to VERSION.md.
+dynamic = ["version", "dependencies"]
 description = "Concrete OpenUSD data adapters and renderer-side OpenUSD support."
-readme = "README.md"
+readme = {content-type = "text/markdown", text = """
+# ovui-data-adapters-openusd
+
+OpenUSD-backed adapter implementations for ovui-widgets. This distribution
+provides USD stage hierarchy, property, transform, layer/composition, renderer,
+camera, picking, selection-highlight, session authoring, and undoable command
+support behind the common adapter contracts.
+
+It depends on `ovui-data-adapters-common` and `numpy`. The `standalone` extra
+supplies `usd-core==25.11`; Kit and custom-USD environments supply their own
+matching `pxr` runtime. Supply ovrtx separately when using renderer-backed
+viewport work.
+"""}
 requires-python = ">=3.10"
-dependencies = [
-    "ovui-data-adapters-common>=0.1.0",
-    "numpy>=1.20",
-]
 
 [project.optional-dependencies]
 standalone = ["usd-core==25.11"]

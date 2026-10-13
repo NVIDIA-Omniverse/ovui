@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ovstage provider registration through the common adapter registry."""
 
@@ -84,7 +77,7 @@ def _patch_provider_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     class _TestOvstageRendererAdapter(renderer_module.OvstageRendererAdapter):
-        def __init__(self, scene=None, undo_manager=None):
+        def __init__(self, scene=None, undo_manager=None, *, viewport_quality=0):
             self.scene = scene
             self.undo_manager = undo_manager
 

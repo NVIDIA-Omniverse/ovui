@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 import { useEffect, useState } from "react";
 import { Streamdown, defaultRemarkPlugins } from "streamdown";
 import { code } from "@streamdown/code";

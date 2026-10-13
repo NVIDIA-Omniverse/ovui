@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "HeadlessEglPlatform.h"
@@ -16,6 +9,7 @@
 
 #include "StandaloneGlyphManager.h"
 #include "StandaloneWindowCallbackManager.h"
+#include "NativeTiming.h"
 
 #include <omni/ui/platform/PlatformRegistry.h>
 #include <omni/ui/Font.h>
@@ -179,6 +173,7 @@ bool HeadlessEglPlatform::setupFboAndImGui(int width, int height)
     }
     fprintf(stderr, "HeadlessEglPlatform: FBO complete (%dx%d RGBA8)\n", width, height);
 
+    OVUI_PERFORMANCE_PHASE_SCOPE(imGuiInitPhase, kImGuiInitPhaseName);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     m_imguiContextCreated = true;
@@ -268,6 +263,7 @@ const std::string& HeadlessEglPlatform::screenshotErrorMessage() const
 
 WindowId HeadlessEglPlatform::createWindow(const char* /*title*/, int width, int height)
 {
+    OVUI_PERFORMANCE_PHASE_SCOPE(openGlInitPhase, kOpenGlInitPhaseName);
     // Step 1: env-var override — surfaceless not yet implemented (E4).
     const char* forceSurfaceless = getenv("OMNIUI_EGL_FORCE_SURFACELESS");
     if (forceSurfaceless &&
@@ -878,3 +874,9 @@ bool HeadlessEglPlatform::needsStrongWindowRefs() const { return false; }
 } // namespace omni
 
 #endif // OMNIUI_HAS_EGL
+
+#include "ImGuiKeyTranslation.h"
+int omni::ui::standalone::HeadlessEglPlatform::nativeKeyCode(int key) const
+{
+    return detail::imguiKeyToGlfwKey(static_cast<ImGuiKey>(key));
+}

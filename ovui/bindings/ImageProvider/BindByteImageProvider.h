@@ -1,18 +1,12 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
 
 #include <pybind11/pybind11.h>
+#include "../PlatformBindings.h"
 #include <pybind11/functional.h>
 
 #include <omni/ui/ImageProvider/ByteImageProvider.h>
@@ -31,9 +25,10 @@ OMNIUI_NAMESPACE_USING_DIRECTIVE
 static void _setBytesData(ByteImageProvider* self,
                           const py::sequence& bytesSeq,
                           const std::vector<uint32_t>& sizes,
-                          PixelFormat format,
+                          py::object nativeFormat,
                           int stride)
 {
+    PixelFormat format = pixelFormatFromPython(nativeFormat);
     const size_t bytesSeqSize = bytesSeq.size();
     if (bytesSeqSize == 0)
         return;
@@ -130,7 +125,7 @@ void wrapByteImageProvider(py::module& m)
             pybind11::gil_scoped_release gil;
             return ImageProvider::create<ByteImageProvider>();
         }), "doc")
-        .def(py::init( [](const py::sequence& bytesSeq, const std::vector<uint32_t>& sizes, PixelFormat format, int stride) {
+        .def(py::init( [](const py::sequence& bytesSeq, const std::vector<uint32_t>& sizes, py::object format, int stride) {
             std::shared_ptr<ByteImageProvider> result;
             {
                 pybind11::gil_scoped_release gil;
@@ -141,7 +136,7 @@ void wrapByteImageProvider(py::module& m)
                 _setBytesData(result.get(), bytesSeq, sizes, format, stride);
             }
             return result;
-        }), py::arg("bytes"), py::arg("sizes"), py::arg("format") = PixelFormat::eUnknown, py::arg("stride") = -1,
+        }), py::arg("bytes"), py::arg("sizes"), py::arg("format") = pixelFormatToPython(PixelFormat::eUnknown), py::arg("stride") = -1,
         "doc")
         .def(
             "set_data",
@@ -159,23 +154,22 @@ void wrapByteImageProvider(py::module& m)
             })
         .def("set_bytes_data", &_setBytesData,
              "Sets Python sequence as byte data. The image provider will recognize flattened color values, or sequence within sequence and convert it into an image.",
-             py::arg("bytes"), py::arg("sizes"), py::arg("format") = PixelFormat::eUnknown, py::arg("stride") = -1)
+             py::arg("bytes"), py::arg("sizes"), py::arg("format") = pixelFormatToPython(PixelFormat::eUnknown), py::arg("stride") = -1)
         .def(
             "set_raw_bytes_data",
-            [](ByteImageProvider* self, const void* rawBytes, const std::vector<uint32_t>& sizes, PixelFormat format,
+            [](ByteImageProvider* self, const void* rawBytes, const std::vector<uint32_t>& sizes, py::object format,
                int stride) {
-                self->setBytesData((const uint8_t*)rawBytes, { sizes[0], sizes[1] }, stride, format);
+                self->setBytesData((const uint8_t*)rawBytes, { sizes[0], sizes[1] }, stride, pixelFormatFromPython(format));
             },
             "Sets byte data that the image provider will turn raw pointer array into an image.", py::arg("raw_bytes"),
-            py::arg("sizes"), py::arg("format") = PixelFormat::eRGBA8_UNORM, py::arg("stride") = -1)
+            py::arg("sizes"), py::arg("format") = pixelFormatToPython(PixelFormat::eRGBA8_UNORM), py::arg("stride") = -1)
         .def(
             "set_bytes_data_from_gpu",
-            [](ByteImageProvider* self, uint64_t gpuBytes, const std::vector<uint32_t>& sizes, PixelFormat format,
+            [](ByteImageProvider* self, uint64_t gpuBytes, const std::vector<uint32_t>& sizes, py::object format,
                int stride) {
-                self->setBytesDataFromGPU((const uint8_t*)gpuBytes, { sizes[0], sizes[1] }, stride, format);
+                self->setBytesDataFromGPU((const uint8_t*)gpuBytes, { sizes[0], sizes[1] }, stride, pixelFormatFromPython(format));
             },
             "Sets byte data from a copy of gpu memory at gpuBytes.", py::arg("gpu_bytes"),
-            py::arg("sizes"), py::arg("format") = PixelFormat::eRGBA8_UNORM, py::arg("stride") = -1)
-
+            py::arg("sizes"), py::arg("format") = pixelFormatToPython(PixelFormat::eRGBA8_UNORM), py::arg("stride") = -1)
         /**/;
 }

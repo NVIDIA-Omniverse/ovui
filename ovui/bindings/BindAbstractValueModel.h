@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -269,6 +262,8 @@ void wrapAbstractValueModel(module& m)
              OMNIUI_PYBIND_DOC_AbstractValueModel_getValueAsString)
         .def("begin_edit", &AbstractValueModel::beginEdit, OMNIUI_PYBIND_DOC_AbstractValueModel_beginEdit)
         .def("end_edit", &AbstractValueModel::endEdit, OMNIUI_PYBIND_DOC_AbstractValueModel_endEdit)
+        .def("is_edit_cancelled", &AbstractValueModel::isEditCancelled,
+             "Whether this model is currently receiving a FloatSlider/FloatDrag temporary-input cancellation.")
         .def("set_value", (void (AbstractValueModel::*)(bool)) & AbstractValueModel::setValue, arg("value"),
              OMNIUI_PYBIND_DOC_AbstractValueModel_setValue)
         .def("set_value", (void (AbstractValueModel::*)(int64_t)) & AbstractValueModel::setValue, arg("value"),

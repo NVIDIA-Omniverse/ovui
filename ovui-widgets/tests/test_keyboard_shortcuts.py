@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for keyboard shortcut handler (Step 53)."""
 
@@ -55,6 +48,7 @@ def _make_app():
         app._property_window = None
         app._viewport_window = None
         app._content_window = None
+        app._secondary_viewport_window = None
         app._layer_window = None
         app._current_stage_sub = None
         app._stage_change_listeners = []
@@ -512,6 +506,38 @@ class TestToggleLayersWindow:
         app = _make_app()
         app._layer_window = None
         app._toggle_layers_window()  # must not raise
+
+
+class TestFilterTextFocus:
+    @pytest.mark.parametrize("focused", [False, True])
+    def test_remote_text_uses_native_focus_only(self, focused):
+        app = _make_app()
+        app._remote_input_bridge = MagicMock()
+        app._ui_native = MagicMock()
+        widget = MagicMock()
+        widget._filter_border_rect.screen_position_x = 10
+        widget._filter_border_rect.screen_position_y = 20
+        widget._filter_border_rect.computed_width = 100
+        widget._filter_border_rect.computed_height = 20
+        app._stage_window = MagicMock()
+        app._stage_window._widget = widget
+        # A prior click cannot keep routing text after the filter loses focus.
+        app._on_remote_left_click(30, 30)
+        widget._focus_filter_field.assert_called_once()
+        widget._filter_border_rect.name = "focused" if focused else ""
+
+        def drain(bridge, ui_native, **callbacks):
+            ui_native._inject_text_input("a")
+            if on_char := callbacks.get("on_char"):
+                on_char("a")
+
+        with patch.dict("sys.modules", {
+            "ovui_widgets.app._input_drain": MagicMock(drain_bridge_into_ui=drain),
+        }):
+            app._drain_remote_input()
+
+        app._ui_native._inject_text_input.assert_called_once_with("a")
+        widget._filter_field.model.set_value.assert_not_called()
 
 
 class TestFilterOwnedDeleteKeys:

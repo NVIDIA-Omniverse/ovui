@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for attribute row widgets + build_attribute_row factory.
 
@@ -2586,16 +2579,34 @@ class TestAssetPathAttributeRow:
         adapter.fire_change()
         assert row._widget.model.get_value_as_string() == "b.png"
 
-    def test_folder_click_is_noop(self, no_ui):
-        """Step 3.6's folder button does nothing — the file_importer hook
-        lands in a later phase. Pinning the no-op means a future refactor
-        that accidentally wires a side-effect fails here first."""
+    def test_folder_click_opens_picker_and_commits_selection(self, no_ui, monkeypatch):
+        from ovui_widgets.content.file_importer import FileImporterHelper
         from ovui_widgets.property.attribute_row import AssetPathAttributeRow
+
+        shown = {}
+
+        class _Importer:
+            def show(self, **kwargs):
+                shown.update(kwargs)
+
+        monkeypatch.setattr(FileImporterHelper, "instance", classmethod(lambda cls: _Importer()))
         adapter = _TrackingAdapter({"tex": "a.png"})
         prop = _make_prop(name="tex", value_type=str, type_name="asset")
         row = AssetPathAttributeRow(prop, adapter)
-        assert row._on_folder_clicked() is None
-        assert adapter.calls == []
+        row._on_folder_clicked()
+
+        assert shown["title"] == "Choose tex"
+        assert shown["filename_url"] == "a.png"
+        shown["import_handler"](
+            "studio.exr",
+            "file:///tmp/textures",
+            ["file:///tmp/textures/studio.exr"],
+        )
+        assert adapter.calls == [
+            ("begin_edit", "tex"),
+            ("set_value", "tex", "/tmp/textures/studio.exr"),
+            ("end_edit", "tex"),
+        ]
 
     def test_resolved_tooltip_falls_back_to_empty(self, no_ui):
         """When the adapter returns ``None`` from ``get_resolved_asset_path``,

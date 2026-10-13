@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """StageDelegate — renders rows in the Stage Browser TreeView.
 
@@ -98,6 +91,14 @@ class StageDelegate(ui.AbstractItemDelegate):
     def build_branch(self, model: Any, item: Any, column_id: Any, level: Any, expanded: Any) -> None:
         if column_id != 0:
             return
+        if isinstance(model, HierarchyModel):
+            return model.profile_call(
+                "StageBrowser.build_branch", self._build_branch,
+                model, item, level, expanded,
+            )
+        self._build_branch(model, item, level, expanded)
+
+    def _build_branch(self, model: Any, item: Any, level: Any, expanded: Any) -> None:
         # NB: intentionally do NOT write ``expanded`` back into
         # ``model._expanded_paths`` here. build_branch fires on every
         # render, including the first render after a tree rebuild when
@@ -207,11 +208,20 @@ class StageDelegate(ui.AbstractItemDelegate):
         if item is None:
             return
         if column_id == 0:
-            self._build_name_column(model, item)
+            builder = self._build_name_column
+            name = "StageBrowser.build_name_column"
         elif column_id == 1:
-            self._build_type_column(model, item)
+            builder = self._build_type_column
+            name = "StageBrowser.build_type_column"
         elif column_id == 2:
-            self._build_visibility_column(model, item)
+            builder = self._build_visibility_column
+            name = "StageBrowser.build_visibility_column"
+        else:
+            return
+        if isinstance(model, HierarchyModel):
+            model.profile_call(name, builder, model, item)
+        else:
+            builder(model, item)
 
     # ── Name column ──────────────────────────────────────────────────────────
 
@@ -229,9 +239,12 @@ class StageDelegate(ui.AbstractItemDelegate):
         is_default = bool(hitem and adapter and hitem.is_default(adapter))
         is_italic = is_class or is_abstract
 
-        category = ""
+        icon_name = ""
         if hitem and adapter:
-            category = adapter.get_type_category(hitem.adapter_item)
+            icon_name = (
+                adapter.get_icon_name(hitem.adapter_item)
+                or adapter.get_type_category(hitem.adapter_item)
+            )
 
         badge_paths: list[str] = []
         if hitem and adapter and not hitem.is_instance_proxy(adapter):
@@ -254,7 +267,7 @@ class StageDelegate(ui.AbstractItemDelegate):
                     ui.Spacer()
                     ui.ImageWithProvider(
                         stage_icons.provider(
-                            stage_icons.prim_type_icon(category, is_class=is_class)
+                            stage_icons.prim_type_icon(icon_name, is_class=is_class)
                         ),
                         width=_TYPE_ICON_SIZE, height=_TYPE_ICON_SIZE,
                         style_type_name_override="Stage.PrimIcon",
@@ -401,7 +414,13 @@ class StageDelegate(ui.AbstractItemDelegate):
                     )
 
                 def build_eye_icon() -> None:
-                    is_hidden = vis_model.get_value_as_bool()
+                    is_hidden = (
+                        model.profile_call(
+                            "StageBrowser.read_visibility", vis_model.get_value_as_bool
+                        )
+                        if isinstance(model, HierarchyModel)
+                        else vis_model.get_value_as_bool()
+                    )
                     enabled = can_toggle_now()
                     icon = (
                         stage_icons.eye_off_icon()

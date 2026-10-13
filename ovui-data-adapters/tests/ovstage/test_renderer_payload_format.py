@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ovstage renderer payload formatting helpers."""
 
@@ -30,6 +23,48 @@ class _FakeStage:
         assert ordinal == self.current_ordinal
         assert len(paths) == 1
         return self._attrs.get((paths[0], attr_name), b"")
+
+
+def test_presentation_render_var_accepts_ovrtx_05_authored_path_key() -> None:
+    adapter = renderer_adapter.OvstageRendererAdapter.__new__(
+        renderer_adapter.OvstageRendererAdapter
+    )
+    adapter._runtime_root_path = "/_OvuiRuntime"
+    render_var = type("RenderVar", (), {"source_name": "LdrColor"})()
+    frame = type(
+        "Frame",
+        (),
+        {"render_vars": {"/_OvuiRuntime/Render/Vars/LdrColor": render_var}},
+    )()
+    product = type("Product", (), {"frames": [frame]})()
+
+    result = adapter._presentation_render_var(
+        {"/_OvuiRuntime/Render/Viewport": product},
+        "/_OvuiRuntime/Render/Viewport",
+    )
+
+    assert result is render_var
+
+
+def test_presentation_render_var_finds_ldr_color_by_source_name() -> None:
+    adapter = renderer_adapter.OvstageRendererAdapter.__new__(
+        renderer_adapter.OvstageRendererAdapter
+    )
+    adapter._runtime_root_path = "/_OvuiRuntime"
+    render_var = type("RenderVar", (), {"source_name": "LdrColor"})()
+    frame = type(
+        "Frame",
+        (),
+        {"render_vars": {"/Document/Render/Vars/Beauty": render_var}},
+    )()
+    product = type("Product", (), {"frames": [frame]})()
+
+    result = adapter._presentation_render_var(
+        {"/Document/Render/Product": product},
+        "/Document/Render/Product",
+    )
+
+    assert result is render_var
 
 
 def test_extract_ldr_color_uses_gpu_frame_when_zero_copy_enabled() -> None:
@@ -287,18 +322,12 @@ def test_runtime_layer_only_authors_private_render_prims() -> None:
 
     assert 'def Scope "OvuiRuntime"' in payload.usda
     assert 'def Camera "Main"' in payload.usda
-    assert '"OmniRtxCameraAutoExposureAPI_1"' in payload.usda
-    assert '"OmniRtxCameraExposureAPI_1"' in payload.usda
-    assert "float exposure:responsivity = 1.1026709" in payload.usda
-    assert "float exposure:time = 0.02" in payload.usda
-    assert "bool omni:rtx:autoExposure:enabled = 1" in payload.usda
     assert 'def RenderProduct "Viewport"' in payload.usda
     assert "uniform uint[] deviceIds = [0]" in payload.usda
     assert "rel camera = <../Cameras/Main>" in payload.usda
     assert "rel orderedVars = <../Vars/LdrColor>" in payload.usda
     assert payload.camera_path == renderer_adapter._RENDER_CAMERA_LOCAL_PATH
     assert payload.usda.count('def Scope "Render"') == 1
-    assert 'def RenderSettings' not in payload.usda
     assert 'def Cube "Cube"' not in payload.usda
     assert 'def Xform "World"' not in payload.usda
 

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for ``ovui_data_adapters.openusd._swap_kernel`` — issue #34 Step 1.5.
 
@@ -213,3 +206,30 @@ def test_swap_rb_in_place_1920x1080_covers_height_tail():
     assert (out[1079, 1919, 0], out[1079, 1919, 1], out[1079, 1919, 2], out[1079, 1919, 3]) == (
         0xF0, 0xFE, 0xCA, 0x0D,
     )
+
+
+@pytest.mark.parametrize("width,height", [(8, 8), (1920, 1080), (1366, 767)])
+def test_copy_swap_rb_writes_bgra_and_leaves_the_source(width, height):
+    """The fused out-of-place kernel (the async livestream copy): BGRA in dst, src untouched."""
+    rng = np.random.default_rng(3)
+    rgba = rng.integers(0, 256, size=(height, width, 4), dtype=np.uint8)
+    expected = rgba.copy()
+    expected[..., [0, 2]] = expected[..., [2, 0]]
+
+    cu = _TestCuda()
+    src = cu.malloc(rgba.nbytes)
+    dst = cu.malloc(rgba.nbytes)
+    try:
+        cu.h2d(src, rgba)
+        _swap_kernel.copy_swap_rb(src, width * 4, dst, width * 4, width, height)
+        cu.sync()
+        out = np.empty_like(rgba)
+        cu.d2h(out, dst)
+        back = np.empty_like(rgba)
+        cu.d2h(back, src)
+    finally:
+        cu.free(src)
+        cu.free(dst)
+
+    assert np.array_equal(out, expected)
+    assert np.array_equal(back, rgba)

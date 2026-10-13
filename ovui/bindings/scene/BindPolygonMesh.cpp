@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/bind/BindUtils.h>
@@ -37,6 +30,10 @@ void wrapPolygonMesh(module& m)
         .def_property_readonly("t", [](const PolygonMesh::PolygonMeshGesturePayload& self) { return self.t; })
         /* */;
 
+    enum_<PolygonMesh::Lighting>(m, "MeshLighting")
+        .value("UNLIT", PolygonMesh::Lighting::eUnlit)
+        .value("HEADLIGHT", PolygonMesh::Lighting::eHeadlight);
+
     class_<PolygonMesh, AbstractShape, std::shared_ptr<PolygonMesh>>(m, "PolygonMesh", polygonMeshDoc)
         .def(init(
             [](object positions, object colors, const std::vector<uint32_t>& vertexCounts,
@@ -49,6 +46,11 @@ void wrapPolygonMesh(module& m)
         .def_property("positions", [](const PolygonMesh& self) { return vector3ToPythonList(self.getPositions()); },
                       [](PolygonMesh& self, const pybind11::handle& obj) { self.setPositions(pythonListToVector3(obj)); },
                       OMNIUI_PYBIND_DOC_PolygonMesh_positions)
+        .def_property("normals", [](const PolygonMesh& self) { return vector3ToPythonList(self.getNormals()); },
+                      [](PolygonMesh& self, const pybind11::handle& value) { self.setNormals(pythonListToVector3(value)); },
+                      "Optional object-space normals indexed like positions; mismatched counts fall back to unlit.")
+        .def_property("lighting", &PolygonMesh::getLighting, &PolygonMesh::setLighting,
+                      "UNLIT by default. HEADLIGHT uses two-sided camera lighting with 25% ambient; requires a capable renderer.")
         .def_property("colors", [](const PolygonMesh& self) { return vector4ToPythonList(self.getColors()); },
                       [](PolygonMesh& self, const pybind11::handle& obj) { self.setColors(pythonListToVector4(obj)); },
                       OMNIUI_PYBIND_DOC_PolygonMesh_colors)

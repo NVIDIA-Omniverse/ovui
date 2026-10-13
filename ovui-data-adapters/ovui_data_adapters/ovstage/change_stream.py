@@ -1,18 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this software, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ovstage dirty-ordinal polling bridged to common change events."""
 
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import os
 from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Callable
@@ -25,12 +20,16 @@ from ovui_data_adapters.common._command import (
 )
 from ovui_data_adapters.common._subscription import SubscriptionProtocol
 from ovui_data_adapters.ovstage._native import resolve_query_names
+from ovui_data_adapters.ovstage._scene import (
+    _KitTopologySnapshot,
+    _kit_topology_snapshot,
+    _record_deleted_paths,
+)
 from ovui_data_adapters.ovstage._stage_write import (
     discard_recorded_stage_writes,
     recorded_stage_writes,
     wait_operation,
 )
-
 
 _EventKey = tuple[ChangeEventType, str | None, tuple[str, ...], tuple[str, ...]]
 _POLL_INTERVAL_SECS = 1.0 / 30.0
@@ -40,6 +39,7 @@ _TOPOLOGY_SOURCE = "ovstage:topology"
 _TRANSFORM_SOURCE = "ovstage:transform"
 _VISIBILITY_SOURCE = "ovstage:visibility"
 _ATTRIBUTE_SOURCE = "ovstage:attribute"
+_USD_PATH_ATTRIBUTE = "usd-path"
 
 _TRANSFORM_ATTRS = frozenset(
     {
@@ -65,6 +65,13 @@ _TOPOLOGY_ATTRS = frozenset(
         "usd-schemas",
     }
 )
+_NATIVE_DIRTY_ATTRIBUTES = (
+    _TOPOLOGY_ATTRS
+    | _TRANSFORM_ATTRS
+    | _VISIBILITY_ATTRS
+    | frozenset({_USD_PATH_ATTRIBUTE})
+)
+_NATIVE_DIRTY_PENDING = object()
 
 
 class _ChangeSubscription(SubscriptionProtocol):
@@ -128,17 +135,58 @@ class OvstageChangeStream:
         # subscriber failures are captured into the innermost scope instead
         # of re-raised mid-dispatch; the scope re-raises them at exit.
         self._committed_edge_captures: list[list] = []
-        stage = getattr(scene, "_stage", None)
-        self._topology_paths = (
-            _native_topology_paths(stage, scene=scene)
-            if _is_native_kit_stage(stage)
-            else set()
+        self._render_flow_mode = os.environ.get(
+            "OMNIUI_RENDER_FLOW_MODE", "nativePacing"
         )
+        self._native_dirty_collector: Any = None
+        self._native_dirty_paths: Any = None
+        self._native_dirty_pending = False
+        stage = getattr(scene, "_stage", None)
+        # Set while no readable topology has been observed yet.  Nothing may
+        # be diffed against an unestablished baseline, and the recovery floor
+        # must not be consumed while it is set.
+        self._topology_baseline_pending = False
+        try:
+            self._topology_paths = (
+                _native_topology_paths(
+                    stage,
+                    scene=scene,
+                    render_flow_mode=self._render_flow_mode,
+                )
+                if _is_native_kit_stage(stage)
+                else set()
+            )
+        except _TopologyUnreadable:
+            self._topology_paths = set()
+            self._topology_baseline_pending = True
+        self._topology_prim_count = getattr(stage, "_ovui_kit_topology_prim_count", None)
+        self._topology_query_revision = 0
         if stage is not None:
             discard_recorded_stage_writes(
                 stage,
                 through_ordinal=self._last_ordinal,
             )
+        if _is_native_kit_stage(stage):
+            (
+                self._native_dirty_collector,
+                self._native_dirty_paths,
+            ) = _create_native_dirty_collector(
+                stage,
+                getattr(scene, "_native_dirty_worker", None),
+            )
+
+    def _profile_call(
+        self,
+        function_name: str,
+        function: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        profile_fn = getattr(self._scene, "profile_ovui_call", None)
+        if callable(profile_fn):
+            return profile_fn(function_name, function, *args, **kwargs)
+        return function(*args, **kwargs)
 
     @property
     def last_ordinal(self) -> int:
@@ -188,6 +236,7 @@ class OvstageChangeStream:
         self._stage_subscribers.clear()
         self._property_subscribers.clear()
         self._cancel_poll()
+        self._close_native_dirty_collector()
 
     def subscribe_stage(
         self,
@@ -234,6 +283,19 @@ class OvstageChangeStream:
         deliver_suppressed: bool = False,
     ) -> tuple[ChangeEvent, ...]:
         """Poll ovstage once and synchronously deliver any classified events."""
+        return self._poll_impl(
+            source=source,
+            deliver_suppressed=deliver_suppressed,
+            allow_native_async=False,
+        )
+
+    def _poll_impl(
+        self,
+        *,
+        source: str | None,
+        deliver_suppressed: bool,
+        allow_native_async: bool,
+    ) -> tuple[ChangeEvent, ...]:
         if self._closed:
             return ()
         scene = self._scene
@@ -242,23 +304,41 @@ class OvstageChangeStream:
         if stage is None or current_ordinal is None:
             return ()
         current = int(current_ordinal)
-        if current <= self._last_ordinal:
+        native_dirty_result: Any = None
+        if self._native_dirty_pending:
+            native_dirty_result = self._profile_call(
+                "OvstageChangeStream.native_dirty.update",
+                self._poll_native_dirty,
+                stage,
+                current,
+                self._last_ordinal,
+                blocking=not allow_native_async,
+            )
+            if native_dirty_result is _NATIVE_DIRTY_PENDING:
+                return ()
+            current = int(native_dirty_result[1])
+        # A pending baseline still owes this ordinal a read, so the usual
+        # "already delivered" shortcut would strand the stream on it.
+        stale = current <= self._last_ordinal and not self._topology_baseline_pending
+        if stale:
             return ()
         if self._suppressed:
             return ()
         if not deliver_suppressed:
             self._discard_suppressed_range(current)
-            if current <= self._last_ordinal:
+            if current <= self._last_ordinal and not self._topology_baseline_pending:
                 return ()
         else:
             self._clear_delivered_suppression(current)
 
         since = self._last_ordinal
-        physics_paths = self._physics_transform_paths_for_range(
-            since_ordinal=since,
-            current_ordinal=current,
-        )
-        if physics_paths:
+        physics_paths: tuple[str, ...] = ()
+        if native_dirty_result is None:
+            physics_paths = self._physics_transform_paths_for_range(
+                since_ordinal=since,
+                current_ordinal=current,
+            )
+        if physics_paths and native_dirty_result is None:
             events = (
                 _info_event(
                     set(physics_paths),
@@ -266,7 +346,40 @@ class OvstageChangeStream:
                 ),
             )
         else:
-            events = tuple(self._collect_events(stage, current, since, source=source))
+            try:
+                if (
+                    native_dirty_result is None
+                    and _is_native_kit_stage(stage)
+                    and self._native_dirty_collector is not None
+                ):
+                    native_dirty_result = self._profile_call(
+                        "OvstageChangeStream.native_dirty.update",
+                        self._poll_native_dirty,
+                        stage,
+                        current,
+                        since,
+                        blocking=not allow_native_async,
+                    )
+                    if native_dirty_result is _NATIVE_DIRTY_PENDING:
+                        return ()
+                    since = int(native_dirty_result[0])
+                    current = int(native_dirty_result[1])
+                events = tuple(
+                    self._profile_call(
+                        "OvstageChangeStream.poll.collect_events",
+                        self._collect_events,
+                        stage,
+                        current,
+                        since,
+                        source=source,
+                        native_dirty_result=native_dirty_result,
+                    )
+                )
+            except _TopologyUnreadable:
+                # Nothing about this ordinal is known yet.  Leave the
+                # watermark, the topology set and the delivered model exactly
+                # as they were so the next poll re-reads this same ordinal.
+                return ()
         self._advance_last_ordinal(current)
         for event in events:
             self._notify_all(event)
@@ -400,6 +513,21 @@ class OvstageChangeStream:
             return None
         current_ordinal = getattr(self._scene, "current_ordinal", None)
         if current_ordinal is not None:
+            stage = getattr(self._scene, "_stage", None)
+            if _is_native_kit_stage(stage):
+                try:
+                    self._topology_paths = _native_topology_paths(
+                        stage,
+                        scene=self._scene,
+                        render_flow_mode=self._render_flow_mode,
+                    )
+                except _TopologyUnreadable:
+                    # This publication could not be reconciled, so the set no
+                    # longer describes the stage.  Keep it for now, but
+                    # re-baseline on the next readable poll: diffing against
+                    # it would replay these paths as native additions on top
+                    # of the delivery this call already made.
+                    self._topology_baseline_pending = True
             self._advance_last_ordinal(int(current_ordinal))
         self._suppressed_until_ordinal = None
         event = ChangeEvent(
@@ -486,14 +614,23 @@ class OvstageChangeStream:
         self._poll_handle = call_later(self._poll_interval_secs, self._scheduled_poll)
 
     def _scheduled_poll(self) -> None:
+        self._scheduled_poll_impl()
+
+    def _scheduled_poll_impl(self) -> None:
         self._poll_scheduled = False
         self._poll_handle = None
         if self._closed or not self._has_subscribers():
             return
-        self.poll()
-        call_later = self._first_call_later()
-        if call_later is not None:
-            self._ensure_polling(call_later)
+        try:
+            self._poll_impl(
+                source=None,
+                deliver_suppressed=False,
+                allow_native_async=True,
+            )
+        finally:
+            call_later = self._first_call_later()
+            if call_later is not None:
+                self._ensure_polling(call_later)
 
     def _cancel_poll(self) -> None:
         handle = self._poll_handle
@@ -536,9 +673,16 @@ class OvstageChangeStream:
         since: int,
         *,
         source: str | None,
+        native_dirty_result: tuple[int, int, dict[str, set[str]], bool] | None = None,
     ) -> list[ChangeEvent]:
         if _is_native_kit_stage(stage):
-            return self._collect_native_events(stage, current, since, source=source)
+            return self._collect_native_events(
+                stage,
+                current,
+                since,
+                source=source,
+                native_dirty_result=native_dirty_result,
+            )
         query = stage.query_prims(current, since_ordinal=since)
         events: list[ChangeEvent] = []
         seen_events: set[_EventKey] = set()
@@ -640,28 +784,133 @@ class OvstageChangeStream:
         since: int,
         *,
         source: str | None,
+        native_dirty_result: tuple[int, int, dict[str, set[str]], bool] | None = None,
     ) -> list[ChangeEvent]:
         events: list[ChangeEvent] = []
         seen_events: set[_EventKey] = set()
-        current_paths = _native_topology_paths(stage, scene=self._scene)
-        previous_paths = set(self._topology_paths)
-        # OVStage's compatibility cache synthesizes missing ancestors so the
-        # hierarchy remains traversable.  A single child creation can therefore
-        # introduce both its path and a synthetic parent in the same ordinal.
-        # Report the leaf operation; consumers resync its ancestors naturally.
-        added_paths = _leafmost_paths(current_paths - previous_paths)
-        removed_paths = _leafmost_paths(previous_paths - current_paths)
-        structural_paths = added_paths | removed_paths
-        self._topology_paths = current_paths
-        self._append_resync_event(events, seen_events, added_paths, _ADDED_SOURCE)
-        self._append_resync_event(events, seen_events, removed_paths, _REMOVED_SOURCE)
+        if native_dirty_result is None:
+            dirty_by_attr, dirty_read_complete = self._profile_call(
+                "OvstageChangeStream.native_dirty.update",
+                _native_dirty_paths_by_attribute,
+                stage,
+                since,
+                current,
+                scene=self._scene,
+                profile_call=self._profile_call,
+            )
+        else:
+            dirty_by_attr = native_dirty_result[2]
+            dirty_read_complete = native_dirty_result[3]
+        structural_paths: set[str] = set()
+        read_topology = True
+        if self._render_flow_mode == "nativePacing":
+            count_sample = getattr(stage, "_ovui_kit_dirty_topology", None)
+            prim_count = (
+                count_sample[1]
+                if count_sample is not None and count_sample[0] == current
+                else None
+            )
+            topology_revision = (
+                count_sample[2]
+                if (
+                    count_sample is not None
+                    and count_sample[0] == current
+                    and len(count_sample) > 2
+                )
+                else None
+            )
+            # Native insert/delete may not dirty usd-path. Use the existing
+            # query's membership revision/count and structural dirty signals.
+            membership_changed = (
+                prim_count is not None and prim_count != self._topology_prim_count
+            )
+            if topology_revision is not None:
+                membership_changed = (
+                    membership_changed
+                    or topology_revision != self._topology_query_revision
+                )
+            structural_dirty = any(dirty_by_attr.get(attr) for attr in _TOPOLOGY_ATTRS)
+            new_paths = any(
+                path not in self._topology_paths
+                for paths in dirty_by_attr.values()
+                for path in paths
+            )
+            topology_dirty_paths = set(
+                dirty_by_attr.get(_USD_PATH_ATTRIBUTE, ())
+            )
+            topology_dirty_read_complete = dirty_read_complete
+            if (
+                not self._topology_baseline_pending
+                and not topology_dirty_read_complete
+            ):
+                (
+                    topology_dirty_paths,
+                    topology_dirty_read_complete,
+                ) = self._profile_call(
+                    "OvstageChangeStream.native_dirty.topology",
+                    _native_dirty_topology_paths,
+                    stage,
+                    since,
+                    current,
+                    scene=self._scene,
+                )
+            read_topology = (
+                self._topology_baseline_pending
+                or not topology_dirty_read_complete
+                or bool(topology_dirty_paths)
+                or membership_changed
+                or structural_dirty
+                or new_paths
+                # Older bindings cannot prove an empty read is value-only.
+                or (prim_count is None and not dirty_by_attr)
+            )
 
-        dirty_by_attr = _native_dirty_paths_by_attribute(
-            stage,
-            since,
-            current,
-            scene=self._scene,
-        )
+        if read_topology:
+            current_paths = _native_topology_paths(
+                stage,
+                scene=self._scene,
+                render_flow_mode=self._render_flow_mode,
+            )
+            if (
+                self._render_flow_mode == "nativePacing"
+                and self._topology_baseline_pending
+            ):
+                self._topology_baseline_pending = False
+                self._topology_paths = set(current_paths)
+                stage._ovui_kit_child_paths_cache = None
+                self._scene._topology_revision += 1
+                self._append_resync_event(
+                    events,
+                    seen_events,
+                    _rootmost_paths(current_paths),
+                    _TOPOLOGY_SOURCE,
+                )
+            previous_paths = set(self._topology_paths)
+            added_delta = current_paths - previous_paths
+            removed_delta = previous_paths - current_paths
+            added_paths = _leafmost_paths(added_delta)
+            removed_paths = _leafmost_paths(removed_delta)
+            structural_paths = added_paths | removed_paths
+            if added_delta or removed_delta:
+                _record_deleted_paths(stage, removed_delta)
+                stage._ovui_kit_child_paths_cache = None
+                self._scene._topology_revision += 1
+            self._topology_paths = current_paths
+            self._append_resync_event(events, seen_events, added_paths, _ADDED_SOURCE)
+            self._append_resync_event(events, seen_events, removed_paths, _REMOVED_SOURCE)
+            if self._render_flow_mode == "nativePacing":
+                self._topology_prim_count = prim_count
+                if topology_revision is not None:
+                    self._topology_query_revision = topology_revision
+        else:
+            # Attribute-only native-pacing commits preserve path membership.
+            # Keep the established snapshot valid at the new ordinal without
+            # enumerating every prim in the stage.
+            cached_topology = getattr(stage, "_ovui_kit_topology_snapshot", None)
+            if cached_topology is not None and bool(
+                getattr(cached_topology, "readable", False)
+            ):
+                cached_topology.ordinal = int(current)
 
         def paths_for(attributes: frozenset[str]) -> set[str]:
             result: set[str] = set()
@@ -671,6 +920,8 @@ class OvstageChangeStream:
             return result
 
         topology_paths = paths_for(_TOPOLOGY_ATTRS)
+        if topology_paths:
+            self._scene._topology_revision += 1
         self._append_resync_event(
             events, seen_events, topology_paths, _TOPOLOGY_SOURCE
         )
@@ -697,7 +948,7 @@ class OvstageChangeStream:
         for attr_name, paths in dirty_by_attr.items():
             if (
                 attr_name in classified
-                or attr_name == "usd-path"
+                or attr_name == _USD_PATH_ATTRIBUTE
                 or attr_name.startswith("_")
             ):
                 continue
@@ -711,6 +962,85 @@ class OvstageChangeStream:
             None,
         )
         return events
+
+    def _poll_native_dirty(
+        self,
+        stage: Any,
+        current: int,
+        since: int,
+        *,
+        blocking: bool,
+    ) -> tuple[int, int, dict[str, set[str]], bool] | object:
+        collector = self._native_dirty_collector
+        paths = self._native_dirty_paths
+        if collector is None or paths is None:
+            return since, current, {}, False
+        try:
+            if not self._native_dirty_pending:
+                if not collector.begin(since, current):
+                    raise RuntimeError("native dirty collector rejected a valid range")
+                self._native_dirty_pending = True
+            else:
+                collector.update_current_ordinal(current)
+            result = collector.poll(blocking=blocking)
+            if result is None:
+                return _NATIVE_DIRTY_PENDING
+            self._native_dirty_pending = False
+            captured_since = int(result[0])
+            captured_current = int(result[1])
+            if captured_current <= self._last_ordinal:
+                return _NATIVE_DIRTY_PENDING
+            if len(result) > 3:
+                stage._ovui_kit_dirty_topology = (captured_current, *result[3:])
+            dirty = _recorded_dirty_paths_for_range(
+                stage,
+                captured_since,
+                captured_current,
+                scene=self._scene,
+                profile_call=self._profile_call,
+            )
+            _merge_native_dirty_handles(
+                dirty,
+                result[2],
+                paths,
+                scene=self._scene,
+            )
+            return (
+                captured_since,
+                captured_current,
+                _normalize_native_dirty_paths(dirty),
+                True,
+            )
+        except Exception:
+            self._native_dirty_pending = False
+            if not blocking:
+                return _NATIVE_DIRTY_PENDING
+            self._close_native_dirty_collector()
+            dirty, complete = _native_dirty_paths_by_attribute(
+                stage,
+                since,
+                current,
+                scene=self._scene,
+                profile_call=self._profile_call,
+            )
+            return since, current, dirty, complete
+
+    def _close_native_dirty_collector(self) -> None:
+        collector = self._native_dirty_collector
+        paths = self._native_dirty_paths
+        self._native_dirty_collector = None
+        self._native_dirty_paths = None
+        self._native_dirty_pending = False
+        if collector is not None:
+            try:
+                collector.close()
+            except Exception:
+                pass
+        if paths is not None:
+            try:
+                paths.destroy()
+            except Exception:
+                pass
 
     def _physics_transform_paths_for_range(
         self,
@@ -840,11 +1170,12 @@ class OvstageChangeStream:
             return ()
 
         if _is_native_kit_stage(stage):
-            dirty_by_attr = _native_dirty_paths_by_attribute(
+            dirty_by_attr, _dirty_read_complete = _native_dirty_paths_by_attribute(
                 stage,
                 since,
                 current,
                 scene=self._scene,
+                profile_call=self._profile_call,
             )
             paths: set[str] = set()
             for attr_name in attrs:
@@ -1012,24 +1343,240 @@ def _is_native_kit_stage(stage: Any) -> bool:
     )
 
 
-def _native_topology_paths(stage: Any, *, scene: Any | None = None) -> set[str]:
+def _create_native_dirty_collector(stage: Any, worker: Any) -> tuple[Any, Any]:
+    """Create the optional native dirty pipeline over the stage's borrowed ABI."""
+    paths = None
+    collector = None
+    try:
+        from omni.ui import _ui as native_ui
+
+        collector_type = getattr(native_ui, "_NativeOvstageDirtyCollector", None)
+        stage_instance = getattr(stage, "__dict__", {}).get("_inst")
+        if collector_type is None or stage_instance is None or worker is None:
+            return None, None
+        stage_address = int(
+            ctypes.cast(stage_instance, ctypes.c_void_p).value or 0
+        )
+        if not stage_address:
+            return None, None
+        ovstage = import_module("ovstage")
+        paths = ovstage.PathDictionary(stage)
+        required_attributes = tuple(
+            paths.intern_token(name) for name in _NATIVE_DIRTY_ATTRIBUTES
+        )
+        collector = collector_type(worker, stage_address, required_attributes)
+        if not bool(collector.supported):
+            collector.close()
+            paths.destroy()
+            return None, None
+        return collector, paths
+    except Exception:
+        if collector is not None:
+            try:
+                collector.close()
+            except Exception:
+                pass
+        if paths is not None:
+            try:
+                paths.destroy()
+            except Exception:
+                pass
+        return None, None
+
+
+class _TopologyUnreadable(RuntimeError):
+    """No OVStage surface could report the whole-stage topology this poll."""
+
+
+def _run_profiled(
+    profile_call: Callable[..., Any] | None,
+    function_name: str,
+    function: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    if profile_call is None:
+        return function(*args, **kwargs)
+    return profile_call(function_name, function, *args, **kwargs)
+
+
+def _native_topology_paths(
+    stage: Any,
+    *,
+    scene: Any | None = None,
+    render_flow_mode: str = "nativePacing",
+) -> set[str]:
     if not _is_native_kit_stage(stage):
         return set()
-    try:
-        result = stage.query_prims(int(getattr(stage, "current_ordinal", 0) or 0))
-        paths: set[str] = set()
-        for group in result.get("groups", ()):
-            handle = int(group.get("prim_list_handle") or 0)
-            if not handle:
-                continue
-            paths.update(
-                str(path)
-                for path in stage.get_prim_paths(handle)
-                if _is_user_change_path(str(path), scene=scene)
+    if callable(getattr(stage, "query", None)) and callable(
+        getattr(stage, "fetch_query_result", None)
+    ):
+        try:
+            return _query_native_kit_topology_paths(stage, scene=scene)
+        except Exception:
+            if render_flow_mode == "fast":
+                return set()
+    if render_flow_mode == "fast":
+        try:
+            result = stage.query_prims(
+                int(getattr(stage, "current_ordinal", 0) or 0)
             )
-        return paths
-    except Exception:
-        return set()
+            topology_paths: set[str] = set()
+            for group in result.get("groups", ()):
+                handle = int(group.get("prim_list_handle") or 0)
+                if not handle:
+                    continue
+                topology_paths.update(
+                    str(path)
+                    for path in stage.get_prim_paths(handle)
+                    if _is_user_change_path(str(path), scene=scene)
+                )
+            return topology_paths
+        except Exception:
+            return set()
+    # The poll owns the retry: it is the one caller that must re-read an
+    # ordinal whose earlier probe found no answer, so a source coming back is
+    # noticed without waiting for the next edit.  Everything else reuses that
+    # probe's result instead of repeating the read.
+    stage._ovui_kit_topology_unreadable = None
+    snapshot = _kit_topology_snapshot(
+        stage,
+        int(getattr(stage, "current_ordinal", 0) or 0),
+    )
+    if not snapshot.readable:
+        raise _TopologyUnreadable
+    return {
+        str(path)
+        for path in snapshot.path_order
+        if _is_user_change_path(str(path), scene=scene)
+    }
+
+
+def _query_native_kit_topology_paths(
+    stage: Any,
+    *,
+    scene: Any | None,
+) -> set[str]:
+    """Copy the native OVStage topology without building the compatibility cache."""
+
+    ovstage = import_module("ovstage")
+    with ovstage.PathDictionary(stage) as paths:
+        with stage.query(None, None) as query:
+            wait_operation(query)
+            result = query.result()
+            handle = int(result.all_handle)
+            if not handle:
+                stage._ovui_kit_topology_prim_count = getattr(result, "total_prim_count", None)
+                stage._ovui_kit_topology_snapshot = _KitTopologySnapshot(
+                    int(getattr(stage, "current_ordinal", 0) or 0),
+                    (),
+                )
+                return set()
+
+            topology_paths: set[str] = set()
+            path_order: list[str] = []
+            for raw_path in paths.get_path_strings(handle):
+                path = str(raw_path)
+                if not _is_user_change_path(path, scene=scene):
+                    continue
+                parts = [part for part in path.split("/") if part]
+                candidate = ""
+                for part in parts:
+                    candidate = f"{candidate}/{part}" if candidate else f"/{part}"
+                    if (
+                        _is_user_change_path(candidate, scene=scene)
+                        and candidate not in topology_paths
+                    ):
+                        topology_paths.add(candidate)
+                        path_order.append(candidate)
+            stage._ovui_kit_topology_snapshot = _KitTopologySnapshot(
+                int(getattr(stage, "current_ordinal", 0) or 0),
+                tuple(path_order),
+            )
+            stage._ovui_kit_topology_unreadable = None
+            stage._ovui_kit_topology_prim_count = getattr(result, "total_prim_count", None)
+            return topology_paths
+
+
+def _filter_recorded_dirty_paths(
+    recorded_writes: dict[str, set[str]],
+    *,
+    scene: Any | None,
+) -> dict[str, set[str]]:
+    dirty = {
+        str(attribute_name): {
+            str(path)
+            for path in attribute_paths
+            if _is_user_change_path(str(path), scene=scene)
+        }
+        for attribute_name, attribute_paths in recorded_writes.items()
+    }
+    return {
+        attribute_name: attribute_paths
+        for attribute_name, attribute_paths in dirty.items()
+        if attribute_paths
+    }
+
+
+def _recorded_dirty_paths_for_range(
+    stage: Any,
+    since: int,
+    current: int,
+    *,
+    scene: Any | None,
+    profile_call: Callable[..., Any] | None,
+) -> dict[str, set[str]]:
+    recorded_writes = _run_profiled(
+        profile_call,
+        "OvstageChangeStream.native_dirty.recorded_stage_writes",
+        recorded_stage_writes,
+        stage,
+        since_ordinal=since,
+        current_ordinal=current,
+    )
+    return _run_profiled(
+        profile_call,
+        "OvstageChangeStream.native_dirty.filter_recorded_writes",
+        _filter_recorded_dirty_paths,
+        recorded_writes,
+        scene=scene,
+    )
+
+
+def _merge_native_dirty_handles(
+    dirty: dict[str, set[str]],
+    raw_groups: Any,
+    paths: Any,
+    *,
+    scene: Any | None,
+) -> None:
+    for attribute_token, prim_paths in raw_groups:
+        attribute_name = paths.token_to_string(int(attribute_token))
+        attribute_paths = dirty.setdefault(attribute_name, set())
+        for prim_path in prim_paths:
+            path = paths.path_to_string(int(prim_path))
+            if _is_user_change_path(path, scene=scene):
+                attribute_paths.add(path)
+
+
+def _prepare_native_dirty_attribute_tokens(result: Any, paths: Any) -> list[int]:
+    attributes = [int(token) for token in getattr(result, "attributes", ())]
+    # A column created after the query population snapshot is writable and
+    # render-visible, but is not necessarily returned by unscoped attribute
+    # discovery immediately. Explicitly include the adapter's semantic columns.
+    attributes.extend(paths.intern_token(name) for name in _NATIVE_DIRTY_ATTRIBUTES)
+    return list(dict.fromkeys(attributes))
+
+
+def _normalize_native_dirty_paths(
+    dirty: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    return {
+        attribute_name: attribute_paths
+        for attribute_name, attribute_paths in dirty.items()
+        if attribute_paths
+    }
 
 
 def _native_dirty_paths_by_attribute(
@@ -1038,9 +1585,12 @@ def _native_dirty_paths_by_attribute(
     current: int,
     *,
     scene: Any | None = None,
-) -> dict[str, set[str]]:
+    profile_call: Callable[..., Any] | None = None,
+) -> tuple[dict[str, set[str]], bool]:
+    """Return dirty user paths and whether the native dirty read completed."""
+
     if current <= since or not _is_native_kit_stage(stage):
-        return {}
+        return {}, True
     query = None
     read = None
     paths = None
@@ -1048,81 +1598,192 @@ def _native_dirty_paths_by_attribute(
     # but renderer-owned writes use the same copy-in path.  Apply the exact
     # user-path policy used below for native read groups before journal
     # evidence can participate in a user-facing ChangeEvent.
-    dirty = {
-        str(attribute_name): {
-            str(path)
-            for path in attribute_paths
-            if _is_user_change_path(str(path), scene=scene)
-        }
-        for attribute_name, attribute_paths in recorded_stage_writes(
-            stage,
-            since_ordinal=since,
-            current_ordinal=current,
-        ).items()
-    }
-    dirty = {
-        attribute_name: attribute_paths
-        for attribute_name, attribute_paths in dirty.items()
-        if attribute_paths
-    }
+    dirty = _recorded_dirty_paths_for_range(
+        stage,
+        since,
+        current,
+        scene=scene,
+        profile_call=profile_call,
+    )
     try:
         ovstage = import_module("ovstage")
-        paths = ovstage.PathDictionary(stage)
-        query = stage.query(filter=None)
-        wait_operation(query)
-        result = query.result()
-        attributes = [int(token) for token in getattr(result, "attributes", ())]
-        # A column created after the query population snapshot is writable and
-        # render-visible, but is not necessarily returned by unscoped attribute
-        # discovery immediately.  Explicitly include the adapter's semantic
-        # columns so their dirty ranges are still observable.
-        known_names = _TOPOLOGY_ATTRS | _TRANSFORM_ATTRS | _VISIBILITY_ATTRS
-        attributes.extend(paths.intern_token(name) for name in known_names)
-        attributes = list(dict.fromkeys(attributes))
+        paths = _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.create_path_dictionary",
+            ovstage.PathDictionary,
+            stage,
+        )
+        query = _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.stage_query",
+            stage.query,
+            filter=None,
+        )
+        _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.wait_query",
+            wait_operation,
+            query,
+        )
+        result = _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.query_result",
+            query.result,
+        )
+        stage._ovui_kit_dirty_topology = (
+            current,
+            getattr(result, "total_prim_count", None),
+        )
+        # The Python-only fallback uses the same already-completed query.
+        # Compare interned handles, not whole-scene attribute/path strings.
+        get_paths = getattr(paths, "get_paths", None)
+        handle = getattr(result, "all_handle", 0)
+        if callable(get_paths) and handle:
+            membership = tuple(sorted(get_paths(handle)))
+            previous = getattr(stage, "_ovui_kit_dirty_membership", None)
+            revision = int(getattr(stage, "_ovui_kit_dirty_membership_revision", 0))
+            if membership != previous:
+                revision += 1
+                stage._ovui_kit_dirty_membership = membership
+                stage._ovui_kit_dirty_membership_revision = revision
+            stage._ovui_kit_dirty_topology += (revision,)
+        attributes = _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.prepare_attributes",
+            _prepare_native_dirty_attribute_tokens,
+            result,
+            paths,
+        )
         if not attributes:
-            return dirty
-        read = stage.read_attributes(
+            return dirty, True
+        read = _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.read_attributes",
+            stage.read_attributes,
             query,
             attributes,
             ovstage.OrdinalRange.between(int(since) + 1, int(current)),
         )
-        wait_operation(read)
-        while True:
-            group = read.fetch_next()
-            if group is None:
-                break
-            try:
-                attr_name = paths.token_to_string(int(group.attribute))
-                group_paths = tuple(
-                    str(path) for path in paths.get_path_strings(group.prim_list)
-                )
-                attr_paths = dirty.setdefault(attr_name, set())
-                for local in range(int(group.prim_count)):
-                    try:
-                        path = group_paths[int(group.prim_index(local))]
-                        if _is_user_change_path(path, scene=scene):
-                            attr_paths.add(path)
-                    except Exception:
-                        continue
-            finally:
+        _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.wait_read",
+            wait_operation,
+            read,
+        )
+
+        def fetch_groups() -> None:
+            while True:
+                group = read.fetch_next()
+                if group is None:
+                    break
                 try:
-                    stage.release_group(group)
-                except Exception:
-                    pass
-        return dirty
+                    attr_name = paths.token_to_string(int(group.attribute))
+                    group_paths = tuple(
+                        str(path) for path in paths.get_path_strings(group.prim_list)
+                    )
+                    attr_paths = dirty.setdefault(attr_name, set())
+                    for local in range(int(group.prim_count)):
+                        try:
+                            path = group_paths[int(group.prim_index(local))]
+                            if _is_user_change_path(path, scene=scene):
+                                attr_paths.add(path)
+                        except Exception:
+                            continue
+                finally:
+                    try:
+                        stage.release_group(group)
+                    except Exception:
+                        pass
+
+        _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.fetch_groups",
+            fetch_groups,
+        )
+        dirty = _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.normalize_results",
+            _normalize_native_dirty_paths,
+            dirty,
+        )
+        return dirty, True
     except Exception:
-        return dirty
+        return dirty, False
     finally:
         if read is not None:
             try:
-                release = getattr(read, "release", None)
-                wait_operation(
-                    release() if callable(release) else stage.release_read(read)
+                def release_read() -> None:
+                    release = getattr(read, "release", None)
+                    wait_operation(
+                        release() if callable(release) else stage.release_read(read)
+                    )
+
+                _run_profiled(
+                    profile_call,
+                    "OvstageChangeStream.native_dirty.release_read",
+                    release_read,
                 )
             except Exception:
                 pass
-        _release_native_query(query)
-        _destroy_path_dictionary(paths)
+        _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.release_query",
+            _release_native_query,
+            query,
+        )
+        _run_profiled(
+            profile_call,
+            "OvstageChangeStream.native_dirty.destroy_path_dictionary",
+            _destroy_path_dictionary,
+            paths,
+        )
+
+
+def _native_dirty_topology_paths(
+    stage: Any,
+    since: int,
+    current: int,
+    *,
+    scene: Any | None = None,
+) -> tuple[set[str], bool]:
+    """Return user topology paths from a narrow native ``usd-path`` read."""
+
+    if current <= since or not _is_native_kit_stage(stage):
+        return set(), True
+    try:
+        ovstage = import_module("ovstage")
+        with ovstage.PathDictionary(stage) as paths:
+            path_token = paths.intern_token(_USD_PATH_ATTRIBUTE)
+            with stage.query(None, [path_token]) as query:
+                wait_operation(query)
+                with stage.read_attributes(
+                    query,
+                    [path_token],
+                    ovstage.OrdinalRange.between(int(since) + 1, int(current)),
+                ) as read:
+                    wait_operation(read)
+                    dirty_paths: set[str] = set()
+                    while True:
+                        group = read.fetch_next()
+                        if group is None:
+                            break
+                        try:
+                            group_paths = tuple(
+                                str(path)
+                                for path in paths.get_path_strings(group.prim_list)
+                            )
+                            for local in range(int(group.prim_count)):
+                                try:
+                                    path = group_paths[int(group.prim_index(local))]
+                                    if _is_user_change_path(path, scene=scene):
+                                        dirty_paths.add(path)
+                                except Exception:
+                                    continue
+                        finally:
+                            stage.release_group(group)
+                    return dirty_paths, True
+    except Exception:
+        return set(), False
 
 
 def _release_native_query(query: Any) -> None:
@@ -1173,6 +1834,16 @@ def _leafmost_paths(paths: set[str]) -> set[str]:
             other != path and other.startswith(path.rstrip("/") + "/")
             for other in normalized
         )
+    }
+
+
+def _rootmost_paths(paths: set[str]) -> set[str]:
+    """Keep only the paths whose parent is not itself in ``paths``."""
+    normalized = {str(path).rstrip("/") or "/" for path in paths}
+    return {
+        path
+        for path in normalized
+        if (path.rsplit("/", 1)[0] or "/") not in normalized
     }
 
 

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 import shutil
 from pathlib import Path
@@ -52,7 +45,21 @@ class BuildPyWithAgentSkills(build_py):
             shutil.copytree(source, target)
 
 
+_VERSION = _read_project_version()
+
+# First-party packages are released together from one VERSION.md. Pin them
+# to this version so that pip cannot install a mix of releases.
 setup(
-    version=_read_project_version(),
+    version=_VERSION,
+    install_requires=[
+        f"ovui=={_VERSION}",
+        f"ovui-widgets-common[testing]=={_VERSION}",
+        f"ovui-widgets-stage=={_VERSION}",
+        f"ovui-widgets-layers=={_VERSION}",
+        f"ovui-widgets-content=={_VERSION}",
+        f"ovui-widgets-property=={_VERSION}",
+        f"ovui-widgets-viewport=={_VERSION}",
+        f"ovui-data-adapters-common=={_VERSION}",
+    ],
     cmdclass={"build_py": BuildPyWithAgentSkills},
 )

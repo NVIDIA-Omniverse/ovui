@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ovstage coverage for the shared ovrtx import resolver."""
 
@@ -78,13 +71,11 @@ def _fake_current_ovrtx_module() -> ModuleType:
             *,
             keep_system_alive,
             log_level,
-            use_vulkan,
             selection_outline_enabled,
             selection_outline_width,
         ) -> None:
             self.keep_system_alive = keep_system_alive
             self.log_level = log_level
-            self.use_vulkan = use_vulkan
             self.selection_outline_enabled = selection_outline_enabled
             self.selection_outline_width = selection_outline_width
 
@@ -161,7 +152,7 @@ class TestOvstageRendererOvRtxResolution:
         adapter = renderer_module.OvstageRendererAdapter()
 
         assert adapter._ovrtx is module
-        assert adapter._renderer.config.use_vulkan is True
+        assert not hasattr(adapter._renderer.config, "use_vulkan")
         assert not hasattr(adapter._renderer.config, "attach_mode")
 
     def test_renderer_uses_active_env_ovrtx_first(

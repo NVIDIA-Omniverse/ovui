@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Colour palette definitions (OvGear design system, design-system style rules).
 
@@ -14,7 +7,7 @@ All colours are registered as named shades in omni.ui.ColorStore so they
 respond to ui.set_shade() theme switching.  Dark values are the default;
 light values activate under ui.set_shade("light").
 
-Dark values follow the latest design-reference hierarchy for this pass:
+Dark values follow the design reference hierarchy:
   - broad application/window/menu chrome: #222222
   - tree, icon-grid, and input wells: #161616
   - #313131 stays reserved for hover and raised affordances
@@ -26,7 +19,7 @@ import omni.ui as ui  # noqa: F401 — ensures ColorStore is initialised
 from omni.ui import color as cl
 
 # ---------------------------------------------------------------------------
-# Backgrounds — follow the latest design-reference two-tier correction against
+# Backgrounds — follow the two-tier design reference against
 # ``OvuiSampleApp.png``: broad docked panel/menu chrome sits on #222222, while
 # tree wells, icon-grid bodies, and input fields sit on #161616.
 # ---------------------------------------------------------------------------
@@ -35,9 +28,8 @@ cl.shade(cl("#161616"), light=cl("#CCCCCC"), name="background_secondary")
 cl.shade(cl("#222222"), light=cl("#D6D6D6"), name="background_tertiary")
 cl.shade(cl("#313131"), light=cl("#E5E5E5"), name="background_elevated")
 
-# Outermost dockspace void (UI-021). The latest design-reference correction
-# makes the broad application background match the window/panel chrome at
-# #222222. Wired through
+# Outermost dockspace void (UI-021). The design reference makes the broad
+# application background match the window/panel chrome at #222222. Wired through
 # ``application.py::dock_frame.set_style({"background_color": ...})``,
 # which the C++ ``DockSpace.cpp::m_dockFrame`` resolves and pushes as
 # ``ImGuiCol_WindowBg`` per frame.
@@ -93,6 +85,9 @@ cl.shade(cl("#E04444"), light=cl("#DD2222"), name="status_error_hovered")
 cl.shade(cl("#DDAA50"), light=cl("#BB6600"), name="status_warning")
 cl.shade(cl("#8AD089"), light=cl("#5A9100"), name="status_success")
 cl.shade(cl("#68A8FF"), light=cl("#2266AA"), name="status_info")
+
+# Native plots need a line color visible on both field-background shades.
+cl.shade(cl("#E6B300"), light=cl("#806400"), name="plot_line")
 
 # ---------------------------------------------------------------------------
 # Property Inspector
@@ -168,12 +163,26 @@ cl.shade(cl("#161616"), light=cl("#EEEEEE"), name="background_field")
 cl.shade(cl("#161616"), light=cl("#F8F8F8"), name="background_field_editing")
 cl.shade(cl("#161616"), light=cl("#EEEEEE"), name="background_value_field")
 cl.shade(cl("#161616"), light=cl("#F8F8F8"), name="background_value_field_editing")
+# Selected-text highlight while a field is in keyboard-edit mode. Without an
+# explicit value the widgets fall through to the global ImGui palette, which is
+# dark-tuned (near-white at 19% alpha) and so renders invisibly on the light
+# theme's near-white field fill. The dark value matches what that global
+# previously resolved to, so dark-theme appearance is unchanged.
+cl.shade(cl("#3F3F3F"), light=cl("#B8C8D8"), name="field_text_selection")
 
 # ---------------------------------------------------------------------------
 # Special
 # ---------------------------------------------------------------------------
 cl.shade(0x0, name="transparent")
-cl.shade(0x40000000, light=0x80FFFFFF, name="hud_background")
+# The viewport stays a dark surface in both themes (the rendered image and the
+# backdrop behind its letterbox bars), so the backdrop and the HUD/toolbar
+# drawn over it must not flip with the theme.
+cl.shade(0x40000000, light=0x40000000, name="hud_background")
+cl.shade(cl("#222222"), light=cl("#222222"), name="viewport_background")
+cl.shade(cl("#E0E0E0"), light=cl("#E0E0E0"), name="viewport_overlay_text_primary")
+cl.shade(cl("#A7A7A7"), light=cl("#A7A7A7"), name="viewport_overlay_text_secondary")
+cl.shade(cl("#4B4B4B"), light=cl("#4B4B4B"), name="viewport_overlay_text_disabled")
+cl.shade(cl("#F0F0F0"), light=cl("#F0F0F0"), name="viewport_overlay_text_value")
 
 # ---------------------------------------------------------------------------
 # Highlight (search-match painting — Content.HighlightLabel::highlight)

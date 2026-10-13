@@ -1,29 +1,32 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "GlfwPlatform.h"
+#include "NativeFramePacing.h"
+#ifdef _WIN32
+#include "Win32WindowTitle.h"
+#endif
 #ifdef OMNIUI_HAS_VULKAN
 #include "VulkanBackend.h"
+#include "VulkanByteImageGpu.h"
 #endif
 #include "StandaloneGlyphManager.h"
 #include "StandaloneInit.h"
 #include "StandaloneWindowCallbackManager.h"
 #include "ImGuiKeyTranslation.h"
+#include "NativeTiming.h"
 
 #include <omni/ui/platform/PlatformRegistry.h>
 #include <omni/ui/Font.h>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+#ifdef _WIN32
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#endif
 #include <imgui/imgui.h>
 #include <imgui/backends/imgui_impl_glfw.h>
 #include <imgui/backends/imgui_impl_opengl3.h>
@@ -39,7 +42,9 @@
 #include <filesystem>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #elif defined(__linux__) || defined(__APPLE__)
 #include <dlfcn.h>
@@ -134,6 +139,11 @@ static std::string findFontPath(const char* fontFile)
 
 GlfwPlatform::~GlfwPlatform()
 {
+    if (m_backendType == BackendType::eVulkan)
+    {
+        registerNativeFramePacingBackend(nullptr);
+        shutdownNativeFramePacing();
+    }
     // Destroy all virtual windows before tearing down the GL context.
     for (auto& [id, vw] : m_virtualWindows)
         deleteFboAttachments(vw);
@@ -173,21 +183,36 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
         return m_mainWindowId;
     }
 
-    if (!glfwInit())
     {
-        fprintf(stderr, "GlfwPlatform::createWindow: glfwInit failed\n");
-        return kInvalidWindowId;
+        OVUI_PERFORMANCE_PHASE_SCOPE(glfwInitPhase, kGlfwInitPhaseName);
+        if (!glfwInit())
+        {
+            fprintf(stderr, "GlfwPlatform::createWindow: glfwInit failed\n");
+            return kInvalidWindowId;
+        }
     }
 
-    // Check environment variable for backend selection
+    // Prefer Vulkan when available.  OpenGL remains available explicitly and
+    // as a fallback when the default Vulkan backend cannot initialize.
     m_backendType = BackendType::eOpenGL;
 #ifdef OMNIUI_HAS_VULKAN
+    bool explicitVulkan = false;
     {
         const char* env = getenv("OMNIUI_BACKEND");
-        if (env && (strcmp(env, "vulkan") == 0 || strcmp(env, "Vulkan") == 0 || strcmp(env, "vk") == 0))
+        m_backendType = BackendType::eVulkan;
+        if (env && (strcmp(env, "opengl") == 0 || strcmp(env, "OpenGL") == 0 || strcmp(env, "gl") == 0))
         {
-            m_backendType = BackendType::eVulkan;
+            m_backendType = BackendType::eOpenGL;
+            fprintf(stdout, "GlfwPlatform: OpenGL backend selected via OMNIUI_BACKEND\n");
+        }
+        else if (env && (strcmp(env, "vulkan") == 0 || strcmp(env, "Vulkan") == 0 || strcmp(env, "vk") == 0))
+        {
+            explicitVulkan = true;
             fprintf(stdout, "GlfwPlatform: Vulkan backend selected via OMNIUI_BACKEND\n");
+        }
+        else if (!env || !*env)
+        {
+            fprintf(stdout, "GlfwPlatform: Vulkan backend selected by default\n");
         }
     }
 #endif
@@ -243,20 +268,42 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
     if (m_backendType == BackendType::eVulkan)
     {
 #ifdef OMNIUI_HAS_VULKAN
+        OVUI_PERFORMANCE_PHASE_SCOPE(vulkanInitPhase, kVulkanInitPhaseName);
         m_vulkanBackend = std::make_unique<VulkanBackend>();
-        if (!m_vulkanBackend->init(m_window, width, height))
+        int framebufferWidth = 0;
+        int framebufferHeight = 0;
+        glfwGetFramebufferSize(m_window, &framebufferWidth, &framebufferHeight);
+        if (!m_vulkanBackend->init(m_window, framebufferWidth, framebufferHeight))
         {
             fprintf(stderr, "GlfwPlatform::createWindow: Vulkan init failed\n");
             m_vulkanBackend.reset();
             glfwDestroyWindow(m_window);
             m_window = nullptr;
-            glfwTerminate();
-            return kInvalidWindowId;
+            if (explicitVulkan)
+            {
+                glfwTerminate();
+                return kInvalidWindowId;
+            }
+
+            fprintf(stderr, "GlfwPlatform::createWindow: falling back to OpenGL\n");
+            m_backendType = BackendType::eOpenGL;
+            glfwDefaultWindowHints();
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+            glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+            m_window = glfwCreateWindow(createW, createH, title ? title : "omni.ui", nullptr, nullptr);
+            if (!m_window)
+            {
+                fprintf(stderr, "GlfwPlatform::createWindow: OpenGL fallback window creation failed\n");
+                glfwTerminate();
+                return kInvalidWindowId;
+            }
         }
 #endif
     }
-    else
+    if (m_backendType == BackendType::eOpenGL)
     {
+        OVUI_PERFORMANCE_PHASE_SCOPE(openGlInitPhase, kOpenGlInitPhaseName);
         glfwMakeContextCurrent(m_window);
 
         // Load OpenGL via glad
@@ -269,11 +316,15 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
             return kInvalidWindowId;
         }
 
-        // Enable vsync
-        glfwSwapInterval(1);
+        // Keep presentation non-blocking. The standalone run loop applies the
+        // app.runLoops.main.rateLimitFrequency cap (120 FPS by default), so a
+        // swap interval of one would incorrectly pin GlfwPlatform::tick to a
+        // 60 Hz display and block here for roughly 16 ms.
+        glfwSwapInterval(0);
     }
 
     // Initialize ImGui
+    OVUI_PERFORMANCE_PHASE_SCOPE(imGuiInitPhase, kImGuiInitPhaseName);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -388,7 +439,10 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
 #endif
     }
 
-    ImGui_ImplGlfw_InitForOpenGL(m_window, true);
+    if (m_backendType == BackendType::eVulkan)
+        ImGui_ImplGlfw_InitForVulkan(m_window, true);
+    else
+        ImGui_ImplGlfw_InitForOpenGL(m_window, true);
 
     // Load a body font at all standard sizes so omni.ui font_size works at any value.
     // Noto Sans is the primary UI font; Roboto is a last-resort fallback.
@@ -429,6 +483,11 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
     {
 #ifdef OMNIUI_HAS_VULKAN
         m_vulkanBackend->initImGui();
+        OVUI_PERFORMANCE_PHASE_STOP(imGuiInitPhase);
+        {
+            OVUI_PERFORMANCE_PHASE_SCOPE(ovrtxIntegrationInitPhase, kOvrtxIntegrationInitPhaseName);
+            registerNativeFramePacingBackend(m_vulkanBackend.get());
+        }
 #endif
     }
     else
@@ -440,6 +499,7 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
         ImGui_ImplOpenGL3_Init("#version 130");
 #endif
     }
+    OVUI_PERFORMANCE_PHASE_STOP(imGuiInitPhase);
 
     m_mainWindowId = m_nextWindowId++;
     return m_mainWindowId;
@@ -453,6 +513,8 @@ void GlfwPlatform::destroyWindow(WindowId id)
 #ifdef OMNIUI_HAS_VULKAN
     if (m_backendType == BackendType::eVulkan)
     {
+        registerNativeFramePacingBackend(nullptr);
+        shutdownNativeFramePacing();
         m_vulkanBackend.reset();
         ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
@@ -630,8 +692,12 @@ void GlfwPlatform::setWindowPosition(WindowId id, int x, int y)
 
 std::string GlfwPlatform::getWindowTitle(WindowId id)
 {
-    if (id == m_mainWindowId)
+    if (id == m_mainWindowId && m_window)
+#ifdef _WIN32
+        return getWin32WindowTitle(glfwGetWin32Window(m_window));
+#else
         return m_title;
+#endif
     return {};
 }
 
@@ -639,8 +705,17 @@ void GlfwPlatform::setWindowTitle(WindowId id, const char* title)
 {
     if (id == m_mainWindowId && m_window && title)
     {
-        m_title = title;
+        // Keep GLFW's own title state synchronized on every platform.
         glfwSetWindowTitle(m_window, title);
+#ifdef _WIN32
+        // The standalone API must describe the real Win32 caption, not the
+        // requested-value cache.  Apply the UTF-16 title to the HWND and force
+        // a non-client repaint so visible desktop chrome changes immediately.
+        if (setWin32WindowTitle(glfwGetWin32Window(m_window), title))
+            m_title = title;
+#else
+        m_title = title;
+#endif
     }
 }
 
@@ -965,8 +1040,20 @@ void GlfwPlatform::drainDeferredQueue()
 
 bool GlfwPlatform::tick()
 {
+    // The standalone pump executes this native UI frame synchronously on the UI thread.
+    OVUI_DEVELOPMENT_TIME_SCOPE(frameScope, "GlfwPlatform.tick [ovui debug]");
     if (!m_window)
         return false;
+
+#ifdef OMNIUI_HAS_VULKAN
+    if (m_backendType == BackendType::eVulkan)
+    {
+        beginNativeFramePacingUiUpdate(m_vulkanBackend.get());
+        // Until this frame's draw data is submitted, it can reference textures
+        // that are released while it is built, so those releases wait.
+        m_vulkanBackend->beginFrameReleases();
+    }
+#endif
 
     // Determine if we are rendering to a virtual window's FBO.
     VirtualWindowInfo* vwTarget = nullptr;
@@ -978,24 +1065,32 @@ bool GlfwPlatform::tick()
     }
 
     // 1. Poll events (still needed even in headless mode for GL context pump)
-    glfwPollEvents();
+    {
+        OVUI_DEVELOPMENT_TIME_SCOPE(pollEventsScope, "GlfwPlatform.pollEvents [ovui debug]");
+        glfwPollEvents();
+    }
 
     // 2. Start new ImGui frame
+    {
+        OVUI_DEVELOPMENT_TIME_SCOPE(backendNewFrameScope, "GlfwPlatform.backendNewFrame [ovui debug]");
 #ifdef OMNIUI_HAS_VULKAN
-    if (m_backendType == BackendType::eVulkan)
-    {
-        ImGui_ImplVulkan_NewFrame();
-    }
-    else
+        if (m_backendType == BackendType::eVulkan)
+        {
+            ImGui_ImplVulkan_NewFrame();
+        }
+        else
 #endif
-    {
-        ImGui_ImplOpenGL3_NewFrame();
+        {
+            ImGui_ImplOpenGL3_NewFrame();
+        }
+        ImGui_ImplGlfw_NewFrame();
     }
-    ImGui_ImplGlfw_NewFrame();
 
     // Apply any programmatically injected input AFTER the GLFW backend
     // has set IO from real events, so our injected values take precedence.
-    applyInjectedInput();
+    {
+        applyInjectedInput();
+    }
 
     // When rendering to a virtual window, override the display size so ImGui
     // lays out to the FBO dimensions rather than the GLFW window dimensions.
@@ -1007,7 +1102,9 @@ bool GlfwPlatform::tick()
         io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
     }
 
-    ImGui::NewFrame();
+    {
+        ImGui::NewFrame();
+    }
 
     // 3. Draw all omni.ui windows
     {
@@ -1020,12 +1117,15 @@ bool GlfwPlatform::tick()
         StandaloneWindowCallbackManager* wcm = getStandaloneWindowCallbackManager();
         if (wcm)
         {
+            OVUI_DEVELOPMENT_TIME_SCOPE(drawWindowsScope, "GlfwPlatform.drawAllWindows [ovui debug]");
             wcm->drawAllWindows(elapsed);
         }
     }
 
     // 4. Render ImGui
-    ImGui::Render();
+    {
+        ImGui::Render();
+    }
 
     // 5. Render backend-specific
 #ifdef OMNIUI_HAS_VULKAN
@@ -1033,19 +1133,65 @@ bool GlfwPlatform::tick()
     {
         int display_w, display_h;
         glfwGetFramebufferSize(m_window, &display_w, &display_h);
-        if (display_w > 0 && display_h > 0)
+        uint64_t pacingGeneration = 0;
+        bool paced = false;
+        if (!m_vulkanBackend->usesFastPresentationMode())
         {
-            m_vulkanBackend->beginFrame(display_w, display_h);
-            ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), m_vulkanBackend->getCommandBuffer());
-            m_vulkanBackend->endFrame();
+            paced = submitNativeFramePacingDrawData(
+                m_vulkanBackend.get(), ImGui::GetDrawData(), display_w, display_h,
+                &pacingGeneration, static_cast<bool>(m_preSwapCallback));
+        }
+        if (!paced && display_w > 0 && display_h > 0)
+        {
+            VulkanBackend::WindowPresentResult prepared =
+                VulkanBackend::WindowPresentResult::eDeferred;
+            uint32_t swapchainImage = 0;
+            {
+                std::lock_guard<std::mutex> queueLock(m_vulkanBackend->getQueueMutex());
+                if (m_vulkanBackend->beginFrame(display_w, display_h))
+                {
+                    ImGui_ImplVulkan_RenderDrawData(
+                        ImGui::GetDrawData(), m_vulkanBackend->getCommandBuffer());
+                    if (m_vulkanBackend->endFrame())
+                    {
+                        prepared = m_vulkanBackend->prepareWindowFrame(
+                            display_w, display_h, &swapchainImage);
+                    }
+                }
+            }
+            if (prepared == VulkanBackend::WindowPresentResult::ePrepared &&
+                m_vulkanBackend->presentWindowFrame(swapchainImage) ==
+                    VulkanBackend::WindowPresentResult::eFailed)
+            {
+                fprintf(stderr, "GlfwPlatform: Vulkan window presentation failed\n");
+            }
+            else if (prepared == VulkanBackend::WindowPresentResult::eFailed)
+            {
+                fprintf(stderr, "GlfwPlatform: Vulkan window preparation failed\n");
+            }
+        }
+
+        IByteImageGpu* byteImageGpu = PlatformRegistry::instance().byteImageGpu();
+        if (byteImageGpu != nullptr)
+        {
+            VulkanByteImageGpu* vulkanByteImageGpu = static_cast<VulkanByteImageGpu*>(byteImageGpu);
+            vulkanByteImageGpu->drainDeferredDestructions();
         }
 
         // Drain deferred queue
-        drainDeferredQueue();
+        {
+            drainDeferredQueue();
+        }
+
+        m_vulkanBackend->endFrameReleases();
 
         // Pre-swap callback (used by screenshot capture)
         if (m_preSwapCallback)
         {
+            if (paced)
+            {
+                waitNativeFramePacingPresentation(pacingGeneration, 500'000'000);
+            }
             auto cb = std::move(m_preSwapCallback);
             m_preSwapCallback = nullptr;
             cb();
@@ -1055,16 +1201,18 @@ bool GlfwPlatform::tick()
 #endif
     {
         // Bind FBO if rendering to virtual window
-        if (vwTarget)
         {
-            glBindFramebuffer(GL_FRAMEBUFFER, vwTarget->fbo);
-            glViewport(0, 0, vwTarget->width, vwTarget->height);
-        }
-        else
-        {
-            int display_w, display_h;
-            glfwGetFramebufferSize(m_window, &display_w, &display_h);
-            glViewport(0, 0, display_w, display_h);
+            if (vwTarget)
+            {
+                glBindFramebuffer(GL_FRAMEBUFFER, vwTarget->fbo);
+                glViewport(0, 0, vwTarget->width, vwTarget->height);
+            }
+            else
+            {
+                int display_w, display_h;
+                glfwGetFramebufferSize(m_window, &display_w, &display_h);
+                glViewport(0, 0, display_w, display_h);
+            }
         }
 
         // Read the cleared-viewport color from ImGui's BASE
@@ -1076,16 +1224,22 @@ bool GlfwPlatform::tick()
         // auto-sized BeginMainMenuBar window and the host
         // ``Begin("DockSpace")`` window) shows a constant gray-blue
         // that doesn't blend with the application's chrome.
-        ImVec4 wbg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
-        if (wbg.w <= 0.0f) {
-            wbg = ImVec4(0.12f, 0.13f, 0.14f, 1.0f);
+        {
+            ImVec4 wbg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
+            if (wbg.w <= 0.0f) {
+                wbg = ImVec4(0.12f, 0.13f, 0.14f, 1.0f);
+            }
+            glClearColor(wbg.x, wbg.y, wbg.z, wbg.w);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         }
-        glClearColor(wbg.x, wbg.y, wbg.z, wbg.w);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        {
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        }
 
         // Drain deferred queue (while FBO is still bound for virtual windows)
-        drainDeferredQueue();
+        {
+            drainDeferredQueue();
+        }
 
         // Pre-swap callback (used by screenshot capture)
         if (m_preSwapCallback)
@@ -1251,3 +1405,9 @@ bool GlfwPlatform::needsStrongWindowRefs() const
 } // namespace standalone
 } // namespace ui
 } // namespace omni
+
+#include "ImGuiKeyTranslation.h"
+int omni::ui::standalone::GlfwPlatform::nativeKeyCode(int key) const
+{
+    return detail::imguiKeyToGlfwKey(static_cast<ImGuiKey>(key));
+}

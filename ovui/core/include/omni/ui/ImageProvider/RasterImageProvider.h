@@ -1,19 +1,14 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
 
 #include "ImageProvider.h"
 
+#include <ctime>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -69,9 +64,17 @@ public:
 
 protected:
     void _shutdown();
+    OMNIUI_API time_t _getModTime(const std::string& path);
+    OMNIUI_API std::string _getCacheKey(const std::string& path);
+    OMNIUI_API void _loadAsset(const std::string& path);
+    OMNIUI_API void _pollAsset();
+    OMNIUI_API void _waitAsset();
+    OMNIUI_API void _releaseAsset();
 
     IUiSettings* m_settings = nullptr;
-    IRasterImageLoader* m_loader = nullptr;
+    // Shared with PlatformRegistry: the provider can outlive the backend shutdown
+    // (for example, a Python global released at interpreter exit).
+    std::shared_ptr<IRasterImageLoader> m_loader;
     int32_t m_shutdownIterMax = 0;
     std::string m_sourceRasterUrl;
     bool m_sourceRasterUrlChanged = false;

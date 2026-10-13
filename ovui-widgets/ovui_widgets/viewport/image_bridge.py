@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ByteImageProvider bridge — decouples renderer from ovui."""
 
@@ -19,6 +12,21 @@ from typing import Optional, Union
 import numpy as np
 import omni.ui as ui
 from ovui_data_adapters.common import _STANDALONE_NOOP_MARKER, GpuFrame, ZeroCopyState
+
+
+
+def _has_gpu_byte_image() -> bool:
+    """Whether this ovui build can actually push a CUDA pointer into an image.
+
+    Mirrors what the native upload path checks, so the probe cannot report
+    success on a build that has no interop compiled in.
+    """
+    try:
+        import omni.ui as ui
+
+        return bool(ui.has_gpu_byte_image())
+    except Exception:
+        return False
 
 
 class ImageBridge:
@@ -51,11 +59,15 @@ class ImageBridge:
     def provider(self) -> ui.ByteImageProvider:
         return self._provider
 
-    def update(self, frame: Union[np.ndarray, GpuFrame]) -> None:
+    def update(self, frame: Union[np.ndarray, GpuFrame, None]) -> None:
         """Push a new frame into the provider.
 
         Accepts either an (H, W, 4) uint8 ndarray or a :class:`GpuFrame`.
+        ``None`` means a native frame-pacing coordinator owns publication;
+        the provider's stable presentation key must remain untouched.
         """
+        if frame is None:
+            return
         if isinstance(frame, GpuFrame):
             self._update_gpu(frame)
             return
@@ -72,6 +84,17 @@ class ImageBridge:
             self._height = h
         try:
             if self._state is not None and self._state.mode.value == "probing":
+                # Capability first. Absence of a stderr marker is not proof
+                # that the GPU push worked: a build without CUDA-Vulkan interop
+                # silently produced no texture, which is how zero-copy came to
+                # report `enabled` while the viewport stayed black. Ask the
+                # backend directly, and fall back for real when it says no.
+                if not _has_gpu_byte_image():
+                    self._state.mark_fallback(
+                        "ovui build has no CUDA-Vulkan byte-image support "
+                        "(omni.ui.has_gpu_byte_image() is False)"
+                    )
+                    return
                 with _capture_fd2() as cap:
                     self._set_gpu_frame_data(frame, [w, h])
                 captured = cap.read()

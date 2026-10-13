@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for Step 62 — theme switching via View menu and Settings."""
 
@@ -38,6 +31,23 @@ def app():
 # ---------------------------------------------------------------------------
 # set_theme() behaviour
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_shared_window_menu_and_checkbox_styles_follow_theme(theme):
+    import omni.ui as ui
+    from ovui_widgets.app.style import set_theme
+
+    try:
+        set_theme(theme)
+        styles = ui.style.default
+        assert styles["Window"]["background_color"] == ui.ColorStore.find("background_primary")
+        assert styles["Menu.Item"]["color"] == ui.ColorStore.find("text_primary")
+        assert styles["Menu.Item"]["color"] != styles["Menu.Item:disabled"]["color"]
+        assert styles["CheckBox"]["border_width"] == 1
+        assert styles["Window"].get("padding", 0) == 0
+    finally:
+        set_theme("dark")
 
 
 class TestSetTheme:
@@ -165,6 +175,9 @@ class TestViewMenuItems:
             def __init__(self, label, triggered_fn=None, **kwargs):
                 if label in ("Light Theme", "Dark Theme"):
                     menu_items[label] = triggered_fn
+
+            def set_checked_changed_fn(self, fn):
+                self.checked_changed_fn = fn
 
         class FakeMenu:
             def __init__(self, *a, **kw):

@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/platform/Assert.h>
@@ -67,6 +60,36 @@ PolygonMesh::PolygonMesh(const std::vector<Vector3>& positions,
 
 PolygonMesh::~PolygonMesh() = default;
 
+const std::vector<Vector3>& PolygonMesh::getNormals() const
+{
+    return _getData<PolygonMeshData>().m_normals;
+}
+
+void PolygonMesh::setNormals(const std::vector<Vector3>& normals)
+{
+    auto& data = _getData<PolygonMeshData>();
+    if (data.m_normals != normals)
+    {
+        data.m_normals = normals;
+        _dirtyCache();
+    }
+}
+
+PolygonMesh::Lighting PolygonMesh::getLighting() const
+{
+    return _getData<PolygonMeshData>().m_lighting;
+}
+
+void PolygonMesh::setLighting(Lighting lighting)
+{
+    auto& data = _getData<PolygonMeshData>();
+    if (data.m_lighting != lighting)
+    {
+        data.m_lighting = lighting;
+        _dirtyCache();
+    }
+}
+
 void PolygonMesh::_drawContent(const Matrix44& projection, const Matrix44& view)
 {
     if (this->getPositions().empty())
@@ -90,6 +113,12 @@ void PolygonMesh::_drawContent(const Matrix44& projection, const Matrix44& view)
                                           data.m_cachedThicknesses.data(), data.m_cachedVertexIndices.data(),
                                           data.m_cachedVertexCounts.data(), nullptr, data.m_cachedVertexCounts.size());
             }
+        }
+        else if (getLighting() == Lighting::eHeadlight && getNormals().size() == getPositions().size())
+        {
+            drawList->addHeadlightPolygonMesh(getPositions().data(), getColors().data(), getNormals().data(),
+                                             getVertexIndices().data(), getVertexCounts().data(),
+                                             getVertexCounts().size());
         }
         else
         {

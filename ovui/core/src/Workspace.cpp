@@ -1,19 +1,13 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Assert.h"
 #include "platform/Log.h"
 #include "platform/PlatformRegistry.h"
 #include "platform/IUiPlatform.h"
+#include "WorkspaceLifecycle.h"
 #include <imgui/imgui.h>
 #include <imgui/imgui_internal.h>
 #include <omni/ui/Profile.h>
@@ -25,6 +19,7 @@
 #include <algorithm>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <map>
 
 
@@ -56,6 +51,27 @@ static std::function<void(const std::shared_ptr<WindowHandle>& window)> g_newWin
 
 // Callback for window visiblity change
 static std::vector<std::function<void(const std::string& title, bool visible)>> g_windowVisiblityChangedCallbackFn;
+
+static bool g_acceptWorkspaceCallbacks = true;
+
+void detail::beginWorkspaceCallbackLifetime()
+{
+    g_acceptWorkspaceCallbacks = true;
+}
+
+void detail::endWorkspaceCallbackLifetime()
+{
+    g_acceptWorkspaceCallbacks = false;
+
+    // Detach every store before releasing Python owners. Their finalizers may
+    // reenter Workspace to remove or register callbacks during teardown.
+    decltype(g_showWindowFns) retiredShowWindowFns;
+    decltype(g_newWindowCallbackFn) retiredNewWindowCallbackFn;
+    decltype(g_windowVisiblityChangedCallbackFn) retiredVisibilityCallbacks;
+    retiredShowWindowFns.swap(g_showWindowFns);
+    retiredNewWindowCallbackFn.swap(g_newWindowCallbackFn);
+    retiredVisibilityCallbacks.swap(g_windowVisiblityChangedCallbackFn);
+}
 
 /**
  * @brief Looking for a window in g_windows. It's very close to std::find if with a small weak_ptr improvement. It
@@ -470,7 +486,9 @@ void Workspace::setDockIdWidth(uint32_t dockId, float width)
     float size = width * Workspace::getDpiScale();
 
     // The current size and sibling size
-    float total = dockNode->Size.x + sibling->Size.x;
+    // During initial docking the child Size fields may still hold the previous
+    // window extent. Resize within the parent's actual allocation.
+    float total = std::max(parent->Size.x - ImGui::GetStyle().DockingSeparatorSize, 0.0f);
 
     // Modify the current size
     dockNode->Size.x = dockNode->SizeRef.x = std::min(size, total);
@@ -511,7 +529,9 @@ void Workspace::setDockIdHeight(uint32_t dockId, float height)
     float size = height * Workspace::getDpiScale();
 
     // The current size and sibling size
-    float total = dockNode->Size.y + sibling->Size.y;
+    // During initial docking the child Size fields may still hold the previous
+    // window extent. Resize within the parent's actual allocation.
+    float total = std::max(parent->Size.y - ImGui::GetStyle().DockingSeparatorSize, 0.0f);
 
     // Modify the current size
     dockNode->Size.y = dockNode->SizeRef.y = std::min(size, total);
@@ -558,6 +578,10 @@ bool Workspace::showWindow(const std::string& title, bool show)
 
 void Workspace::setShowWindowFn(const std::string& title, std::function<void(bool)> showWindowFn)
 {
+    if (!g_acceptWorkspaceCallbacks)
+    {
+        return;
+    }
     if (!showWindowFn)
     {
         auto found = g_showWindowFns.find(title);
@@ -585,6 +609,10 @@ std::vector<std::string> Workspace::getShowWindowTitles()
 void Workspace::setWindowCreatedCallback(
     std::function<void(const std::shared_ptr<WindowHandle>& window)> windowCreatedCallbackFn)
 {
+    if (!g_acceptWorkspaceCallbacks)
+    {
+        return;
+    }
     g_newWindowCallbackFn = windowCreatedCallbackFn;
 }
 
@@ -686,6 +714,10 @@ std::vector<std::shared_ptr<WindowHandle>> Workspace::_getWindows(const void* wi
 
 uint32_t Workspace::setWindowVisibilityChangedCallback(std::function<void(const std::string& title, bool visible)> windowVisibilityChangedCallbackFn)
 {
+    if (!g_acceptWorkspaceCallbacks)
+    {
+        return std::numeric_limits<uint32_t>::max();
+    }
     //This prevents the vector size from growing indefinitely.
     for (uint32_t id = 0; id < g_windowVisiblityChangedCallbackFn.size(); id++)
     {
@@ -702,6 +734,10 @@ uint32_t Workspace::setWindowVisibilityChangedCallback(std::function<void(const 
 
 void Workspace::removeWindowVisibilityChangedCallback(uint32_t id)
 {
+    if (!g_acceptWorkspaceCallbacks)
+    {
+        return;
+    }
     if (id < g_windowVisiblityChangedCallbackFn.size())
     {
         // We don't remove it to keep the ids that we already returned. Instead, we make this function NULL, so it will be

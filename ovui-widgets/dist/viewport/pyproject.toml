@@ -1,18 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-widgets-viewport"
-dynamic = ["version"]
+license = {text = "Apache-2.0"}
+# Dependencies are in setup.py: first-party packages are pinned to VERSION.md.
+dynamic = ["version", "dependencies"]
 description = "ovui-widgets Viewport"
-readme = "README.md"
+readme = {content-type = "text/markdown", text = """
+# ovui-widgets-viewport
+
+Viewport package for ovui-widgets. It combines rendered frames, camera controls,
+HUD state, scene overlays, picking, selection outline feedback, and transform
+manipulators into the viewport surface used by USD Viewer.
+
+The viewport receives renderer, stage, transform, selection, snapping, and undo
+objects from the application, so rendering and scene data can be swapped behind
+the same visible interaction model.
+"""}
 requires-python = ">=3.10"
-dependencies = [
-    "ovui-widgets-common>=0.1.0",
-    "ovui-data-adapters-common>=0.1.0",
-    "numpy>=1.20",
-]
 
 [tool.setuptools.packages.find]
 namespaces = true

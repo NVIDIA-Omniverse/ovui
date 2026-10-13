@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ovuiinspect -- FastAPI inspector for standalone ovui apps.
 
@@ -15,9 +8,11 @@ are available. UI-mutating requests are queued and must be drained by the app's
 frame loop through :func:`drain_pending`.
 """
 
+import asyncio
 import base64
 import contextlib
 import io
+import inspect
 import itertools
 import os
 import struct
@@ -31,14 +26,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from .commands import Arguments, Command, Registration
+
 __all__ = [
     "attach_application",
     "detach_application",
     "drain_pending",
     "status",
+    "Arguments",
+    "Command",
+    "register_command",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 9910
@@ -122,6 +122,11 @@ class _Command:
     scheduled: bool = False
     result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
+    task: Any = None
+    cancel_requested: bool = False
+    # Set once the frame loop begins executing the command; a timeout after
+    # this point cannot promise that nothing happened.
+    started: bool = False
 
     @property
     def deadline(self) -> float:
@@ -135,9 +140,9 @@ class _Command:
         self.result = {"success": True, **result}
         self.event.set()
 
-    def fail(self, message: str) -> None:
+    def fail(self, message: str, **details: Any) -> None:
         self.error = message
-        self.result = {"success": False, "error": message}
+        self.result = {"success": False, "error": message, **details}
         self.event.set()
 
 
@@ -148,18 +153,25 @@ class _State:
         self.attached_at: Optional[float] = None
         self.server_started_at: Optional[float] = None
         self.startup_error: Optional[str] = None
+        self.contribution_error: Optional[str] = None
         self.last_error: Optional[str] = None
+        self.last_error_at: Optional[float] = None
         self.last_frame_at: Optional[float] = None
         self.queue: list[_Command] = []
+        self.commands: dict[str, Registration] = {}
 
     def enqueue(self, command: _Command) -> None:
         with self.lock:
+            if len(self.queue) >= 128:
+                raise RuntimeError(
+                    "Inspector command queue is full; retry after pending work completes"
+                )
             self.queue.append(command)
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
-                "status": "ok" if self.startup_error is None else "degraded",
+                "status": "degraded" if self.startup_error or self.contribution_error else "ok",
                 "version": __version__,
                 "host": _host(),
                 "port": _port(),
@@ -171,7 +183,9 @@ class _State:
                 "state_enabled": _state_enabled(),
                 "execute_enabled": _execute_enabled(),
                 "startup_error": self.startup_error,
+                "contribution_error": self.contribution_error,
                 "last_error": self.last_error,
+                "last_error_at": self.last_error_at,
             }
 
 
@@ -216,17 +230,72 @@ def _log(message: str) -> None:
 
 def attach_application(application: Any) -> None:
     """Attach the current Application instance for status and execute helpers."""
+    if _STATE.application is application:
+        return
+    if _STATE.application is not None and _STATE.application is not application:
+        detach_application()
     with _STATE.lock:
         _STATE.application = application
         _STATE.attached_at = time.time()
+        _STATE.contribution_error = None
+    provider = getattr(application, "get_inspector_commands", None)
+    if callable(provider):
+        registrations = []
+        try:
+            for command in provider():
+                registrations.append(register_command(command))
+        except Exception as exc:
+            for registration in registrations:
+                registration.remove()
+            # Optional contributions must not disable the existing screenshot,
+            # input and execute pipeline. Roll back their catalog atomically.
+            with _STATE.lock:
+                _STATE.contribution_error = f"{type(exc).__name__}: {exc}"
+            print(f"[ovuiinspect] Application commands unavailable: {exc}", file=sys.stderr)
 
 
-def detach_application(application: Optional[Any] = None) -> None:
-    """Detach the current Application instance."""
+def detach_application(application: Optional[Any] = None) -> tuple[asyncio.Future, ...]:
+    """Detach on the owning thread; return cancelled work the host may await.
+
+    An async host should await these tasks before releasing native resources.
+    Existing synchronous hosts may ignore the return value.
+    """
+    tasks = []
     with _STATE.lock:
         if application is None or _STATE.application is application:
+            for registration in _STATE.commands.values():
+                registration.active = False
+            _STATE.commands.clear()
+            for command in _STATE.queue:
+                if command.task is not None:
+                    tasks.append(command.task)
+                    if not command.cancel_requested:
+                        command.cancel_requested = True
+                        command.task.cancel()
+                command.fail("Application detached before command completed")
+            _STATE.queue.clear()
             _STATE.application = None
             _STATE.attached_at = None
+    return tuple(tasks)
+
+
+def register_command(command: Command) -> Registration:
+    """Add a command to this application's Inspector and discovery catalog."""
+
+    def remove(registration):
+        with _STATE.lock:
+            registration.active = False
+            if _STATE.commands.get(command.name) is registration:
+                del _STATE.commands[command.name]
+
+    registration = Registration(command, remove)
+    with _STATE.lock:
+        if _STATE.application is None:
+            raise RuntimeError("Attach an application before registering commands")
+        if command.name in _STATE.commands:
+            raise ValueError(f"Inspector command already registered: {command.name}")
+        _STATE.commands[command.name] = registration
+    return registration
 
 
 def status() -> dict[str, Any]:
@@ -241,8 +310,42 @@ def _require_attached() -> None:
 
 def _wait(command: _Command) -> dict[str, Any]:
     if not command.event.wait(command.timeout + 0.25):
-        command.fail("command timed out before the ovui frame loop drained it")
+        if command.started and command.kind == "steps":
+            command.fail(
+                "input sequence timed out after it started; the remaining steps are "
+                "dropped and held buttons/keys released"
+            )
+        elif command.started:
+            command.fail(
+                f"{command.kind} command timed out after it started; it may still complete "
+                "(synchronous work cannot be interrupted, async work is cancelled). Inspect "
+                "application state before retrying"
+            )
+        else:
+            command.fail(
+                f"{command.kind} command timed out before the ovui frame loop started it; "
+                "it was not run"
+            )
     return command.result or {"success": False, "error": "command finished without a result"}
+
+
+def _exception_details(exc: BaseException, *, include_traceback: bool = False) -> tuple[str, dict[str, Any]]:
+    """A one-line message plus any coded errors; the traceback goes to the server log.
+
+    ``include_traceback`` returns it to the client too (``execute`` reports the
+    caller's own code).
+    """
+    trace = traceback.format_exc()
+    details: dict[str, Any] = {}
+    if include_traceback:
+        details["traceback"] = trace
+    else:
+        print(f"[ovuiinspect] request failed:\n{trace}", file=sys.stderr)
+    errors = getattr(exc, "errors", None)
+    if isinstance(errors, list):
+        details["errors"] = _json_safe(errors)
+    text = " ".join(str(exc).split())  # USD error text spans lines
+    return f"{type(exc).__name__}: {text}", details
 
 
 def _submit(command: _Command) -> dict[str, Any]:
@@ -250,7 +353,10 @@ def _submit(command: _Command) -> dict[str, Any]:
         _require_attached()
     except RuntimeError as exc:
         return {"success": False, "error": str(exc)}
-    _STATE.enqueue(command)
+    try:
+        _STATE.enqueue(command)
+    except RuntimeError as exc:
+        return {"success": False, "error": str(exc)}
     return _wait(command)
 
 
@@ -434,6 +540,14 @@ def _make_combo(combo: str, timeout: float) -> _Command:
     return _make_press(key, modifiers, timeout)
 
 
+def _track_held(command: _Command, kind: str, code: int, down: bool) -> None:
+    held = command.payload.setdefault("held", {})
+    if down:
+        held[(kind, code)] = True
+    else:
+        held.pop((kind, code), None)
+
+
 def _advance_steps(
     command: _Command,
     ui_native: Any,
@@ -451,6 +565,7 @@ def _advance_steps(
         command.payload["last_xy"] = (float(args[0]), float(args[1]))
     elif action == "button":
         ui_native._inject_mouse_button(int(args[0]), bool(args[1]))
+        _track_held(command, "button", int(args[0]), bool(args[1]))
         if int(args[0]) == 0 and bool(args[1]) and application is not None:
             hook = getattr(application, "_on_remote_left_click", None)
             xy = command.payload.get("last_xy")
@@ -467,6 +582,7 @@ def _advance_steps(
                     hook(ch)
     elif action == "key":
         ui_native._inject_key_event(int(args[0]), bool(args[1]))
+        _track_held(command, "key", int(args[0]), bool(args[1]))
     else:
         command.fail(f"internal error: unsupported step {action!r}")
         return
@@ -766,7 +882,19 @@ def _advance_legacy_screenshot_request(
     return _validate_completed_screenshot(command, snapshot)
 
 
-def _advance_screenshot(command: _Command, ui_native: Any) -> None:
+def _screenshot_needs_frame(command: _Command, application: Optional[Any]) -> bool:
+    """An application whose viewport presents GPU-only frames (a streaming host that reads back
+    CPU images on demand) returns True until a rendered frame carried a CPU image; the screenshot is
+    scheduled on the first frame on which it returns False, so it shows the last rendered frame."""
+    if command.scheduled:
+        return False
+    prepare = getattr(application, "prepare_inspector_screenshot", None)
+    return bool(callable(prepare) and prepare())
+
+
+def _advance_screenshot(command: _Command, ui_native: Any, application: Optional[Any] = None) -> None:
+    if _screenshot_needs_frame(command, application):
+        return
     metadata = _advance_screenshot_request(command, ui_native)
     if metadata is not None:
         command.succeed(
@@ -783,17 +911,54 @@ def _advance_execute(command: _Command, application: Optional[Any]) -> None:
     code = str(command.payload.get("code", ""))
     stdout = io.StringIO()
     stderr = io.StringIO()
-    namespace = dict(_EXEC_GLOBALS)
+    provider = getattr(application, "get_inspector_namespace", None)
+    namespace = provider() if callable(provider) else dict(_EXEC_GLOBALS)
+    if not isinstance(namespace, dict):
+        command.fail("get_inspector_namespace() must return a dict")
+        return
+    namespace.pop("result", None)
     namespace["application"] = application
     namespace["app"] = application
     try:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             compiled = compile(code, "<ovuiinspect>", "exec")
             exec(compiled, namespace, namespace)
-    except Exception:
-        command.fail(traceback.format_exc())
+    except Exception as exc:
+        output, errors = stdout.getvalue()[-65536:], stderr.getvalue()[-65536:]
+        message, details = _exception_details(exc, include_traceback=True)
+        lines = [
+            frame.lineno
+            for frame in traceback.extract_tb(exc.__traceback__)
+            if frame.filename == "<ovuiinspect>"
+        ]
+        if lines:
+            message += f" (execute line {lines[-1]})"
+        command.fail(message, stdout=output, stderr=errors, **details)
         return
-    command.succeed(stdout=stdout.getvalue(), stderr=stderr.getvalue())
+    command.succeed(
+        stdout=stdout.getvalue()[-65536:],
+        stderr=stderr.getvalue()[-65536:],
+        result=_json_safe(namespace.get("result")),
+    )
+
+
+def _advance_extension(command: _Command) -> None:
+    registration = command.payload["registration"]
+    if not registration.active:
+        command.fail("Application command was removed; discover commands again")
+        return
+    if command.task is None:
+        result = registration.command.handler(**command.payload["arguments"])
+        if inspect.isawaitable(result):
+            command.task = asyncio.ensure_future(result)
+        else:
+            command.succeed(result=_json_safe(result))
+            return
+    if command.task.done():
+        if command.task.cancelled():
+            command.fail("Command cancelled; inspect application state before retrying a mutation")
+        else:
+            command.succeed(result=_json_safe(command.task.result()))
 
 
 def _json_safe(value: Any) -> Any:
@@ -850,11 +1015,13 @@ def _advance_checkpoint(
     """Correlate read-only state with one exact screenshot request.
 
     State capture and screenshot registration happen together during the first
-    queued UI-thread advance. Later advances only wait for that request's
+    queued UI-thread advance on which the application needs no further frame. Later advances only wait for that request's
     terminal result; the state is never recaptured or overwritten.
     """
 
     if "_checkpoint_state" not in command.payload:
+        if _screenshot_needs_frame(command, application):
+            return
         try:
             command.payload["_checkpoint_state"] = _capture_application_state(application)
         except ValueError as exc:
@@ -898,20 +1065,58 @@ def _cancel_screenshot_request(command: _Command, ui_native: Any) -> None:
         cancel(int(request_id))
 
 
+def _release_held_input(command: _Command, ui_native: Any) -> None:
+    """Release buttons and keys a partially executed input sequence pressed."""
+    held = command.payload.pop("held", {})
+    for (kind, code) in reversed(list(held)):
+        with contextlib.suppress(Exception):
+            if kind == "button":
+                ui_native._inject_mouse_button(code, False)
+            else:
+                ui_native._inject_key_event(code, False)
+
+
 def _advance_command(command: _Command, ui_native: Any, application: Optional[Any]) -> None:
-    if time.monotonic() >= command.deadline:
+    if command.done or time.monotonic() >= command.deadline:
+        if (
+            command.task is not None
+            and not command.task.done()
+            and not command.cancel_requested
+        ):
+            command.cancel_requested = True
+            command.task.cancel()
         _cancel_screenshot_request(command, ui_native)
-        command.fail(f"{command.kind} command timed out")
+        if command.kind == "steps":
+            # A timed-out drag or combo must not leave a button or key pressed.
+            _release_held_input(command, ui_native)
+        if not command.done:
+            if command.kind == "steps":
+                command.fail(
+                    f"input sequence timed out after {command.step_index} of "
+                    f"{len(command.steps)} steps; the rest was dropped and held "
+                    "buttons/keys were released"
+                )
+            elif command.started:
+                command.fail(
+                    f"{command.kind} command timed out after it started; async work was "
+                    "cancelled and may have partially run. Inspect application state "
+                    "before retrying"
+                )
+            else:
+                command.fail(f"{command.kind} command timed out before it started; it was not run")
         return
+    command.started = True
     try:
         if command.kind == "steps":
             _advance_steps(command, ui_native, application)
         elif command.kind == "screenshot":
-            _advance_screenshot(command, ui_native)
+            _advance_screenshot(command, ui_native, application)
         elif command.kind == "checkpoint":
             _advance_checkpoint(command, ui_native, application)
         elif command.kind == "execute":
             _advance_execute(command, application)
+        elif command.kind == "extension":
+            _advance_extension(command)
         elif command.kind == "state":
             _advance_state(command, application)
         elif command.kind == "shutdown":
@@ -920,18 +1125,25 @@ def _advance_command(command: _Command, ui_native: Any, application: Optional[An
             command.fail(f"internal error: unsupported command {command.kind!r}")
         if command.error:
             _cancel_screenshot_request(command, ui_native)
-    except Exception:
+    except Exception as exc:
         _cancel_screenshot_request(command, ui_native)
-        command.fail(traceback.format_exc())
+        message, details = _exception_details(exc)
+        command.fail(message, **details)
 
 
-def drain_pending(ui_native: Any, *, application: Optional[Any] = None) -> int:
+def drain_pending(
+    ui_native: Any, *, application: Optional[Any] = None, advance_input: bool = True
+) -> int:
     """Drain one queued inspector step onto the ovui frame loop.
 
     The host ovui application calls this immediately before
     ``await ui.next_frame()``. Only one step is advanced per frame so hover,
     press, release, and drag sequences preserve ImGui's expected frame
     ordering.
+
+    Hosts that also drain between renders within one UI frame must pass
+    ``advance_input=False`` there. This can progress contributed commands but
+    leaves input sequences queued until the next real UI frame boundary.
     """
     with _STATE.lock:
         _STATE.last_frame_at = time.time()
@@ -940,10 +1152,19 @@ def drain_pending(ui_native: Any, *, application: Optional[Any] = None) -> int:
         command = _STATE.queue[0] if _STATE.queue else None
     if command is None:
         return 0
+    if (
+        command.kind == "steps" and not advance_input and not command.done
+        and time.monotonic() < command.deadline
+    ):
+        return 0
 
     _advance_command(command, ui_native, application or _STATE.application)
 
-    if command.done:
+    if command.done and (command.task is None or command.task.done()):
+        if command.task is not None and not command.task.cancelled():
+            # A timed-out command may fail during cancellation cleanup. Retrieve
+            # its terminal exception even though the HTTP result is already sent.
+            command.task.exception()
         with _STATE.lock:
             if _STATE.queue and _STATE.queue[0] is command:
                 _STATE.queue.pop(0)
@@ -954,6 +1175,7 @@ def drain_pending(ui_native: Any, *, application: Optional[Any] = None) -> int:
                     pass
             if command.error:
                 _STATE.last_error = command.error
+                _STATE.last_error_at = time.time()
     return 1
 
 
@@ -996,6 +1218,7 @@ def _checkpoint_bytes(fmt: str, timeout: float) -> tuple[bytes, str, dict[str, A
 
 def _create_app() -> Any:
     from fastapi import Body, FastAPI, HTTPException, Response
+    from fastapi.responses import JSONResponse
     from pydantic import BaseModel
 
     app = FastAPI(title="ovuiinspect", version=__version__)
@@ -1050,9 +1273,20 @@ def _create_app() -> Any:
         code: str
         timeout: float = 10.0
 
-    def checked(result: dict[str, Any]) -> dict[str, Any]:
+    def _timeout(request: Any, query: Optional[float]) -> float:
+        # ``?timeout=`` works on input verbs as on /commands; it overrides the body.
+        return request.timeout if query is None else query
+
+    def checked(result: dict[str, Any]) -> Any:
         if result.get("success") is False:
-            raise HTTPException(status_code=400, detail=result.get("error", "request failed"))
+            # ``detail`` stays a one-line message; diagnostics travel beside it.
+            extras = {k: result[k] for k in ("traceback", "errors") if k in result}
+            if not extras:
+                raise HTTPException(status_code=400, detail=result.get("error", "request failed"))
+            return JSONResponse(
+                status_code=400,
+                content={"detail": result.get("error", "request failed"), **extras},
+            )
         return result
 
     def require_state_enabled() -> None:
@@ -1072,6 +1306,28 @@ def _create_app() -> Any:
     @app.get("/status")
     def get_status() -> dict[str, Any]:
         return _STATE.snapshot()
+
+    @app.get("/commands")
+    def get_commands() -> dict[str, Any]:
+        with _STATE.lock:
+            catalog = [entry.command.describe() for entry in _STATE.commands.values()]
+        return {"success": True, "commands": catalog}
+
+    @app.post("/commands/{name}")
+    def call_command(name: str, arguments: dict = Body(default={}), timeout: float = 30.0):
+        if not 0 < timeout <= 600:
+            raise HTTPException(422, "timeout must be between 0 and 600 seconds")
+        with _STATE.lock:
+            registration = _STATE.commands.get(name)
+        if registration is None:
+            raise HTTPException(404, f"Unknown application command: {name}; see /commands")
+        try:
+            validated = registration.command.arguments.model_validate(arguments).model_dump()
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return checked(_submit(_Command(
+            "extension", {"registration": registration, "arguments": validated}, timeout
+        )))
 
     @app.get("/state")
     def get_application_state(timeout: float = 5.0) -> dict[str, Any]:
@@ -1147,22 +1403,22 @@ def _create_app() -> Any:
         return capture_application_json(fmt, timeout)
 
     @app.post("/mouse/move")
-    def mouse_move(request: MoveRequest = Body(...)) -> dict[str, Any]:
+    def mouse_move(request: MoveRequest = Body(...), timeout: Optional[float] = None) -> dict[str, Any]:
         try:
-            command = _make_move(request.x, request.y, request.timeout)
+            command = _make_move(request.x, request.y, _timeout(request, timeout))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return checked(_submit(command))
 
     @app.post("/mouse/click")
-    def mouse_click(request: ClickRequest = Body(...)) -> dict[str, Any]:
+    def mouse_click(request: ClickRequest = Body(...), timeout: Optional[float] = None) -> dict[str, Any]:
         try:
             command = _make_click(
                 request.x,
                 request.y,
                 request.button,
                 request.double,
-                request.timeout,
+                _timeout(request, timeout),
                 request.modifiers,
             )
         except ValueError as exc:
@@ -1170,7 +1426,9 @@ def _create_app() -> Any:
         return checked(_submit(command))
 
     @app.post("/mouse/drag")
-    def mouse_drag(request: DragRequest = Body(...)) -> dict[str, Any]:
+    def mouse_drag(
+        request: DragRequest = Body(...), timeout: Optional[float] = None
+    ) -> dict[str, Any]:
         try:
             command = _make_drag(
                 request.start_x,
@@ -1178,7 +1436,7 @@ def _create_app() -> Any:
                 request.end_x,
                 request.end_y,
                 request.button,
-                request.timeout,
+                _timeout(request, timeout),
                 request.steps,
                 request.duration,
                 request.modifiers,
@@ -1188,35 +1446,35 @@ def _create_app() -> Any:
         return checked(_submit(command))
 
     @app.post("/mouse/scroll")
-    def mouse_scroll(request: ScrollRequest = Body(...)) -> dict[str, Any]:
+    def mouse_scroll(request: ScrollRequest = Body(...), timeout: Optional[float] = None) -> dict[str, Any]:
         try:
             command = _make_scroll(
                 request.direction,
                 request.amount,
                 request.x,
                 request.y,
-                request.timeout,
+                _timeout(request, timeout),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return checked(_submit(command))
 
     @app.post("/keyboard/type")
-    def keyboard_type(request: TypeRequest = Body(...)) -> dict[str, Any]:
-        return checked(_submit(_make_type(request.text, request.timeout)))
+    def keyboard_type(request: TypeRequest = Body(...), timeout: Optional[float] = None) -> dict[str, Any]:
+        return checked(_submit(_make_type(request.text, _timeout(request, timeout))))
 
     @app.post("/keyboard/press")
-    def keyboard_press(request: PressRequest = Body(...)) -> dict[str, Any]:
+    def keyboard_press(request: PressRequest = Body(...), timeout: Optional[float] = None) -> dict[str, Any]:
         try:
-            command = _make_press(request.key, request.modifiers, request.timeout)
+            command = _make_press(request.key, request.modifiers, _timeout(request, timeout))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return checked(_submit(command))
 
     @app.post("/keyboard/combo")
-    def keyboard_combo(request: ComboRequest = Body(...)) -> dict[str, Any]:
+    def keyboard_combo(request: ComboRequest = Body(...), timeout: Optional[float] = None) -> dict[str, Any]:
         try:
-            command = _make_combo(request.combo, request.timeout)
+            command = _make_combo(request.combo, _timeout(request, timeout))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return checked(_submit(command))

@@ -1,22 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for command-line settings overrides (``--/path/to/key=value``)."""
 
 import json
+import os
 
 import pytest
 
 from ovui_widgets.app.__main__ import _parse_args
 from ovui_widgets.app.application import Application
 from ovui_widgets.app.cli_settings import (
+    apply_early_setting_overrides,
     coerce_value,
     extract_setting_overrides,
     parse_override_token,
@@ -34,6 +29,26 @@ EXAMPLE_EXPECTED = {
     "snap.enabled": True,
     "snap.grid_size": 0.25,
 }
+
+
+@pytest.mark.parametrize("existing_backend", [None, "opengl", "vulkan"])
+def test_automatic_backend_preserves_native_fallback_and_environment(
+    monkeypatch, existing_backend,
+):
+    monkeypatch.delenv("OMNIUI_BACKEND", raising=False)
+    if existing_backend is not None:
+        monkeypatch.setenv("OMNIUI_BACKEND", existing_backend)
+    monkeypatch.delenv("OMNIUI_RENDER_FLOW_MODE", raising=False)
+    apply_early_setting_overrides({})
+    assert os.environ.get("OMNIUI_BACKEND") == existing_backend
+
+
+@pytest.mark.parametrize("backend, expected", [("vk", "vulkan"), ("ogl", "opengl")])
+def test_explicit_cli_backend_overrides_environment(monkeypatch, backend, expected):
+    monkeypatch.setenv("OMNIUI_BACKEND", "opengl")
+    monkeypatch.delenv("OMNIUI_RENDER_FLOW_MODE", raising=False)
+    apply_early_setting_overrides({"app.renderer.backend": backend})
+    assert os.environ["OMNIUI_BACKEND"] == expected
 
 
 @pytest.fixture(autouse=True)
@@ -197,7 +212,8 @@ class TestMainWiring:
                 captured["usd_path"] = usd_path
 
         monkeypatch.setattr(
-            bootstrap_module, "preconstruct_selected_native_renderer", lambda: None
+            bootstrap_module, "preconstruct_selected_native_renderer",
+            lambda settings: captured.update(bootstrap_settings=settings),
         )
         monkeypatch.setattr(
             bootstrap_module,
@@ -209,6 +225,7 @@ class TestMainWiring:
         app_main.main(["scene.usda", *EXAMPLE_OVERRIDES])
 
         assert captured["settings_overrides"] == EXAMPLE_EXPECTED
+        assert captured["bootstrap_settings"] == EXAMPLE_EXPECTED
         assert captured["usd_path"] == "scene.usda"
 
 

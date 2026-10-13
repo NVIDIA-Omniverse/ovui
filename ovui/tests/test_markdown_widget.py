@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Visual smoke tests for the native MarkdownWidget."""
 
@@ -151,6 +144,100 @@ class TestMarkdownWidget(OmniUiTest):
         self.assertEqual(outline[0]["slug"], "anchor-target")
         self.assertEqual(outline[0]["level"], 1)
         self.assertTrue(widget.scroll_to_anchor("anchor-target"))
+        await self.finalize_test_no_image()
+
+    async def test_glyph_forms_do_not_depend_on_atlas_bake_order(self):
+        """A character must render the same whether or not
+        the font atlas had already rasterized it.
+
+        The widget used to ask the atlas "is this glyph loaded?" to decide
+        whether the active face was missing a character.  Since ImGui 1.92
+        rasterizes glyphs lazily, every character the application had not
+        drawn yet looked missing and was rerouted to the fallback face, so a
+        source `v`/`w` came out in the fallback typeface's letterforms -- at
+        body size those read as uppercase `V`/`W`.  Which characters were hit
+        depended purely on what the application had drawn earlier, which is
+        why the reporter saw it come and go between launches.
+
+        This renders the same document twice: once while the characters are
+        still cold, then again after a plain `ui.Label` has rasterized them.
+        The two markdown renders must be identical.  The document uses
+        Latin-1 letters no other fixture in this suite draws, so the first
+        render really is cold no matter which tests ran before it.
+
+        On a platform with no fallback face (the widget only has one when the
+        styled or built-in fallback font file exists) both renders are
+        trivially equal and the test still passes.
+        """
+        import tempfile
+
+        from PIL import Image, ImageChops
+
+        from omni.ui import _ui
+
+        cold_chars = "þ ð ø ç ñ æ ß ý"
+        source = f"Body text {cold_chars} in a paragraph.\n\n- List item {cold_chars}\n"
+        width, height = 256, 160
+        markdown_height = 96  # the band the widget occupies; excludes the primer
+
+        window = await self.create_test_window(width=width, height=height)
+        with window.frame:
+            with ui.ZStack(width=ui.Fraction(1), height=ui.Fraction(1), style=self._style()):
+                ui.Rectangle(style={"background_color": ui.color(0.985, 0.99, 1.0)})
+                with ui.VStack():
+                    ui.MarkdownWidget(source, width=ui.Fraction(1), height=markdown_height)
+                    # Starts empty so it cannot rasterize the characters before
+                    # the first markdown render; filled in below to prime them.
+                    # Must match the widget's body size -- ovui bakes each font
+                    # size separately, so a differently-sized label would prime
+                    # a different glyph table and prove nothing.
+                    primer = ui.Label(
+                        "",
+                        height=ui.Fraction(1),
+                        style={"Label": {"font_size": self._style()["MarkdownWidget"]["font_size"]}},
+                    )
+
+        async def capture(path: str) -> Image.Image:
+            # Schedule a pre-swap capture and pump frames until it lands --
+            # the same mechanism finalize_test() uses.  ui.testing's
+            # synchronous wrapper cannot be used here because it drives the
+            # event loop itself, which IsolatedAsyncioTestCase owns.
+            await self.wait_n_updates(6)
+            self.assertTrue(_ui._schedule_screenshot(path), "screenshot capture failed")
+            for _ in range(8):
+                await self.wait_n_updates(1)
+                if _ui._poll_screenshot_done():
+                    break
+            return Image.open(path).convert("RGB").crop((0, 0, width, markdown_height))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cold = await capture(f"{tmp}/cold.png")
+            primer.text = cold_chars
+            warm = await capture(f"{tmp}/warm.png")
+
+            # Prove the glyphs really drew before comparing.  "Differs from
+            # black" would prove nothing: the ZStack paints a near-white
+            # rectangle over the whole area and the test window frames it in
+            # dark chrome, so a frame with no text at all is already
+            # non-black.  Inset past that 4 px chrome and count pixels
+            # clearly darker than the backdrop -- inside that region only the
+            # body colour (luma ~30, against the backdrop's ~252) can make
+            # one, so the count is glyph coverage.
+            inset = 8
+            interior = cold.crop((inset, inset, width - inset, markdown_height))
+            ink = sum(interior.convert("L").histogram()[:128])
+            self.assertGreater(
+                ink, 300,
+                f"only {ink} foreground pixels inside the markdown band -- "
+                "the text did not render, which would make the comparison "
+                "below pass vacuously",
+            )
+            self.assertIsNone(
+                ImageChops.difference(cold, warm).getbbox(),
+                "MarkdownWidget rendered the same text differently once the "
+                "font atlas had rasterized its glyphs",
+            )
+
         await self.finalize_test_no_image()
 
     async def test_p1_alerts_render_smoke(self):

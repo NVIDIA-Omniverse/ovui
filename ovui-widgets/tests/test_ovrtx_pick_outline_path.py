@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Focused tests for ovrtx-backed viewport pick and selection outlines."""
 
@@ -235,11 +228,14 @@ class _FakeOutlineOperation:
 
 
 class _FakeAsyncOnlyRenderer(_FakeRenderer):
-    """Outline-group runtime exposing only the async string variant.
+    """Hypothetical runtime exposing only the async string membership API.
 
-    ``write_attribute`` still accepts the legacy ``omni:selectionOutlineGroup``
-    write as a generic Fabric write, but the outline pass no longer reads it —
-    only the dedicated API draws.
+    The INSTALLED ovrtx 0.4.0 wheel exposes neither string variant; its
+    surface (style APIs plus ``write_attribute`` of the reserved
+    ``omni:selectionOutlineGroup`` attribute) is the base ``_FakeRenderer``
+    and is covered by the attribute-transport tests above.  This subclass
+    verifies the precedence and completion-validation bookkeeping the
+    adapter must keep for runtimes that do ship the dedicated API.
     """
 
     def __init__(self) -> None:
@@ -264,9 +260,10 @@ class _FakeAsyncOnlyRenderer(_FakeRenderer):
 
 
 class _FakeModernRenderer(_FakeAsyncOnlyRenderer):
-    """ovrtx 0.4: both string variants of the outline-group API.
+    """Hypothetical runtime shipping both string variants of the API.
 
-    Mirrors the real wheel: the blocking string variant wraps
+    NOT the installed ovrtx 0.4.0 wheel (which ships neither variant).
+    The blocking string variant wraps
     ``set_selection_outline_group_strings_async(...).wait()``, so completion
     failures surface as exceptions from the blocking call.
     """
@@ -277,12 +274,14 @@ class _FakeModernRenderer(_FakeAsyncOnlyRenderer):
 
 
 def test_selection_highlight_uses_modern_outline_group_api(monkeypatch):
-    """Modern ovrtx must receive outline groups via its dedicated API.
+    """A dedicated membership API takes precedence over attribute writes.
 
-    ovrtx 0.4 removed the attribute-driven outline mechanism, so a legacy
-    ``omni:selectionOutlineGroup`` write is silently inert: selection sync
-    succeeds but no outline is rendered. This is the exact regression seen
-    in release validation on the OpenUSD provider.
+    On a runtime that exposes the string membership API, outline groups
+    must flow through it rather than the attribute write, so a runtime
+    that stops honoring attribute-driven membership still outlines.  (The
+    installed ovrtx 0.4.0 wheel exposes no string API; there the reserved
+    ``omni:selectionOutlineGroup`` attribute write IS the documented
+    transport, covered by the ``_FakeRenderer`` attribute tests.)
     """
     fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
     monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
@@ -639,7 +638,7 @@ def test_two_rapid_picks_do_not_inherit_canceled_hit(monkeypatch):
 def test_collapsed_same_render_product_pick_delivers_latest_replacement_hit(monkeypatch):
     """ovrtx 0.3 can collapse rapid same-RenderProduct picks to latest hit.
 
-    Regression for PR #67 Step 6: a rapid replacement pick under the same
+    Regression coverage: a rapid replacement pick under the same
     RenderProduct returned the latest hit while the superseded FIFO slot
     was still at the adapter head, then a miss on the live slot. The live
     callback must receive that cached latest hit instead of ``None``.
@@ -1097,7 +1096,7 @@ def test_load_stage_strips_stale_root_session_scaffolding_from_ovrtx_snapshot(
     assert adapter._owned_tmp_path == snapshot_path
 
 
-def test_transform_info_change_keeps_ovrtx_attribute_update_path(tmp_path):
+def test_transform_info_change_keeps_ovrtx_attribute_update_path(tmp_path, monkeypatch):
     Usd, UsdGeom = _pxr_usd_modules()
     scene_path = tmp_path / "scene.usda"
     stage = Usd.Stage.CreateNew(str(scene_path))
@@ -1114,6 +1113,10 @@ def test_transform_info_change_keeps_ovrtx_attribute_update_path(tmp_path):
     adapter = _make_load_stage_adapter(renderer)
     adapter.load_stage(stage)
     renderer.calls.clear()
+    monkeypatch.setattr(
+        renderer_mod, "_ovrtx",
+        SimpleNamespace(Semantic=SimpleNamespace(XFORM_MAT4x4="matrix")),
+    )
 
     adapter.notify_stage_changed(ChangeEvent(
         changed_paths=("/World/Cube.xformOp:translate",),
@@ -1122,7 +1125,11 @@ def test_transform_info_change_keeps_ovrtx_attribute_update_path(tmp_path):
     ))
 
     assert not any(call[0] == "file" for call in renderer.calls)
-    assert any(call[0] == "write_attribute" for call in renderer.calls)
+    writes = [call for call in renderer.calls if call[0] == "write_attribute"]
+    assert len(writes) == 1
+    assert writes[0][2]["attribute_name"] == "omni:xform"
+    assert writes[0][2]["prim_paths"] == ["/World/Cube"]
+    assert np.allclose(writes[0][2]["tensor"][0, 3, :3], (1.0, 2.0, 3.0))
 
 
 def test_load_stage_drains_pending_picks_from_previous_stage(monkeypatch):
@@ -1204,3 +1211,44 @@ def test_viewport_pick_still_publishes_through_selection_bus():
         assert bus.get_snapshot().paths() == ["/World/Cube"]
     finally:
         viewport.destroy()
+
+
+class _FakeResettableRenderer(_FakeModernRenderer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reset_calls = 0
+        self.reset_failures = 0
+
+    def reset(self):
+        self.reset_calls += 1
+        if self.reset_failures:
+            self.reset_failures -= 1
+            raise RuntimeError("simulated reset failure")
+
+
+def test_selection_highlight_activates_outline_pass_once(monkeypatch):
+    """The first applied outline membership resets the renderer exactly once.
+
+    With ovrtx 0.5 a membership write alone does not invalidate a converged,
+    camera-static render, so without this one-shot reset the outline of a
+    headless (CPU-presented) viewport never appears. A failed reset stays
+    owed and is retried by the next selection sync.
+    """
+    fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
+    monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
+    renderer = _FakeResettableRenderer()
+    renderer.reset_failures = 1
+    adapter = _make_adapter(renderer)
+    adapter._selection_outline_pass_needs_reset = True
+
+    adapter.set_selection_highlight(["/World/Cube"])
+    assert renderer.reset_calls == 1
+    assert adapter._selection_outline_pass_needs_reset is True
+
+    adapter.set_selection_highlight(["/World/Sphere"])
+    assert renderer.reset_calls == 2
+    assert adapter._selection_outline_pass_needs_reset is False
+
+    adapter.set_selection_highlight(["/World/Cube"])
+    adapter.set_selection_highlight([])
+    assert renderer.reset_calls == 2

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for Step 35: PropertyWindow subscribes to stage changes and rebuilds
 when selected prim attributes change.
@@ -14,16 +7,19 @@ when selected prim attributes change.
 All tests skip when pxr (OpenUSD) is not available.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 try:
-    from pxr import Usd, UsdGeom
+    from pxr import Gf, Usd, UsdGeom
     HAS_USD = True
 except ImportError:
     HAS_USD = False
 
 pytestmark = pytest.mark.skipif(not HAS_USD, reason="pxr (OpenUSD) not available")
 
+from ovui_data_adapters.common import ChangeEvent, ChangeEventType
 from ovui_data_adapters.openusd import UsdPropertyAdapter
 from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
 
@@ -51,6 +47,46 @@ def _make_headless_widget():
 
 class TestPropertyChangeSubscription:
 
+    def test_selected_property_rebuild_waits_for_active_edit(self, monkeypatch):
+        from ovui_widgets.common import scheduler
+
+        w = _make_headless_widget()
+        w._selection = ["/Sphere"]
+        editing_model = SimpleNamespace(editing=True)
+        w._inspector_attribute_rows = {
+            "radius": SimpleNamespace(_model=editing_model),
+        }
+        rebuilds = []
+        w._rebuild_content = lambda: rebuilds.append("rebuilt")
+        callbacks = []
+
+        class _Handle:
+            def cancel(self):
+                pass
+
+        monkeypatch.setattr(
+            scheduler,
+            "call_later",
+            lambda _delay, callback: callbacks.append(callback) or _Handle(),
+        )
+        event = ChangeEvent(
+            changed_paths=("/Sphere.radius",),
+            resynced_paths=(),
+            event_type=ChangeEventType.INFO_CHANGE,
+        )
+
+        w._on_stage_changed(event)
+        assert rebuilds == []
+        assert len(callbacks) == 1
+
+        callbacks.pop(0)()
+        assert rebuilds == []
+        assert len(callbacks) == 1
+
+        editing_model.editing = False
+        callbacks.pop(0)()
+        assert rebuilds == ["rebuilt"]
+
     def test_attr_change_on_selected_prim_triggers_rebuild(self):
         """Changing an attribute on the selected prim fires _rebuild_content."""
         stage = Usd.Stage.CreateInMemory()
@@ -74,6 +110,35 @@ class TestPropertyChangeSubscription:
         sphere.GetRadiusAttr().Set(2.0)
 
         assert len(rebuilds) > baseline
+
+    def test_selected_transform_stack_change_reenumerates_properties(self):
+        """A matrix replacement is reflected without reselecting the prim."""
+        stage = Usd.Stage.CreateInMemory()
+        sphere = UsdGeom.Sphere.Define(stage, "/Sphere")
+        xformable = UsdGeom.Xformable(sphere)
+        xformable.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.0))
+
+        stage_adapter = UsdStageAdapter(stage)
+        w = _make_headless_widget()
+        w._selection = ["/Sphere"]
+        w._adapter = UsdPropertyAdapter(
+            stage, w._selection, stage_adapter=stage_adapter
+        )
+        w.set_property_adapter_factory(
+            lambda paths: UsdPropertyAdapter(
+                stage, paths, stage_adapter=stage_adapter
+            )
+        )
+        w.set_stage_adapter(stage_adapter)
+        assert "xformOp:translate" in w._adapter.get_attribute_names()
+        assert "xformOp:transform" not in w._adapter.get_attribute_names()
+
+        matrix = Gf.Matrix4d(1.0)
+        matrix.SetTranslateOnly(Gf.Vec3d(4.0, 5.0, 6.0))
+        xformable.MakeMatrixXform().Set(matrix)
+
+        names = w._adapter.get_attribute_names()
+        assert "xformOp:transform" in names
 
     def test_attr_change_on_unselected_prim_does_not_trigger_rebuild(self):
         """Changing an attribute on a prim NOT in the selection does not rebuild."""

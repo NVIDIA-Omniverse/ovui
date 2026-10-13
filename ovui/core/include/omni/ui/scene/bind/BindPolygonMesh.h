@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -25,6 +18,8 @@
     OMNIUI_PYBIND_INIT_CAST(vertex_indices, setVertexIndices, std::vector<uint32_t>)                                   \
     OMNIUI_PYBIND_INIT_CAST(thicknesses, setThicknesses, std::vector<float>)                                           \
     OMNIUI_PYBIND_INIT_CAST(intersection_thickness, setIntersectionThickness, float)                                   \
+    OMNIUI_PYBIND_INIT_CALL(normals, setNormals, pythonListToVector3) \
+    OMNIUI_PYBIND_INIT_CAST(lighting, setLighting, PolygonMesh::Lighting) \
     OMNIUI_PYBIND_INIT_CAST(wireframe, setWireframe, bool)
 
 #define OMNIUI_PYBIND_KWARGS_DOC_PolygonMesh                                                                           \
@@ -42,6 +37,8 @@
     OMNIUI_PYBIND_DOC_PolygonMesh_intersectionThickness                                                                \
     "\n    `wireframe: `\n        "                                                                                    \
     OMNIUI_PYBIND_DOC_PolygonMesh_wireframe                                                                            \
+    "\n    `normals : `\n        Optional object-space normals indexed like positions; mismatched counts render unlit." \
+    "\n    `lighting : `\n        MeshLighting.UNLIT by default; HEADLIGHT requires a capable renderer." \
     OMNIUI_PYBIND_KWARGS_DOC_AbstractShape
 
 // clang-format on

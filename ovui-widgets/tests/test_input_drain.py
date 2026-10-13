@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for ovui_widgets.app._input_drain.drain_bridge_into_ui (issue #34, Step 3.3).
 
@@ -739,8 +732,8 @@ def test_application_set_remote_input_bridge_can_clear() -> None:
 
 
 def test_run_async_drains_before_next_frame_in_main_loop() -> None:
-    """Static-source check: the main loop body must call
-    ``self._drain_remote_input()`` *before* ``await ui.next_frame()``.
+    """The main loop must drain remote input through its IO handoff phase
+    *before* ``await ui.next_frame()``.
 
     Mocking through ``run_async`` would require booting ovui, so the
     cheapest enforcement is a textual ordering assertion against the
@@ -756,9 +749,11 @@ def test_run_async_drains_before_next_frame_in_main_loop() -> None:
     m = re.search(r"while self\._running", src)
     assert m, "Application.run_async has no while self._running loop"
     body = src[m.start():]
-    drain_at = body.find("self._drain_remote_input()")
+    handoff_src = inspect.getsource(Application._run_io_handoff_phase)
+    assert "self._drain_remote_input()" in handoff_src
+    drain_at = body.find("self._run_io_handoff_phase()")
     next_frame_at = body.find("await ui.next_frame()")
-    assert drain_at != -1, "Application.run_async loop body never calls _drain_remote_input"
+    assert drain_at != -1, "Application.run_async loop body never calls _run_io_handoff_phase"
     assert next_frame_at != -1, "Application.run_async loop body never awaits ui.next_frame"
     assert drain_at < next_frame_at, (
         "_drain_remote_input must precede ui.next_frame inside the "

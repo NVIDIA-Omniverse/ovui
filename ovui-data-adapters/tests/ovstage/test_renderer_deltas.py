@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OVStage edits consumed directly by an OVRTX BORROW renderer."""
 
@@ -163,9 +156,11 @@ def _borrow_adapter(
     adapter._logged_first_step = True
     adapter._render_product_path = "/_OvuiRuntime/Render/Viewport"
     adapter._camera_path = None
+    adapter._render_flow_mode = "nativePacing"
+    adapter._secondary_viewport_active = False
     adapter._last_resolution = (64, 32)
     adapter._last_render_product_resolution = (64, 32)
-    adapter._dt_clock = time.monotonic()
+    adapter._dt_clock = time.perf_counter()
     adapter._borrow_step_count = 0
     adapter._in_flight_pick_queries = None
     adapter._extract_ldr_color = (  # type: ignore[method-assign]

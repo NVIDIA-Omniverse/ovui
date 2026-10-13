@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 // Standalone variant: carb/logging/Log.h removed;
@@ -110,6 +103,11 @@ void wrapSceneView(module& m)
         .def_property("child_windows_input", &SceneView::isChildWindowsInput, &SceneView::setChildWindowsInput,
                       OMNIUI_PYBIND_DOC_SceneView_childWindowsInput)
         .def_property("scene", &SceneView::getScene, &SceneView::setScene, OMNIUI_PYBIND_DOC_SceneView_scene)
+        .def_property_readonly("supports_depth_groups", &SceneView::supportsDepthGroups)
+        .def_property_readonly("supports_distance_fade", &SceneView::supportsDistanceFade)
+        .def_property_readonly("supports_world_space_widths", &SceneView::supportsWorldSpaceWidths)
+        .def_property_readonly("supports_pixel_diameter_widths", &SceneView::supportsPixelDiameterWidths)
+        .def_property_readonly("supports_mesh_lighting", &SceneView::supportsMeshLighting)
         .def_property("cache_draw_buffer", &SceneView::getCacheDrawBuffer, &SceneView::setCacheDrawBuffer, OMNIUI_PYBIND_DOC_SceneView_cacheDrawBuffer);
     /* */;
 }

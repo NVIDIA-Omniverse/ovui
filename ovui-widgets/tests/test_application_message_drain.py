@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Application-level tests for the Step 3.7 message drain + resize path.
 
@@ -441,8 +434,8 @@ def test_message_dispatch_change_resolution_reports_error_when_no_resize_path(
 
 
 def test_run_async_drains_message_queue_before_next_frame() -> None:
-    """Static-source check: the main loop body must call
-    ``self._drain_message_queue()`` before ``await ui.next_frame()``.
+    """The main loop must drain messages through its IO handoff phase
+    before ``await ui.next_frame()``.
     Mirror of the Step 3.3 check for ``_drain_remote_input``."""
     import inspect
     import re
@@ -453,10 +446,12 @@ def test_run_async_drains_message_queue_before_next_frame() -> None:
     m = re.search(r"while self\._running", src)
     assert m, "Application.run_async has no while self._running loop"
     body = src[m.start():]
-    drain_at = body.find("self._drain_message_queue()")
+    handoff_src = inspect.getsource(Application._run_io_handoff_phase)
+    assert "self._drain_message_queue()" in handoff_src
+    drain_at = body.find("self._run_io_handoff_phase()")
     next_frame_at = body.find("await ui.next_frame()")
     assert drain_at != -1, (
-        "Application.run_async loop body never calls _drain_message_queue"
+        "Application.run_async loop body never calls _run_io_handoff_phase"
     )
     assert next_frame_at != -1
     assert drain_at < next_frame_at, (

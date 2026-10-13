@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """3D viewport widget with a real tool toolbar and layered viewport body.
 
@@ -30,10 +23,12 @@ import omni.ui as ui
 from omni.ui_scene import scene as sc
 from ovui_data_adapters.common import (
     VIEWPORT_CAMERA_POSE_SOURCE,
+    AovCameraState,
     BoundCameraPose,
     RendererAdapter,
     is_viewport_camera_pose_change_event,
 )
+from ovui_data_adapters.common.instrumentation import VIEWPORT_FPS_VALUE, get_instrumentation
 
 from ovui_widgets.common.error_reporter import ErrorReporter
 from ovui_widgets.common.managed_window import ManagedWindow
@@ -66,6 +61,7 @@ from ovui_widgets.viewport.camera_manipulator import (
 )
 from ovui_widgets.viewport.camera_navigation_state import CameraNavigationState
 from ovui_widgets.viewport.image_bridge import ImageBridge
+from ovui_widgets.viewport.light_manipulator import LightManipulator
 from ovui_widgets.viewport.manipulator_registry import ACTIVE_TOOL_SETTING, ToolRegistry
 from ovui_widgets.viewport.pick_gesture import (
     MOD_CTRL,
@@ -171,6 +167,8 @@ _TOOLBAR_TOOL_SPECS = (
 _TOOLBAR_CAMERA_KEY = "camera"
 _TOOLBAR_CAMERA_MENU_TITLE = "Camera"
 _TOOLBAR_NO_CAMERAS_LABEL = "(no cameras)"
+_DEFAULT_PERSPECTIVE_CAMERA_ID = "ovui:perspective"
+_DEFAULT_ORTHO_CAMERA_ID = "ovui:orthographic"
 _TOOLBAR_ICON_PROVIDERS: dict[str, "ui.RasterImageProvider"] = {}
 FOUNDATION_QA_PRE_TOOLS_PLACEHOLDER_ENV = (
     "OVUI_VIEWPORT_FOUNDATION_QA_PRETOOLS_PLACEHOLDER"
@@ -902,12 +900,17 @@ class ViewportContributionState:
     text: str = ""
 
 
+# Distinguishes "caller already validated the rate" from a validated ``None``.
+_UNVALIDATED = object()
+
+
 @dataclass(frozen=True)
 class ViewportHudState:
     """Backend-readable viewport HUD scalar values."""
 
     scene: str = ""
     fps: Optional[float] = None
+    render_fps: Optional[float] = None
     fps_text: str = ""
     resolution: Optional[tuple[int, int]] = None
     resolution_text: str = ""
@@ -931,6 +934,8 @@ class ViewportStateSnapshot:
     toolbar_contributions: tuple[ViewportContributionState, ...]
     output_contributions: tuple[ViewportContributionState, ...]
     hud: ViewportHudState
+    # False in selection mode: the active tool is remembered but not drawn.
+    transform_manipulator_visible: bool = True
 
 
 def _shielded_report(module: str, label: str, exc: BaseException) -> None:
@@ -1042,7 +1047,7 @@ class ViewportSurface:
     """
 
     @staticmethod
-    def _configured_max_fps() -> float:
+    def _configured_max_fps() -> Optional[float]:
         """Live Kit-compatible FPS cap (app.runLoops.main.rateLimitFrequency).
 
         Read on sparse, event-driven paths only (resize / resolution
@@ -1123,6 +1128,9 @@ class ViewportSurface:
     TOOLBAR_ICON_SIZE = 13
     CAMERA_NAVIGATION_SETTLE_FRAMES = 2
     FPS_AVERAGE_WINDOW_SECONDS = 1.0
+    # A render rate stops being real once sampling stops, so it expires rather
+    # than lingering across updates that never produced a new one.
+    RENDER_FPS_MAX_AGE_SECONDS = 2.0
 
     def __init__(
         self,
@@ -1170,7 +1178,7 @@ class ViewportSurface:
         self._unresolved_predecessor: Optional[Any] = None
         self._width = 1280
         self._height = 720
-        # Shared zero-copy state (strata#16 tier-2). When OVGEAR_ZERO_COPY=1
+        # Shared zero-copy state (strata#16 tier-2). Unless OVGEAR_ZERO_COPY=0
         # is set, both the renderer and the bridge route LdrColor through a
         # CUDA-mapped pointer; the bridge probes ovui's GPU backend on the
         # first frame and latches to tier-1 if the standalone build no-ops
@@ -1178,6 +1186,15 @@ class ViewportSurface:
         # already carries its own state, reuse it; otherwise install ours.
         from ovui_data_adapters.common import ZeroCopyState
         self._zero_copy_state = ZeroCopyState.from_env()
+        if self._zero_copy_state.gpu_pending:
+            has_gpu_byte_image = getattr(ui, "has_gpu_byte_image", None)
+            if callable(has_gpu_byte_image):
+                if has_gpu_byte_image():
+                    self._zero_copy_state.mark_enabled()
+                else:
+                    self._zero_copy_state.mark_fallback(
+                        "the active OVUI backend does not support GPU byte images"
+                    )
         self._attach_zero_copy_state(renderer, adopt_existing=True)
         # The viewport drives a continuous frame loop, so it opts the
         # renderer into the depth-one LdrColor overlap (present frame N-1
@@ -1186,6 +1203,7 @@ class ViewportSurface:
         # historical synchronous behavior.
         self._enable_renderer_frame_overlap(renderer)
         self._bridge = ImageBridge(self._width, self._height, state=self._zero_copy_state)
+        self._attach_renderer_frame_pacing(renderer)
         self._camera = CameraController()
         self._camera_model = CameraManipulatorModel()
         # Flight-mode keyboard — Step B.3. Constructed here (not in
@@ -1232,6 +1250,9 @@ class ViewportSurface:
         )
         self._camera_manipulator: Optional[CameraManipulator] = None
         self._transform_manipulator: Optional[TransformManipulator] = None
+        self._transform_manipulator_visible = True
+        self._light_manipulator: Optional[LightManipulator] = None
+        self._selected_light_type_cache: tuple[Any, str, str] | None = None
         # Construct the transform model eagerly in ``__init__`` so it is
         # already present when :meth:`Application._load_stage` calls
         # :meth:`attach_stage`. Before this moved out of ``_build_ui``,
@@ -1266,6 +1287,12 @@ class ViewportSurface:
         self._last_fps: Optional[float] = None
         self._fps_sample_intervals: deque[float] = deque()
         self._fps_sample_seconds = 0.0
+        self._last_render_fps: Optional[float] = None
+        self._render_fps_sampled_at = 0.0
+        self._render_update_anchor: Optional[tuple[float, int, int]] = None
+        reset_throughput = getattr(ui, "_reset_frame_throughput_metrics", None)
+        if callable(reset_throughput):
+            reset_throughput()
         self._last_resolution: Optional[tuple[int, int]] = None
         self._resolution_state = ViewportResolutionState.default(
             clamp_limits=ResolutionClampLimits(
@@ -1294,6 +1321,13 @@ class ViewportSurface:
         ] = weakref.WeakSet()
         self._resolution_availability_observers_closed = False
         self._last_image_frame: Optional[Any] = None
+        self._render_viewport_id = f"viewport-{id(self):x}"
+        self._render_generation = 0
+        self._render_generation_extent: Optional[tuple[int, int]] = None
+        self._render_generation_product_path: Optional[str] = None
+        self._last_presented_frame_metadata: Optional[Any] = None
+        self._async_render_dt = 0.0
+        self._async_resize_refresh_was_pending = False
         self._fps_label: Optional[Any] = None
         self._prim_count_label: Optional[Any] = None
         self._scene_row: Optional[Any] = None
@@ -1393,6 +1427,7 @@ class ViewportSurface:
         self._resolution_shared_settings_values: dict[str, Any] = {}
         self._settings_menu_reshow_pending = False
         self._settings_menu_dismiss_pending = False
+        self._settings_menu_hidden_until_update: Optional[Any] = None
         self._settings_menu_control_callback_tokens: set[str] = set()
         self._custom_resolution_save_dialog_window: Optional[Any] = None
         self._custom_resolution_save_dialog_name_field: Optional[Any] = None
@@ -1542,6 +1577,9 @@ class ViewportSurface:
         chrome = self._get_chrome_options()
         with ui.ZStack():
             with ui.ZStack():
+                # Layer 0: theme-independent backdrop behind letterbox bars,
+                # so the HUD and toolbar keep contrast off the image edge.
+                ui.Rectangle(style_type_name_override="ViewportWidget.Background")
                 # Layer 1: rendered image via ByteImageProvider
                 self._image = ui.ImageWithProvider(
                     self._bridge.provider,
@@ -1565,6 +1603,7 @@ class ViewportSurface:
                     self._scene_view = None
                     self._camera_manipulator = None
                     self._transform_manipulator = None
+                    self._light_manipulator = None
                     self._pick_manager = None
                     old_registry = getattr(self, "_tool_registry", None)
                     if old_registry is not None:
@@ -1616,17 +1655,30 @@ class ViewportSurface:
                             tumble_inertia=self._tumble_inertia,
                             generation=generation,
                         )
+                        self._light_manipulator = LightManipulator(
+                            type_fn=self._selected_light_type,
+                            geometry_fn=self._selected_light_geometry,
+                            transform_fn=self._transform_model.get_first_world_transform,
+                        )
                         self._transform_manipulator = TransformManipulator(
                             model=self._transform_model,
                             tool=initial_tool,
                             pivot_fn=self._transform_model.get_pivot_world,
                             size_fn=self._get_gizmo_world_scale,
                             generation=generation,
+                            front_fn=self._gizmo_pivot_in_front,
+                            view_dir_fn=self._gizmo_view_direction,
+                            cancel_drag_fn=lambda: self.cancel_active_transform_drag(
+                                reason="near_plane_transition"
+                            ),
                         )
+                        self._transform_manipulator.visible = self._transform_manipulator_visible
                         # Register the gizmo's persistent drags with the
                         # pick manager (introspection; dispatch is scene-order).
                         self._pick_manager.set_gizmo_gestures([
                             *self._transform_manipulator._translate_drags,
+                            *self._transform_manipulator._translate_plane_drags,
+                            self._transform_manipulator._translate_free_drag,
                             *self._transform_manipulator._rotate_drags,
                             *self._transform_manipulator._scale_drags,
                             self._transform_manipulator._uniform_scale_drag,
@@ -1971,6 +2023,8 @@ class ViewportSurface:
         if manipulator is not None:
             for gesture in (
                 *(getattr(manipulator, "_translate_drags", ()) or ()),
+                *(getattr(manipulator, "_translate_plane_drags", ()) or ()),
+                getattr(manipulator, "_translate_free_drag", None),
                 *(getattr(manipulator, "_rotate_drags", ()) or ()),
                 *(getattr(manipulator, "_scale_drags", ()) or ()),
                 getattr(manipulator, "_uniform_scale_drag", None),
@@ -3424,6 +3478,7 @@ class ViewportSurface:
         self._viewport_resize_render_refresh_pending = False
         self._settings_menu_reshow_pending = False
         self._settings_menu_dismiss_pending = False
+        self._settings_menu_hidden_until_update = None
         self._custom_resolution_field_apply_pending = False
         self._custom_resolution_field_pending_size = None
         self._last_viewport_mode_visible_frame_size = None
@@ -3617,7 +3672,15 @@ class ViewportSurface:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._dismiss_settings_toolbar_menu()
+            # The standalone ovui loop runs control callbacks inside the frame,
+            # where destroying the menu is not supported. Hide it now and
+            # destroy it on the next update(), which runs outside the frame.
+            menu = self._pre_tools_toolbar_hooks._menus.get(
+                VIEWPORT_RESOLUTION_ATTACHMENT_ID
+            )
+            if menu is not None:
+                menu.hide()
+            self._settings_menu_hidden_until_update = menu
             return
 
         if self._settings_menu_dismiss_pending:
@@ -4427,7 +4490,14 @@ class ViewportSurface:
     def _dismiss_settings_toolbar_menu(self) -> bool:
         """Close the Settings menu if it is currently retained."""
 
-        if VIEWPORT_RESOLUTION_ATTACHMENT_ID not in self._pre_tools_toolbar_hooks._menus:
+        menu = self._pre_tools_toolbar_hooks._menus.get(
+            VIEWPORT_RESOLUTION_ATTACHMENT_ID
+        )
+        if menu is None:
+            return False
+        if menu is self._settings_menu_hidden_until_update:
+            # Already hidden and waiting for update(); a click is not needed
+            # to close it, so let the caller handle that click.
             return False
         self._pre_tools_toolbar_hooks._destroy_menu(VIEWPORT_RESOLUTION_ATTACHMENT_ID)
         return True
@@ -6548,7 +6618,7 @@ class ViewportSurface:
                             width=self.TOOLBAR_BUTTON_SIZE,
                             height=self.TOOLBAR_BUTTON_SIZE,
                             identifier="viewport_toolbar_camera",
-                            tooltip="Camera",
+                            tooltip="Camera: Perspective",
                         )
                         button.set_clicked_fn(self._on_camera_menu_button_clicked)
                     self._toolbar_buttons[_TOOLBAR_CAMERA_KEY] = button
@@ -6580,7 +6650,24 @@ class ViewportSurface:
                 except AttributeError:
                     pass
         self._refresh_toolbar_state()
-        return self._get_active_tool() == tool
+        activated = self._get_active_tool() == tool
+        if activated:
+            # An explicit tool choice shows a gizmo hidden by selection mode.
+            self.set_transform_manipulator_visible(True)
+        return activated
+
+    def set_transform_manipulator_visible(self, visible: bool) -> None:
+        """Show/hide the existing gizmo without changing the selected prims."""
+        self._transform_manipulator_visible = bool(visible)
+        if self._transform_manipulator is not None:
+            self._transform_manipulator.visible = self._transform_manipulator_visible
+
+    def handle_navigation_key(self, key: int, modifiers: int, pressed: bool) -> None:
+        """Route normalized host key events to existing flight/tool controllers."""
+        self._flight_keyboard.handle_key_event(key, modifiers, pressed)
+        if not self._flight_keyboard.rmb_held and self._tool_registry is not None:
+            if self._tool_registry.handle_key_event(key, modifiers, pressed):
+                self.set_transform_manipulator_visible(True)
 
     def _on_tool_changed(self, _old_tool: str, _new_tool: str) -> None:
         self._refresh_toolbar_state()
@@ -6657,7 +6744,24 @@ class ViewportSurface:
         return tuple(states)
 
     def _build_camera_state_snapshot(self) -> tuple[ViewportCameraState, ...]:
-        states: list[ViewportCameraState] = []
+        states: list[ViewportCameraState] = [
+            ViewportCameraState(
+                path=_DEFAULT_PERSPECTIVE_CAMERA_ID,
+                label="Perspective",
+                active=(
+                    self._active_camera_path is None
+                    and self._camera.projection_mode == "perspective"
+                ),
+            ),
+            ViewportCameraState(
+                path=_DEFAULT_ORTHO_CAMERA_ID,
+                label="Ortho",
+                active=(
+                    self._active_camera_path is None
+                    and self._camera.projection_mode == "orthographic"
+                ),
+            ),
+        ]
         for choice in self._list_camera_choices():
             path = str(getattr(choice, "path", "") or "")
             if not path:
@@ -6741,7 +6845,8 @@ class ViewportSurface:
     def _build_hud_state_snapshot(self) -> ViewportHudState:
         self._refresh_livestream_status()
         fps = self._last_fps
-        fps_text = "" if fps is None else f"{fps:.0f}"
+        render_fps = self._current_render_fps()
+        fps_text = self._hud_fps_text(render_fps)
         resolution = self._last_resolution
         resolution_text = ""
         if resolution is not None:
@@ -6749,6 +6854,7 @@ class ViewportSurface:
         return ViewportHudState(
             scene=self._scene_name or "",
             fps=fps,
+            render_fps=render_fps,
             fps_text=fps_text,
             resolution=resolution,
             resolution_text=resolution_text,
@@ -6773,6 +6879,9 @@ class ViewportSurface:
             toolbar_contributions=self._build_toolbar_contribution_snapshot(),
             output_contributions=self._build_output_contribution_snapshot(),
             hud=self._build_hud_state_snapshot(),
+            transform_manipulator_visible=bool(
+                getattr(self, "_transform_manipulator_visible", True)
+            ),
         )
 
     @property
@@ -6815,10 +6924,63 @@ class ViewportSurface:
         )
 
     @property
+    def camera_distance(self) -> float:
+        """Return the current orbit-camera distance."""
+
+        return float(self._camera.state.distance)
+
+    def orbit_camera(self, delta_x: float, delta_y: float = 0.0) -> None:
+        """Apply a programmatic orbit delta in radians."""
+
+        self._camera.orbit(float(delta_x), float(delta_y))
+
+    def zoom_camera(self, delta: float) -> None:
+        """Apply a programmatic orbit-camera distance delta."""
+
+        self._camera.zoom(float(delta))
+
+    def capture_aov_camera_state(self) -> AovCameraState | None:
+        """Copy the effective current view for session Camera authoring."""
+
+        width, height = self._get_viewport_size()
+        if width <= 0 or height <= 0:
+            return None
+        view, projection = self._camera.get_matrices(width, height)
+        try:
+            return AovCameraState(
+                view_matrix=tuple(
+                    tuple(float(component) for component in row)
+                    for row in view
+                ),
+                projection_matrix=tuple(
+                    tuple(float(component) for component in row)
+                    for row in projection
+                ),
+                width=int(width),
+                height=int(height),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    @property
     def renderer_adapter(self) -> Optional[RendererAdapter]:
         """Renderer adapter currently driving this viewport."""
 
         return self._renderer
+
+    def _attach_renderer_frame_pacing(
+        self,
+        renderer: Optional[RendererAdapter],
+    ) -> None:
+        """Offer this viewport's provider to an optional native coordinator.
+
+        The adapter capability is deliberately duck-typed so every existing
+        renderer and every non-Vulkan backend keeps its historical path.
+        """
+
+        attach = getattr(renderer, "set_frame_pacing_provider", None)
+        if callable(attach):
+            attach(self._bridge.provider)
 
     def get_viewport_id(self) -> str:
         """Return this viewport's stable lifetime identity.
@@ -7171,6 +7333,78 @@ class ViewportSurface:
         except Exception:
             return None
 
+    def _selected_light_type(self) -> str:
+        """Return the concrete type of the single selected light, if any."""
+        if self._bus is None:
+            return ""
+        try:
+            snapshot = self._bus.get_snapshot()
+            paths = list(snapshot.paths()) if snapshot is not None else []
+        except Exception:
+            return ""
+        if len(paths) != 1:
+            return ""
+        adapter = self._get_stage_adapter()
+        if adapter is None:
+            return ""
+        path = str(paths[0])
+        cached = getattr(self, "_selected_light_type_cache", None)
+        if cached is not None and cached[0] is adapter and cached[1] == path:
+            return cached[2]
+        try:
+            item = adapter.get_item_at_path(path)
+            if item is None:
+                # Population can finish after selection. Retry missing prims.
+                return ""
+            light_type = (
+                str(adapter.get_icon_name(item) or "")
+                if adapter.get_type_category(item) == "Light"
+                else ""
+            )
+        except Exception:
+            return ""
+        # Camera commits advance OVStage's ordinal but cannot change this
+        # prim's type. Selection and relevant stage notices invalidate it.
+        self._selected_light_type_cache = (adapter, path, light_type)
+        return light_type
+
+    def _invalidate_selected_light_type(self, event: Any) -> None:
+        cached = getattr(self, "_selected_light_type_cache", None)
+        if cached is None:
+            return
+        paths = tuple(getattr(event, "changed_paths", ()) or ())
+        paths += tuple(getattr(event, "resynced_paths", ()) or ())
+        if any(self._stage_change_path_affects_prim(path, cached[1]) for path in paths):
+            self._selected_light_type_cache = None
+
+    def _selected_light_geometry(self) -> dict[str, float]:
+        """Return live authored dimensions of the single selected light."""
+        if not self._selected_light_type():
+            return {}
+        if self._bus is None:
+            return {}
+        try:
+            snapshot = self._bus.get_snapshot()
+            paths = list(snapshot.paths()) if snapshot is not None else []
+        except Exception:
+            return {}
+        if len(paths) != 1:
+            return {}
+        adapter = self._get_stage_adapter()
+        if adapter is None:
+            return {}
+        try:
+            item = adapter.get_item_at_path(paths[0])
+            if item is None or adapter.get_type_category(item) != "Light":
+                return {}
+            geometry = dict(adapter.get_light_shape_attributes(item))
+            geometry["meters_per_unit"] = float(
+                adapter.read_stage_meters_per_unit()
+            )
+            return geometry
+        except Exception:
+            return {}
+
     def _list_camera_choices(self) -> tuple[Any, ...]:
         adapter = self._get_stage_adapter()
         if adapter is None:
@@ -7218,8 +7452,23 @@ class ViewportSurface:
         self._camera_menu_items = []
         choices = self._list_camera_choices()
         with menu:
-            added_item = False
+            for camera_id, label, mode in (
+                (_DEFAULT_PERSPECTIVE_CAMERA_ID, "Perspective", "perspective"),
+                (_DEFAULT_ORTHO_CAMERA_ID, "Ortho", "orthographic"),
+            ):
+                item = ui.MenuItem(
+                    label,
+                    checkable=True,
+                    checked=(
+                        self._active_camera_path is None
+                        and self._camera.projection_mode == mode
+                    ),
+                    triggered_fn=lambda value=mode: self._select_default_camera(value),
+                )
+                self._camera_menu_items.append((camera_id, label, True, item))
+            added_item = True
             if choices:
+                ui.Separator()
                 for choice in choices:
                     path = str(getattr(choice, "path", "") or "")
                     if not path:
@@ -7243,6 +7492,28 @@ class ViewportSurface:
         menu.show_at(float(x), float(y))
         return menu
 
+    def _select_default_camera(self, mode: str) -> bool:
+        if mode not in {"perspective", "orthographic"}:
+            return False
+        self._commit_active_camera_pose_if_dirty()
+        if not self._set_renderer_camera_path_if_supported(None):
+            return False
+        if not self._camera.set_projection_mode(mode):
+            return False
+        self._active_camera_path = None
+        self._last_authored_camera_signature = None
+        self._render_target_camera_snapshot = None
+        self._reset_camera_navigation_state()
+        button = self._toolbar_buttons.get(_TOOLBAR_CAMERA_KEY)
+        if button is not None:
+            try:
+                button.tooltip = (
+                    "Camera: Ortho" if mode == "orthographic" else "Camera: Perspective"
+                )
+            except Exception:
+                pass
+        return True
+
     def _set_renderer_camera_path_if_supported(self, path: Optional[str]) -> bool:
         """Return False only when a concrete renderer selector rejects ``path``."""
         setter = getattr(self._renderer, "set_active_camera_path", None)
@@ -7263,6 +7534,12 @@ class ViewportSurface:
         """
 
         return self._select_camera_path(path)
+
+    @property
+    def active_camera_path(self) -> Optional[str]:
+        """USD camera bound to navigation, or ``None`` for a free camera."""
+
+        return self._active_camera_path
 
     def suspend_camera_binding_for_render_target(self) -> bool:
         """Use free viewport navigation for a non-camera render target.
@@ -7303,10 +7580,11 @@ class ViewportSurface:
             float(state.elevation),
             tuple(float(v) for v in self._camera.up_axis),
             float(self._camera.fov_degrees),
+            self._camera.projection_mode,
         )
 
     def _restore_camera_state_snapshot(self, snapshot: tuple[Any, ...]) -> None:
-        target, distance, azimuth, elevation, up_axis, fov = snapshot
+        target, distance, azimuth, elevation, up_axis, fov, projection_mode = snapshot
         state = self._camera.state
         state.target = [float(v) for v in target]
         state.distance = float(distance)
@@ -7314,6 +7592,7 @@ class ViewportSurface:
         state.elevation = float(elevation)
         self._camera.up_axis = [float(v) for v in up_axis]
         self._camera.fov_degrees = float(fov)
+        self._camera.set_projection_mode(str(projection_mode))
         self._sync_camera_manipulator_up_axis()
 
     def _select_camera_path(self, path: str) -> bool:
@@ -7337,7 +7616,10 @@ class ViewportSurface:
             return False
         if previous_path and previous_path != path:
             self._commit_active_camera_pose_if_dirty()
+        previous_projection = self._camera.projection_mode
+        self._camera.set_projection_mode("perspective")
         if not self.apply_camera_pose(pose):
+            self._camera.set_projection_mode(previous_projection)
             self._set_renderer_camera_path_if_supported(previous_path)
             return False
         self._active_camera_path = path
@@ -7396,7 +7678,7 @@ class ViewportSurface:
                                 self._fps_value_label = self._build_hud_pair(
                                     "FPS",
                                     label_width=28,
-                                    value_width=30,
+                                    value_width=68,
                                 )
                                 ui.Spacer(width=8)
                                 self._fps_res_separator_label = self._build_hud_label(
@@ -7480,18 +7762,27 @@ class ViewportSurface:
         if self._resolution_sync_is_disposed():
             return
         scene = self._scene_name or ""
-        if self._scene_value_label is not None:
+        if (
+            self._scene_value_label is not None
+            and getattr(self._scene_value_label, "text", None) != scene
+        ):
             self._scene_value_label.text = scene
         self._set_widget_visible(self._scene_row, bool(scene))
 
-        fps_text = "" if self._last_fps is None else f"{self._last_fps:.0f}"
+        fps_text = self._hud_fps_text()
         res_text = ""
         resolution_size = self._hud_resolution_size()
         if resolution_size is not None:
             res_text = f"{resolution_size[0]}×{resolution_size[1]}"
-        if self._fps_value_label is not None:
+        if (
+            self._fps_value_label is not None
+            and getattr(self._fps_value_label, "text", None) != fps_text
+        ):
             self._fps_value_label.text = fps_text
-        if self._resolution_value_label is not None:
+        if (
+            self._resolution_value_label is not None
+            and getattr(self._resolution_value_label, "text", None) != res_text
+        ):
             self._resolution_value_label.text = res_text
         self._set_widget_visible(self._fps_res_row, bool(fps_text or res_text))
         self._set_widget_visible(self._resolution_label, bool(res_text))
@@ -7513,6 +7804,145 @@ class ViewportSurface:
             self._fps_sample_seconds -= self._fps_sample_intervals.popleft()
         if self._fps_sample_seconds > 0.0:
             self._last_fps = len(self._fps_sample_intervals) / self._fps_sample_seconds
+            self._publish_fps_value(self._last_fps)
+
+    def _publish_fps_value(self, fps: float) -> None:
+        renderer = self._renderer
+        if renderer is None:
+            return
+        try:
+            get_instrumentation().record_value(renderer, VIEWPORT_FPS_VALUE, fps)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _pacing_counter(value: Any) -> Optional[int]:
+        """A native counter/token only when it really is one.
+
+        Strings, floats, booleans and negatives are malformed rather than
+        coercible, so they can never become a displayed rate.
+        """
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    def _owned_pacing_session(self) -> int:
+        """Token of the native pacing session *this* viewport's renderer owns.
+
+        Zero when this viewport holds no borrow, so a second viewport never
+        reports another viewport's rendering updates.
+        """
+        token = self._pacing_counter(
+            getattr(self._renderer, "_frame_pacing_token", None)
+        )
+        return token or 0
+
+    def _owned_render_updates(self) -> Optional[tuple[int, int]]:
+        """``(epoch/session token, completions)`` for this renderer.
+
+        Native pacing and synchronous rendering publish into the same semantic
+        completion counter without conflating UI ticks, content selection, or
+        successful presentation submissions.
+        """
+        status_getter = getattr(ui, "get_frame_pacing_status", None)
+        if not callable(status_getter):
+            return None
+        try:
+            status = status_getter()
+            owned = self._owned_pacing_session()
+            if owned:
+                if status.get("active") is not True:
+                    return None
+                if status.get("render_loop_fatal") or status.get("render_loop_exited"):
+                    return None
+                token = self._pacing_counter(status.get("session_token"))
+                if token != owned:
+                    return None
+            else:
+                if status.get("active") is True or self._renderer is None:
+                    return None
+                token = self._pacing_counter(status.get("metrics_epoch"))
+            updates = self._pacing_counter(status.get("renderer_completions"))
+        except Exception:
+            return None
+        if not token or updates is None:
+            return None
+        return token, updates
+
+    def _record_render_update_sample(self) -> None:
+        """Sample renderer completions per second of wall time.
+
+        Generated images, UI updates, content selection and repeated presents
+        remain separately observable and do not increment this counter.
+        """
+        owned = self._owned_render_updates()
+        if owned is None:
+            self._render_update_anchor = None
+            self._last_render_fps = None
+            return
+        token, updates = owned
+        now = time.perf_counter()
+        anchor = self._render_update_anchor
+        if anchor is None or anchor[2] != token or updates < anchor[1]:
+            # A restarted session never reuses the prior session's anchor.
+            self._render_update_anchor = (now, updates, token)
+            self._last_render_fps = None
+            return
+        elapsed = now - anchor[0]
+        if elapsed >= self.FPS_AVERAGE_WINDOW_SECONDS:
+            self._last_render_fps = (updates - anchor[1]) / elapsed
+            self._render_fps_sampled_at = now
+            self._render_update_anchor = (now, updates, token)
+
+    def _expire_painted_render_fps(self) -> None:
+        """Drop the painted rate as soon as it stops being real.
+
+        Updates that return early or raise never resample, so the visible
+        label — not only the cached value — has to fall back to the
+        placeholder.
+        """
+        if self._last_render_fps is None or self._current_render_fps() is not None:
+            return
+        self._last_render_fps = None
+        self._render_update_anchor = None
+        self._render_fps_sampled_at = 0.0
+        label = self._fps_value_label
+        if label is None:
+            return
+        text = self._hud_fps_text()
+        if getattr(label, "text", None) != text:
+            label.text = text
+
+    def _current_render_fps(self) -> Optional[float]:
+        """The sampled rate, but only while current status still proves it.
+
+        Every read revalidates against live status, so no paint, refresh or
+        snapshot can report a rate whose session ended, changed, failed or
+        restarted its counter since the sample was taken.
+        """
+        if self._last_render_fps is None or self._render_update_anchor is None:
+            return None
+        if time.perf_counter() - self._render_fps_sampled_at > self.RENDER_FPS_MAX_AGE_SECONDS:
+            return None
+        owned = self._owned_render_updates()
+        if owned is None:
+            return None
+        token, updates = owned
+        _, anchor_updates, anchor_token = self._render_update_anchor
+        if token != anchor_token or updates < anchor_updates:
+            return None
+        return self._last_render_fps
+
+    def _hud_fps_text(self, render_fps: Optional[float] = _UNVALIDATED) -> str:
+        """``<UI>/<render>`` — UI updates over rendered-content updates."""
+        if self._last_fps is None:
+            return ""
+        render = (
+            self._current_render_fps()
+            if render_fps is _UNVALIDATED
+            else render_fps
+        )
+        return f"{self._last_fps:.0f}/{'-' if render is None else f'{render:.0f}'}"
 
     def _reset_fps_samples(self) -> None:
         if not hasattr(self, "_fps_sample_intervals"):
@@ -7520,6 +7950,9 @@ class ViewportSurface:
         self._fps_sample_intervals.clear()
         self._fps_sample_seconds = 0.0
         self._last_fps = None
+        self._render_update_anchor = None
+        self._last_render_fps = None
+        self._render_fps_sampled_at = 0.0
 
     def _refresh_livestream_status(self) -> None:
         """Read the current livestream-tap snapshot and update the
@@ -7722,6 +8155,32 @@ class ViewportSurface:
             "viewport_click",
         )
 
+    def map_pick_to_render_ndc(self, x: float, y: float) -> tuple[float, float] | None:
+        """Map viewport NDC to rendered-image NDC, respecting letterboxing."""
+        return self._map_widget_pick_to_render_ndc(x, y)
+
+    def get_inspector_viewport_rect(self) -> tuple[float, float, float, float]:
+        """Visible viewport image bounds in Inspector application screenshot pixels."""
+        image = self._image
+        if image is None:
+            return (0.0, 0.0, 0.0, 0.0)
+        return tuple(
+            float(getattr(image, key, 0))
+            for key in (
+                "screen_position_x", "screen_position_y", "computed_width", "computed_height"
+            )
+        )
+
+    def apply_pick_selection(self, path: Any, mode: str = "replace") -> None:
+        """Apply a renderer pick through the same selection and gizmo path as a click.
+
+        Headless hosts may pick coordinates from an exported render image instead
+        of a window event. The selection bus remains the single authority.
+        """
+        if mode not in {"replace", "add", "toggle", "remove"}:
+            raise ValueError("Unknown selection mode")
+        self._on_pick_result(path, mode)
+
     def _on_pick_result(self, path: Any, mode: str = "replace") -> None:
         hits = self._validate_selection_paths([path] if path else [])
         merged = self._merge_selection(hits, mode)
@@ -7799,6 +8258,7 @@ class ViewportSurface:
         them for non-viewport sources (Stage Browser, keyboard shortcut,
         undo, etc.).
         """
+        self._selected_light_type_cache = None
         self._set_renderer_selection_highlight(paths)
         self._request_selection_highlight_retry(paths)
         if self._manipulator_registry is not None:
@@ -7820,6 +8280,11 @@ class ViewportSurface:
             # next ``_maybe_invalidate_gizmo_for_scale`` re-evaluates
             # against the new pivot rather than the previous prim's.
             self._last_gizmo_scale = 0.0
+        if self._light_manipulator is not None:
+            try:
+                self._light_manipulator.invalidate()
+            except Exception:
+                pass
         self._refresh_toolbar_state()
 
     def sync_selection_from_bus(self) -> list[str]:
@@ -7856,6 +8321,8 @@ class ViewportSurface:
         * ``"remove"`` — current selection minus ``hits``; order of the
           surviving paths is preserved. A ctrl-click on empty space
           (``hits == []``) leaves the selection unchanged.
+        * ``"toggle"`` — selected hits are removed and unselected hits are
+          appended; empty space leaves the selection unchanged.
 
         Duplicates in ``hits`` or between ``hits`` and current selection
         are collapsed via ``dict.fromkeys`` (preserves order, dedupes).
@@ -7874,6 +8341,13 @@ class ViewportSurface:
         if mode == "remove":
             hit_set = set(hits)
             return [p for p in current if p not in hit_set]
+        if mode == "toggle":
+            # Selected hits leave the selection, unselected hits join it;
+            # a toggle on empty space changes nothing.
+            hit_set = set(hits)
+            kept = [p for p in current if p not in hit_set]
+            added = [p for p in dict.fromkeys(hits) if p not in current]
+            return kept + added
         # Unknown mode — fall back to replace rather than raise so a
         # stale setting can't bring the viewport down.
         return list(dict.fromkeys(hits))
@@ -7881,23 +8355,35 @@ class ViewportSurface:
     def _on_bus_selection_changed(self, event: SelectionChangedEvent) -> None:
         if self._pushing_to_bus:
             return
+        self._selected_light_type_cache = None
         self._receiving_from_bus = True
         try:
             paths = event.snapshot.paths()
-            self._set_renderer_selection_highlight(paths)
+            self._profile_ovui_call(
+                "ViewportWidget._set_renderer_selection_highlight",
+                self._set_renderer_selection_highlight, paths,
+            )
             self._request_selection_highlight_retry(paths)
             if self._manipulator_registry is not None:
-                self._manipulator_registry.on_selection_changed(paths)
+                self._profile_ovui_call(
+                    "ViewportWidget.manipulator_registry.on_selection_changed",
+                    self._manipulator_registry.on_selection_changed, paths,
+                )
             # Feed the transform gizmo. ``set_selection`` filters to the
             # transformable subset when the adapter is wired (post
             # ``attach_stage``); otherwise it keeps the raw list so the
             # gizmo still appears. Invalidate so the next draw emits
             # geometry at the new pivot.
             if self._transform_model is not None:
-                self._transform_model.set_selection(paths)
+                self._profile_ovui_call(
+                    "ViewportWidget.transform_model.set_selection",
+                    self._transform_model.set_selection, paths,
+                )
             if self._transform_manipulator is not None:
                 self._transform_manipulator.invalidate()
                 self._last_gizmo_scale = 0.0
+            if self._light_manipulator is not None:
+                self._light_manipulator.invalidate()
             self._refresh_toolbar_state()
         finally:
             self._receiving_from_bus = False
@@ -7920,7 +8406,10 @@ class ViewportSurface:
                 current_paths = snap.paths() if snap else []
             except Exception:
                 current_paths = list(retry_paths)
-        self._set_renderer_selection_highlight(current_paths, force=True)
+        self._profile_ovui_call(
+            "ViewportWidget._set_renderer_selection_highlight",
+            self._set_renderer_selection_highlight, current_paths, force=True,
+        )
 
     def _set_renderer_selection_highlight(
         self,
@@ -7936,7 +8425,10 @@ class ViewportSurface:
         descendant mesh prims before calling the renderer.
         """
         try:
-            highlight_paths = self._resolve_selection_highlight_paths(paths)
+            highlight_paths = self._profile_ovui_call(
+                "ViewportWidget._resolve_selection_highlight_paths",
+                self._resolve_selection_highlight_paths, paths,
+            )
             renderer = self._renderer
             if force:
                 refresh_highlight = getattr(
@@ -8014,16 +8506,15 @@ class ViewportSurface:
         placeholder is too small for USD scenes authored in centimetres or
         larger units — a 0.05-unit gizmo is sub-pixel at normal camera
         distances. This computes a world scale that keeps the gizmo a
-        consistent fraction of the viewport height:
+        constant on-screen size (about 80 px) in any viewport or quad cell:
 
             world_scale = distance_from_eye_to_pivot
                          * tan(fov/2) * 2
-                         * SCREEN_FRACTION / viewport_height_px
+                         * SCREEN_PIXEL_TARGET / viewport_height_px
 
-        With ``fov = 45°`` and ``SCREEN_FRACTION = 80 px``, that collapses
-        to roughly ``0.092 * distance`` on a 720-px-tall viewport, which
-        sits comfortably between "visible at every distance" and
-        "dominates the frame".
+        ``fov`` is the camera's vertical field of view (45° gives roughly
+        ``0.092 * distance`` on a 720-px-tall viewport); orthographic views
+        use the orbit distance that sets their extent.
         """
         import math
         try:
@@ -8035,18 +8526,74 @@ class ViewportSurface:
             dist = math.sqrt(dx * dx + dy * dy + dz * dz)
         except Exception:
             dist = float(self._camera.state.distance)
-        # Keep the gizmo roughly 80 pixels tall on a 720-tall viewport.
-        # tan(22.5°) ≈ 0.4142. The final ratio is independent of viewport
-        # height for a perspective camera — the FOV fully determines the
-        # screen-space / world-space ratio at the pivot.
+        # Keep the gizmo roughly 80 pixels tall: the visible height at the
+        # pivot follows the camera's actual vertical FOV (a narrow quad
+        # perspective lens drew a fixed-45° gizmo ~2.4x too large), and an
+        # orthographic view's extent follows its orbit distance, not the eye.
         SCREEN_PIXEL_TARGET = 80.0
-        _, vh = self._get_viewport_size()
+        fov = float(getattr(self._camera, "fov_degrees", 45.0) or 45.0)
+        if getattr(self._camera, "projection_mode", "perspective") == "orthographic":
+            dist = float(self._camera.state.distance)
+        # This is a UI-space size, so use the displayed viewport height rather
+        # than the renderer's independent output resolution.
+        _, vh = self._get_raw_viewport_frame_size()
         if vh <= 0:
             vh = 720
-        scale = dist * math.tan(math.radians(45.0) * 0.5) * 2.0 * (SCREEN_PIXEL_TARGET / float(vh))
+        scale = dist * math.tan(math.radians(fov) * 0.5) * 2.0 * (SCREEN_PIXEL_TARGET / float(vh))
         # Floor so the gizmo never shrinks to zero at very small camera
         # distances (e.g., min-zoom clamp at 0.01).
         return max(scale, 1e-4)
+
+    def _gizmo_pivot_in_front(self, pivot: Any) -> bool:
+        """Return whether ``pivot`` is beyond the camera's near plane.
+
+        Hiding the transform manipulator at or behind that plane prevents its
+        line shafts from projecting across the viewport. The calculation uses
+        the same dynamic near-plane rule as ``CameraController.get_matrices``
+        and fails open if camera state is temporarily unavailable.
+        """
+        try:
+            import numpy as np
+
+            renderer = getattr(self, "_renderer", None)
+            presented = getattr(renderer, "presented_camera_snapshot", None)
+            if presented is not None:
+                point = np.ones(4, dtype=float)
+                point[:3] = np.asarray(pivot, dtype=float).reshape(3)
+                view = np.asarray(presented.view, dtype=float).reshape(4, 4)
+                projection = np.asarray(
+                    presented.projection, dtype=float
+                ).reshape(4, 4)
+                clip = projection @ view @ point
+                clip_z = float(clip[2])
+                clip_w = float(clip[3])
+                if not np.isfinite(clip_z) or not np.isfinite(clip_w):
+                    return True
+                # OpenGL's near clip plane is z = -w. The aspect-fit
+                # transform applied to SceneView changes only x/y, so this is
+                # the exact near-plane classification of the visible frame.
+                return clip_w > 0.0 and clip_z > -clip_w
+
+            eye = np.asarray(self._camera._get_eye(), dtype=float)
+            _, _, forward = self._camera._get_basis()
+            forward = np.asarray(forward, dtype=float)
+            near = max(float(self._camera.state.distance) / 1000.0, 0.01)
+            depth = float(np.dot(np.asarray(pivot, dtype=float) - eye, forward))
+            return depth > near
+        except Exception:
+            return True
+
+    def _gizmo_view_direction(self, pivot: Any) -> Any:
+        """Return the world-space view-ray direction through ``pivot``.
+
+        Orthographic rays all share the camera's forward vector; perspective
+        rays run from the eye to the pivot.
+        """
+        import numpy as np
+
+        if getattr(self._camera, "projection_mode", "perspective") == "orthographic":
+            return self._camera._get_basis()[2]
+        return np.asarray(pivot, dtype=float) - np.asarray(self._camera._get_eye(), dtype=float)
 
     def _compute_world_bbox(self, path: str):
         """Return ``((min_xyz, max_xyz))`` AABB for ``path`` or ``None``.
@@ -8095,6 +8642,7 @@ class ViewportSurface:
         if getattr(self, "_destroyed", False):
             # Terminal: a late stage load must not rewire model state.
             return
+        self._selected_light_type_cache = None
         if self._transform_model is None:
             return
         # Resolve a held drag against the outgoing wiring first.
@@ -8105,6 +8653,7 @@ class ViewportSurface:
         self._commit_active_camera_pose_if_dirty()
         self._active_camera_path = None
         self._last_authored_camera_signature = None
+        self._camera.set_projection_mode("perspective")
         self._reset_camera_navigation_state()
         # Drop any previously bound camera selection on the renderer so
         # a fresh stage starts on the default session camera instead of
@@ -8161,7 +8710,7 @@ class ViewportSurface:
         self._sync_camera_manipulator_up_axis()
         return True
 
-    def frame_paths(self, paths: list) -> bool:
+    def frame_paths(self, paths: list, fallback_to_default: bool = True) -> bool:
         """Frame the camera to enclose the given prim paths.
 
         Returns ``True`` when real bounds were computed and applied;
@@ -8170,8 +8719,9 @@ class ViewportSurface:
         raised). On the ``False`` path with non-empty ``paths``, the
         camera falls back to a safe default focus
         (``center=(0, 0, 0)``, ``distance=5.0``) so the viewport remains
-        usable. Empty ``paths`` returns ``False`` without touching the
-        camera at all.
+        usable, unless ``fallback_to_default`` is false (programmatic
+        callers that report the failure must leave the camera alone).
+        Empty ``paths`` returns ``False`` without touching the camera at all.
 
         Adapter exceptions are caught and treated as "no bounds available"
         (matching the pre-Step-17 inline pxr code's blanket ``except``
@@ -8199,7 +8749,8 @@ class ViewportSurface:
             # focus. Mirrors the pre-Step-17 inline behavior where
             # missing/invalid bounds fell through to the default
             # ``center=(0,0,0), distance=5.0`` focus call.
-            self._camera.focus([0.0, 0.0, 0.0], 5.0)
+            if fallback_to_default:
+                self._camera.focus([0.0, 0.0, 0.0], 5.0)
             return False
         (min_x, min_y, min_z), (max_x, max_y, max_z) = bounds
         center = [
@@ -8229,12 +8780,18 @@ class ViewportSurface:
         if pose is None:
             return False
         try:
+            self._camera.set_projection_mode(pose.projection)
             self._camera.set_pose(
                 eye=pose.eye,
                 target=pose.target,
                 up_axis=pose.up_axis,
                 fov_degrees=pose.fov_degrees,
             )
+            if pose.projection == "orthographic" and pose.orthographic_height:
+                # The orbit controller expresses ortho scale as an equivalent
+                # field of view at its target distance, preserving normal zoom.
+                self._camera.fov_degrees = math.degrees(2 * math.atan(
+                    pose.orthographic_height / (2 * self._camera.state.distance)))
         except Exception:
             return False
         self._sync_camera_manipulator_up_axis()
@@ -8464,6 +9021,9 @@ class ViewportSurface:
         """
         if self._resolution_sync_is_disposed():
             return
+        if self._settings_menu_hidden_until_update is not None:
+            self._settings_menu_hidden_until_update = None
+            self._dismiss_settings_toolbar_menu()
         if tick_dt is None or tick_dt <= 0.0:
             return
         # Flight integration is speed × seconds; clamp before forwarding so
@@ -8623,6 +9183,212 @@ class ViewportSurface:
             return safe_effective_size
         return ensure_safe_renderer_request_size(committed_size)
 
+    def supports_async_render(self) -> bool:
+        """Whether the current renderer exposes the enqueue/poll contract."""
+
+        renderer = self._renderer
+        return bool(
+            renderer is not None
+            and callable(getattr(renderer, "enqueue_render_frame", None))
+            and callable(getattr(renderer, "submit_enqueued_render_frames", None))
+            and callable(getattr(renderer, "poll_render_frame", None))
+        )
+
+    def enqueue_render(self, render_dt: float) -> bool:
+        """Prepare and queue one viewport request without stepping OVRTX."""
+
+        if not self.supports_async_render() or self._resolution_sync_is_disposed():
+            return False
+        if self._resolution_render_in_progress:
+            return False
+        self._resolution_render_in_progress = True
+        try:
+            if self._image is None or not self._image.visible:
+                return False
+            visible_frame_size = self._visible_viewport_frame_size_for_render()
+            if visible_frame_size is None or self._renderer is None:
+                return False
+            resize_refresh = bool(self._viewport_resize_render_refresh_pending)
+            if self._resolution_state.is_viewport_mode:
+                effective = self._compute_viewport_mode_effective_resolution(
+                    visible_frame_size
+                )
+                self._last_viewport_mode_effective_resolution = effective
+                self._last_viewport_mode_visible_frame_size = visible_frame_size
+                self._last_fixed_mode_effective_resolution = None
+                self._last_fill_viewport_visible_frame_size = None
+                w, h = self._commit_resolution_effective_size(effective.effective_size)
+            elif self._resolution_state.is_fixed_mode:
+                effective = self._compute_fixed_mode_effective_resolution(
+                    visible_frame_size
+                )
+                self._last_fixed_mode_effective_resolution = effective
+                self._last_viewport_mode_effective_resolution = None
+                self._last_viewport_mode_visible_frame_size = None
+                self._last_fill_viewport_visible_frame_size = (
+                    visible_frame_size if self._resolution_state.fill_viewport else None
+                )
+                w, h = self._commit_resolution_effective_size(effective.effective_size)
+            else:
+                frame_width, frame_height = visible_frame_size
+                w = max(self.MIN_RENDER_WIDTH, min(self.MAX_RENDER_WIDTH, frame_width))
+                h = max(self.MIN_RENDER_HEIGHT, min(self.MAX_RENDER_HEIGHT, frame_height))
+                self._last_viewport_mode_effective_resolution = None
+                self._last_viewport_mode_visible_frame_size = None
+                self._last_fixed_mode_effective_resolution = None
+                self._last_fill_viewport_visible_frame_size = None
+            self._viewport_resize_render_refresh_pending = False
+            w, h = ensure_safe_renderer_request_size((w, h))
+            extent = (w, h)
+            product_path = str(
+                self._renderer.get_active_render_product_path() or ""
+            )
+            if (
+                extent != self._render_generation_extent
+                or product_path != self._render_generation_product_path
+            ):
+                self._render_generation += 1
+                self._render_generation_extent = extent
+                self._render_generation_product_path = product_path
+            self._last_resolution = extent
+            self._async_render_dt = float(render_dt)
+            self._async_resize_refresh_was_pending = resize_refresh
+            self._refresh_hud()
+            self._refresh_resolution_render_qa_window()
+            view, proj = self._camera.get_matrices(w, h)
+            self._tick_camera_navigation_state()
+            self._author_active_camera_pose(view, proj, w, h)
+            self._renderer.enqueue_render_frame(
+                self._render_viewport_id,
+                self._render_generation,
+                w,
+                h,
+                view,
+                proj,
+            )
+            return True
+        finally:
+            self._resolution_render_in_progress = False
+
+    def submit_render_batch(self) -> bool:
+        """Ask the shared renderer coordinator to submit its queued batch."""
+
+        submit = getattr(self._renderer, "submit_enqueued_render_frames", None)
+        return bool(submit()) if callable(submit) else False
+
+    def poll_render(self) -> bool:
+        """Present one frame already completed by the renderer worker."""
+
+        poll = getattr(self._renderer, "poll_render_frame", None)
+        if not callable(poll):
+            return False
+        result = poll(self._render_viewport_id)
+        if result is None:
+            return False
+        metadata = result.metadata
+        if int(metadata.generation) != self._render_generation:
+            close = getattr(result.image, "close", None)
+            if callable(close):
+                close()
+            release = getattr(self._renderer, "release_render_frame", None)
+            if callable(release):
+                release(metadata)
+            return False
+        self._present_async_render_frame(result.image, metadata)
+        return True
+
+    def _present_async_render_frame(self, frame: Any, metadata: Any) -> None:
+        """Publish a completed image using its exact submission camera."""
+        self._present_async_render_frame_impl(frame, metadata)
+
+    def _present_async_render_frame_impl(self, frame: Any, metadata: Any) -> None:
+        w, h = metadata.extent
+        view = metadata.view_matrix
+        proj = metadata.projection_matrix
+        self._last_presented_frame_metadata = metadata
+        self._last_image_frame = frame
+        try:
+            self._bridge.update(frame)
+        except BaseException:
+            release = getattr(self._renderer, "release_render_frame", None)
+            if callable(release):
+                release(metadata)
+            raise
+        mark_presented = getattr(self._renderer, "mark_render_frame_presented", None)
+        if callable(mark_presented):
+            mark_presented(metadata)
+        self._retry_selection_highlight_after_render()
+        self._record_fps_sample(self._async_render_dt)
+        self._refresh_hud()
+        if self._scene_view is not None:
+            try:
+                overlay_frame_size = self._get_raw_viewport_frame_size()
+                overlay_proj = apply_aspect_fit_projection_transform(
+                    proj,
+                    overlay_frame_size,
+                    (w, h),
+                )
+                view_flat = (
+                    view.T.flatten().tolist() if hasattr(view, "T") else list(view)
+                )
+                proj_flat = (
+                    overlay_proj.T.flatten().tolist()
+                    if hasattr(overlay_proj, "T")
+                    else list(overlay_proj)
+                )
+                self._scene_view.view = view_flat
+                self._scene_view.projection = proj_flat
+            except Exception:
+                pass
+        self._viewport_hooks.update_frame(
+            ViewportFrameContext(
+                owner=self,
+                width=w,
+                height=h,
+                render_dt=self._async_render_dt,
+                view_matrix=view,
+                projection_matrix=proj,
+                image_frame=frame,
+                image_bridge=self._bridge,
+                scene_view=self._scene_view,
+            )
+        )
+        if self._transform_manipulator is not None:
+            try:
+                self._transform_manipulator.refresh_transform()
+            except Exception:
+                pass
+        self._maybe_invalidate_gizmo_for_scale()
+        if self._async_resize_refresh_was_pending:
+            self._request_settings_menu_reshow()
+            self._async_resize_refresh_was_pending = False
+
+    def get_presentation_image(self):
+        """Return an owned, immutable CPU image of the last presentation, if any.
+
+        GPU-only presentations have no CPU image. Call on the owner thread
+        immediately after rendering to pair it with application-owned metadata.
+        """
+        import numpy as np
+
+        frame = self._last_image_frame
+        if not isinstance(frame, np.ndarray) or not frame.size:
+            return None
+        # A bytes-backed array cannot be made writable by a later consumer.
+        return np.frombuffer(frame.tobytes(), dtype=frame.dtype).reshape(frame.shape)
+
+    def _profile_ovui_call(
+        self, function_name: str, function: Callable, /, *args: Any, **kwargs: Any
+    ) -> Any:
+        # A static lookup: a renderer double's __getattr__ must not replace
+        # the call with its own result.
+        profile_fn = None
+        if inspect.getattr_static(self._renderer, "_profile_ovui_call", None) is not None:
+            profile_fn = getattr(self._renderer, "_profile_ovui_call", None)
+        if callable(profile_fn):
+            return profile_fn(function_name, function, *args, **kwargs)
+        return function(*args, **kwargs)
+
     def render(self, render_dt: float) -> bool:
         """Per-render path — RTX render, image bridge upload, HUD refresh.
 
@@ -8653,10 +9419,10 @@ class ViewportSurface:
                 return False
             if not self._image.visible:
                 return False
+            if self._renderer is None:
+                return False
             visible_frame_size = self._visible_viewport_frame_size_for_render()
             if visible_frame_size is None:
-                return False
-            if self._renderer is None:
                 return False
             if self._resolution_state.is_viewport_mode:
                 effective = self._compute_viewport_mode_effective_resolution(
@@ -8686,7 +9452,10 @@ class ViewportSurface:
                 self._viewport_resize_render_refresh_pending = False
             else:
                 frame_width, frame_height = visible_frame_size
-                w = max(self.MIN_RENDER_WIDTH, min(self.MAX_RENDER_WIDTH, frame_width))
+                w = max(
+                    self.MIN_RENDER_WIDTH,
+                    min(self.MAX_RENDER_WIDTH, frame_width),
+                )
                 h = max(
                     self.MIN_RENDER_HEIGHT,
                     min(self.MAX_RENDER_HEIGHT, frame_height),
@@ -8697,25 +9466,48 @@ class ViewportSurface:
                 self._last_fill_viewport_visible_frame_size = None
                 self._viewport_resize_render_refresh_pending = False
             w, h = ensure_safe_renderer_request_size((w, h))
+            resolution_changed = self._last_resolution != (w, h)
             self._last_resolution = (w, h)
-            self._refresh_hud()
-            self._refresh_resolution_render_qa_window()
+            if resolution_changed or resize_render_refresh_was_pending:
+                self._refresh_resolution_render_qa_window()
             view, proj = self._camera.get_matrices(w, h)
             self._tick_camera_navigation_state()
-            self._author_active_camera_pose(view, proj, w, h)
-            frame = self._renderer.render_frame(  # type: ignore[union-attr]
+            self._profile_ovui_call(
+                "ViewportWidget._author_active_camera_pose",
+                self._author_active_camera_pose, view, proj, w, h,
+            )
+            frame = self._profile_ovui_call(
+                "ViewportWidget.renderer.render_frame",
+                self._renderer.render_frame,  # type: ignore[union-attr]
                 w,
                 h,
                 view,
                 proj,
             )
             self._last_image_frame = frame
-            self._bridge.update(frame)
-            self._retry_selection_highlight_after_render()
+            if frame is not None:
+                record_completion = getattr(
+                    ui, "_record_synchronous_renderer_completion", None
+                )
+                if callable(record_completion):
+                    record_completion()
+                self._profile_ovui_call(
+                    "ViewportWidget.image_bridge.update", self._bridge.update, frame
+                )
+                record_selection = getattr(
+                    ui, "_record_synchronous_content_selection", None
+                )
+                if callable(record_selection):
+                    record_selection()
+            self._profile_ovui_call(
+                "ViewportWidget._retry_selection_highlight_after_render",
+                self._retry_selection_highlight_after_render,
+            )
             # Update the FPS HUD after the render succeeds. The rolling one-second
             # window keeps short stalls from dominating the visible value.
             self._record_fps_sample(render_dt)
-            self._refresh_hud()
+            self._record_render_update_sample()
+            self._profile_ovui_call("ViewportWidget._refresh_hud", self._refresh_hud)
             # Sync the scene-view overlay's camera so gizmo geometry drawn in
             # world coordinates (translate handles, pick markers, etc.) aligns
             # with the rendered prims. ``sc.SceneView.view`` / ``projection``
@@ -8765,7 +9557,8 @@ class ViewportSurface:
                     self._scene_view.projection = proj_flat
                 except Exception:
                     pass
-            self._viewport_hooks.update_frame(
+            self._profile_ovui_call(
+                "ViewportWidget.hooks.update_frame", self._viewport_hooks.update_frame,
                 ViewportFrameContext(
                     owner=self,
                     width=w,
@@ -8789,19 +9582,36 @@ class ViewportSurface:
             # actually changed, no-op otherwise.
             if self._transform_manipulator is not None:
                 try:
-                    self._transform_manipulator.refresh_transform()
+                    self._profile_ovui_call(
+                        "ViewportWidget.transform_manipulator.refresh_transform",
+                        self._transform_manipulator.refresh_transform,
+                    )
+                except Exception:
+                    pass
+            if self._light_manipulator is not None:
+                try:
+                    self._profile_ovui_call(
+                        "ViewportWidget.light_manipulator.refresh_transform",
+                        self._light_manipulator.refresh_transform,
+                    )
                 except Exception:
                     pass
             # Kept for the "camera moved enough → invalidate" fallback path
             # that still forces a full rebuild when the gizmo size needs a
             # major step. With ``refresh_transform`` in place this is
             # mostly a no-op; retained as defence in depth.
-            self._maybe_invalidate_gizmo_for_scale()
+            self._profile_ovui_call(
+                "ViewportWidget._maybe_invalidate_gizmo_for_scale",
+                self._maybe_invalidate_gizmo_for_scale,
+            )
             if resize_render_refresh_was_pending:
                 self._request_settings_menu_reshow()
             return True
         finally:
             self._resolution_render_in_progress = False
+            # Returning early or raising skips the sampler, so revalidate the
+            # painted rate rather than leave a dead session's number on screen.
+            self._expire_painted_render_fps()
 
     def _on_frame(self, dt: float) -> None:
         """Backward-compatible single-call entry — splits into update + render.
@@ -8814,11 +9624,11 @@ class ViewportSurface:
         configured cap period" gate, so it honors the same Kit-compatible
         ``rateLimitFrequency`` setting as the production cadence path.
         """
-        target_dt = 1.0 / self._configured_max_fps()
+        configured_fps = self._configured_max_fps()
         self.update(dt)
         if self._image is None or not self._image.visible:
             return
-        if dt < target_dt:
+        if configured_fps is not None and dt < 1.0 / configured_fps:
             return
         self.render(dt)
 
@@ -8835,6 +9645,7 @@ class ViewportSurface:
             return False
         for group in (
             getattr(mani, "_translate_drags", None) or (),
+            getattr(mani, "_translate_plane_drags", None) or (),
             getattr(mani, "_rotate_drags", None) or (),
             getattr(mani, "_scale_drags", None) or (),
         ):
@@ -8843,6 +9654,9 @@ class ViewportSurface:
                     return True
         uniform = getattr(mani, "_uniform_scale_drag", None)
         if uniform is not None and getattr(uniform, "is_active", False):
+            return True
+        free_translate = getattr(mani, "_translate_free_drag", None)
+        if free_translate is not None and getattr(free_translate, "is_active", False):
             return True
         return False
 
@@ -8901,6 +9715,7 @@ class ViewportSurface:
         through the stage adapter so Properties edits to the selected camera
         immediately update the viewport's controller pose.
         """
+        self._invalidate_selected_light_type(event)
         if not self._is_self_authored_active_camera_pose_event(event):
             self._sync_active_camera_from_stage_change(event)
         if self._renderer is not None:
@@ -8942,9 +9757,19 @@ class ViewportSurface:
                 break
         if not affected:
             return
+        # A selected path may have been published before its native prim was
+        # populated. Reuse the renderer's production refresh seam so missing
+        # outline work converges on the topology event without fabricating an
+        # applied member. Stable applied paths remain a no-op in native mode.
+        self._set_renderer_selection_highlight(selected, force=True)
         if self._transform_manipulator is not None:
             try:
                 self._transform_manipulator.invalidate()
+            except Exception:
+                pass
+        if self._light_manipulator is not None:
+            try:
+                self._light_manipulator.invalidate()
             except Exception:
                 pass
 
@@ -9067,6 +9892,8 @@ class ViewportSurface:
         self._scene_view = None
         self._camera_manipulator = None
         self._transform_manipulator = None
+        self._light_manipulator = None
+        self._selected_light_type_cache = None
         self._pick_manager = None
         self._tool_registry = None
 
@@ -9105,6 +9932,10 @@ class ViewportSurface:
                     self._refresh_resolution_availability,
                 )
                 return True
+            self._render_generation += 1
+            self._render_generation_extent = None
+            self._render_generation_product_path = None
+            self._last_presented_frame_metadata = None
             # Resolve the drag, then invalidate the outgoing generation
             # BEFORE native shutdown can re-enter old callbacks.
             cleanup.run(
@@ -9136,6 +9967,9 @@ class ViewportSurface:
                 cleanup.run(
                     "frame-overlap opt-in",
                     lambda: self._enable_renderer_frame_overlap(published))
+                cleanup.run(
+                    "frame-pacing provider attach",
+                    lambda: self._attach_renderer_frame_pacing(published))
             # Publication: model first, surface second.
             model = getattr(self, "_transform_model", None)
             if model is not None:
@@ -9147,6 +9981,9 @@ class ViewportSurface:
                     self._refuse_renderer(rejected, cleanup,
                                           "courtesy shutdown of rejected renderer")
             self._renderer = published
+            reset_throughput = getattr(ui, "_reset_frame_throughput_metrics", None)
+            if callable(reset_throughput):
+                reset_throughput()
             cleanup.run("fps sample reset", self._reset_fps_samples)
             if hasattr(self, "_scene_value_label"):
                 cleanup.run("hud refresh", self._refresh_hud)

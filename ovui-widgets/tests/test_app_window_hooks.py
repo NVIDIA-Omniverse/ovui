@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for generic lazy app window contributions."""
 
@@ -151,3 +144,56 @@ def test_lazy_window_gates_capabilities_and_isolates_failures():
     good_window = registry.open("good")
     assert good_window is not None
     assert good_window.visible is True
+
+
+def test_window_registration_ownership_is_generation_bound():
+    """same-ID foreign contributions are rejected,
+    and a stale handle no-ops on an independent replacement instead of
+    removing it."""
+    import pytest
+
+    app = object()
+    registry = AppWindowRegistry(app)
+
+    original = AppWindowContribution(
+        id="tools.panel", title="Original", factory=lambda a: object()
+    )
+    handle = registry.add(original)
+
+    # A different contribution under an existing ID is never silently
+    # granted ownership.
+    foreign = AppWindowContribution(
+        id="tools.panel", title="Foreign", factory=lambda a: object()
+    )
+    with pytest.raises(ValueError, match="already registered"):
+        registry.add(foreign)
+
+    # Original removed and independently replaced: the stale handle
+    # no-ops and the replacement survives.
+    assert registry.remove("tools.panel") is True
+    replacement_handle = registry.add(foreign)
+    assert handle.remove() is False
+    assert registry._records["tools.panel"].contribution is foreign
+
+    # Identity-conditional removal removes only the exact owner.
+    assert registry.remove_if_matches("tools.panel", original) is False
+    assert registry.remove_if_matches("tools.panel", foreign) is True
+    assert registry._records == {}
+    assert replacement_handle.remove() is False
+
+
+def test_window_handle_is_generation_bound_across_same_object_readd():
+    """removing and re-adding the very same contribution
+    starts a new generation; the stale handle no-ops on it."""
+    registry = AppWindowRegistry(object())
+    contribution = AppWindowContribution(
+        id="tools.gen", title="Gen", factory=lambda a: object()
+    )
+    stale = registry.add(contribution)
+    assert registry.remove("tools.gen") is True
+    fresh = registry.add(contribution)
+
+    assert stale.remove() is False
+    assert registry._records["tools.gen"].contribution is contribution
+    assert fresh.remove() is True
+    assert registry._records == {}

@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Assert.h"
@@ -29,7 +22,7 @@
 #include <omni/ui/windowmanager/WindowManagerUtils.h>
 
 #include "WindowData.h"
-#include "ImGuiKeyTranslation.h"
+#include "platform/IUiPlatform.h"
 
 #include <functional>
 
@@ -854,7 +847,10 @@ void Window::_draw(const char* windowName, float elapsedTime)
         ctx->IO.ConfigWindowsResizeFromEdges = true;
     }
 
-    ImGuiWindowFlags flags = (ImGuiWindowFlags)this->getFlags();
+    const auto windowFlags = this->getFlags();
+    ImGuiWindowFlags flags = static_cast<ImGuiWindowFlags>(windowFlags & ~kWindowFlagNoDocking);
+    if (windowFlags & kWindowFlagNoDocking)
+        flags |= ImGuiWindowFlags_NoDocking;
     flags &= ~(kWindowFlagModal | kWindowFlagPopup);
 
     if (this->getRasterPolicy() != RasterPolicy::eNever)
@@ -1198,8 +1194,8 @@ void Window::_updateWindow(const char* windowName, float elapsedTime, bool cache
         // ImGui 1.87+ named keys live in [ImGuiKey_NamedKey_BEGIN, _END);
         // iterating 0..256 (the legacy native range) never fires because
         // IsKeyPressed((ImGuiKey)0..255) matches nothing with
-        // IMGUI_DISABLE_OBSOLETE_FUNCTIONS. Translate back to GLFW codes so
-        // Python callbacks stay on the historical code space.
+        // IMGUI_DISABLE_OBSOLETE_FUNCTIONS. The platform bridge maps named keys to the
+        // native code space expected by host callbacks.
         KeyboardModifierFlags modifiers =
             (io.KeyAlt ? kKeyModAlt : 0) |
             (io.KeyShift ? kKeyModShift : 0) |
@@ -1212,9 +1208,10 @@ void Window::_updateWindow(const char* windowName, float elapsedTime, bool cache
             ImGuiKey key = static_cast<ImGuiKey>(k);
             if (ImGui::IsKeyPressed(key, false))
             {
-                int glfw = detail::imguiKeyToGlfwKey(key);
-                if (glfw != 0)
-                    this->callKeyPressedFn(glfw, modifiers, true);
+                auto* inputPlatform = PlatformRegistry::instance().platform();
+                const int nativeKey = inputPlatform ? inputPlatform->nativeKeyCode(key) : 0;
+                if (nativeKey != 0)
+                    this->callKeyPressedFn(nativeKey, modifiers, true);
             }
         }
         for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k)
@@ -1222,9 +1219,10 @@ void Window::_updateWindow(const char* windowName, float elapsedTime, bool cache
             ImGuiKey key = static_cast<ImGuiKey>(k);
             if (ImGui::IsKeyReleased(key))
             {
-                int glfw = detail::imguiKeyToGlfwKey(key);
-                if (glfw != 0)
-                    this->callKeyPressedFn(glfw, modifiers, false);
+                auto* inputPlatform = PlatformRegistry::instance().platform();
+                const int nativeKey = inputPlatform ? inputPlatform->nativeKeyCode(key) : 0;
+                if (nativeKey != 0)
+                    this->callKeyPressedFn(nativeKey, modifiers, false);
             }
         }
     }
@@ -1259,7 +1257,7 @@ void Window::_updateWindow(const char* windowName, float elapsedTime, bool cache
     ImGui::SetCursorPos(ImGui::GetCursorStartPos());
 
     // Use GetContentRegionAvail() to get content region dimensions.
-    auto contentRegionAvail = ImGui::GetContentRegionAvail();
+    const ImVec2 contentRegionAvail = window->ContentRegionRect.GetSize();
 
     float contentRegionWidth = contentRegionAvail.x;
     float contentRegionHeight = contentRegionAvail.y;

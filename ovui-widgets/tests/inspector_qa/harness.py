@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Subprocess and evidence harness for state-guided real ovui Inspector QA.
 
@@ -540,9 +533,7 @@ class InspectorAppProcess:
             renderer = state.get("renderer", {})
             components = state.get("components", {})
             loaded_components = set(components.get("loaded_names", ()))
-            required_components = {
-                "ovstage_physics_controls",
-            }
+            required_components = {"ovstage_physics_controls"}
             core_scene_ready = bool(
                 state.get("ovstage", {}).get("available")
                 and state.get("adapter", {}).get("available")
@@ -556,8 +547,7 @@ class InspectorAppProcess:
             if core_scene_ready and (missing_components or component_failures):
                 raise RuntimeError(
                     "Inspector native runtime is missing installed component "
-                    "entry points. Install ovui-data-adapters/dist/ovstage "
-                    "in the application "
+                    "entry points. Install ovui-data-adapters/dist/ovstage in the application "
                     f"interpreter. missing={missing_components}, "
                     f"failures={component_failures}\n{self.log_text()}"
                 )
@@ -1125,4 +1115,5 @@ def assert_real_borrow_renderer(state: dict[str, Any]) -> None:
     assert renderer.get("native_attached_exact_ovstage") is True, renderer
     assert int(renderer.get("borrow_step_count", 0)) > 0, renderer
     assert int(renderer.get("successful_frame_count", 0)) > 0, renderer
+    # Foreign renderer data-plane writes are prohibited in BORROW mode.
     assert int(renderer.get("selection_outline_attribute_writes", 0)) == 0, renderer

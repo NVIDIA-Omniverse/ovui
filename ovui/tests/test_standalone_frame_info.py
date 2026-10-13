@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the standalone FrameInfo / max-FPS pacing API.
 
@@ -106,11 +99,6 @@ class TestMaxFrameRate(unittest.TestCase):
     def tearDown(self):
         standalone._max_frame_rate = self._saved
 
-    def test_default_cap_is_60(self):
-        # Reset and re-init to default.
-        standalone.set_max_frame_rate(60.0)
-        self.assertEqual(standalone.get_max_frame_rate(), 60.0)
-
     def test_set_disables_cap_with_none(self):
         standalone.set_max_frame_rate(None)
         self.assertIsNone(standalone.get_max_frame_rate())
@@ -135,13 +123,13 @@ class TestMaxFrameRate(unittest.TestCase):
     def test_remaining_zero_when_uncapped(self):
         standalone.set_max_frame_rate(None)
         self.assertEqual(
-            standalone._max_fps_remaining_since(time.monotonic()), 0.0,
+            standalone._max_fps_remaining_since(time.perf_counter()), 0.0,
         )
 
     def test_remaining_full_budget_when_frame_start_is_now(self):
         """Iteration just started — almost the full 1/60s budget remains."""
         standalone.set_max_frame_rate(60.0)
-        frame_start = time.monotonic()
+        frame_start = time.perf_counter()
         remaining = standalone._max_fps_remaining_since(frame_start)
         self.assertGreater(remaining, 0.010)
         self.assertLess(remaining, 0.020)
@@ -151,7 +139,7 @@ class TestMaxFrameRate(unittest.TestCase):
         no extra sleep should be requested."""
         standalone.set_max_frame_rate(60.0)
         # Pretend frame_start was 100ms ago.
-        frame_start = time.monotonic() - 0.1
+        frame_start = time.perf_counter() - 0.1
         self.assertEqual(
             standalone._max_fps_remaining_since(frame_start), 0.0,
         )
@@ -189,7 +177,7 @@ class TestVsyncHostDoesNotDoubleSleep(unittest.TestCase):
                 time.sleep(target * 1.05)
 
             with patch.object(standalone._ui, "_standalone_tick", side_effect=slow_tick):
-                frame_start = time.monotonic()
+                frame_start = time.perf_counter()
                 standalone._tick_one_frame()
                 remaining = standalone._max_fps_remaining_since(frame_start)
                 # The tick already consumed ≥ target — no extra sleep.
@@ -198,7 +186,7 @@ class TestVsyncHostDoesNotDoubleSleep(unittest.TestCase):
     def test_fast_tick_leaves_most_of_the_budget(self):
         target = 1.0 / 60.0
         with _NoopTickPatch():
-            frame_start = time.monotonic()
+            frame_start = time.perf_counter()
             standalone._tick_one_frame()  # noop tick, microseconds
             remaining = standalone._max_fps_remaining_since(frame_start)
             # Most of the budget should remain — 80%+ as a generous floor.

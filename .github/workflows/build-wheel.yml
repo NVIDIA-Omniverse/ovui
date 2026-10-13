@@ -1,27 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-License-Identifier: Apache-2.0
 #
 # Wheel build — produces native binary wheels for ovui.
 #
 # The Linux wheels are built against the headless Vulkan + Lavapipe toolchain
 # (the same recipe B1 uses) plus CUDA 12.8 development components. A CUDA
 # driver stub keeps hosted-runner smoke tests driver-free; real CUDA use still
-# requires a driver at runtime. The Windows
+# requires a driver at runtime. The Linux ARM64 wheels are cross-compiled on an
+# x86_64 runner (see .github/scripts/setup_linux_aarch64_cross.sh), so their
+# import smoke test, which runs ARM64 code, is skipped. The Windows
 # wheel uses the GitHub-hosted Windows Server 2022 image, its preinstalled
 # Visual Studio 2022 toolchain, Vulkan headers/loader installed with the
 # image's preinstalled vcpkg, and CUDA 12.8 compiler/runtime components from
 # NVIDIA's network installer. setup.py bundles the compiled native libraries
 # into each wheel:
 #
-#   omni/ui/_ui*.so|*.pyd
-#   omni/ui/libovui.so* or ovui.dll
+#   omni/ui/_ui*.so|*.pyd, omni/ui/_standalone*.so|*.pyd (standalone bridge)
+#   omni/ui/libovui.so + libomni.ui.so, or ovui.dll + forwarder-only omni.ui.dll
 #   omni/ui/libomniui_standalone.so* or omniui_standalone.dll
 #   omni/ui/resources/{fonts,glyphs,twemoji-atlas.{png,json}}
 #   omni/ui_scene/_scene*.so|*.pyd
-#   omni/ui_scene/libovuiscene.so* or ovuiscene.dll
+#   omni/ui_scene/libomni.ui.scene.so or omni.ui.scene.dll
 #
-# RPATH is set to $ORIGIN on Linux by setup.py so the libraries find each other
-# at runtime without LD_LIBRARY_PATH manipulation. Windows package imports add
+# On Linux the libraries find each other through their search paths ($ORIGIN
+# and the other wheel folders; the shared binaries use the fixed list in
+# ovui/cmake/SharedRpath.cmake) without LD_LIBRARY_PATH manipulation. Windows package imports add
 # the package DLL directories at import time.
 #
 # Triggers:
@@ -34,6 +37,9 @@
 #     both a plain linux_<arch> wheel and a retagged
 #     manylinux_2_35_<arch> wheel into the same artifact)
 #   * Release assets on published release events and manual release_tag runs
+#
+# These public jobs build unsigned Windows wheels and validate the complete
+# release set before attaching it to an explicitly selected GitHub release.
 
 name: Build Wheel
 
@@ -56,8 +62,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve-source:
+    name: Resolve source commit
+    runs-on: ubuntu-22.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.sha }}
+      - id: resolve
+        env:
+          PUBLISH: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+
   build-wheel-linux:
     name: Build wheel (${{ matrix.label }}, Vulkan + CUDA)
+    needs: resolve-source
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
 
@@ -72,11 +96,14 @@ jobs:
             manylinux_tag: manylinux_2_35_x86_64
             cuda_repo_arch: x86_64
           - label: Linux ARM64
-            runner: ubuntu-22.04-arm
+            # Cross-compiled on x86_64 with the host CUDA toolkit plus its
+            # sbsa cross runtime.
+            runner: ubuntu-22.04
             artifact: ovui-wheel-linux-arm64
             linux_tag: linux_aarch64
             manylinux_tag: manylinux_2_35_aarch64
-            cuda_repo_arch: sbsa
+            cuda_repo_arch: x86_64
+            cross_compile: true
 
     env:
       DEBIAN_FRONTEND: noninteractive
@@ -95,7 +122,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Resolve checked-out commit
         run: |
@@ -153,10 +180,24 @@ jobs:
       - name: Upgrade pip toolchain
         run: |
           python -m pip install --upgrade pip wheel setuptools build
+          # Pinned: native frame pacing only starts with an ovrtx runtime of the
+          # same major.minor as these headers, so a new ovrtx release must not
+          # change a release build silently.
+          python -m pip install --no-deps ovrtx==0.5.0.377615
+
+      - name: Set up Linux ARM64 cross-compilation
+        if: matrix.cross_compile
+        run: bash ../.github/scripts/setup_linux_aarch64_cross.sh "$RUNNER_TEMP/aarch64-cross"
 
       - name: Build wheel
         run: |
-          python -m pip wheel . --no-deps -w dist/ -v
+          ovrtx_include="$(python -c "from importlib.util import find_spec; from pathlib import Path; print(Path(find_spec('ovrtx').origin).parent / 'include')")"
+          # The OVUI_CROSS_* variables are set only by the cross-compilation step.
+          # Only ovrtx headers are offered. ovui depends on no scene library;
+          # a scene provider lives in its own ovui-data-adapters package.
+          OVRTX_INCLUDE_DIR="$ovrtx_include" \
+          OMNIUI_CMAKE_ARGS="$OMNIUI_CMAKE_ARGS ${OVUI_CROSS_CMAKE_ARGS:-}" \
+            "${OVUI_CROSS_PYTHON:-python}" -m pip wheel . --no-deps ${OVUI_CROSS_PYTHON:+--no-build-isolation} -w dist/ -v
 
       - name: Retag wheel for manylinux
         run: |
@@ -179,7 +220,15 @@ jobs:
             python -m zipfile -l "$whl"
           done
 
+      - name: Note ARM64 runtime checks not run
+        if: matrix.cross_compile
+        run: |
+          msg="${{ matrix.label }} wheels are cross-compiled on x86_64. The install/import smoke test runs ARM64 code and is skipped; the wheels have not been executed in this job."
+          echo "::notice title=ARM64 runtime checks skipped::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Smoke test — verify filename, install wheel, import omni.ui
+        if: ${{ !matrix.cross_compile }}
         env:
           OMNIUI_HEADLESS: "1"
           OMNIUI_BACKEND: "vulkan"
@@ -201,6 +250,11 @@ jobs:
           python -m venv /tmp/wheel-venv
           /tmp/wheel-venv/bin/pip install --upgrade pip
           /tmp/wheel-venv/bin/pip install "${wheels[0]}"
+          # Import with only the driver stub on the search path. The builder's
+          # CUDA Toolkit runtime directory is deliberately dropped: a wheel that
+          # needs it would install cleanly here and then fail on a machine that
+          # has the NVIDIA driver but no Toolkit.
+          LD_LIBRARY_PATH="$RUNNER_TEMP/cuda-driver-stub" \
           /tmp/wheel-venv/bin/python - <<'PY'
           import os
           import omni.ui
@@ -215,6 +269,8 @@ jobs:
           assert commit == expected, (
               f"omni.ui.__commit__ {commit!r} does not match GITHUB_SHA {expected!r}"
           )
+          frame_pacing = omni.ui.get_frame_pacing_status()
+          assert frame_pacing["supported"], frame_pacing
           PY
           /tmp/wheel-venv/bin/python ../.github/scripts/validate_packaged_skills.py \
             --expected omniverse-ui-apis omniverse-ui-inspector
@@ -263,6 +319,7 @@ jobs:
 
   build-wheel-windows:
     name: Build wheel (Windows x64, Vulkan + CUDA)
+    needs: resolve-source
     runs-on: windows-2022
     timeout-minutes: 90
 
@@ -284,7 +341,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Resolve checked-out commit
         shell: pwsh
@@ -369,11 +426,19 @@ jobs:
       - name: Upgrade pip toolchain
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip wheel setuptools build cmake pybind11
+          python -m pip install --upgrade pip wheel setuptools build cmake pybind11==2.11.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Pinned for the same reason as the Linux job.
+          python -m pip install --no-deps ovrtx==0.5.0.377615
 
       - name: Build wheel
         shell: pwsh
         run: |
+          $ovrtxInclude = python -c "from importlib.util import find_spec; from pathlib import Path; print(Path(find_spec('ovrtx').origin).parent / 'include')"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:OVRTX_INCLUDE_DIR = $ovrtxInclude.Trim()
+          # Only ovrtx headers are offered. ovui depends on no scene library;
+          # a scene provider lives in its own ovui-data-adapters package.
           python -m pip wheel . --no-deps -w dist/ -v
 
       - name: Show wheel contents
@@ -401,6 +466,16 @@ jobs:
           $python = "$env:RUNNER_TEMP\wheel-venv\Scripts\python.exe"
           & $python -m pip install --upgrade pip
           & $python -m pip install $wheels[0].FullName
+          # Take the builder's CUDA Toolkit away from the import entirely: the
+          # wheel must carry the runtime the backend needs. Both the search
+          # path and the CUDA root variables have to go, because the package
+          # adds $CUDA_PATH\bin back as a fallback when it finds no packaged
+          # runtime — which would hide exactly the omission this checks for.
+          # The NVIDIA driver and the Vulkan loader stay: they are separate
+          # host prerequisites.
+          $cudaBin = @((Join-Path $env:CUDA_PATH 'bin'), (Join-Path $env:CUDA_PATH 'bin\x64'))
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -and ($cudaBin -notcontains $_) }) -join ';'
+          Remove-Item Env:\CUDA_PATH, Env:\CUDAToolkit_ROOT, Env:\CUDA_HOME -ErrorAction SilentlyContinue
           $checkScript = @'
           import os
           p = os.environ.get("Vulkan_DLL_DIR")
@@ -416,10 +491,13 @@ jobs:
           assert version, "omni.ui.__version__ is empty"
           print(f"  version={version!r} - OK")
           assert commit == expected, f"omni.ui.__commit__ {commit!r} does not match GITHUB_SHA {expected!r}"
+          frame_pacing = omni.ui.get_frame_pacing_status()
+          assert frame_pacing["supported"], frame_pacing
           '@
           $scriptPath = Join-Path $env:RUNNER_TEMP "wheel_smoke.py"
           Set-Content -Path $scriptPath -Value $checkScript -Encoding utf8
           & $python $scriptPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $python ..\.github\scripts\validate_packaged_skills.py `
             --expected omniverse-ui-apis omniverse-ui-inspector
 
@@ -430,21 +508,54 @@ jobs:
           path: ovui/dist/*.whl
           if-no-files-found: error
 
+  # Install exact-version siblings together from this run's wheel set.
+  # Linux ARM64 wheels are cross-compiled and reported as unexecuted here.
+  install-release-set:
+    name: Install the complete wheel set
+    needs: [resolve-source, build-wheel-linux, build-wheel-windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out validation scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download the complete wheel set
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ovui-wheel-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Install the set
+        run: python .github/scripts/install_release_set.py --wheels-dir wheelhouse
+
   attach-release-wheels:
     name: Attach wheels to GitHub release
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    if: needs.resolve-source.outputs.publish == 'true'
     runs-on: ubuntu-22.04
-    needs:
-      - build-wheel-linux
-      - build-wheel-windows
+    needs: [resolve-source, build-wheel-linux, build-wheel-windows, install-release-set]
     permissions:
       contents: write
 
     steps:
-      - name: Checkout release ref
+      - name: Check out validation scripts
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
 
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
@@ -461,9 +572,8 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # 17 = 5 native ovui wheels (Linux x64/ARM64, manylinux x64/aarch64,
-          # Windows x64) + the 12 universal pure-Python distributions below.
           wheels=(wheelhouse/*.whl)
+          # 17 = five native ovui wheels and twelve universal Python wheels.
           if [ "${#wheels[@]}" -ne 17 ]; then
             echo "Expected exactly 17 project wheels, found ${#wheels[@]}"
             printf '  %s\n' "${wheels[@]}"
@@ -506,11 +616,50 @@ jobs:
             require_one "$distribution-*-py3-none-any.whl" "$distribution universal"
           done
 
+      - name: Every wheel must come from this release's commit
+        env:
+          EXPECTED: ${{ needs.resolve-source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/assert_wheel_commit.py --selftest
+          python3 .github/scripts/assert_wheel_commit.py \
+            wheelhouse --expected "$EXPECTED" --expect-native 5
+
+      # Every gate above works from a commit resolved ONCE, early in the run. A
+      # tag is mutable, so it is resolved again here, at the last moment before
+      # the upload, and compared with the commit the wheels proved they came
+      # from.
+      #
+      # `--require-tag` is the publishing rule: resolve through the TAG
+      # NAMESPACE only. `repos/<repo>/commits/<ref>` takes any committish, so
+      # without it a branch of the same name satisfied the check and a release
+      # did not need its tag to exist at all.
+      - name: The release tag must exist and still name the verified commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED: ${{ needs.resolve-source.outputs.sha }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/assert_tag_commit.py --selftest
+
+          moved=0000000000000000000000000000000000000000
+          if python3 .github/scripts/assert_tag_commit.py \
+               --tag "$RELEASE_TAG" --expected "$EXPECTED" --actual "$moved"; then
+            echo "::error title=Tag gate is not armed::a tag naming $moved was accepted"
+            exit 1
+          fi
+          echo "OK: a moved tag is refused"
+
+          python3 .github/scripts/assert_tag_commit.py --require-tag \
+            --repo "${{ github.repository }}" --tag "$RELEASE_TAG" --expected "$EXPECTED"
+
       - name: Attach wheels to GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
         run: |
+          set -euo pipefail
           gh release view "$RELEASE_TAG" >/dev/null
           gh release upload "$RELEASE_TAG" wheelhouse/*.whl --clobber

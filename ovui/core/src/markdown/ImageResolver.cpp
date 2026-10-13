@@ -1,23 +1,13 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_NO_STDIO
-#define STBI_NO_HDR
-#include <stb_image.h>
+#include <omni/ui/platform/IUiFileIO.h>
+#include <omni/ui/platform/IUiRenderer.h>
+#include <omni/ui/platform/PlatformRegistry.h>
 
 #include "ImageResolver.h"
-
-#include <glad/glad.h>
 
 #include <cstring>
 #include <fstream>
@@ -73,34 +63,22 @@ std::vector<uint8_t> base64Decode(const char* begin, size_t len)
 
 ImTextureID uploadRGBA(const uint8_t* pixels, int w, int h)
 {
-    // Same guard as TwemojiAtlas::init: the markdown image upload path uses
-    // raw OpenGL, but glad is only loaded by GL-backed platforms. Under the
-    // Vulkan headless backend glad_glGenTextures is NULL and the call below
-    // would jump to address 0. Bail with a 0 texture id; StbImageResolver
-    // marks the cache entry invalid and the markdown widget renders without
-    // the image.
-    if (glad_glGenTextures == nullptr)
-        return 0;
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    if (tex == 0)
-        return 0;
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    return static_cast<ImTextureID>(tex);
+    auto* renderer = PlatformRegistry::instance().renderer();
+    return renderer ? renderer->createTexture(w, h, TextureFormat::eRGBA8, pixels) : 0;
 }
 
 void deleteTexture(ImTextureID id)
 {
     if (id == 0)
         return;
-    GLuint tex = static_cast<GLuint>(id);
-    glDeleteTextures(1, &tex);
+    if (auto* renderer = PlatformRegistry::instance().renderer())
+        renderer->destroyTexture(id);
+}
+
+ImTextureID drawTextureId(ImTextureID handle)
+{
+    auto* renderer = PlatformRegistry::instance().renderer();
+    return renderer ? reinterpret_cast<ImTextureID>(renderer->getImGuiTextureId(handle)) : 0;
 }
 
 } // namespace
@@ -113,8 +91,10 @@ StbImageResolver::~StbImageResolver()
 
 ResolvedImage StbImageResolver::_loadFromMemory(const std::string& key, const unsigned char* data, size_t len)
 {
-    int w = 0, h = 0, channels = 0;
-    unsigned char* pixels = stbi_load_from_memory(data, static_cast<int>(len), &w, &h, &channels, 4);
+    auto* fileIO = PlatformRegistry::instance().fileIO();
+    auto image = fileIO ? fileIO->decodeImage(data, len) : ImageData{};
+    int w = image.width, h = image.height;
+    const auto* pixels = image.pixels.empty() ? nullptr : image.pixels.data();
     if (!pixels)
     {
         m_cache[key] = {0, {0, 0}, false};
@@ -122,7 +102,6 @@ ResolvedImage StbImageResolver::_loadFromMemory(const std::string& key, const un
     }
 
     ImTextureID texId = uploadRGBA(pixels, w, h);
-    stbi_image_free(pixels);
 
     CacheEntry entry;
     entry.texId = texId;
@@ -130,7 +109,8 @@ ResolvedImage StbImageResolver::_loadFromMemory(const std::string& key, const un
     entry.valid = (texId != 0);
     m_cache[key] = entry;
 
-    return {entry.texId, entry.size, {0, 0}, {1, 1}, entry.valid};
+    auto drawId = drawTextureId(entry.texId);
+    return {drawId, entry.size, {0, 0}, {1, 1}, entry.valid && drawId != 0};
 }
 
 ResolvedImage StbImageResolver::_loadFromFile(const std::string& path)
@@ -165,7 +145,10 @@ ResolvedImage StbImageResolver::resolve(const std::string& src)
 
     auto it = m_cache.find(resolved);
     if (it != m_cache.end())
-        return {it->second.texId, it->second.size, {0, 0}, {1, 1}, it->second.valid};
+    {
+        auto drawId = drawTextureId(it->second.texId);
+        return {drawId, it->second.size, {0, 0}, {1, 1}, it->second.valid && drawId != 0};
+    }
 
     if (resolved.compare(0, 11, "data:image/") == 0)
     {

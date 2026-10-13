@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """CI invariant: ``read_bound_camera`` resolves boundCamera Path 1 + Path 2.
 
@@ -216,3 +209,31 @@ def test_empty_camera_settings_returns_none():
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
     stage.GetRootLayer().customLayerData = {"cameraSettings": {}}
     assert read_bound_camera(stage) is None
+
+@pytest.mark.parametrize('axis,eye', [('Z',(0,0,20)),('Y',(0,20,0))])
+def test_selected_orthographic_top_camera_preserves_projection_and_eye(axis, eye):
+    import numpy as np
+    from ovui_widgets.viewport.camera_controller import CameraController
+    from ovui_widgets.viewport.viewport_widget import ViewportSurface
+    from unittest.mock import Mock
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.SetStageUpAxis(stage, axis)
+    camera = UsdGeom.Camera.Define(stage, '/Camera')
+    up = Gf.Vec3d(0,1,0) if axis == 'Z' else Gf.Vec3d(0,0,-1)
+    UsdGeom.Xformable(camera).MakeMatrixXform().Set(
+        Gf.Matrix4d().SetLookAt(Gf.Vec3d(*eye),Gf.Vec3d(0),up).GetInverse())
+    camera.CreateProjectionAttr('orthographic')
+    camera.CreateVerticalApertureAttr(200)  # 20 stage units
+    camera.CreateFocusDistanceAttr(20)
+    pose = read_camera_pose(stage,'/Camera')
+    assert pose.projection == 'orthographic' and pose.orthographic_height == 20
+    surface = ViewportSurface.__new__(ViewportSurface)
+    surface._camera = CameraController()
+    surface._sync_camera_manipulator_up_axis = Mock()
+    assert surface.apply_camera_pose(pose)
+    view, projection = surface._camera.get_matrices(640,360)
+    np.testing.assert_allclose(np.linalg.inv(view)[:3,3], eye, atol=1e-5)
+    np.testing.assert_allclose(view @ np.array([*eye,1]), [0,0,0,1], atol=1e-5)
+    assert np.isfinite(view).all()
+    assert projection[3,3] == 1 and projection[3,2] == 0
+    assert projection[1,1] == pytest.approx(0.1)

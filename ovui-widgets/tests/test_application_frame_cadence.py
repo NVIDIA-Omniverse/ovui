@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the Application's central frame-cadence pipeline.
 
@@ -18,10 +11,10 @@ After the FrameClock split (Codex review of 675b260), Application owns:
 * a commit on the clock only when ``render()`` returns ``True``.
 
 This file proves all five constraints survive the refactor: physics advance
-even when render is gated, the gate clamps the render rate to ~60 FPS even at
-230 FPS tick rate, the clock doesn't poison itself on a hidden / zero-size /
-exception-throwing render, and the first render does not surface a fake
-infinite FPS.
+even when an explicit finite render limit gates output, the opt-in gate clamps
+the render rate to ~60 FPS even at 230 FPS tick rate, the clock doesn't poison
+itself on a hidden / zero-size / exception-throwing render, and the first
+render does not surface a fake infinite FPS.
 """
 
 
@@ -46,6 +39,9 @@ class _FakeViewport:
 
     def update(self, tick_dt: float) -> None:
         self.update_calls.append(tick_dt)
+
+    def supports_async_render(self) -> bool:
+        return False
 
     def render(self, render_dt: float) -> bool:
         self.render_calls.append(render_dt)
@@ -83,6 +79,7 @@ class TestPhysicsAlwaysAdvancesOnEveryTick:
     def test_update_called_when_render_throttled(self):
         app = _fresh_app()
         try:
+            app._viewport_render_clock.target_fps = 60.0
             vp = _FakeViewport(render_returns=True)
             app._viewport_window = vp
             # First tick — render gate fires (first call returns 0.0).
@@ -174,6 +171,7 @@ class TestRenderClockDoesNotPoisonOnSkip:
     def test_clock_committed_after_successful_render(self):
         app = _fresh_app()
         try:
+            app._viewport_render_clock.target_fps = 60.0
             vp = _FakeViewport(render_returns=True)
             app._viewport_window = vp
             app._on_frame_update(0.005)  # first tick: render fires, clock commits
@@ -187,12 +185,12 @@ class TestRenderClockDoesNotPoisonOnSkip:
 
 
 class TestStandaloneFramePacing:
-    def test_standalone_loop_keeps_viewport_render_gate(self):
+    def test_standalone_loop_preserves_uncapped_default(self):
         app = _fresh_app()
         try:
-            assert app._viewport_render_clock.target_fps == 120.0
+            assert app._viewport_render_clock.target_period == 0.0
             app._use_standalone_frame_pacing()
-            assert app._viewport_render_clock.target_fps == 120.0
+            assert app._viewport_render_clock.target_period == 0.0
         finally:
             _release(app)
 
@@ -200,7 +198,7 @@ class TestStandaloneFramePacing:
 class TestCadenceCappedAtMaxFpsForeground:
     def test_renders_settle_around_target_fps(self):
         """Drive 230 ticks per simulated second — render commits ~60 / s."""
-        # Skip the Application path here because real ``time.monotonic()``
+        # Skip the Application path here because real ``time.perf_counter()``
         # advances between ``_on_frame_update`` calls; instead test the
         # FrameClock directly with controlled time.
         clock = FrameClock(target_fps=60.0)
@@ -237,3 +235,58 @@ class TestRendererSwapResetsClock:
             assert app._viewport_render_clock._next_due_time is None
         finally:
             _release(app)
+
+
+def test_native_pacing_update_has_balanced_development_child_scopes():
+    app = _fresh_app()
+    scopes = []
+    calls = []
+    scope_names = {}
+
+    def start_scope(name):
+        scopes.append(("start", name))
+        uid = len(scope_names) + 1
+        scope_names[uid] = name
+        return uid
+
+    def end_scope(uid):
+        scopes.append(("end", scope_names[uid]))
+
+    try:
+        viewport = _FakeViewport()
+        viewport.renderer_adapter = SimpleNamespace(
+            start_ovui_performance_scope=start_scope,
+            end_ovui_performance_scope=end_scope,
+        )
+        app._viewport_window = viewport
+        app._adapter_session = SimpleNamespace(
+            physics_controls=SimpleNamespace(tick=lambda dt: calls.append("physics"))
+        )
+        callback = lambda: calls.append("callback")
+        app._pending_callbacks = [SimpleNamespace(
+            _cancelled=False, _due_time=0.0,
+            _callback=callback,
+        )]
+
+        app._on_native_pacing_frame_update(0.01)
+
+        callback_name = "Application.callback." + callback.__qualname__
+        names = [
+            "Application.native_pacing.physics",
+            "Application.native_pacing.viewport_update",
+            "Application.native_pacing.viewport_render",
+        ]
+        assert scopes == [
+            ("start", "Application.native_pacing.callback"),
+            ("start", callback_name),
+            ("end", callback_name),
+            ("end", "Application.native_pacing.callback"),
+        ] + [event for name in names for event in (
+            ("start", name), ("end", name)
+        )]
+        assert calls == ["callback", "physics"]
+        assert viewport.update_calls == [0.01]
+        assert viewport.render_calls == [0.0]
+    finally:
+        app._adapter_session = None
+        _release(app)

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 # Third-Party Notices
 
@@ -18,11 +11,14 @@ runtime / optional dependencies declared in this repository.
 NVIDIA's own license terms (see [README.md](README.md)) do **not** override
 the upstream licenses of these components - your use of each component is
 subject to its license. The full upstream license text for every
-redistributable component - including the C/C++ libraries (sections 1-2),
-the inlined pybind11 headers (section 3), and the bundled font and image
-assets (section 4) - is reproduced verbatim in this file so that downstream
-consumers can satisfy MIT/BSD/Apache/zlib/Boost/SIL-OFL/CC-BY/Unlicense
-attribution obligations without consulting external sources.
+redistributable open-source component - including the C/C++ libraries
+(sections 1-2), the inlined pybind11 headers (section 3), and the bundled font
+and image assets (section 4) - is reproduced verbatim in this file so that
+downstream consumers can satisfy
+MIT/BSD/Apache/zlib/Boost/SIL-OFL/CC-BY/Unlicense attribution obligations
+without consulting external sources. NVIDIA proprietary components are
+governed by their own license terms, which are referenced rather than
+reproduced here.
 
 If you discover a missing or incorrect attribution, please open an issue
 at <https://github.com/NVIDIA-Omniverse/ovui/issues>.
@@ -351,9 +347,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ## 3. External system prerequisites (`find_package` / runtime)
 
 These libraries and toolchain components are resolved from the host system
-at build or run time. They are not vendored in this repository and are not
-redistributed by `omni-ui`. They are listed here because they affect what
-downstream users must have installed to build or run `omni-ui`.
+at build or run time. They are not vendored in this repository. Apart from the
+CUDA runtime library described in the notes below, they are not redistributed
+by `omni-ui`. They are listed here because they affect what downstream users
+must have installed to build or run `omni-ui`.
 
 | Prerequisite | Pinned ref | License |
 |---|---|---|
@@ -362,13 +359,20 @@ downstream users must have installed to build or run `omni-ui`.
 | `glfw3` | 3.3 | Zlib |
 | `OpenGL` | (unpinned) | MIT (Khronos headers); vendor-licensed runtime ICD |
 | `PkgConfig` | (unpinned) | GPL-2.0-or-later (build-time tool, not redistributed) |
-| `pybind11` | (unpinned) | BSD-3-Clause |
+| `pybind11` | 2.11.1 | BSD-3-Clause |
 | `Python3` | (unpinned) | Python-2.0 (Python Software Foundation License v2) |
 | `Vulkan` | (unpinned) | Apache-2.0 (Khronos headers + LunarG/Khronos loader) |
 
 Notes:
 - **CUDAToolkit** is governed by the NVIDIA CUDA Toolkit EULA; it is an
-  NVIDIA proprietary prerequisite, not an OSS component.
+  NVIDIA proprietary prerequisite, not an OSS component. The Toolkit itself is
+  a build-time prerequisite and is not redistributed. One file from it is: the
+  CUDA runtime library (`cudart64_*.dll` / `libcudart.so.*`) ships inside the
+  `omni.ui` package, because the native backend imports it and a supported
+  machine has the NVIDIA driver without a Toolkit installation. Its terms are
+  the EULA's, which is referenced here rather than reproduced. The CUDA
+  *driver* library (`nvcuda.dll` / `libcuda.so.1`) is not redistributed; it
+  comes from the installed driver.
 - **Freetype** is dual-licensed under the FreeType License (FTL, a BSD-style
   license with a credit clause) or GPLv2. `omni-ui` builds against Freetype
   under the FTL option; the required credit line is in section 5. The
@@ -573,38 +577,129 @@ at install time and are not vendored.
 
 | Package | Required version | License |
 |---|---|---|
-| `cmake` | >=3.22 | Apache-2.0 OR BSD-3-Clause |
-| `pybind11` | >=2.11 | BSD-3-Clause |
-| `setuptools` | >=68.0 | MIT |
-| `wheel` | 0.47.0 | MIT |
+| `cmake` | >=3.22 | Apache-2.0 AND BSD-3-Clause |
+| `pybind11` | ==2.11.1 | BSD-3-Clause |
+| `setuptools` | >=84.0.0 (`ovui`), >=68 (all other packages) | MIT |
+| `wheel` | (unpinned) | MIT |
 
 ### 6b. Runtime / optional dependencies (declared)
 
 | Package | Version | License | Scope |
 |---|---|---|---|
-| `fastapi` | >=0.100.0 | MIT | runtime |
-| `httpx` | >=0.25.0 | BSD-3-Clause | runtime |
-| `python-multipart` | >=0.0.7 | Apache-2.0 | runtime |
-| `uvicorn` | >=0.23.0 | BSD-3-Clause | runtime |
-| `cmake` | (unpinned) | Apache-2.0 OR BSD-3-Clause | example |
-| `cuda-python` | 13.2.0 | LicenseRef-NVIDIA-SOFTWARE-LICENSE | optional:examples |
-| `numpy` | >=1.21 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | optional:examples |
-| `pybind11` | (unpinned) | BSD-3-Clause | example |
-| `setuptools` | 82.0.1 | MIT | example |
-| `usd-core` | 26.5 | LicenseRef-TOST-1.0 | example |
-| `wheel` | 0.47.0 | MIT | example |
+| `fastapi` | >=0.100.0 | MIT | runtime (inspector skill) |
+| `httpx` | >=0.25.0 | BSD-3-Clause | runtime (inspector skill) |
+| `pydantic` | >=2 | MIT | runtime (inspector skill) |
+| `python-multipart` | >=0.0.7 | Apache-2.0 | runtime (inspector skill) |
+| `uvicorn` | >=0.23.0 (`[standard]` extra) | BSD-3-Clause | runtime (inspector skill) |
+| `numpy` | >=1.20 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | runtime: `ovui-data-adapters-common`, `ovui-data-adapters-openusd`, `ovui-widgets-viewport` |
+| `numpy` | >=1.21 | (as above) | optional: `ovui[examples]` |
+| `numpy` | >=1.26 | (as above) | optional: `ovui-widgets-app[media]` |
+| `numpy` | (unpinned) | (as above) | optional: `ovui-widgets-common[testing]` |
+| `cuda-python` | (unpinned) | LicenseRef-NVIDIA-SOFTWARE-LICENSE (up to 13.3); Apache-2.0 (13.4 and later) | optional: `ovui[examples]` |
+| `usd-core` | ==25.11 | LicenseRef-TOST-1.0 | optional: `ovui-data-adapters-openusd[standalone]` |
 
 Notes:
-- `fastapi`, `httpx`, `python-multipart`, `uvicorn` are declared by the
-  `skills/omniverse-ui-inspector/` developer skill; they are not part of the
-  shipped `omni-ui` Python wheel.
-- `cuda-python` reports `LicenseRef-NVIDIA-SOFTWARE-LICENSE` (NVIDIA CUDA
-  Python license); it is an optional example-time dependency only.
+- `fastapi`, `httpx`, `pydantic`, `python-multipart`, `uvicorn` are declared
+  by the `skills/omniverse-ui-inspector/` developer skill; they are not part
+  of the shipped `omni-ui` Python wheel. The inspector command providers in
+  `ovui-widgets` import `pydantic` only when the inspector is in use.
+- `cuda-python` is unpinned, so its license depends on the installed release.
 - `usd-core` reports `LicenseRef-TOST-1.0` (Tomorrow Open Source Technology
-  License 1.0, the OpenUSD upstream license). Used only by example code in
-  `ovui-data-adapters/`.
+  License 1.0, the OpenUSD upstream license). It provides the OpenUSD Python
+  bindings for the `standalone` extra.
 - `numpy` is BSD-3-Clause with embedded files under 0BSD, MIT, Zlib, and
   CC0-1.0 (see numpy upstream LICENSE).
+
+### 6c. Optional packages that users install separately
+
+These packages are not bundled in any `ovui` wheel. They are installed from
+PyPI only when the user installs them or asks for the extra. Shipped `ovui`
+code uses them when they are present.
+
+| Package | Version | License | How it is used |
+|---|---|---|---|
+| `CairoSVG` | (not declared) | LGPL-3.0-or-later | `omni.ui.markdown_providers` (`svg.py`, `math.py`) rasterizes SVG to PNG if it is installed |
+| `imageio-ffmpeg` | >=0.6 | BSD-2-Clause | `ovui-widgets-app[media]` |
+| `ovstream` | (unpinned) | LicenseRef-NvidiaProprietary (NVIDIA package) | `ovui-widgets-app[media]`, `ovui-data-adapters-openusd[livestream]` |
+| `ovrtx` | (not declared) | LicenseRef-NvidiaProprietary (NVIDIA package) | renderer for `ovui-widgets` and `ovui-data-adapters` |
+| `ovstage` | (not declared) | LicenseRef-NvidiaProprietary (NVIDIA package) | runtime for `ovui-data-adapters-ovstage` |
+
+Note on FFmpeg: `imageio-ffmpeg` installs or downloads an FFmpeg executable.
+`ovui` does not distribute FFmpeg. Depending on where that FFmpeg build comes
+from, it can be licensed under the LGPL or the GPL. Check its license before
+you use or redistribute it.
+
+Note on CairoSVG: `ovui` does not distribute CairoSVG. It is licensed under
+the LGPL-3.0-or-later.
+
+NOTICE AND DISCLAIMER: This software automatically retrieves, accesses or interacts with external materials.  Those retrieved materials are not distributed with this software and are governed solely by separate terms, conditions and licenses.  You are solely responsible for finding, reviewing and complying with all applicable terms, conditions, and licenses, and for verifying the security, integrity and suitability of any retrieved materials for your specific use case. This software is provided "AS IS", without warranty of any kind. The author makes no representations or warranties regarding any retrieved materials, and assumes no liability for any losses, damages, liabilities or legal consequences from your use or inability to use this software or any retrieved materials. Use this software and the retrieved materials at your own risk.
+
+---
+
+## 7. Build, test and development tools (not distributed)
+
+The tools below are used only to build, test or develop `ovui`. They are
+**not distributed**: they are not part of any `ovui` wheel or release
+artifact. Only direct dependencies are listed.
+
+### 7a. Python
+
+| Package | Version | License | Used by |
+|---|---|---|---|
+| `pip` | (unpinned) | MIT | CI workflows (`build-app-wheelhouse.yml`) |
+| `build` | (unpinned) | MIT | CI workflows (`build-app-wheelhouse.yml`), Windows build recipe |
+| `ninja` | (unpinned) | Apache-2.0 | Windows build recipe (`ovui-widgets/WINDOWS-BUILD*.md`) |
+| `conan` | >=2.14 | MIT | `ovui/pyproject.toml` (build-system), SBOM |
+| conan-extensions `sbom` command | (default branch) | MIT | `ovui/setup.py` fetches it from <https://github.com/conan-io/conan-extensions> to generate the SBOM |
+| `cyclonedx-python-lib` | >=5.0.0,<6 | Apache-2.0 | `ovui/pyproject.toml` (build-system), SBOM |
+| `pytest` | >=7.0 (`ovui/requirements-test.txt`), >=7,<10 (CI), unpinned (`ovui-widgets-app[dev]`) | MIT | tests |
+| `pytest-forked` | >=1.4 | MIT | `ovui/requirements-test.txt` |
+| `pytest-asyncio` | >=0.21 | Apache-2.0 | `ovui/requirements-test.txt` |
+| `pytest-timeout` | >=2.1 | MIT | `ovui/requirements-test.txt` |
+| `pytest-cov` | >=5.0 | MIT | `ovui/requirements-test.txt` |
+| `numpy` | >=1.21 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | `ovui/requirements-test.txt` |
+| `Pillow` | >=9.0 | MIT-CMU | `ovui/requirements-test.txt`, Markdown quality harness |
+| `PyOpenGL` | >=3.1 | BSD-3-Clause (the wheel also bundles freeglut, MIT-style, and GLE, Artistic / IBM example license, for Windows) | `ovui/requirements-test.txt` |
+| `libcst` | (unpinned) | MIT AND PSF-2.0 AND Apache-2.0 | `ovui-widgets-app[dev]` |
+| `tomli` | (unpinned) | MIT | `ovui-widgets-app[dev]` |
+| `ruff` | (unpinned) | MIT | lint config in `ovui-widgets/pyproject.toml`, dev setup in `LIVESTREAM.md` |
+| `mypy` | (unpinned) | MIT | type-check config in `ovui-widgets/pyproject.toml`, dev setup in `LIVESTREAM.md` |
+| `scikit-image` | (unpinned) | BSD-3-Clause | Markdown quality harness (`compare.py`) |
+| `PyMuPDF` | (unpinned) | AGPL-3.0 or Artifex commercial license | Markdown quality harness (`generate_qa_ground_truth.py`) |
+| `Markdown` | (unpinned) | BSD-3-Clause | Markdown quality harness (`generate_qa_ground_truth.py`) |
+| `WeasyPrint` | (unpinned) | BSD-3-Clause | Markdown quality harness (`generate_qa_ground_truth.py`) |
+| `playwright` | (unpinned) | Apache-2.0 | Markdown quality harness (`render_oracle.py`) |
+| `ovphysx` | (not declared) | LicenseRef-NVIDIA-Omniverse (NVIDIA package) | optional import in `ovui-data-adapters` tests |
+
+CI workflows also pin `ovrtx` (==0.5.0.377615, ==0.5.1.385782), `ovstage`
+(==0.2.1.385922) and `ovstream` (==0.4.5) for tests; see section 6c.
+
+### 7b. JavaScript
+
+Two private npm projects under `ovui/markdown/quality_harness/` are used
+for Markdown tests and local showcases. Constraints are from their
+`package.json` files; locked versions are from their `package-lock.json`
+files. CI also runs one npm tool.
+
+| Package | Constraint (locked) | License | Used by |
+|---|---|---|---|
+| `@streamdown/code` | ^1.1.1 (1.1.1) | Apache-2.0 | `oracle` |
+| `@streamdown/math` | ^1.0.2 (1.0.2) | Apache-2.0 | `oracle` |
+| `react` | ^18.3.1 (18.3.1) | MIT | `oracle` |
+| `react-dom` | ^18.3.1 (18.3.1) | MIT | `oracle` |
+| `remark-github-blockquote-alert` | ^2.1.0 (2.1.0) | MIT | `oracle` |
+| `streamdown` | ^2.5.0 (2.5.0) | Apache-2.0 | `oracle` |
+| `@tailwindcss/typography` | ^0.5.15 (0.5.19) | MIT | `oracle` (dev) |
+| `@types/react` | ^18.3.12 (18.3.28) | MIT | `oracle` (dev) |
+| `@types/react-dom` | ^18.3.1 (18.3.7) | MIT | `oracle` (dev) |
+| `@vitejs/plugin-react` | ^4.3.4 (4.7.0) | MIT | `oracle` (dev) |
+| `autoprefixer` | ^10.4.20 (10.5.0) | MIT | `oracle` (dev) |
+| `postcss` | ^8.4.49 (8.5.10) | MIT | `oracle` (dev) |
+| `tailwindcss` | ^3.4.17 (3.4.19) | MIT | `oracle` (dev) |
+| `typescript` | ^5.6.3 (5.9.3) | Apache-2.0 | `oracle` (dev) |
+| `vite` | ^5.4.11 (5.4.21) | MIT | `oracle` (dev) |
+| `@mathjax/src` | ^4.0.0 (4.1.2) | Apache-2.0 | `providers` |
+| `@mermaid-js/mermaid-cli` | ^11.12.0 (11.12.0) | MIT | `providers` |
 
 ---
 

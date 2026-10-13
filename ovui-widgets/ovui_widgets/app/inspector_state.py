@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Read-only USD Viewer state captured by the ovui Inspector.
 
@@ -1918,6 +1911,32 @@ def _create_catalog_snapshot(app: Any) -> dict[str, Any]:
     }
 
 
+def _menu_item_labels(menu: Any) -> list[str]:
+    """The menu's entries, top to bottom, as the user reads them.
+
+    An observation oracle for tests that drive the menu with the mouse: the
+    row a label sits on is its index here, so an entry added above the one a
+    test clicks moves that test's row instead of silently redirecting its
+    click to a different command. ``ui.Separator`` is a text-less
+    ``MenuItem`` that adds no row, so it is left out.
+    """
+    try:
+        from omni import ui
+
+        children = list(ui.Inspector.get_children(menu))
+    except Exception:
+        return []
+    labels: list[str] = []
+    for child in children:
+        try:
+            text = str(getattr(child, "text", "") or "")
+        except (TypeError, ValueError):
+            continue
+        if text:
+            labels.append(text)
+    return labels
+
+
 def _menu_snapshot(app: Any) -> dict[str, Any]:
     top_levels: list[dict[str, Any]] = []
     for label, menu in (
@@ -1933,6 +1952,7 @@ def _menu_snapshot(app: Any) -> dict[str, Any]:
                 ),
                 "rect": rect,
                 "point": _rect_point(rect),
+                "items": _menu_item_labels(menu),
             }
         )
     registry = getattr(app, "_menu_registry", None)
@@ -1970,17 +1990,26 @@ def _component_snapshot(app: Any) -> dict[str, Any]:
     loaded: list[dict[str, Any]] = []
     for name, record in (getattr(manager, "_loaded", {}) or {}).items():
         handle = getattr(record, "handle", None)
+        if bool(getattr(handle, "inspector_hidden", False)):
+            continue
         loaded.append(
             {
                 "name": str(name),
                 "entry_point": str(getattr(getattr(record, "entry_point", None), "value", "") or ""),
                 "handle_type": type(handle).__name__ if handle is not None else "",
                 "handle_present": handle is not None,
+                "controller_count": len(getattr(handle, "controllers", ()) or ()),
+                "render_var_controller_count": len(
+                    getattr(handle, "render_var_controllers", ()) or ()
+                ),
+                "point_cloud_controller_count": len(
+                    getattr(handle, "point_cloud_controllers", ()) or ()
+                ),
             }
         )
     failures = getattr(manager, "failures", {}) if manager is not None else {}
     return {
-        "loaded_names": sorted(str(name) for name in (getattr(manager, "loaded_names", ()) or ())),
+        "loaded_names": sorted(item["name"] for item in loaded),
         "loaded": sorted(loaded, key=lambda item: item["name"]),
         "failures": {
             str(name): f"{type(exc).__name__}: {exc}"
@@ -1988,157 +2017,6 @@ def _component_snapshot(app: Any) -> dict[str, Any]:
         },
     }
 
-
-def _result_snapshot(result: Any) -> dict[str, Any] | None:
-    if result is None:
-        return None
-    request = getattr(result, "active_request", None)
-    return {
-        "accepted": bool(getattr(result, "accepted", False)),
-        "message": str(getattr(result, "message", "") or ""),
-        "warning_code": str(getattr(result, "warning_code", "") or ""),
-        "active_render_product_path": str(
-            getattr(result, "active_render_product_path", "") or ""
-        ),
-        "active_camera_path": str(
-            getattr(result, "active_camera_path", "") or ""
-        ),
-        "active_request": (
-            {
-                "viewport_id": str(getattr(request, "viewport_id", "") or ""),
-                "render_product_path": str(
-                    getattr(request, "render_product_path", "") or ""
-                ),
-                "output_id": str(getattr(request, "output_id", "") or ""),
-                "render_var_name": str(
-                    getattr(request, "render_var_name", "") or ""
-                ),
-            }
-            if request is not None
-            else None
-        ),
-    }
-
-
-def _frame_metadata(frame: Any) -> dict[str, Any] | None:
-    if frame is None:
-        return None
-    data = getattr(frame, "display_data", None)
-    if data is None:
-        data = getattr(frame, "coordinates", None)
-    shape = getattr(data, "shape", None)
-    warnings = tuple(getattr(frame, "warnings", ()) or ())
-    return {
-        "render_product_path": str(
-            getattr(frame, "render_product_path", "") or ""
-        ),
-        "output_id": str(getattr(frame, "output_id", "") or ""),
-        "render_var_name": str(getattr(frame, "render_var_name", "") or ""),
-        "width": int(getattr(frame, "width", 0) or 0),
-        "height": int(getattr(frame, "height", 0) or 0),
-        "dtype": str(getattr(frame, "dtype", "") or ""),
-        "component_count": int(getattr(frame, "component_count", 0) or 0),
-        "point_count": int(getattr(frame, "point_count", 0) or 0),
-        "valid_point_count": int(getattr(frame, "valid_point_count", 0) or 0),
-        "frame_index": int(getattr(frame, "frame_index", 0) or 0),
-        "stale": bool(getattr(frame, "stale", False)),
-        "shape": [int(value) for value in shape] if shape is not None else [],
-        "warning_count": len(warnings),
-        "warnings": [
-            {
-                "code": str(getattr(warning, "code", "") or ""),
-                "message": str(getattr(warning, "message", "") or ""),
-                "severity": str(
-                    _enum_value(getattr(warning, "severity", "")) or ""
-                ),
-            }
-            for warning in warnings
-        ],
-    }
-
-
-def _render_settings_window_snapshot(component: Any) -> dict[str, Any]:
-    if component is None:
-        return {"available": False, "window_visible": False, "rows": {}}
-    context = _safe_call(None, component.target_context)
-    window = getattr(component, "window", None)
-    native_window = getattr(window, "_window", None)
-    rows: dict[str, Any] = {}
-    for attr_name, record in (
-        getattr(window, "_inspector_provider_rows", {}) or {}
-    ).items():
-        row = record.get("row") if isinstance(record, dict) else None
-        adapter = record.get("adapter") if isinstance(record, dict) else None
-        widgets = list(getattr(row, "_widgets", ()) or ())
-        if not widgets:
-            widget = getattr(row, "_widget", None)
-            if widget is not None:
-                widgets = [widget]
-        rects = [_widget_rect(widget) for widget in widgets]
-        metadata = _safe_call(None, adapter.get_attribute_metadata, attr_name)
-        indicator = getattr(row, "_indicator", None)
-        indicator_widget = getattr(indicator, "widget", None)
-        row_widget = getattr(row, "_row_hstack", None)
-        row_rect = _widget_rect(row_widget)
-        context_menu = getattr(row, "_active_context_menu", None)
-        try:
-            from ovui_widgets.property.parts.attr_context_menu import (
-                inspector_menu_items,
-            )
-
-            raw_context_items = inspector_menu_items(context_menu)
-        except Exception:
-            raw_context_items = ()
-        context_items: list[dict[str, Any]] = []
-        for item_id, label, enabled, widget in raw_context_items:
-            item_rect = _widget_rect(widget)
-            context_items.append(
-                {
-                    "id": str(item_id),
-                    "label": str(label),
-                    "enabled": bool(enabled),
-                    "rect": item_rect,
-                    "point": _rect_point(item_rect),
-                }
-            )
-        rows[str(attr_name)] = {
-            "provider_id": str(record.get("provider_id", "")),
-            "display_name": str(getattr(metadata, "display_name", "") or ""),
-            "type_name": str(getattr(metadata, "type_name", "") or ""),
-            "group": str(getattr(metadata, "group", "") or ""),
-            "value": _json_value(_safe_call(None, adapter.get_value, attr_name)),
-            "field_rects": rects,
-            "field_points": [
-                point for point in (_rect_point(rect) for rect in rects) if point is not None
-            ],
-            "field_enabled": [
-                bool(getattr(widget, "enabled", True)) for widget in widgets
-            ],
-            "indicator_rect": _widget_rect(indicator_widget),
-            "indicator_point": _rect_point(_widget_rect(indicator_widget)),
-            "row_rect": row_rect,
-            "context_menu_point": _rect_point(row_rect),
-            "context_menu": {
-                "shown": bool(
-                    getattr(context_menu, "shown", False)
-                    or getattr(context_menu, "visible", False)
-                ),
-                "rect": _widget_rect(context_menu),
-                "items": context_items,
-            },
-        }
-    window_rect = _widget_rect(native_window)
-    return {
-        "available": context is not None,
-        "active_render_product_path": str(
-            getattr(context, "render_product_path", "") or ""
-        ),
-        "window_created": window is not None,
-        "window_visible": bool(getattr(native_window, "visible", False)),
-        "window_rect": window_rect,
-        "window_point": _rect_point(window_rect),
-        "rows": rows,
-    }
 
 
 def _physics_snapshot(app: Any) -> dict[str, Any]:
@@ -2318,6 +2196,11 @@ def _renderer_snapshot(app: Any, scene: Any) -> dict[str, Any]:
         "selection_outline_attribute_writes": int(
             getattr(renderer, "_selection_outline_attribute_writes", 0) or 0
         ),
+        # Renderer presentation-membership writes are counted separately
+        # from the foreign data-plane counter, which stays zero in BORROW mode.
+        "selection_outline_reserved_writes": int(
+            getattr(renderer, "_selection_outline_reserved_writes", 0) or 0
+        ),
         "live_preview_write_count": int(
             getattr(renderer, "_live_preview_write_count", 0) or 0
         ),
@@ -2387,11 +2270,37 @@ def _renderer_snapshot(app: Any, scene: Any) -> dict[str, Any]:
         # on older ovrtx) and a single flag misrepresented working legacy
         # outlines as unsupported.
         "selection_outline": {
+            "requested_paths": [
+                str(path)
+                for path in (getattr(renderer, "_selected_paths", ()) or ())
+            ],
             "applied_paths": sorted(
                 str(path)
                 for path in (
                     getattr(renderer, "_selection_outline_previous_paths", ()) or ()
                 )
+            ),
+            "pending_paths": sorted(
+                set(str(path) for path in (getattr(renderer, "_selected_paths", ()) or ()))
+                - set(
+                    str(path)
+                    for path in (
+                        getattr(renderer, "_selection_outline_previous_paths", ())
+                        or ()
+                    )
+                )
+            ),
+            "stale_cleanup_paths": sorted(
+                str(path)
+                for path in (
+                    getattr(renderer, "_selection_outline_stale_paths", ()) or ()
+                )
+            ),
+            "generation": int(
+                getattr(renderer, "_selection_outline_generation", 0) or 0
+            ),
+            "last_write": _json_value(
+                getattr(renderer, "_selection_outline_last_write", {}) or {}
             ),
         },
         "point_cloud_request_count": len(
@@ -3314,6 +3223,34 @@ def _parity_snapshot(
     }
 
 
+def _attach_runtime_infrastructure_paths(
+    native_snapshot: dict[str, Any], stage_adapter: Any
+) -> None:
+    """Expose the PRODUCT's user-facing classification next to the paths.
+
+    The stage adapter deliberately hides population-owned runtime
+    infrastructure (its ``_is_user_facing_scene_path`` contract:
+    presentation roots, /TempChangeTracking, /omni_rtx_loadingStatePrim,
+    and a population-born /Render graph) while user-authored content —
+    including a user-born /Render subtree — stays user-facing. QA
+    consistency checks consume this classification instead of guessing,
+    so a missing user-authored path is a detected regression while hidden
+    runtime infrastructure is not a false positive."""
+
+    classifier = getattr(stage_adapter, "_is_user_facing_scene_path", None)
+    if not callable(classifier) or not native_snapshot.get("available"):
+        return
+    hidden: list[str] = []
+    for path in native_snapshot.get("paths", ()):
+        try:
+            user_facing = bool(classifier(path))
+        except Exception:
+            continue
+        if not user_facing:
+            hidden.append(str(path))
+    native_snapshot["runtime_infrastructure_paths"] = sorted(hidden)
+
+
 def capture_application_state(app: Any) -> dict[str, Any]:
     """Return the complete read-only state used by Inspector QA assertions."""
 
@@ -3324,6 +3261,7 @@ def capture_application_state(app: Any) -> dict[str, Any]:
     adapter_snapshot = _adapter_hierarchy_snapshot(stage_adapter)
     usd_snapshot = _usd_stage_snapshot(usd_stage, scene, evidence_provider)
     native_snapshot = _ovstage_snapshot(scene, evidence_provider)
+    _attach_runtime_infrastructure_paths(native_snapshot, stage_adapter)
     transform_snapshot = _transform_snapshot(app, usd_snapshot, native_snapshot)
     layer_snapshot = _layer_snapshot(getattr(app, "_layer_adapter", None))
     backing_layer_snapshot = _backing_layer_snapshot(

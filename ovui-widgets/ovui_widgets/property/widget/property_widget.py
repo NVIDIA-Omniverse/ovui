@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Abstract ``PropertyWidget`` base class.
 
@@ -83,6 +76,31 @@ class PropertyWidget(ABC):
         ``finally`` cleanup in the body runs on widget teardown.
         """
         return None
+
+    def build_pre_filter_items(self) -> None:
+        """Contribute chrome above the host window's filter bar.
+
+        Default is a no-op, so the ordinary property panel renders
+        exactly as before. The host window opens its pre-filter
+        contribution container as the ambient ``with`` scope before
+        calling this hook on every widget the scheme registry selected
+        for the current payload — a scheme whose chrome must sit above
+        the shared Search field (for example a scheme-supplied target
+        selector) emits it here instead of duplicating the window's
+        filter bar or content stack. Contributions are plain data-driven
+        widgets; the window still owns filtering, scrolling, styling,
+        and rebuild scheduling.
+        """
+
+    def build_filter_accessory_items(self) -> None:
+        """Contribute chrome beside the host window's filter field.
+
+        Default is a no-op. Same contract as
+        :meth:`build_pre_filter_items` but the ambient container sits in
+        the filter-bar row immediately after the shared Search pill, so
+        schemes can add compact accessories (an options button, a status
+        glyph) without building a second SearchField or filter row.
+        """
 
     def request_rebuild(self) -> None:
         """Schedule a deferred rebuild of this widget.

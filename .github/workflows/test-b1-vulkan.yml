@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+# SPDX-License-Identifier: Apache-2.0
 #
 # B1 — pytest under headless Vulkan + Mesa Lavapipe (no GPU).
 # Runs the Python test suite against the standalone Vulkan backend on

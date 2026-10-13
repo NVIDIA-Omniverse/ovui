@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/ImageProvider/VectorImageProvider.h>
@@ -139,5 +132,26 @@ size_t VectorImageProvider::getMaxMipLevels() const
     return m_maxMipLevels;
 }
 
+}
+}
+
+namespace omni::ui
+{
+bool VectorImageProvider::_rasterizeSVG(const std::string& filePath, int width, int height)
+{
+    auto* rasterizer = PlatformRegistry::instance().svgRasterizer();
+    TextureOptions options{};
+    if (!rasterizer || !mergeTextureOptions(options))
+        return false;
+
+    auto result = rasterizer->rasterize(filePath, static_cast<float>(width), static_cast<float>(height), getMaxMipLevels(), options);
+    if (!result.success)
+        return false;
+
+    if (!m_cacheKey.empty())
+        rasterizer->releaseGpuResource(m_cacheKey);
+    m_cacheKey = std::move(result.cacheKey);
+    setImageData(result.imGuiReference, result.imageSize, result.imageFormat);
+    return true;
 }
 }

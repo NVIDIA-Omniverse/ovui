@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ovui-inspect -- zero-dependency CLI client for the ovui inspector."""
 
@@ -249,11 +242,22 @@ def _exit_code(data) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="ovui-inspect", description="ovui Inspector CLI")
+def main(
+    argv: list[str] | None = None,
+    *,
+    prog: str = "ovui-inspect",
+    description: str = "ovui Inspector CLI",
+) -> int:
+    """Run the CLI; a product front end may present it under its own name."""
+    parser = argparse.ArgumentParser(prog=prog, description=description)
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("health")
     sub.add_parser("status")
+    sub.add_parser("commands", help="Discover the attached application's additional commands and schemas")
+    call_cmd = sub.add_parser("call", help="Invoke an application command through the Inspector frame loop")
+    call_cmd.add_argument("name")
+    call_cmd.add_argument("--arguments", default="{}", help="JSON argument object; see commands")
+    call_cmd.add_argument("--timeout", type=float, default=30.0)
     state_cmd = sub.add_parser(
         "state",
         help="Read QA application state (requires OVUIINSPECT_ENABLE_STATE=1)",
@@ -308,6 +312,12 @@ def main(argv: list[str] | None = None) -> int:
     ex.add_argument("code")
     ex.add_argument("--timeout", type=float, default=10.0)
     sub.add_parser("shutdown")
+    # Input verbs advance one step per UI frame; slow frames need a longer budget.
+    for verb, default in ((mv, 5.0), (ck, 5.0), (dg, 10.0), (sc, 5.0), (ty, 5.0), (pr, 5.0), (co, 5.0)):
+        verb.add_argument(
+            "--timeout", type=float, default=default,
+            help="seconds to wait for the frame loop to finish the input sequence",
+        )
 
     args = parser.parse_args(argv)
     if not args.command:
@@ -318,6 +328,16 @@ def main(argv: list[str] | None = None) -> int:
         result = health()
     elif args.command == "status":
         result = status()
+    elif args.command == "commands":
+        result = _get("/commands")
+    elif args.command == "call":
+        try:
+            arguments = json.loads(args.arguments)
+            if not isinstance(arguments, dict):
+                raise ValueError("arguments must be a JSON object")
+        except ValueError as exc:
+            parser.error(str(exc))
+        result = _post(f"/commands/{args.name}?timeout={args.timeout}", arguments, timeout=args.timeout + 5)
     elif args.command == "state":
         result = application_state(args.timeout)
         if args.out and isinstance(result, dict) and result.get("success"):
@@ -332,10 +352,13 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "screenshot":
         result = screenshot(args.out, args.format, args.timeout)
     elif args.command == "move":
-        result = move(args.x, args.y)
+        result = move(args.x, args.y, timeout=args.timeout)
     elif args.command == "click":
         modifiers = [m.strip() for m in args.modifiers.split(",")] if args.modifiers else None
-        result = click(args.x, args.y, button=args.button, double=args.double, modifiers=modifiers)
+        result = click(
+            args.x, args.y, button=args.button, double=args.double, modifiers=modifiers,
+            timeout=args.timeout,
+        )
     elif args.command == "drag":
         modifiers = [m.strip() for m in args.modifiers.split(",")] if args.modifiers else None
         result = drag(
@@ -347,16 +370,17 @@ def main(argv: list[str] | None = None) -> int:
             steps=args.steps,
             duration=args.duration,
             modifiers=modifiers,
+            timeout=args.timeout,
         )
     elif args.command == "scroll":
-        result = scroll(args.direction, amount=args.amount, x=args.x, y=args.y)
+        result = scroll(args.direction, amount=args.amount, x=args.x, y=args.y, timeout=args.timeout)
     elif args.command == "type":
-        result = type_text(args.text)
+        result = type_text(args.text, timeout=args.timeout)
     elif args.command == "press":
         modifiers = [m.strip() for m in args.modifiers.split(",")] if args.modifiers else None
-        result = press(args.key, modifiers)
+        result = press(args.key, modifiers, timeout=args.timeout)
     elif args.command == "combo":
-        result = combo(args.combo)
+        result = combo(args.combo, timeout=args.timeout)
     elif args.command == "execute":
         result = execute(args.code, args.timeout)
     elif args.command == "shutdown":

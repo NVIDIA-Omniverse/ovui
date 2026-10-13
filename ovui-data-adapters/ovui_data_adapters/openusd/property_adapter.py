@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """USD-backed PropertyAdapter: attribute enumeration, get/set value, and undo.
 
@@ -31,8 +24,8 @@ from ovui_data_adapters.common import (
     AdapterCapability,
     AttributeMetadata,
     Command,
-    PropertyCapabilities,
     PropertyAdapter,
+    PropertyCapabilities,
     UndoManagerProtocol,
 )
 
@@ -113,6 +106,18 @@ _VALUE_TYPE_TO_PYTHON: Dict[str, Any] = {
 _VECTOR_VALUE_TYPES = frozenset({
     "float2", "float3", "float4", "color3f", "color4f",
     "int2", "int3", "int4",
+})
+
+# Types rendered by Property Inspector drag controls.  Their USD opinions need
+# to be authored during an edit so renderer and viewport consumers can show
+# live feedback while the pointer is still held.  Text-like fields retain the
+# buffered default: loading an asset or token for every intermediate keystroke
+# is both wasteful and potentially disruptive.
+_DRAGGABLE_VALUE_TYPES = frozenset({
+    "float", "int",
+    "float2", "float3", "float4", "color3f", "color4f",
+    "int2", "int3", "int4",
+    "matrix2d", "matrix3d", "matrix4d",
 })
 
 _NAMESPACE_GROUP_MAP: Dict[str, str] = {
@@ -750,6 +755,10 @@ class UsdPropertyAdapter(PropertyAdapter):
             type_name=type_name,
             value_type=python_type,
             group=prop.group_name,
+            # Numeric drag controls are write-through so scheduled USD change
+            # notices reach the renderer on frames during the drag.  The
+            # adapter's begin/end transaction still records one undo command.
+            change_on_edit_end=prop.value_type not in _DRAGGABLE_VALUE_TYPES,
             allowed_values=allowed_values,
             is_big_array=is_big_array,
             soft_range_min=soft_min,

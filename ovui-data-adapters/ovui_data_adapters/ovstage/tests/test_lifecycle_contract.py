@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION is strictly
-# prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Native OVStage scene construction, replacement, and ownership contracts."""
 
@@ -109,6 +102,45 @@ def test_population_waits_before_frame_commit_and_scene_readiness() -> None:
     scene.shutdown()
     assert events.count("stage.destroy") == 1
     assert scene.is_open is False
+
+
+def test_https_scene_identifier_reaches_native_population_unchanged() -> None:
+    populated_paths: list[str] = []
+    operation = _PopulationOperation([])
+
+    class Stage:
+        def __init__(self, name=None):
+            self.current_ordinal = 0
+            self._inst = True
+
+        def begin_frame(self):
+            return 1
+
+        def end_frame(self, ordinal):
+            self.current_ordinal = int(ordinal)
+
+        def get_child_paths(self, parent):
+            return ()
+
+        def destroy(self):
+            self._inst = False
+
+    population = ModuleType("population")
+
+    def open_usd_async(stage, path, ordinal):
+        populated_paths.append(path)
+        return operation
+
+    population.open_usd_async = open_usd_async
+    remote_url = "https://example.com/scenes/remote.usda"
+    scene = _scene.open_scene_from_file(
+        runtime=_runtime(Stage, population),
+        path=remote_url,
+    )
+    try:
+        assert populated_paths == [remote_url]
+    finally:
+        scene.shutdown()
 
 
 def test_failed_population_ends_frame_and_preserves_cleanup_diagnostics() -> None:
@@ -246,6 +278,45 @@ def _session(events: list[str]) -> OvstageProviderSession:
     session = OvstageProviderSession(runtime=object())
     session.physics_controls = _Physics(events)
     return session
+
+
+def test_native_dirty_worker_persists_across_scene_replacement(monkeypatch) -> None:
+    events: list[str] = []
+
+    class _Worker:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    worker = _Worker()
+    monkeypatch.setattr(provider, "_create_native_dirty_worker", lambda: worker)
+    first = _ProviderScene("first", events)
+    second = _ProviderScene("second", events)
+    candidates = [first, second]
+    received_workers: list[object] = []
+
+    def open_candidate(**kwargs):
+        received_workers.append(kwargs["native_dirty_worker"])
+        return candidates.pop(0)
+
+    monkeypatch.setattr(provider, "open_scene_from_file", open_candidate)
+    session = OvstageProviderSession(runtime=object())
+    session.physics_controls = _Physics(events)
+
+    session.open_stage("first.usda")
+    session.open_stage("second.usda")
+
+    assert received_workers == [worker, worker]
+    assert first.shutdown_calls == 1
+    assert worker.close_calls == 0
+
+    session.shutdown_scene()
+    session.close()
+
+    assert second.shutdown_calls == 1
+    assert worker.close_calls == 1
 
 
 def test_successful_replacement_installs_candidate_after_old_close(monkeypatch) -> None:
@@ -626,6 +697,7 @@ def test_stale_scene_close_cannot_close_current_replacement() -> None:
 def test_exact_runtime_lifecycle_subprocess_stays_forbidden_module_free(
     tmp_path: Path,
 ) -> None:
+    result_prefix = "OVUI_LIFECYCLE_RESULT:"
     scene_path = tmp_path / "lifecycle.usda"
     scene_path.write_text(
         '#usda 1.0\n\ndef Xform "World"\n{\n    def Cube "Item" {}\n}\n'
@@ -665,18 +737,31 @@ assert session.current_scene is scene
 session.shutdown_scene()
 session.shutdown_scene()
 loaded = sorted(name for name in sys.modules if any(name == root or name.startswith(root + ".") for root in forbidden))
-print(json.dumps({"attempts": blocker.attempts, "loaded": loaded, "failed": failed, "open": scene.is_open}))
+print(sys.argv[3] + json.dumps({"attempts": blocker.attempts, "loaded": loaded, "failed": failed, "open": scene.is_open}))
 '''
     env = os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     result = subprocess.run(
-        [sys.executable, "-c", code, str(scene_path), str(missing_path)],
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(scene_path),
+            str(missing_path),
+            result_prefix,
+        ],
         check=True,
         capture_output=True,
         text=True,
         env=env,
     )
-    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    marked_results = [
+        line.removeprefix(result_prefix)
+        for line in result.stdout.splitlines()
+        if line.startswith(result_prefix)
+    ]
+    assert len(marked_results) == 1, result.stdout
+    payload = json.loads(marked_results[0])
     assert payload == {
         "attempts": [],
         "loaded": [],

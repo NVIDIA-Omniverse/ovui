@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """NVRTC-compiled in-place R/B channel-swap kernel.
 
@@ -71,7 +64,21 @@ void swap_rb_in_place(unsigned char* p, int w, int h, unsigned long long pitch)
     pixel[0] = pixel[2];
     pixel[2] = tmp;
 }
+
+extern "C" __global__
+void copy_swap_rb(const unsigned char* src, unsigned long long src_pitch,
+                  unsigned char* dst, unsigned long long dst_pitch, int w, int h)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    unsigned int p = *(const unsigned int*)(src + (unsigned long long)y * src_pitch + (unsigned long long)x * 4);
+    *(unsigned int*)(dst + (unsigned long long)y * dst_pitch + (unsigned long long)x * 4) =
+        (p & 0xFF00FF00u) | ((p & 0xFFu) << 16) | ((p >> 16) & 0xFFu);
+}
 """
+
+_COPY_KERNEL_NAME = b"copy_swap_rb"
 
 
 class CudaSwapError(RuntimeError):
@@ -316,12 +323,26 @@ _state_lock = threading.Lock()
 _cached: dict = {}
 
 
+_driver = None
+
+
+def _shared_driver() -> _Driver:
+    """One driver binding per process; cuInit runs once, not on every launch."""
+    global _driver
+    if _driver is None:
+        with _state_lock:
+            if _driver is None:
+                driver = _Driver()
+                driver.init()
+                _driver = driver
+    return _driver
+
+
 def _ensure_compiled() -> dict:
     """Return the kernel state bound to this thread's current CUDA context."""
-    driver = _Driver()
-    driver.init()
+    driver = _shared_driver()
     driver.ensure_context()
-    cache_key = ("v1", driver.current_context())
+    cache_key = ("v2", driver.current_context())
     cached = _cached.get(cache_key)
     if cached is not None:
         return cached
@@ -337,6 +358,7 @@ def _ensure_compiled() -> dict:
             "driver": driver,
             "module": module,
             "func": func,
+            "copy_func": driver.get_function(module, _COPY_KERNEL_NAME),
             "ptx": ptx,
         }
         _cached[cache_key] = cached
@@ -398,3 +420,32 @@ def swap_rb_in_place(
     pi_val = ctypes.c_uint64(int(pitch))
 
     driver.launch(func, grid, block, [p_val, w_val, h_val, pi_val], stream=stream)
+
+
+def copy_swap_rb(
+    src_ptr: int,
+    src_pitch: int,
+    dst_ptr: int,
+    dst_pitch: int,
+    width: int,
+    height: int,
+    stream: int = 0,
+) -> None:
+    """Copy a pitched RGBA8 device image to ``dst`` as BGRA8, in one kernel on ``stream``.
+
+    Replaces a D2D copy followed by :func:`swap_rb_in_place`: one read and one write per pixel,
+    queued on the caller's stream (asynchronous on host and device).
+    """
+    if width <= 0 or height <= 0:
+        return
+    if src_pitch < width * 4 or dst_pitch < width * 4:
+        raise ValueError(f"pitches ({src_pitch}, {dst_pitch}) must be >= width*4 ({width * 4})")
+    state = _ensure_compiled()
+    block = (32, 8, 1)
+    grid = (((width + 31) // 32), ((height + 7) // 8), 1)
+    args = [
+        ctypes.c_uint64(int(src_ptr)), ctypes.c_uint64(int(src_pitch)),
+        ctypes.c_uint64(int(dst_ptr)), ctypes.c_uint64(int(dst_pitch)),
+        ctypes.c_int(int(width)), ctypes.c_int(int(height)),
+    ]
+    state["driver"].launch(state["copy_func"], grid, block, args, stream=stream)

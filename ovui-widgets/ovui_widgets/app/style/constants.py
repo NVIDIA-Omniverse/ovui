@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Layout and sizing constants (OvGear design system, design-system style rules).
 
@@ -41,7 +34,7 @@ fl.shade(8.0, light=4.0, name="spacing_medium")
 fl.shade(16.0, light=8.0, name="spacing_large")
 
 # ---------------------------------------------------------------------------
-# Font sizes — fixed across themes. The design-reference correction scales the
+# Font sizes — fixed across themes. The design reference scales the
 # previous ladder up by 25% and rounds to whole pixels.
 # ---------------------------------------------------------------------------
 BASE_FONT_SIZE = 18.0

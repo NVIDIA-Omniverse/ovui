@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for CameraController — Step 41."""
 
@@ -62,6 +55,34 @@ class TestGetMatrices:
         cam = CameraController()
         _, proj = cam.get_matrices(1280, 720)
         assert proj[3, 2] == pytest.approx(-1.0)
+
+    def test_orthographic_projection_removes_depth_dependent_scale(self):
+        cam = CameraController()
+        assert cam.set_projection_mode("orthographic") is True
+        _, proj = cam.get_matrices(1280, 720)
+
+        near_point = np.array([1.0, 0.0, -2.0, 1.0], dtype=np.float32)
+        far_point = np.array([1.0, 0.0, -20.0, 1.0], dtype=np.float32)
+        near_clip = proj @ near_point
+        far_clip = proj @ far_point
+
+        assert proj[3, 3] == pytest.approx(1.0)
+        assert proj[3, 2] == pytest.approx(0.0)
+        assert near_clip[0] / near_clip[3] == pytest.approx(
+            far_clip[0] / far_clip[3]
+        )
+
+    def test_projection_switch_restores_perspective_divide(self):
+        cam = CameraController()
+        assert cam.set_projection_mode("orthographic") is True
+        assert cam.set_projection_mode("invalid") is False
+        assert cam.projection_mode == "orthographic"
+        assert cam.set_projection_mode("perspective") is True
+
+        _, proj = cam.get_matrices(1280, 720)
+
+        assert proj[3, 2] == pytest.approx(-1.0)
+        assert proj[3, 3] == pytest.approx(0.0)
 
 
 class TestOrbit:
@@ -264,3 +285,37 @@ class TestPerspective:
         proj_narrow = _perspective(math.radians(30), 1.0, 0.01, 1000.0)
         proj_wide = _perspective(math.radians(90), 1.0, 0.01, 1000.0)
         assert proj_narrow[1, 1] > proj_wide[1, 1]
+
+
+class TestExactPolePoses:
+    """Authored top/bottom cameras navigate in the orientation they render."""
+
+    @staticmethod
+    def _screen_basis(cam):
+        view, _projection = cam.get_matrices(640, 360)
+        return np.asarray(view[0, :3]), np.asarray(view[1, :3])
+
+    @pytest.mark.parametrize("up_axis", ["Z", "Y"])
+    @pytest.mark.parametrize("pole", [1.0, -1.0])
+    @pytest.mark.parametrize("noise", [0.0, 1.0e-9, -1.0e-9])
+    def test_pan_basis_matches_the_rendered_image(self, up_axis, pole, noise):
+        cam = CameraController()
+        vertical = 2 if up_axis == "Z" else 1
+        eye = [noise, -noise, noise]
+        eye[vertical] = 10.0 * pole
+        cam.set_pose(eye, [0.0, 0.0, 0.0], up_axis=up_axis)
+        rendered_right, rendered_up = self._screen_basis(cam)
+        pan_right, pan_up = cam._get_pan_basis()
+        assert np.dot(rendered_right, pan_right) > 0.99
+        assert np.dot(rendered_up, pan_up) > 0.99
+
+    @pytest.mark.parametrize("up_axis", ["Z", "Y"])
+    def test_first_orbit_from_a_top_view_does_not_flip_the_image(self, up_axis):
+        cam = CameraController()
+        eye = [0.0, 0.0, 10.0] if up_axis == "Z" else [0.0, 10.0, 0.0]
+        cam.set_pose(eye, [0.0, 0.0, 0.0], up_axis=up_axis)
+        before_right, before_up = self._screen_basis(cam)
+        cam.orbit(0.0, -0.01)
+        after_right, after_up = self._screen_basis(cam)
+        assert np.dot(before_right, after_right) > 0.9
+        assert np.dot(before_up, after_up) > 0.9

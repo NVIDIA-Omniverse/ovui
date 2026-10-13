@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Persistent application settings.
 
@@ -18,6 +11,7 @@ and process singleton wiring on the widget/app side.
 
 from __future__ import annotations
 
+import json
 import math
 from typing import Any, Mapping, Optional
 
@@ -26,11 +20,17 @@ from ovui_data_adapters.services.settings import Subscription
 
 _MISSING = object()
 
-# Kit-compatible main run-loop FPS cap. Canonical path from Kit's
+# Optional Kit-compatible main run-loop FPS cap. Canonical path from Kit's
 # omni.kit.loop-default (RunLoopRunner.cpp: "/app/runLoops" +
-# "/main/rateLimitFrequency"); Kit ships 120 in its extension.toml.
+# "/main/rateLimitFrequency"). USD Viewer is uncapped unless the user authors
+# a positive finite value.
 RATE_LIMIT_FPS_SETTING_KEY = "app.runLoops.main.rateLimitFrequency"
-DEFAULT_RATE_LIMIT_FPS = 120.0
+DEFAULT_RATE_LIMIT_FPS: Optional[float] = None
+_LEGACY_DEFAULT_RATE_LIMIT_FPS = 120.0
+_UNCAPPED_RATE_LIMIT_MIGRATION_KEY = "app.migrations.uncappedRateLimitDefaultV1"
+RENDER_FLOW_MODE_SETTING_KEY = "app.renderer.flowMode"
+DEFAULT_RENDER_FLOW_MODE = "nativePacing"
+RENDER_FLOW_MODES = frozenset({"fast", "nativePacing"})
 
 
 def valid_rate_limit_fps(value: Any, default: Optional[float]) -> Optional[float]:
@@ -53,7 +53,11 @@ def valid_rate_limit_fps(value: Any, default: Optional[float]) -> Optional[float
 
 
 def _rate_limit_fps_is_valid(value: Any) -> bool:
-    return valid_rate_limit_fps(value, default=None) is not None
+    return value is None or valid_rate_limit_fps(value, default=None) is not None
+
+
+def _render_flow_mode_is_valid(value: Any) -> bool:
+    return isinstance(value, str) and value in RENDER_FLOW_MODES
 
 
 # Per-key write validators enforced at the store boundary (runtime ``set``,
@@ -64,14 +68,25 @@ def _rate_limit_fps_is_valid(value: Any) -> bool:
 # persisted baseline.
 _KEY_VALIDATORS: dict = {
     RATE_LIMIT_FPS_SETTING_KEY: _rate_limit_fps_is_valid,
+    RENDER_FLOW_MODE_SETTING_KEY: _render_flow_mode_is_valid,
 }
 
 _DEFAULTS: dict = {
     "ui.theme": "dark",
     "app.recent_files": [],
-    # Kit-compatible main run-loop FPS cap (omni.kit.loop-default's
-    # /app/runLoops/main/rateLimitFrequency; Kit ships 120).
-    "app.runLoops.main.rateLimitFrequency": 120.0,
+    "app.window.width": 1280,
+    "app.window.height": 720,
+    "app.window.x": None,
+    "app.window.y": None,
+    "app.renderer.backend": "vk",
+    RENDER_FLOW_MODE_SETTING_KEY: DEFAULT_RENDER_FLOW_MODE,
+    # No factory cap. A positive finite authored value opts the UI and
+    # viewport-render loops into the Kit-compatible rate limit.
+    "app.runLoops.main.rateLimitFrequency": None,
+    # A saved marker distinguishes profiles already upgraded from the former
+    # factory 120 FPS value. Without it, a later user-authored 120 would be
+    # indistinguishable from the legacy default on the next launch.
+    _UNCAPPED_RATE_LIMIT_MIGRATION_KEY: True,
     "layout.save_path": "~/.ovgear/layout.json",
     "viewport.camera.fov": 45.0,
     "viewport.camera.near": 0.1,
@@ -135,6 +150,9 @@ class Settings(_SettingsBase):
         cls._instance = settings
 
     def __init__(self) -> None:
+        self._explicit_keys: set[str] = set()
+        self._loading_persisted = False
+        self._migrate_legacy_rate_limit = False
         super().__init__(_DEFAULTS)
         # Launch-local override values (``--/path/to/key=value`` on the app
         # command line). They win over defaults and persisted values for
@@ -172,6 +190,7 @@ class Settings(_SettingsBase):
                 continue
             old_visible = self.get(key, _MISSING)
             self._launch_overrides[key] = value
+            self._explicit_keys.add(key)
             if old_visible is _MISSING or old_visible != value:
                 for cb in list(self._subscribers.get(key, [])):
                     cb(key, value)
@@ -185,8 +204,26 @@ class Settings(_SettingsBase):
         # Per-key validation happens before any state changes hands, so an
         # invalid write cannot pop a launch-local overlay or replace a valid
         # persisted value — visible/effective/persisted state stay coherent.
+        if (
+            self._loading_persisted
+            and self._migrate_legacy_rate_limit
+            and key == RATE_LIMIT_FPS_SETTING_KEY
+            and value == _LEGACY_DEFAULT_RATE_LIMIT_FPS
+        ):
+            # Releases before the uncapped default persisted the old factory
+            # 120 value into otherwise untouched profiles. It was already
+            # classified as non-explicit, so migrate it to the new uncapped
+            # factory state rather than silently turning it into an opt-in cap.
+            value = DEFAULT_RATE_LIMIT_FPS
         if self._rejects(key, value):
             return
+        persisted_factory_rate = (
+            self._loading_persisted
+            and key == RATE_LIMIT_FPS_SETTING_KEY
+            and value == DEFAULT_RATE_LIMIT_FPS
+        )
+        if not persisted_factory_rate:
+            self._explicit_keys.add(key)
         override = self._launch_overrides.pop(key, _MISSING)
         if override is _MISSING:
             super().set(key, value)
@@ -199,10 +236,36 @@ class Settings(_SettingsBase):
             for cb in list(self._subscribers.get(key, [])):
                 cb(key, value)
 
+    def is_explicit(self, key: str) -> bool:
+        """Whether launch, persisted, or runtime state authored ``key``."""
+        return key in self._explicit_keys
+
+    def load_from_file(self, path: str) -> None:
+        """Load persisted state and perform the bounded legacy-rate migration."""
+        with open(path, encoding="utf-8") as stream:
+            persisted = json.load(stream)
+        migrate_legacy_rate_limit = (
+            persisted.get(_UNCAPPED_RATE_LIMIT_MIGRATION_KEY) is not True
+        )
+        self._loading_persisted = True
+        self._migrate_legacy_rate_limit = migrate_legacy_rate_limit
+        try:
+            super().load_from_file(path)
+        finally:
+            self._loading_persisted = False
+            self._migrate_legacy_rate_limit = False
+        if migrate_legacy_rate_limit:
+            # Persisted on the next normal save. Once present, a genuine
+            # user-authored 120 FPS value is no longer reinterpreted.
+            self._data[_UNCAPPED_RATE_LIMIT_MIGRATION_KEY] = True
+
 
 __all__ = [
+    "DEFAULT_RENDER_FLOW_MODE",
     "DEFAULT_RATE_LIMIT_FPS",
     "RATE_LIMIT_FPS_SETTING_KEY",
+    "RENDER_FLOW_MODES",
+    "RENDER_FLOW_MODE_SETTING_KEY",
     "Settings",
     "Subscription",
     "valid_rate_limit_fps",

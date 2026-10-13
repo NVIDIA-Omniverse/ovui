@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Standalone equivalent of the Kit OmniUiTest base class.
@@ -49,17 +42,19 @@ def _backend_tag() -> str:
     The tag selects which sibling golden directory under ``tests/golden/``
     a test compares against:
 
-    - ``"vulkan"`` — headless Vulkan compositor (OMNIUI_HEADLESS=1)
+    - ``"vulkan"`` — headless Vulkan compositor (OMNIUI_HEADLESS=1), or
+                     windowed GLFW + Vulkan, which is what an ordinary
+                     launch selects when ``OMNIUI_BACKEND`` is unset
     - ``"egl"``    — headless EGL surfaceless GL (OMNIUI_HEADLESS=1 +
                      OMNIUI_HEADLESS_GL=1)
-    - ``"opengl"`` — desktop GLFW + OpenGL (default developer flow)
+    - ``"opengl"`` — desktop GLFW + OpenGL, reached only by asking for it
+                     explicitly through ``OMNIUI_BACKEND``
 
-    The two Vulkan-related env vars must agree about which capture API
-    works, so the matrix is intentionally small. ``OMNIUI_BACKEND=vulkan``
-    (or its ``vk`` alias) without ``OMNIUI_HEADLESS=1`` (a configuration
-    nobody currently exercises) is still classified as ``"vulkan"``
-    because the capture path it would take is the Vulkan one — it never
-    falls back to GL.
+    This mirrors the runtime policy in ``GlfwPlatform::createWindow``:
+    Vulkan is the ordinary default and OpenGL is entered only on explicit
+    request or as a genuine initialization fallback. Classifying an unset
+    backend as OpenGL would send windowed captures to the wrong golden
+    directory and would let a silent revert of that default pass.
     """
     headless = os.environ.get("OMNIUI_HEADLESS") in ("1", "true")
     headless_gl = os.environ.get("OMNIUI_HEADLESS_GL") in ("1", "true")
@@ -69,9 +64,9 @@ def _backend_tag() -> str:
         return "egl"
     if headless:
         return "vulkan"
-    if backend in ("vulkan", "vk"):
-        return "vulkan"
-    return "opengl"
+    if backend in ("opengl", "gl"):
+        return "opengl"
+    return "vulkan"
 
 
 def _is_vulkan_backend() -> bool:

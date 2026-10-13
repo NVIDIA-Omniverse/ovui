@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Truthful renderer attachment and native viewport projection reporting.
 
@@ -59,6 +52,65 @@ def test_borrow_mode_is_claimed_only_with_native_attachment_proof() -> None:
     assert snapshot["is_borrow_mode"] is False
     assert snapshot["attach_mode"] == ""
     assert snapshot["native_attached_exact_ovstage"] is False
+
+
+def test_native_outline_snapshot_separates_requested_applied_and_pending() -> None:
+    stage = object()
+    native = SimpleNamespace(config=SimpleNamespace(), _attached_ovstage=stage)
+    renderer = _adapter(native, stage)
+    renderer._selected_paths = ["/World/Existing", "/World/Later"]
+    renderer._selection_outline_previous_paths = {"/World/Existing"}
+    renderer._selection_outline_stale_paths = {"/World/OldGeneration"}
+    renderer._selection_outline_generation = 4
+    renderer._selection_outline_last_write = {
+        "requested_paths": ["/World/Existing", "/World/Later"],
+        "applied_paths": ["/World/Existing"],
+        "pending_paths": ["/World/Later"],
+        "stale_cleanup_paths": ["/World/OldGeneration"],
+        "generation": 4,
+        "stale_reason": "missing_native_paths",
+    }
+
+    snapshot = _renderer_snapshot(
+        _app_with_renderer(renderer), SimpleNamespace(_stage=stage)
+    )["selection_outline"]
+
+    assert snapshot == {
+        "requested_paths": ["/World/Existing", "/World/Later"],
+        "applied_paths": ["/World/Existing"],
+        "pending_paths": ["/World/Later"],
+        "stale_cleanup_paths": ["/World/OldGeneration"],
+        "generation": 4,
+        "last_write": renderer._selection_outline_last_write,
+    }
+
+
+def test_native_outline_snapshot_keeps_stale_generation_unapplied() -> None:
+    stage = object()
+    native = SimpleNamespace(config=SimpleNamespace(), _attached_ovstage=stage)
+    renderer = _adapter(native, stage)
+    renderer._selected_paths = ["/World/Selected"]
+    renderer._selection_outline_previous_paths = set()
+    renderer._selection_outline_stale_paths = {"/World/Selected"}
+    renderer._selection_outline_generation = 7
+    renderer._selection_outline_last_write = {
+        "requested_paths": ["/World/Selected"],
+        "applied_paths": [],
+        "pending_paths": ["/World/Selected"],
+        "stale_cleanup_paths": ["/World/Selected"],
+        "generation": 7,
+        "stale_reason": "stale_cleanup_pending",
+    }
+
+    snapshot = _renderer_snapshot(
+        _app_with_renderer(renderer), SimpleNamespace(_stage=stage)
+    )["selection_outline"]
+
+    assert snapshot["requested_paths"] == ["/World/Selected"]
+    assert snapshot["applied_paths"] == []
+    assert snapshot["pending_paths"] == ["/World/Selected"]
+    assert snapshot["stale_cleanup_paths"] == ["/World/Selected"]
+    assert snapshot["generation"] == 7
 
 
 def test_native_projection_consumes_provider_user_facing_classification() -> None:

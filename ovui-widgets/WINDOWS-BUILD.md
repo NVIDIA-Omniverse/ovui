@@ -190,6 +190,7 @@ Install local packages in editable mode. The OpenUSD adapter is installed with
 & $env:PYTHON_BIN -m pip install -e "$env:REPO\ovui"
 
 & $env:PYTHON_BIN -m pip install -e "$env:REPO\ovui-data-adapters\dist\common" --no-deps
+& $env:PYTHON_BIN -m pip install -e "$env:REPO\ovui-data-adapters\dist\services" --no-deps
 & $env:PYTHON_BIN -m pip install -e "$env:REPO\ovui-data-adapters\dist\openusd" --no-deps
 
 & $env:PYTHON_BIN -m pip install -e "$env:REPO\ovui-widgets\dist\common" --no-deps

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Pytest configuration and shared fixtures for the OvGear test suite.
 
@@ -62,20 +55,120 @@ if _ovui_test_os.name == "nt":
                 ) from _ovui_test_exc
 """
 
+import ast
+import importlib
 import os
 import pathlib
 import sys
 
 import pytest
 
+_INSTALLED_RELEASE_ENV = "OVUI_TEST_INSTALLED_RELEASE"
+_INSTALLED_RELEASE_TESTS = os.environ.get(_INSTALLED_RELEASE_ENV, "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_TESTS_ROOT = pathlib.Path(__file__).resolve().parent
+_monorepo_root = _TESTS_ROOT.parents[1]
+_ovui_widgets_project_root = _monorepo_root / "ovui-widgets"
+_data_adapters_project_root = _monorepo_root / "ovui-data-adapters"
+_CHECKOUT_RELEASE_PACKAGES = (
+    ("ovui_widgets", (_ovui_widgets_project_root / "ovui_widgets").resolve()),
+    (
+        "ovui_widgets_agent_skills",
+        (_ovui_widgets_project_root / "ovui_widgets_agent_skills").resolve(),
+    ),
+    (
+        "ovui_data_adapters",
+        (_data_adapters_project_root / "ovui_data_adapters").resolve(),
+    ),
+)
+_RELEASE_PACKAGE_PREFIXES = tuple(name for name, _ in _CHECKOUT_RELEASE_PACKAGES)
+
+
+def _resolved_import_path(value: object) -> pathlib.Path | None:
+    if value == "":
+        value = os.curdir
+    if not isinstance(value, (str, os.PathLike)):
+        return None
+    text = os.fspath(value)
+    if text in {"built-in", "frozen"}:
+        return None
+    try:
+        return pathlib.Path(text).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _is_checkout_product_origin(value: object) -> bool:
+    path = _resolved_import_path(value)
+    return path is not None and any(
+        path == package_root or package_root in path.parents
+        for _, package_root in _CHECKOUT_RELEASE_PACKAGES
+    )
+
+
+def _can_resolve_checkout_product(value: object) -> bool:
+    path = _resolved_import_path(value)
+    return path is not None and any(
+        (path / package_name).resolve() == package_root
+        for package_name, package_root in _CHECKOUT_RELEASE_PACKAGES
+    )
+
+
+def _module_import_paths(module: object) -> tuple[object, ...]:
+    spec = getattr(module, "__spec__", None)
+    values = [
+        getattr(module, "__file__", None),
+        getattr(spec, "origin", None),
+    ]
+    for locations in (
+        getattr(module, "__path__", None),
+        getattr(spec, "submodule_search_locations", None),
+    ):
+        if locations is not None:
+            values.extend(locations)
+    return tuple(values)
+
+
+def _prepare_installed_release_imports() -> None:
+    checkout_module_loaded = any(
+        any(_is_checkout_product_origin(path) for path in _module_import_paths(module))
+        for name, module in tuple(sys.modules.items())
+        if any(
+            name == prefix or name.startswith(prefix + ".")
+            for prefix in _RELEASE_PACKAGE_PREFIXES
+        )
+    )
+    if checkout_module_loaded:
+        raise pytest.UsageError(
+            "installed-release validation started after a checkout product import"
+        )
+
+    sys.path[:] = [entry for entry in sys.path if not _can_resolve_checkout_product(entry)]
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        entry
+        for entry in pythonpath.split(os.pathsep)
+        if not _can_resolve_checkout_product(entry)
+    )
+    for entry in tuple(sys.path_importer_cache):
+        if _can_resolve_checkout_product(entry):
+            sys.path_importer_cache.pop(entry, None)
+    importlib.invalidate_caches()
+
+
+if _INSTALLED_RELEASE_TESTS:
+    _prepare_installed_release_imports()
+
 # Ensure the ovui-widgets project root is on sys.path so editable installs
 # aren't required when running pytest from the monorepo root during
 # development. After the repo merge, ``__file__`` lives at
 # ``<monorepo-root>/ovui-widgets/tests/conftest.py``, so
 # ``parents[0]=tests/``, ``parents[1]=ovui-widgets/``, ``parents[2]=<monorepo-root>/``.
-_monorepo_root = pathlib.Path(__file__).resolve().parents[2]
-_ovui_widgets_project_root = _monorepo_root / "ovui-widgets"
-if str(_ovui_widgets_project_root) not in sys.path:
+if not _INSTALLED_RELEASE_TESTS and str(_ovui_widgets_project_root) not in sys.path:
     sys.path.insert(0, str(_ovui_widgets_project_root))
 
 # The data-adapters source lives under the dash-form folder
@@ -96,7 +189,7 @@ if str(_ovui_widgets_project_root) not in sys.path:
 # doesn't, and the regression manifests as a misleading "cannot import
 # name" error from inside ``ovui_widgets.viewport.image_bridge``.
 _data_adapters_dist_roots = (
-    _monorepo_root / "ovui-data-adapters",
+    _data_adapters_project_root,
 )
 
 
@@ -157,37 +250,12 @@ def _prepend_runtime_usd_python_path() -> None:
         return
 
 
-for _da_root in _data_adapters_dist_roots:
-    _prepend_sys_path(_da_root)
+if not _INSTALLED_RELEASE_TESTS:
+    for _da_root in _data_adapters_dist_roots:
+        _prepend_sys_path(_da_root)
 
-
-_prepend_runtime_usd_python_path()
-_prepend_to_pythonpath(_data_adapters_dist_roots)
-
-
-# Issue #35 Step 10 verification gate: pytest prints the summary line and
-# then deadlocks during interpreter shutdown. The C++ ``atexit`` chain in
-# ovrtx's bundled runtime (``rtx.neuraylib.plugin``, carb) can hang once
-# those libraries have been loaded into the test process — a known
-# pre-existing bug we cannot fix from ovui_widgets.app (ovui/ovrtx are out of scope
-# per the issue-35 plan). The wrapper-hook below lets pytest's own
-# terminal-reporter wrapper resume first (so the summary line prints), then
-# ``os._exit`` skips the remaining atexit handlers so the shell-level
-# ``FINAL_RC=$?`` capture actually fires with the real pytest exit code.
-_session_exit_status: int = 0
-
-
-@pytest.hookimpl(wrapper=True)
-def pytest_sessionfinish(session, exitstatus):
-    global _session_exit_status
-    _session_exit_status = int(exitstatus)
-    yield
-
-
-def pytest_unconfigure(config):
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(_session_exit_status)
+    _prepend_runtime_usd_python_path()
+    _prepend_to_pythonpath(_data_adapters_dist_roots)
 
 
 @pytest.fixture(autouse=True)
@@ -317,3 +385,59 @@ def fake_widget_services() -> FakeWidgetServices:
     tests.
     """
     return FakeWidgetServices()
+
+
+def _declared_dependencies(project_dir: pathlib.Path) -> list[str]:
+    """Return the run-time requirements that a dist project declares.
+
+    Static ``[project].dependencies`` in ``pyproject.toml`` are returned as
+    they are. Otherwise the ``install_requires`` list of the ``setup()`` call
+    in ``setup.py`` is returned, with ``_VERSION`` replaced by the content of
+    ``VERSION.md``.
+    """
+    try:
+        import tomllib
+    except ImportError:  # pragma: no cover - Python < 3.11
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    with (project_dir / "pyproject.toml").open("rb") as fh:
+        project = tomllib.load(fh)["project"]
+    if "dependencies" in project:
+        return list(project["dependencies"])
+    assert "dependencies" in project.get("dynamic", []), project_dir
+
+    version = (_monorepo_root / "VERSION.md").read_text(encoding="utf-8").strip()
+    tree = ast.parse((project_dir / "setup.py").read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "setup"
+    ]
+    assert len(calls) == 1, f"{project_dir}: expected one setup() call"
+    lists = [kw.value for kw in calls[0].keywords if kw.arg == "install_requires"]
+    assert len(lists) == 1 and isinstance(lists[0], ast.List), (
+        f"{project_dir}: install_requires must be a list literal"
+    )
+
+    dependencies = []
+    for item in lists[0].elts:
+        if isinstance(item, ast.Constant) and isinstance(item.value, str):
+            dependencies.append(item.value)
+            continue
+        assert isinstance(item, ast.JoinedStr), ast.unparse(item)
+        parts = []
+        for part in item.values:
+            if isinstance(part, ast.Constant):
+                parts.append(part.value)
+            elif isinstance(part.value, ast.Name) and part.value.id == "_VERSION":
+                parts.append(version)
+            else:
+                raise AssertionError(f"{project_dir}: unsupported requirement {ast.unparse(item)}")
+        dependencies.append("".join(parts))
+    return dependencies
+
+
+@pytest.fixture
+def declared_dependencies():
+    """Return :func:`_declared_dependencies` for dist project directories."""
+    return _declared_dependencies

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ovphysx -> OVStage -> OVRTX BORROW fixed-step frame-loop behavior."""
 
@@ -465,10 +458,12 @@ def _renderer_adapter(
     adapter._render_product_path = "/Render/Product"
     adapter._default_render_product_path = adapter._render_product_path
     adapter._active_render_product_common_path = None
+    adapter._secondary_viewport_active = False
+    adapter._render_flow_mode = "nativePacing"
     adapter._camera_path = None
     adapter._last_resolution = (64, 32)
     adapter._last_render_product_resolution = adapter._last_resolution
-    adapter._dt_clock = time.monotonic()
+    adapter._dt_clock = time.perf_counter()
     adapter._last_load_from_scene_context = False
     adapter._borrow_step_count = 0
     adapter._in_flight_pick_queries = []

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Provider metadata and factories for the ovstage adapter scaffold."""
 
@@ -82,6 +75,31 @@ PHYSICS_MAX_SUBSTEPS_PER_TICK = 8
 PHYSICS_POSE_WRITE_HISTORY_LIMIT = 512
 PHYSICS_XFORM_ATTRIBUTES = ("localMatrix", "worldMatrix", "xformOp:transform")
 PHYSICS_TRACE_SHUTDOWN_ENV = "OVUI_WIDGETS_TRACE_SHUTDOWN"
+
+
+def _create_native_dirty_worker() -> Any:
+    """Create the session-owned worker used across OVStage scene replacements."""
+
+    worker = None
+    try:
+        from omni.ui import _ui as native_ui
+
+        worker_type = getattr(native_ui, "_NativeOvstageDirtyWorker", None)
+        if worker_type is None:
+            return None
+        worker = worker_type()
+        if not bool(worker.supported):
+            worker.close()
+            return None
+        return worker
+    except Exception:
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:
+                pass
+        return None
+
 
 _OVSTAGE_STAGE_CAPABILITIES = StageCapabilities(
     create_stage=AdapterCapability.unsupported(
@@ -652,6 +670,7 @@ class OvstageProviderSession:
         self._population_failures: list[OvstagePopulationFailure] = []
         self.physics_controls = OvstagePhysicsControls(self)
         self.prepare_runtime_imports()
+        self._native_dirty_worker = _create_native_dirty_worker()
 
     def prepare_runtime_imports(self) -> None:
         if self._runtime is None:
@@ -717,6 +736,7 @@ class OvstageProviderSession:
             scene = open_scene_from_file(
                 runtime=self._runtime,
                 path=path,
+                native_dirty_worker=self._native_dirty_worker,
             )
             scene.attach_physics_controls(self.physics_controls)
         except Exception as exc:
@@ -780,6 +800,17 @@ class OvstageProviderSession:
             for action, secondary in errors[1:]:
                 _add_cleanup_note(primary, action, secondary)
             raise primary
+
+    def close(self) -> None:
+        """Stop process-lifetime provider resources after all scenes are closed."""
+
+        if self._current_scene is not None or self._pending_scene_cleanup:
+            raise RuntimeError("cannot close the OVStage provider while scenes remain owned")
+        worker = self._native_dirty_worker
+        if worker is None:
+            return
+        worker.close()
+        self._native_dirty_worker = None
 
     def _cleanup_rejected_scene(
         self,
@@ -889,9 +920,10 @@ class OvstageProviderSession:
             raise ValueError(f"native prim delete path does not exist: {value}")
         return NativeDeletePrimsCommand(scene, (value,))
 
-    def create_renderer(self) -> Any:
+    def create_renderer(self, *, viewport_quality: int = 0) -> Any:
         return OvstageRendererAdapter(
             undo_manager=_undo_manager_from_app(self._app),
+            viewport_quality=viewport_quality,
         )
 
     def renderer_available(self) -> bool:
@@ -1036,8 +1068,10 @@ def create_layer_stack_adapter(
 def create_renderer_adapter(
     scene: Any | None = None,
     undo_manager: Any | None = None,
+    *,
+    viewport_quality: int = 0,
 ) -> OvstageRendererAdapter:
-    return OvstageRendererAdapter(scene, undo_manager)
+    return OvstageRendererAdapter(scene, undo_manager, viewport_quality=viewport_quality)
 
 
 def create_selection_adapter(

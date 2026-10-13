@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/ImageProvider/RasterImageProvider.h>
@@ -41,7 +34,7 @@ RasterImageProvider::RasterImageProvider(std::string url)
         m_settings->setDefaultInt(kShutdownIterMaxSettingsPath, 4000);
         m_shutdownIterMax = m_settings->getInt(kShutdownIterMaxSettingsPath, 4000);
     }
-    m_loader = PlatformRegistry::instance().rasterImageLoader();
+    m_loader = PlatformRegistry::instance().sharedRasterImageLoader();
 }
 
 RasterImageProvider::~RasterImageProvider()
@@ -51,6 +44,9 @@ RasterImageProvider::~RasterImageProvider()
 
 void RasterImageProvider::_shutdown()
 {
+    // Only give the reference back. A provider going away says nothing about
+    // the file, so the shared entry stays available to whoever still draws it
+    // and to the next consumer of the same URL.
     if (m_loader)
     {
         m_loader->waitForCompletion(this, m_shutdownIterMax);
@@ -68,7 +64,7 @@ void RasterImageProvider::prepareDraw(float widgetWidth, float widgetHeight)
 {
     OMNIUI_PROFILE_VERBOSE_ZONE("RasterImageProvider::prepareDraw");
 
-    auto* loader = m_loader;
+    auto* loader = m_loader.get();
     if (!loader)
     {
         return;
@@ -84,19 +80,26 @@ void RasterImageProvider::prepareDraw(float widgetWidth, float widgetHeight)
 
     if (urlChanged && !m_assetLoading)
     {
-        // Release old resources
+        TextureOptions textureOptions = { 0 };
+        if (!mergeTextureOptions(textureOptions))
+            return;
+
+        // Release old resources. The source URL was set again, which is how a
+        // replaced file is reloaded, so the old entry must also stop being
+        // shared: the next load has to read the file rather than return the
+        // texture decoded from its previous contents.
         loader->releaseLoad(this);
         if (!m_cacheKey.empty())
         {
             loader->releaseGpuResource(m_cacheKey);
+            loader->invalidateCacheEntry(m_cacheKey);
             m_cacheKey.clear();
         }
 
-        auto result = loader->beginLoad(this, url);
-        m_cacheKey = result.cacheKey;
-
+        auto result = loader->beginLoadWithOptions(this, url, textureOptions);
         if (result.status == IRasterImageLoader::LoadResult::eCached)
         {
+            m_cacheKey = result.cacheKey;
             setImageData(result.imGuiReference, result.imageSize, result.imageFormat, result.managedResource);
             {
                 std::lock_guard<std::mutex> lock(m_sourceRasterUrlMutex);
@@ -109,7 +112,10 @@ void RasterImageProvider::prepareDraw(float widgetWidth, float widgetHeight)
         }
         else
         {
-            // Failed to begin load
+            // Failed to begin load. The previous image's resources were handed
+            // back to the loader above, so stop publishing them: keep reporting
+            // the requested URL, but report no image so callers can fall back.
+            setImageData(nullptr, { 0, 0 }, PixelFormat::eUnknown);
             {
                 std::lock_guard<std::mutex> lock(m_sourceRasterUrlMutex);
                 m_sourceRasterUrlChanged = false;
@@ -135,6 +141,7 @@ void RasterImageProvider::prepareDraw(float widgetWidth, float widgetHeight)
         auto result = loader->poll(this, textureOptions, maxMipLevels);
         if (result.status == IRasterImageLoader::LoadResult::eReady)
         {
+            m_cacheKey = result.cacheKey;
             setImageData(result.imGuiReference, result.imageSize, result.imageFormat, result.managedResource);
             m_assetLoading = false;
             {
@@ -144,6 +151,10 @@ void RasterImageProvider::prepareDraw(float widgetWidth, float widgetHeight)
         }
         else if (result.status == IRasterImageLoader::LoadResult::eFailed)
         {
+            // Terminal failure of an asynchronous load. Same contract as the
+            // begin-load failure above: the previous image is gone, so report
+            // no image rather than the released one.
+            setImageData(nullptr, { 0, 0 }, PixelFormat::eUnknown);
             m_assetLoading = false;
             {
                 std::lock_guard<std::mutex> lock(m_sourceRasterUrlMutex);
@@ -183,5 +194,82 @@ size_t RasterImageProvider::getMaxMipLevels() const
     return m_maxMipLevels;
 }
 
+time_t RasterImageProvider::_getModTime(const std::string& path)
+{
+    return m_loader ? m_loader->getModTime(path) : 0;
+}
+
+std::string RasterImageProvider::_getCacheKey(const std::string& path)
+{
+    return m_loader ? m_loader->getCacheKey(path) : path;
+}
+
+void RasterImageProvider::_loadAsset(const std::string& path)
+{
+    auto* loader = m_loader.get();
+    if (!loader)
+        return;
+    TextureOptions textureOptions = { 0 };
+    if (!mergeTextureOptions(textureOptions))
+        return;
+    const auto result = loader->beginLoadWithOptions(this, path, textureOptions);
+    m_assetLoading = result.status == IRasterImageLoader::LoadResult::eLoading;
+    if (result.status == IRasterImageLoader::LoadResult::eCached)
+    {
+        m_cacheKey = result.cacheKey;
+        setImageData(result.imGuiReference, result.imageSize, result.imageFormat, result.managedResource);
+        std::lock_guard<std::mutex> lock(m_sourceRasterUrlMutex);
+        m_sourceRasterUrlChanged = false;
+    }
+}
+
+void RasterImageProvider::_pollAsset()
+{
+    auto* loader = m_loader.get();
+    if (!loader || !m_assetLoading)
+        return;
+
+    // Waiting completes the CPU load and clears m_assetLoading. Legacy derived
+    // callers still poll that completed load to publish its image afterwards.
+    TextureOptions textureOptions = { 0 };
+    if (!mergeTextureOptions(textureOptions))
+        return;
+    size_t maxMipLevels;
+    {
+        std::lock_guard<std::mutex> lock(m_maxMipLevelsMutex);
+        maxMipLevels = m_maxMipLevels;
+    }
+    const auto result = loader->poll(this, textureOptions, maxMipLevels);
+    if (result.status == IRasterImageLoader::LoadResult::eReady)
+    {
+        m_cacheKey = result.cacheKey;
+        setImageData(result.imGuiReference, result.imageSize, result.imageFormat, result.managedResource);
+    }
+    else if (result.status == IRasterImageLoader::LoadResult::eFailed)
+        setImageData(nullptr, { 0, 0 }, PixelFormat::eUnknown);
+    else
+        return;
+
+    m_assetLoading = false;
+    std::lock_guard<std::mutex> lock(m_sourceRasterUrlMutex);
+    m_sourceRasterUrlChanged = false;
+}
+
+void RasterImageProvider::_waitAsset()
+{
+    if (auto* loader = m_loader.get())
+        loader->waitForCompletion(this, m_shutdownIterMax);
+}
+
+void RasterImageProvider::_releaseAsset()
+{
+    if (auto* loader = m_loader.get())
+    {
+        loader->releaseLoad(this);
+        if (!m_cacheKey.empty())
+            loader->releaseGpuResource(m_cacheKey);
+    }
+    m_cacheKey.clear();
+}
 }
 }

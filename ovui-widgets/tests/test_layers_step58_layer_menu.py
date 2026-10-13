@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for LAYERS-PLAN Step 58 — Main menu bar "Layer" menu.
 
@@ -95,6 +88,9 @@ class _FakeMenuItem:
                 "hotkey_text": hotkey_text,
             }
         )
+
+    def set_checked_changed_fn(self, fn: Callable[[bool], None]) -> None:
+        self.checked_changed_fn = fn
 
 
 class _FakeSeparator:

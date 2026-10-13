@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Standalone run-loop for omni.ui outside of Kit.
@@ -23,12 +16,9 @@ that just resolved the awaiter. Existing callers that ignore the return
 value (``await ui.next_frame()``) keep working — only callers that bind
 the result (``frame = await ui.next_frame()``) see the new metadata.
 
-The run-loop also enforces a max-FPS cap. ``glfwSwapInterval(1)`` is
-already set on real GPUs and gives a hardware vsync; on hosts where
-``glfwSwapBuffers`` does not block (Mesa llvmpipe under kasmvnc / Xvnc),
-the sleep cap in :func:`run` / :func:`run_async` keeps the loop from
-free-running at 200+ FPS. Default cap is 60 FPS, configurable via
-:func:`set_max_frame_rate` or ``ui.init(..., max_fps=...)``.
+The run-loop can enforce an opt-in max-FPS cap. It is uncapped by default;
+call :func:`set_max_frame_rate` or pass ``ui.init(..., max_fps=...)`` to
+request a positive finite limit.
 """
 
 from __future__ import annotations
@@ -54,8 +44,8 @@ class FrameInfo:
     """Metadata about a single standalone tick.
 
     Returned from :func:`next_frame`. Use ``frame.dt`` for tick-relative
-    delta time, ``frame.time`` for the monotonic timestamp at this tick,
-    and ``frame.index`` for the increasing tick index (0-based).
+    delta time, ``frame.time`` for the :func:`time.perf_counter` timestamp at
+    this tick, and ``frame.index`` for the increasing tick index (0-based).
 
     Backward compatibility: callers that ``await ui.next_frame()`` without
     binding the return value keep working — the FrameInfo is simply
@@ -75,8 +65,9 @@ _next_frame_futures: list[asyncio.Future] = []
 _frame_index: int = 0
 _last_tick_time: Optional[float] = None
 # Hard-cap on the standalone tick rate. ``None`` disables the cap; set via
-# :func:`set_max_frame_rate` or ``ui.init(..., max_fps=...)``. Default 60.
-_max_frame_rate: Optional[float] = 60.0
+# :func:`set_max_frame_rate` or ``ui.init(..., max_fps=...)``. Uncapped by
+# default.
+_max_frame_rate: Optional[float] = None
 # Wakes an in-flight pacing wait in :func:`run` (blocking) so a live
 # :func:`set_max_frame_rate` change or :func:`request_wakeup` takes effect
 # immediately instead of after the old period elapses.
@@ -134,25 +125,36 @@ def init(
     width: int = 1280,
     height: int = 720,
     *,
-    max_fps: Optional[float] = 60.0,
+    max_fps: Optional[float] = None,
+    present_fps: Optional[float] = 0.0,
 ) -> None:
     """Initialize the standalone GLFW/ImGui backend.
 
     ``max_fps`` caps the tick rate of the standalone run loop. ``None`` (or
-    a non-positive value) disables the cap. Default is 60. The cap can be
-    changed at any time via :func:`set_max_frame_rate`.
+    a non-positive value) disables the cap. The default is uncapped. A cap
+    can be changed at any time via :func:`set_max_frame_rate`.
 
-    Safe to call multiple times — subsequent calls are no-ops aside from
-    the ``max_fps`` update.
+    ``present_fps`` enables native saved-geometry replay on the standalone
+    Vulkan backend.  The default of zero preserves the historical UI-tick
+    presentation path.  Unsupported backends leave that path unchanged;
+    :func:`get_frame_pacing_status` reports the exact capability reason.
+
+    Safe to call multiple times — subsequent calls only update the two rates.
+
+    Raises :class:`RuntimeError` if the native backend fails to initialize
+    (for example, no window or graphics device could be created).
     """
     global _initialized, _shutdown_requested_in_tick
     set_max_frame_rate(max_fps)
     with _native_lock:
         if _initialized:
+            set_present_rate(present_fps)
             return
         _shutdown_requested_in_tick = False
-        _ui._standalone_init(title, width, height)
+        if not _ui._standalone_init(title, width, height):
+            raise RuntimeError("omni.ui.standalone.init() failed; see the native log for the cause")
         _initialized = True
+    set_present_rate(present_fps)
     # Register atexit handler so that the backend is torn down before
     # Python destroys module globals.  Without this, process exit
     # destroys C++ objects (Window, ImGui context, GLFW) in arbitrary
@@ -363,6 +365,67 @@ def get_max_frame_rate() -> Optional[float]:
     return _max_frame_rate
 
 
+def set_present_rate(fps: Optional[float]) -> bool:
+    """Set the requested native Vulkan offscreen presentation rate.
+
+    A positive rate requests a capped three-thread frame-pacing path. ``-1``
+    requests work-conserving Vulkan max-throughput. Zero (or ``None``) stops
+    it and restores presentation from the UI tick. ``True``
+    means the current backend accepted the configured rate; use
+    :func:`get_frame_pacing_status` to determine whether a renderer borrow is
+    supported and active. The synchronous viewport remains usable when the
+    request is declined or inactive.
+    """
+
+    value = 0.0 if fps is None else float(fps)
+    if value < -1.0:
+        value = 0.0
+    setter = getattr(_ui, "_set_present_rate", None)
+    if not callable(setter) or not _initialized:
+        return value == 0.0
+    return bool(setter(value))
+
+
+def get_present_rate() -> float:
+    """Return the configured native presentation rate, or zero if unavailable."""
+
+    getter = getattr(_ui, "_get_present_rate", None)
+    if not callable(getter) or not _initialized:
+        return 0.0
+    return float(getter())
+
+
+def get_frame_pacing_status() -> dict:
+    """Return capability, lifecycle state, and non-overlapping pacing counts."""
+
+    getter = getattr(_ui, "_get_native_frame_pacing_status", None)
+    if not callable(getter):
+        return {
+            "available": False,
+            "active": False,
+            "reason": "native frame pacing was not built",
+        }
+    return dict(getter())
+
+
+def _reset_frame_throughput_metrics() -> None:
+    resetter = getattr(_ui, "_reset_frame_throughput_metrics", None)
+    if callable(resetter):
+        resetter()
+
+
+def _record_synchronous_renderer_completion() -> None:
+    recorder = getattr(_ui, "_record_synchronous_renderer_completion", None)
+    if callable(recorder):
+        recorder()
+
+
+def _record_synchronous_content_selection() -> None:
+    recorder = getattr(_ui, "_record_synchronous_content_selection", None)
+    if callable(recorder):
+        recorder()
+
+
 def set_window_size(width: int, height: int) -> bool:
     """Resize the main OS window (and its default OpenGL framebuffer).
 
@@ -376,11 +439,36 @@ def set_window_size(width: int, height: int) -> bool:
     return bool(_ui._standalone_set_window_size(width, height))
 
 
+def set_window_position(x: int, y: int) -> bool:
+    """Move the main OS window, returning ``False`` for headless mode."""
+    if not _initialized:
+        return False
+    return bool(_ui._standalone_set_window_position(x, y))
+
+
 def get_window_size() -> tuple[int, int]:
     """Return ``(width, height)`` of the main OS window framebuffer."""
     if not _initialized:
         return (0, 0)
     return tuple(_ui._standalone_get_window_size())
+
+
+def set_window_title(title: str) -> bool:
+    """Set the title of the main OS window.
+
+    Returns ``False`` when the standalone backend is not initialized or the
+    main window is unavailable.
+    """
+    if not _initialized:
+        return False
+    return bool(_ui._standalone_set_window_title(str(title)))
+
+
+def get_window_title() -> str:
+    """Return the current main OS window title, or ``""`` when unavailable."""
+    if not _initialized:
+        return ""
+    return str(_ui._standalone_get_window_title())
 
 
 def set_software_cursor(enabled: bool) -> None:
@@ -403,6 +491,20 @@ def is_software_cursor_enabled() -> bool:
     Returns ``False`` when no ImGui context exists yet.
     """
     return bool(_ui._is_software_cursor_enabled())
+
+
+def is_text_input_active() -> bool:
+    """Return ``True`` while a text input owns the keyboard.
+
+    This is ImGui's ``io.WantTextInput``. It is ``True`` while a
+    ``StringField`` is edited, or while a ``FloatDrag`` / ``IntDrag`` is in
+    keyboard-edit mode (double-click or Ctrl+click). App-level shortcuts
+    use it so that a key the field edits (Backspace, Delete) does not also
+    run a global action.
+
+    Returns ``False`` when no ImGui context exists yet.
+    """
+    return bool(_ui._is_text_input_active())
 
 
 def _ensure_initialized() -> None:
@@ -428,10 +530,11 @@ def _ensure_initialized_for_run() -> bool:
         if _stop_requested:
             return False
         if not _initialized:
-            # Mirrors init()'s auto-init defaults (title/size/60 FPS cap).
-            set_max_frame_rate(60.0)
+            # Mirrors init()'s auto-init defaults (title/size, no FPS cap).
+            set_max_frame_rate(None)
             _shutdown_requested_in_tick = False
-            _ui._standalone_init("omni.ui", 1280, 720)
+            if not _ui._standalone_init("omni.ui", 1280, 720):
+                raise RuntimeError("omni.ui.standalone.init() failed; see the native log for the cause")
             _initialized = True
             initialized_now = True
     if initialized_now:
@@ -499,7 +602,7 @@ def _tick_one_frame() -> FrameInfo:
     if deferred_teardown:
         return None
 
-    now = time.monotonic()
+    now = time.perf_counter()
     if _last_tick_time is None:
         dt = 0.0
     else:
@@ -529,7 +632,7 @@ def _max_fps_target_period() -> float:
 def _max_fps_remaining_since(frame_start: float) -> float:
     """Return seconds left in the budget for the iteration that began at ``frame_start``.
 
-    The caller must capture ``frame_start = time.monotonic()`` *before*
+    The caller must capture ``frame_start = time.perf_counter()`` *before*
     invoking :func:`_tick_one_frame`, so the budget covers the tick itself
     (poll events / draw / swap) plus any post-tick asyncio pumping. This
     matters on hosts where ``glfwSwapBuffers`` blocks on hardware vsync —
@@ -537,6 +640,10 @@ def _max_fps_remaining_since(frame_start: float) -> float:
     timestamp on :class:`FrameInfo`), we'd add another ``1 / max_fps``
     sleep on top of the ~16.7 ms the swap already consumed, halving the
     effective frame rate.
+
+    Use the high-resolution performance counter for this budget: on Windows
+    Python 3.12, ``monotonic()`` can have a 15.625 ms resolution and miss an
+    entire tick at high frame rates, incorrectly requesting another wait.
 
     On free-running software hosts (Mesa llvmpipe under Xvnc / kasmvnc)
     the tick is fast and most of the budget remains; the run loops sleep
@@ -548,7 +655,7 @@ def _max_fps_remaining_since(frame_start: float) -> float:
     period = _max_fps_target_period()
     if period <= 0.0:
         return 0.0
-    elapsed = max(0.0, time.monotonic() - frame_start)
+    elapsed = max(0.0, time.perf_counter() - frame_start)
     return max(0.0, period - elapsed)
 
 
@@ -611,7 +718,7 @@ def run(coro: Optional[Coroutine] = None) -> None:
             # Capture frame_start BEFORE the tick so the budget covers the
             # tick itself plus the asyncio pump. See _max_fps_remaining_since
             # for why this matters on hardware-vsync hosts.
-            frame_start = time.monotonic()
+            frame_start = time.perf_counter()
             _tick_one_frame()
             # Pump asyncio: run all ready callbacks.
             loop.call_soon(loop.stop)
@@ -684,7 +791,7 @@ async def run_async() -> None:
 
 async def _run_async_loop() -> None:
     while _initialized and not _stop_requested and not _ui._standalone_should_close():
-        frame_start = time.monotonic()
+        frame_start = time.perf_counter()
         _tick_one_frame()
         # Same interruptible per-iteration pacing as :func:`run`: rate
         # changes recompute the remaining budget (both directions, no

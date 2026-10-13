@@ -1,4 +1,6 @@
 <!doctype html>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -163,6 +165,7 @@
         <li>Standalone entrypoints preconstruct the selected OVRTX renderer before importing <code>omni.ui</code> or creating OVStage. <code>open_file()</code> reuses that exact renderer, so the Kit OVRTX/OVStage runtime shares one Carbonite/plugin framework; a failed early attempt is never retried after a stage opens.</li>
         <li><code>run_async()</code> creates the menu row, status row, widget windows, default mock adapters, shortcut routing, file-drop handling, and the frame loop.</li>
         <li>When a stage opens, <code>_load_stage()</code> clears old selection, creates data adapters, hands them to widgets, swaps the viewport renderer, and resets render timing.</li>
+        <li>The OpenUSD renderer loads a composed snapshot when the stage has session sublayers, preserving Live participant geometry across structural reloads. Existing-camera transforms and numeric lens properties use live OVRTX writes without reopening that snapshot. Camera pose commands leave an unchanged RenderProduct camera relationship untouched; genuine structural edits retain the reload path. Neither path saves the stored base scene.</li>
       </ul>
       <div class="diagram application-diagram" role="img" aria-label="Application connects widgets, common Python classes, data adapters, settings and commands, menu and status, and the frame loop">
         <div class="application-grid">

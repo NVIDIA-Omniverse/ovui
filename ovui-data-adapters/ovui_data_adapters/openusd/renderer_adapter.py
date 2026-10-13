@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OvRtxRendererAdapter — RendererAdapter backed by the ovrtx GPU renderer.
 
@@ -43,10 +36,11 @@ import collections
 import math
 import re
 import struct
+import sys
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dataclass_replace
 from typing import Any, Callable, Deque, List, Optional, Tuple
 
 # RFC 3986 URI scheme prefix (used by ``_anchor_asset_path`` to keep
@@ -55,6 +49,7 @@ from typing import Any, Callable, Deque, List, Optional, Tuple
 _ASSET_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
 
 import numpy as np
+
 from ovui_data_adapters.common import (
     ChangeEventType,
     GpuFrame,
@@ -69,6 +64,21 @@ from ovui_data_adapters.common import (
     PointCloudRequest,
     PointCloudRequestResult,
     PointCloudWarning,
+    RendererAdapter,
+    RenderSettingApplyResult,
+    RenderSettingDescriptor,
+    RenderSettingRequirement,
+    RenderSettingResetResult,
+    RenderSettingsCatalog,
+    RenderSettingsGroupDescriptor,
+    RenderSettingsProviderDescriptor,
+    RenderSettingValidationResult,
+    RenderSettingValueConstraints,
+    RenderSettingValueState,
+    RenderSettingValueType,
+    RenderSettingVisibility,
+    RenderSettingWarning,
+    RenderTargetActivationResult,
     RenderVarCategoricalSettings,
     RenderVarHdrSettings,
     RenderVarOutputCatalog,
@@ -82,32 +92,21 @@ from ovui_data_adapters.common import (
     RenderVarVectorSettings,
     RenderVarVisualizationPreset,
     RenderVarWarning,
-    RenderSettingApplyResult,
-    RenderSettingDescriptor,
-    RenderSettingRequirement,
-    RenderSettingResetResult,
-    RenderSettingValidationResult,
-    RenderSettingValueConstraints,
-    RenderSettingValueState,
-    RenderSettingValueType,
-    RenderSettingVisibility,
-    RenderSettingWarning,
-    RenderSettingsCatalog,
-    RenderSettingsGroupDescriptor,
-    RenderSettingsProviderDescriptor,
-    RendererAdapter,
-    RenderTargetActivationResult,
     ZeroCopyState,
-)
-from ovui_data_adapters.common.ovrtx_import import (
-    OVRTX_BIN_DIR_ENV as _OVRTX_BIN_DIR_ENV,
-    OVRTX_ROOT_ENV as _OVRTX_ROOT_ENV,
-    import_ovrtx,
 )
 from ovui_data_adapters.common._ldr_overlap import (
     CameraSnapshot,
     LdrOverlapState,
     camera_state_differs,
+)
+from ovui_data_adapters.common.instrumentation import get_instrumentation
+from ovui_data_adapters.common.ovrtx_import import import_ovrtx
+from ovui_data_adapters.common.render_settings import (
+    CAMERA_OWNER_SCOPE as _CAMERA_OWNER_SCOPE,
+    RENDER_SETTINGS_OWNER_SCOPE as _RENDER_SETTINGS_OWNER_SCOPE,
+    RenderSettingLifecycle,
+    build_render_setting_builtin_spec_index,
+    render_setting_owner_scope,
 )
 
 # ── Note on carb's ``omni.hydra`` re-registration warning ──
@@ -209,6 +208,18 @@ _RENDER_PRODUCT_PATH = "/OvGearSession/Render/Viewport"
 _LDR_VAR_PATH = "/OvGearSession/Render/Vars/LdrColor"
 _DOME_LIGHT_PATH = "/OvGearSession/Lights/FallbackDome"
 _SESSION_ROOT_PATH = "/OvGearSession"
+
+# The prim OVRTX itself resolves for globally owned render settings.
+# ``RenderProductPrim::getStageRenderSettings`` (omni.usd-abi) tries the stage
+# metadatum ``renderSettingsPrimPath`` first and falls back to
+# ``kRenderRoot``/``OmniverseGlobalRenderSettings``; when neither exists it
+# DEFINES this prim on its own runtime stage. The metadata leg was measured
+# to be ignored by the installed build, so this literal path is the only
+# owner OVRTX honours (see OWNER-ROUTE, routes ``b`` vs ``c``/``e``); the
+# scope itself is ``_RENDER_SETTINGS_OWNER_SCOPE``, imported above.
+_RENDER_SETTINGS_OWNER_ROOT_PATH = "/Render"
+_RENDER_SETTINGS_OWNER_PATH = "/Render/OmniverseGlobalRenderSettings"
+_RENDER_SETTINGS_OWNER_TYPE = "RenderSettings"
 
 _DEFAULT_RESOLUTION: Tuple[int, int] = (1280, 720)
 _LDR_VAR_NAME = "LdrColor"
@@ -619,6 +630,22 @@ def _source_token_key(value: Any) -> str:
     return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
 
 
+# Canonical RenderVar source names this adapter renders and decodes: the
+# display color first, then every output in ``_RENDER_VAR_OUTPUT_SPECS``.
+_RENDER_VAR_SOURCE_NAMES = (
+    "LdrColor",
+    "HdrColor",
+    "DiffuseAlbedoSD",
+    "DepthSD",
+    "DistanceToCameraSD",
+    "DistanceToImagePlaneSD",
+    "NormalSD",
+    "Camera3dPositionSD",
+    "SemanticSegmentation",
+    "SemanticIdMap",
+)
+
+
 def _render_var_warning(code: str, message: str) -> RenderVarWarning:
     return RenderVarWarning(code=code, message=message)
 
@@ -853,80 +880,66 @@ def _render_var_output_for_request(
     return None
 
 
-_RENDER_SETTINGS_PROVIDER_ID = "openusd.render_product.public"
-_RENDER_SETTINGS_PROVIDER_LABEL = "Public RenderProduct Settings"
-_RENDER_SETTINGS_PUBLIC_NAMESPACES: Tuple[str, ...] = ("omni:rtx:",)
-_RENDER_SETTINGS_METADATA_KEY = "renderSettings"
-_RENDER_SETTINGS_GROUP_FALLBACK = "omni_rtx"
-_RENDER_SETTINGS_GROUP_LABEL_FALLBACK = "Omni RTX"
-_RENDER_SETTINGS_BUILTIN_SPECS: Tuple[dict[str, Any], ...] = (
-    {
-        "attr_name": "omni:rtx:rtpt:maxBounces",
-        "usd_type": "int",
-        "value_type": RenderSettingValueType.INT,
-        "default": 3,
-        "label": "Max Bounces",
-        "description": "Maximum real-time path-tracing bounce count.",
-        "group_id": "quality",
-        "group_label": "Quality",
-        "group_order": 10.0,
-        "order": 10.0,
-        "requirement": RenderSettingRequirement.WARMUP.value,
-        "range": {"min": 0.0, "max": 32.0},
-        "soft_range": {"min": 0.0, "max": 16.0},
-        "units": "bounces",
-    },
-    {
-        "attr_name": "omni:rtx:rendermode",
-        "usd_type": "string",
-        "value_type": RenderSettingValueType.ENUM,
-        "default": "Real-Time Path-Tracing",
-        "label": "Render Mode",
-        "group_id": "quality",
-        "group_label": "Quality",
-        "group_order": 10.0,
-        "order": 20.0,
-        "requirement": RenderSettingRequirement.RENDERER_RESTART.value,
-        "allowed_values": ("Real-Time Path-Tracing", "PathTracing", "Minimal"),
-    },
-    {
-        "attr_name": "omni:rtx:rt:ambientLight:intensity",
-        "usd_type": "float",
-        "value_type": RenderSettingValueType.FLOAT,
-        "default": 0.0,
-        "label": "Ambient Light Intensity",
-        "group_id": "tone",
-        "group_label": "Tone",
-        "group_order": 20.0,
-        "order": 10.0,
-        "requirement": RenderSettingRequirement.WARMUP.value,
-        "range": {"min": 0.0, "max": 50000.0},
-        "soft_range": {"min": 0.0, "max": 5000.0},
-    },
-    {
-        "attr_name": "omni:rtx:minimal:constantColor",
-        "usd_type": "color3f",
-        "value_type": RenderSettingValueType.COLOR,
-        "default": (0.0, 0.0, 0.0),
-        "label": "Minimal Constant Color",
-        "description": "Constant RGB output used by ovrtx Minimal render mode.",
-        "group_id": "tone",
-        "group_label": "Tone",
-        "group_order": 20.0,
-        "order": 20.0,
-        "requirement": RenderSettingRequirement.WARMUP.value,
-        "component_count": 3,
-        "range": {"min": 0.0, "max": 1.0},
-        "soft_range": {"min": 0.0, "max": 1.0},
-    },
-)
+_RENDER_SETTINGS_PROVIDER_ID = ""
+_RENDER_SETTINGS_PROVIDER_LABEL = ""
+_RENDER_SETTINGS_PUBLIC_NAMESPACES: Tuple[str, ...] = ()
+_RENDER_SETTINGS_METADATA_KEY = ""
+_RENDER_SETTINGS_GROUP_FALLBACK = ""
+_RENDER_SETTINGS_GROUP_LABEL_FALLBACK = ""
+_RENDER_SETTINGS_BUILTIN_SPECS: Tuple[dict[str, Any], ...] = ()
+#: ``attr_name`` -> spec index over the tuple above. The catalog is
+#: rebuilt per request and the declared setting surface is large, so a
+#: linear scan per attribute is quadratic; the index is rebuilt only
+#: when a schema is installed.
+_RENDER_SETTINGS_BUILTIN_SPEC_INDEX: dict[str, dict[str, Any]] = {}
+_SESSION_CAMERA_PRIM_METADATA_LINES: Tuple[str, ...] = ()
+_SESSION_CAMERA_ATTRIBUTE_LINES: Tuple[str, ...] = ()
+_RENDER_SETTINGS_CATALOG_REVISION_FN: Callable[[Any], Any] = repr
+
+
+def configure_render_settings_schema(
+    *,
+    provider_id: str,
+    provider_label: str,
+    public_namespaces: Tuple[str, ...],
+    metadata_key: str,
+    group_fallback: str,
+    group_label_fallback: str,
+    builtin_specs: Tuple[dict[str, Any], ...],
+    session_camera_prim_metadata_lines: Tuple[str, ...] = (),
+    session_camera_attribute_lines: Tuple[str, ...] = (),
+    catalog_revision_fn: Callable[[Any], Any] = repr,
+) -> None:
+    """Install an opaque optional renderer-property schema."""
+
+    global _RENDER_SETTINGS_PROVIDER_ID
+    global _RENDER_SETTINGS_PROVIDER_LABEL
+    global _RENDER_SETTINGS_PUBLIC_NAMESPACES
+    global _RENDER_SETTINGS_METADATA_KEY
+    global _RENDER_SETTINGS_GROUP_FALLBACK
+    global _RENDER_SETTINGS_GROUP_LABEL_FALLBACK
+    global _RENDER_SETTINGS_BUILTIN_SPECS
+    global _RENDER_SETTINGS_BUILTIN_SPEC_INDEX
+    global _SESSION_CAMERA_PRIM_METADATA_LINES
+    global _SESSION_CAMERA_ATTRIBUTE_LINES
+    global _RENDER_SETTINGS_CATALOG_REVISION_FN
+    _RENDER_SETTINGS_PROVIDER_ID = str(provider_id)
+    _RENDER_SETTINGS_PROVIDER_LABEL = str(provider_label)
+    _RENDER_SETTINGS_PUBLIC_NAMESPACES = tuple(public_namespaces)
+    _RENDER_SETTINGS_METADATA_KEY = str(metadata_key)
+    _RENDER_SETTINGS_GROUP_FALLBACK = str(group_fallback)
+    _RENDER_SETTINGS_GROUP_LABEL_FALLBACK = str(group_label_fallback)
+    _RENDER_SETTINGS_BUILTIN_SPECS = tuple(dict(spec) for spec in builtin_specs)
+    _RENDER_SETTINGS_BUILTIN_SPEC_INDEX = build_render_setting_builtin_spec_index(
+        _RENDER_SETTINGS_BUILTIN_SPECS
+    )
+    _SESSION_CAMERA_PRIM_METADATA_LINES = tuple(session_camera_prim_metadata_lines)
+    _SESSION_CAMERA_ATTRIBUTE_LINES = tuple(session_camera_attribute_lines)
+    _RENDER_SETTINGS_CATALOG_REVISION_FN = catalog_revision_fn
 
 
 def _render_setting_builtin_spec(attr_name: str) -> dict[str, Any] | None:
-    for spec in _RENDER_SETTINGS_BUILTIN_SPECS:
-        if str(spec.get("attr_name") or "") == attr_name:
-            return spec
-    return None
+    return _RENDER_SETTINGS_BUILTIN_SPEC_INDEX.get(attr_name)
 
 
 def _render_setting_builtin_metadata(spec: dict[str, Any]) -> dict[str, Any]:
@@ -1446,6 +1459,46 @@ def _render_setting_for_id(
     return None
 
 
+class _RenderSettingsSubscription:
+    """RAII handle for one render-settings change subscription."""
+
+    def __init__(self, cancel: Callable[[], None]) -> None:
+        self._cancel = cancel
+
+    def cancel(self) -> None:
+        cancel = self._cancel
+        self._cancel = None
+        if callable(cancel):
+            cancel()
+
+
+def _stage_change_touches_public_render_settings(
+    paths: Any,
+    active_product_path: str = "",
+) -> bool:
+    """Whether a changed path authors a public setting on the ACTIVE product.
+
+    Public settings edits on OTHER RenderProducts are not part of this
+    adapter's catalog and must not produce (first-)events for subscribers.
+    An empty ``active_product_path`` matches nothing.
+    """
+
+    product = str(active_product_path or "")
+    if not product:
+        return False
+    for raw_path in tuple(paths or ()):
+        text = str(raw_path)
+        prim_text, separator, property_text = text.partition(".")
+        if not separator or prim_text != product:
+            continue
+        if any(
+            property_text.startswith(namespace)
+            for namespace in _RENDER_SETTINGS_PUBLIC_NAMESPACES
+        ):
+            return True
+    return False
+
+
 def _render_setting_reject_validation(
     setting_id: str,
     message: str,
@@ -1659,13 +1712,120 @@ def _render_setting_usd_type_name(usd_type: str) -> Any:
     }.get(key)
 
 
+#: Runtime-verified role-compatible USD declarations per authoritative
+#: builtin spelling.  The effective native column follows the authored
+#: declaration for every listed variant (``int`` populates a valid int32
+#: column, ``uint`` a uint32 column) and the unchanged provider transaction
+#: updates either coherently through the real application path
+#: (full-application GPU probes 2026-07-16; pinned
+#: ``tests/docs/python/test_attribute_read.py`` documents that the native
+#: 32-bit integer storage may be signed or unsigned depending on the schema,
+#: and ``skills/render-settings/SKILL.md`` documents the int32 write path).
+_RENDER_SETTING_ROLE_COMPATIBLE_USD_TYPES: dict[str, tuple[str, ...]] = {
+    "uint": ("int",),
+    "int": ("uint",),
+}
+
+
+def _render_setting_native_type_conflict(attr: Any) -> str:
+    """Concrete reason when an authored builtin cannot carry the native type.
+
+    The mapped RenderProduct builtins have runtime-authoritative native
+    column roles. Compatibility is
+    classified from the live authored attribute against the builtin's role:
+
+    - the authoritative generated-schema spelling is always compatible (it
+      is also what absent-attribute creation authors);
+    - runtime-verified role variants stay editable with their EFFECTIVE
+      USD/native type preserved (signed/unsigned 32-bit integers — the
+      write payload derives from the descriptor's effective ``usd_type``,
+      so the established native int32/uint32 column keeps its dtype and
+      exact value);
+    - role-only spellings that share the exact underlying value type
+      (``float3`` vs ``color3f``, both ``GfVec3f``) are compatible;
+    - everything else (e.g. ``string``/``float`` on the integer builtin,
+      ``string`` on the ``token`` render mode) would silently desynchronize
+      or mis-type the native store, so the edit fails truthfully instead.
+    """
+
+    attr_name = str(attr.GetName())
+    spec = _render_setting_builtin_spec(attr_name)
+    if spec is None:
+        return ""
+    expected_key = str(spec.get("usd_type") or "").lower()
+    expected = _render_setting_usd_type_name(expected_key)
+    if expected is None:
+        return ""
+    try:
+        actual = attr.GetTypeName()
+    except Exception:
+        return ""
+    if not actual:
+        return ""
+    if actual == expected or actual.type == expected.type:
+        return ""
+    if str(actual).lower() in _RENDER_SETTING_ROLE_COMPATIBLE_USD_TYPES.get(
+        expected_key, ()
+    ):
+        return ""
+    return (
+        f"RenderProduct builtin {attr_name!r} is authored with USD type "
+        f"{str(actual)!r}, but the native runtime column requires the exact "
+        f"type {str(expected)!r}; retype or remove the authored attribute "
+        "before editing this setting."
+    )
+
+
+#: Shared with the OVStage adapter: one classification, one fallback.
+_render_setting_owner_scope = render_setting_owner_scope
+
+
+def _render_setting_owner_path(
+    stage: Any,
+    descriptor: RenderSettingDescriptor,
+) -> str:
+    """Prim that authoritatively owns this setting.
+
+    Most settings are owned by the active RenderProduct. Exposure and
+    auto-exposure are owned by the Camera the product references, so they are
+    resolved through that relationship instead of being authored onto the
+    product where the renderer would never read them. Globally owned settings
+    resolve to the prim OVRTX itself resolves — never to the product, which
+    the renderer would never read them from. An owner that cannot be resolved
+    yields an empty path so the caller fails closed.
+    """
+
+    product_path = str(descriptor.metadata.get("render_product_path") or "")
+    owner_scope = _render_setting_owner_scope(descriptor)
+    if owner_scope == "RenderProduct":
+        return product_path
+    if owner_scope == _RENDER_SETTINGS_OWNER_SCOPE:
+        # The owner is a fixed, adapter-owned prim; it is only addressable
+        # while a document is loaded, because the value reaches the renderer
+        # through that document's root snapshot.
+        return _RENDER_SETTINGS_OWNER_PATH if stage is not None else ""
+    if owner_scope != _CAMERA_OWNER_SCOPE or not product_path:
+        return ""
+    try:
+        product = stage.GetPrimAtPath(product_path)
+        if not product or not product.IsValid():
+            return ""
+        relationship = product.GetRelationship("camera")
+        targets = relationship.GetTargets() if relationship else ()
+    except Exception:
+        return ""
+    # Exactly one referenced camera is authoritative; anything else is
+    # ambiguous and must not be authored.
+    return str(targets[0]) if len(targets) == 1 else ""
+
+
 def _render_setting_attr_for_descriptor(
     stage: Any,
     descriptor: RenderSettingDescriptor,
     *,
     create: bool = False,
 ) -> Any:
-    product_path = str(descriptor.metadata.get("render_product_path") or "")
+    product_path = _render_setting_owner_path(stage, descriptor)
     attr_name = str(descriptor.metadata.get("attr_name") or "")
     if not product_path or not attr_name:
         return None
@@ -1703,6 +1863,11 @@ def _render_setting_edit_target_layer(
     stage: Any,
     descriptor: RenderSettingDescriptor,
 ) -> Any:
+    if _render_setting_owner_scope(descriptor) == _RENDER_SETTINGS_OWNER_SCOPE:
+        # The globally owned prim lives on the adapter's own hidden stage,
+        # whose root layer is already the edit target; retargeting the user
+        # document's session layer would author nowhere useful.
+        return None
     product_path = str(descriptor.metadata.get("render_product_path") or "")
     if not product_path.startswith(f"{_SESSION_ROOT_PATH}/"):
         return None
@@ -2101,6 +2266,12 @@ def _copy_tensor_to_host(data: Any) -> np.ndarray:
     return np.array(np.from_dlpack(data), copy=True)
 
 
+def _mapped_render_var_tensor(mapping: Any) -> Any:
+    # ovrtx 0.5 removed ``MappedRenderVar.tensor``; a single-tensor mapping
+    # is itself the DLPack tensor (``shape``, ``dtype``, ``data``).
+    return getattr(mapping, "tensor", mapping)
+
+
 def _point_cloud_copy_tensor(data: Any) -> np.ndarray:
     return _copy_tensor_to_host(data)
 
@@ -2298,6 +2469,8 @@ def _render_var_runtime_render_var(
         descriptor.render_var_name,
         descriptor.metadata.get("source_name", ""),
         descriptor.display_name,
+        # ovrtx 0.5 keys render vars by full RenderVar path.
+        descriptor.metadata.get("render_var_path", ""),
     )
     for name in names:
         if name and name in render_vars:
@@ -2367,6 +2540,30 @@ def _point_cloud_requested_channel_names(
     )
 
 
+def _renderer_config_with_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
+    """Copy ``config`` with ``overrides`` applied, leaving the original untouched.
+
+    A ``RENDERER_CONFIG_RECREATE`` setting's real owner is a public
+    ``RendererConfig`` field, so the rebuilt renderer must carry the new field
+    value while every other field this adapter negotiated (attach mode, Vulkan,
+    selection outline, GPU selection, log path) survives verbatim.
+    """
+
+    if not overrides or config is None:
+        return config
+    import dataclasses  # noqa: PLC0415 — only needed on the rebuild path
+
+    if dataclasses.is_dataclass(config):
+        known = {field_.name for field_ in dataclasses.fields(config)}
+        return dataclasses.replace(
+            config,
+            **{name: value for name, value in overrides.items() if name in known},
+        )
+    for name, value in overrides.items():
+        setattr(config, name, value)
+    return config
+
+
 def _config_with_selection_outline_enabled(config: Any) -> Any:
     """Return an ovrtx renderer config with outline and sensor motion enabled."""
     if not _probe_ovrtx():
@@ -2415,6 +2612,52 @@ _STAGE_CHANGE_SYNC_LIVE = "live"
 _STAGE_CHANGE_SYNC_OVERLAY = "overlay"
 _STAGE_CHANGE_SYNC_RELOAD = "reload"
 
+# Numeric UsdGeomCamera properties consumed by OVRTX's live attribute writer.
+# Projection/schema changes and relationships retain structural handling.
+# Kit viewport metadata on cameras: the orbit target. The viewport's camera writer authors it at the
+# end of every navigation gesture; as an unknown property it reloaded the whole scene (~0.55 s on a
+# five-prim stage), so every orbit, pan, zoom or fly ended with a visible freeze.
+_KIT_VIEWPORT_METADATA = ("omni:kit:centerOfInterest",)
+
+_LIVE_CAMERA_ATTRIBUTE_TYPES = {
+    "focalLength": "float",
+    "focusDistance": "float",
+    "fStop": "float",
+    "horizontalAperture": "float",
+    "verticalAperture": "float",
+    "horizontalApertureOffset": "float",
+    "verticalApertureOffset": "float",
+    "clippingRange": "float2",
+}
+
+# Value inputs of existing lights and shaders that OVRTX updates in place with
+# write_attribute. OVRTX requires the attribute's exact dtype (it rejects a
+# float64 payload for a float input). Asset-valued and connected inputs, shader
+# identity (info:*), material bindings and schema changes stay structural.
+_LIVE_INPUT_DTYPES = {
+    "float": (np.float32, None),
+    "bool": (np.bool_, None),
+    "int": (np.int32, None),
+    "float3": (np.float32, 3),
+    "color3f": (np.float32, 3),
+}
+_LIVE_LIGHT_INPUTS = frozenset(
+    {
+        "inputs:intensity",
+        "inputs:exposure",
+        "inputs:color",
+        "inputs:colorTemperature",
+        "inputs:enableColorTemperature",
+        "inputs:radius",
+        "inputs:width",
+        "inputs:height",
+        "inputs:length",
+        "inputs:angle",
+        "inputs:diffuse",
+        "inputs:specular",
+    }
+)
+
 
 def _stage_change_path_is_session(path: Any) -> bool:
     path_str = str(path)
@@ -2427,6 +2670,8 @@ def _build_session_usda(
     resolution: Tuple[int, int],
     include_fallback_dome: bool,
     camera_path: str = _CAMERA_PATH,
+    camera_projection: str = "perspective",
+    camera_setting_lines: Tuple[str, ...] = (),
     render_product_setting_lines: Tuple[str, ...] = (),
 ) -> str:
     """Return an inline USDA layer defining OvGear's camera and render product.
@@ -2443,12 +2688,28 @@ def _build_session_usda(
     w = int(resolution[0])
     h = int(resolution[1])
     camera_target = camera_path or _CAMERA_PATH
+    projection_token = (
+        "orthographic" if camera_projection == "orthographic" else "perspective"
+    )
     render_product_device_ids = ", ".join(
         str(device_id) for device_id in _PICK_RENDER_PRODUCT_DEVICE_IDS
     )
     render_product_setting_block = ""
     if render_product_setting_lines:
         render_product_setting_block = "\n" + "\n".join(render_product_setting_lines)
+    camera_metadata_block = ""
+    if _SESSION_CAMERA_PRIM_METADATA_LINES:
+        camera_metadata_block = " (\n" + "\n".join(
+            f"            {line}" for line in _SESSION_CAMERA_PRIM_METADATA_LINES
+        ) + "\n        )"
+    camera_attribute_block = ""
+    camera_lines = tuple(_SESSION_CAMERA_ATTRIBUTE_LINES) + tuple(
+        camera_setting_lines
+    )
+    if camera_lines:
+        camera_attribute_block = "".join(
+            f"            {line.strip()}\n" for line in camera_lines
+        )
     dome_block = ""
     if include_fallback_dome:
         # DomeLight doubles as the visible environment; ``inputs:color`` set
@@ -2488,19 +2749,15 @@ def Scope "OvGearSession"
 {{
     def Scope "Cameras"
     {{
-        def Camera "Main" (
-            prepend apiSchemas = ["OmniRtxCameraAutoExposureAPI_1", "OmniRtxCameraExposureAPI_1"]
-        )
+        def Camera "Main"{camera_metadata_block}
         {{
+{camera_attribute_block}\
             float focalLength = 18
             float horizontalAperture = 20.955
             float verticalAperture = 15.2908
             float2 clippingRange = (0.01, 10000)
-            float exposure:responsivity = 1.1026709
-            float exposure:time = 0.02
             float fStop = 0
-            bool omni:rtx:autoExposure:enabled = 1
-            token projection = "perspective"
+            token projection = "{projection_token}"
             matrix4d xformOp:transform = ( (1,0,0,0), (0,1,0,0), (0,0,1,0), (0,0,0,1) )
             uniform token[] xformOpOrder = ["xformOp:transform"]
         }}
@@ -2565,6 +2822,21 @@ def _render_setting_usda_line(attr: Any) -> str | None:
     return f"            {type_name} {name} = {_usda_value_literal(value)}"
 
 
+def _render_setting_default_usda_line(attr_name: str) -> str | None:
+    """USDA line stating a builtin's declared default explicitly."""
+
+    spec = _render_setting_builtin_spec(attr_name)
+    if not spec:
+        return None
+    usd_type = str(spec.get("usd_type") or "")
+    if not usd_type or "default" not in spec:
+        return None
+    value = _render_setting_python_value(spec.get("default"))
+    if value is None:
+        return None
+    return f"            {usd_type} {attr_name} = {_usda_value_literal(value)}"
+
+
 def _stage_has_any_light(stage: Any) -> bool:
     """True if any user-scene ``UsdLux.LightAPI`` prim exists on the stage."""
     # Local import so this module imports cleanly when pxr is not
@@ -2616,6 +2888,114 @@ def _view_to_ovrtx_transform(view_matrix: np.ndarray) -> np.ndarray:
     return world_usd.reshape(1, 4, 4)
 
 
+_PICK_RAY_MAX_TRIANGLES = 2_000_000
+
+
+def _ray_prim_parameter(prim: Any, origin: np.ndarray, direction: np.ndarray) -> Optional[float]:
+    """First ``t >= 0`` where ``origin + t * direction`` meets ``prim`` (local space)."""
+    from pxr import UsdGeom
+
+    if prim.IsA(UsdGeom.Cube):
+        half = 0.5 * float(UsdGeom.Cube(prim).GetSizeAttr().Get() or 2.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t0 = (-half - origin) / direction
+            t1 = (half - origin) / direction
+        near = np.nanmax(np.minimum(t0, t1))
+        far = np.nanmin(np.maximum(t0, t1))
+        if not np.isfinite(near) or near > far or far < 0:
+            return None
+        return float(near if near >= 0 else far)
+    if prim.IsA(UsdGeom.Sphere):
+        radius = float(UsdGeom.Sphere(prim).GetRadiusAttr().Get() or 1.0)
+        a = float(direction @ direction)
+        b = 2.0 * float(origin @ direction)
+        c = float(origin @ origin) - radius * radius
+        disc = b * b - 4 * a * c
+        if a <= 0 or disc < 0:
+            return None
+        roots = sorted(((-b - math.sqrt(disc)) / (2 * a), (-b + math.sqrt(disc)) / (2 * a)))
+        return next((float(t) for t in roots if t >= 0), None)
+    if prim.IsA(UsdGeom.Mesh):
+        mesh = UsdGeom.Mesh(prim)
+        points = np.asarray(mesh.GetPointsAttr().Get() or [], dtype=np.float64).reshape(-1, 3)
+        counts = np.asarray(mesh.GetFaceVertexCountsAttr().Get() or [], dtype=np.int64)
+        indices = np.asarray(mesh.GetFaceVertexIndicesAttr().Get() or [], dtype=np.int64)
+        if not len(points) or not len(counts) or counts.sum() != len(indices):
+            return None
+        if int(np.maximum(counts - 2, 0).sum()) > _PICK_RAY_MAX_TRIANGLES:
+            return None
+        # Fan-triangulate every face: (v0, v[k+1], v[k+2]) for k in 0..count-3.
+        starts = np.cumsum(counts) - counts
+        triangles = np.maximum(counts - 2, 0)
+        face = np.repeat(np.arange(len(counts)), triangles)
+        k = np.arange(len(face)) - (np.cumsum(triangles) - triangles)[face]
+        base = starts[face]
+        try:
+            v0 = points[indices[base]]
+            v1 = points[indices[base + k + 1]]
+            v2 = points[indices[base + k + 2]]
+        except IndexError:
+            return None
+        # Moller-Trumbore, vectorized over triangles.
+        e1, e2 = v1 - v0, v2 - v0
+        p = np.cross(direction, e2)
+        det = np.einsum("ij,ij->i", e1, p)
+        valid = np.abs(det) > 1e-12
+        inv = np.where(valid, 1.0 / np.where(valid, det, 1.0), 0.0)
+        tvec = origin - v0
+        u = np.einsum("ij,ij->i", tvec, p) * inv
+        q = np.cross(tvec, e1)
+        v = (q @ direction) * inv
+        t = np.einsum("ij,ij->i", e2, q) * inv
+        hit = valid & (u >= 0) & (v >= 0) & (u + v <= 1) & (t >= 0)
+        return float(t[hit].min()) if hit.any() else None
+    return None
+
+
+def _pick_surface_point(
+    stage: Any,
+    path: str,
+    view: Any,
+    projection: Any,
+    ndc_x: float,
+    ndc_y: float,
+) -> Optional[Tuple[float, float, float]]:
+    """World point where the pick ray through NDC ``(x, y)`` first meets ``path``.
+
+    ``view``/``projection`` are the GL column-vector matrices of the rendered
+    frame (y up, depth -1..1). Supports Cube, Sphere and Mesh prims; returns
+    None for other geometry, missing prims or a ray that misses the prim.
+    """
+    try:
+        from pxr import Usd, UsdGeom
+
+        prim = stage.GetPrimAtPath(str(path)) if stage is not None and path else None
+        if not prim or not prim.IsA(UsdGeom.Gprim):
+            return None
+        inverse = np.linalg.inv(
+            np.asarray(projection, dtype=np.float64).reshape(4, 4)
+            @ np.asarray(view, dtype=np.float64).reshape(4, 4)
+        )
+        near = inverse @ np.array([ndc_x, ndc_y, -1.0, 1.0])
+        far = inverse @ np.array([ndc_x, ndc_y, 1.0, 1.0])
+        near, far = near[:3] / near[3], far[:3] / far[3]
+        # USD row-vector matrices; the ray parameter survives the affine map.
+        world = np.asarray(
+            UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default()),
+            dtype=np.float64,
+        )
+        to_local = np.linalg.inv(world)
+        origin = (np.append(near, 1.0) @ to_local)[:3]
+        direction = (np.append(far, 1.0) @ to_local)[:3] - origin
+        t = _ray_prim_parameter(prim, origin, direction)
+        if t is None or t > 1.0:
+            return None
+        point = np.append(origin + t * direction, 1.0) @ world
+        return (float(point[0]), float(point[1]), float(point[2]))
+    except Exception:
+        return None
+
+
 class OvRtxRendererAdapter(RendererAdapter):
     """Concrete :class:`RendererAdapter` that delegates to ``ovrtx.Renderer``.
 
@@ -2624,6 +3004,16 @@ class OvRtxRendererAdapter(RendererAdapter):
     constructing the adapter on an unavailable system raises
     :class:`RuntimeError`.
     """
+
+    _camera_projection_mode: str = "perspective"
+    # Property-name prefixes of metadata a host authors but nothing renders
+    # (for example collaboration presence). Edits to them never reach ovrtx
+    # and never reload the scene.
+    non_rendering_property_prefixes: tuple[str, ...] = ()
+
+    def _non_rendering_prefixes(self) -> tuple[str, ...]:
+        """Host-declared non-rendering prefixes plus Kit viewport metadata RTX never renders."""
+        return (*self.non_rendering_property_prefixes, *_KIT_VIEWPORT_METADATA)
 
     def __init__(
         self,
@@ -2644,6 +3034,16 @@ class OvRtxRendererAdapter(RendererAdapter):
         os.environ.setdefault("OVRTX_SKIP_USD_CHECK", "1")
 
         config = _config_with_selection_outline_enabled(config)
+        # Set once a rebuild for a process-global setting destroyed the old
+        # renderer without standing up a replacement: this adapter can never
+        # rebuild again, and every global row must say so.
+        self._global_setting_rebuild_fault: str = ""
+        # Retained so a process-global setting whose owner is a public
+        # RendererConfig field can rebuild the renderer from the exact
+        # negotiated configuration instead of reading it back off the
+        # native handle.
+        self._renderer_config = config
+        get_instrumentation().prepare_renderer_config(self, config)
         self._renderer = (
             _ovrtx.Renderer(config) if config is not None else _ovrtx.Renderer()
         )
@@ -2656,6 +3056,10 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._camera_path = camera_path
 
         self._stage: Any = None
+        # Usd.Stage layer muting is stage-local and does not emit a useful
+        # ObjectsChanged notice.  Remember the composition state represented
+        # by the native renderer so render_frame can detect that boundary.
+        self._loaded_muted_layer_identifiers: tuple[str, ...] = ()
         self._usd_handle: Any = None
         self._session_handle: Any = None
         self._live_resync_handles: list[Any] = []
@@ -2683,10 +3087,11 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._pending_resolution: Tuple[int, int] = _DEFAULT_RESOLUTION
         self._last_render_product_resolution: Optional[Tuple[int, int]] = None
         self._last_pushed_camera_intrinsics: Optional[tuple[str, float, float, float]] = None
-        self._dt_clock: float = time.monotonic()
+        self._camera_projection_mode: str = "perspective"
+        self._dt_clock: float = time.perf_counter()
         # Clock injection point — tests override to drive the debounce
         # timers deterministically without real wall-clock waits.
-        self._clock: Callable[[], float] = time.monotonic
+        self._clock: Callable[[], float] = time.perf_counter
         # ``-inf`` so the very first size mismatch after construction
         # applies immediately (no spurious "actively resizing" state).
         self._last_big_delta_time: float = -math.inf
@@ -2698,6 +3103,12 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._selection_outline_attribute_writes: int = 0
         self._selection_outline_generation: int = 0
         self._selection_outline_last_write: dict[str, Any] = {}
+        # The ovrtx outline pass does not show newly written membership in a
+        # converged, camera-static render until one renderer.reset() runs
+        # after membership exists (same contract as the OVStage adapter's
+        # activation reset). Armed on construction, root reload, and session
+        # reinjects that happen while no outline membership is applied.
+        self._selection_outline_pass_needs_reset: bool = True
         # FIFO of in-flight ovrtx pick queries that we have already
         # enqueued and are waiting to drain on a subsequent frame. Each
         # entry is ``[seq, kind, name, cb_or_None, cancel_reason,
@@ -2709,6 +3120,8 @@ class OvRtxRendererAdapter(RendererAdapter):
         # collapse same-RenderProduct picks and surface the latest hit
         # while the superseded FIFO slot is at the head.
         self._in_flight_pick_queries: Deque[list] = collections.deque()
+        self._pick_query_products: dict[int, str] = {}
+        self._pick_query_waits: dict[int, int] = {}
         self._pick_seq: int = 0
         self._pick_enqueue_count: int = 0
         self._pick_result_count: int = 0
@@ -2733,6 +3146,17 @@ class OvRtxRendererAdapter(RendererAdapter):
         # every caller; the continuous viewport frame loop opts in via
         # :meth:`set_ldr_overlap_enabled` (and OVGEAR_LDR_OVERLAP=0 vetoes).
         self._ldr_overlap: Optional[LdrOverlapState] = None
+        # Presented-frame bookkeeping read by the inspector state endpoint.
+        self._successful_frame_count = 0
+        self._last_frame_nonblack_pixels: int | None = None
+        self._last_frame_shape: tuple[int, ...] | None = None
+        # RenderProducts a host presents together (see
+        # :meth:`set_render_product_group`); the camera state each last wrote
+        # into the renderer; and CPU images the latest group step rendered
+        # for the others, keyed like the camera state.
+        self._render_product_group: frozenset[str] = frozenset()
+        self._grouped_cameras: dict[str, tuple] = {}
+        self._grouped_frames: dict[str, tuple] = {}
         # Optional ovstream livestream tap (strata#17). ``None`` unless
         # the ``OVGEAR_LIVESTREAM=1`` environment variable is set AND
         # ``ovstream`` is importable. When active, ``_extract_ldr_color``
@@ -2760,18 +3184,395 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._point_cloud_requests: dict[str, PointCloudRequest] = {}
         self._latest_point_cloud_frames: dict[tuple[str, str], PointCloudFrame] = {}
         self._render_var_output_requests: dict[str, RenderVarOutputRequest] = {}
+        # Render Settings change observers: tokenized
+        # (token, callback) records notified through the snapshot-deduped
+        # publisher after successful apply/reset and when live stage edits
+        # (external editors, undo/redo, product resyncs) change the public
+        # RenderProduct settings state.
+        self._render_settings_subscribers: list[tuple[object, Callable[[], None]]] = []
+        self._render_settings_last_snapshot: tuple | None = None
         self._latest_render_var_output_frames: dict[
             tuple[str, str, str],
             RenderVarOutputFrame,
         ] = {}
 
+        # Optional native pacing borrows (but never owns) the Python-created
+        # renderer between the matching start and stop/drain calls.
+        self._frame_pacing_provider: Any = None
+        self._frame_pacing_token: int = 0
+        self._frame_pacing_needs_sync_step: bool = True
+        self._frame_pacing_size: tuple[int, int] | None = None
+        self._frame_pacing_projection: np.ndarray | None = None
+        self._frame_pacing_camera_path: str = ""
+        self._frame_pacing_last_raw_world: np.ndarray | None = None
+        self._frame_pacing_last_intent_time: float = 0.0
+        self._frame_pacing_restore_overlap: bool = False
+        self._frame_pacing_pick_snapshot: CameraSnapshot | None = None
+        self._frame_pacing_presented_snapshot: CameraSnapshot | None = None
+        self._frame_pacing_pick_generated: bool = False
+        self._frame_pacing_pick_association_unavailable: bool = False
+        self._frame_pacing_render_paused: bool = False
+
+    def _native_render_is_paused(self) -> bool:
+        """Report the pick lease state safely on compatibility instances.
+
+        Partially constructed and compatibility adapters predate this state,
+        so every read goes through the same defensive accessor already used
+        for the pacing token.
+        """
+
+        return bool(getattr(self, "_frame_pacing_render_paused", False))
+
     def set_zero_copy_state(self, state: Optional[ZeroCopyState]) -> None:
         """Share zero-copy coordination state with the viewport bridge."""
         self._zero_copy_state = state
 
+    def set_frame_pacing_provider(self, provider: Any) -> None:
+        """Bind the viewport provider used by optional native frame pacing."""
+
+        if provider is getattr(self, "_frame_pacing_provider", None):
+            return
+        self._stop_native_frame_pacing("viewport provider replacement")
+        self._frame_pacing_provider = provider
+
+    def set_frame_pacing_suspended(self, suspended: bool) -> None:
+        """Pause native renderer demand while its viewport is hidden.
+
+        Visibility restoration deliberately does not resume here. The next
+        visible viewport publication goes through ``_publish_native_frame``,
+        whose existing resume handshake revalidates the renderer, camera,
+        resolution, and pick-query state before returning ownership to the
+        native worker.
+        """
+
+        token = int(getattr(self, "_frame_pacing_token", 0) or 0)
+        if suspended:
+            if token and not self._native_render_is_paused():
+                self._stop_native_frame_pacing(
+                    "hidden viewport", pause_render=True
+                )
+
+    @staticmethod
+    def _frame_pacing_bindings() -> Any:
+        try:
+            from omni.ui import _ui as native_ui
+        except (ImportError, AttributeError):
+            return None
+        names = (
+            "_native_frame_pacing_start",
+            "_native_frame_pacing_publish",
+            "_native_frame_pacing_stop",
+            "_native_frame_pacing_pause_render",
+            "_native_frame_pacing_resume_render",
+            "_get_present_rate",
+            "_get_native_frame_pacing_status",
+        )
+        if not all(callable(getattr(native_ui, name, None)) for name in names):
+            return None
+        return native_ui
+
+    def _frame_pacing_eligible(self) -> bool:
+        # The native worker steps one product; a group must keep stepping all.
+        if len(getattr(self, "_render_product_group", ())) > 1:
+            return False
+        native_ui = self._frame_pacing_bindings()
+        if native_ui is None or float(native_ui._get_present_rate()) == 0.0:
+            return False
+        if (
+            self._renderer is None
+            or self._stage is None
+            or self._usd_handle is None
+            or self._frame_pacing_provider is None
+            or self._livestream is not None
+            or self._point_cloud_requests
+            or self._render_var_output_requests
+        ):
+            return False
+        # Native pacing publishes GPU-resident images itself, so a pending
+        # Python zero-copy request no longer competes with it: while a session
+        # owns the renderer borrow, render_frame never runs and the legacy
+        # GpuFrame path stays dormant. Refusing pacing here is what left the
+        # ordinary launcher, which requests zero-copy, permanently unpaced.
+        # `_ldr_overlap_allowed` keeps its own gate: that path really does
+        # share the Python GpuFrame mechanism.
+        if getattr(self._renderer, "_attached_ovstage", None) is not None:
+            return False
+        return True
+
+    def _borrow_native_renderer(self) -> tuple[int, str, int, int, int] | None:
+        """Validate and describe the usable OVRTX native borrow."""
+
+        if not self._frame_pacing_eligible():
+            return None
+        import ctypes
+
+        # The installed ctypes wrapper does not expose a public borrow
+        # accessor. Keep this bridge isolated as plain wrapper state so
+        # renderer capabilities never escape through normal adapter paths.
+        wrapper_state = self.__dict__["_renderer"].__dict__
+        handle = wrapper_state.get("_handle")
+        bindings = wrapper_state.get("_bindings")
+        if handle is None or bindings is None:
+            return None
+        try:
+            address = int(ctypes.cast(handle, ctypes.c_void_p).value or 0)
+            library_path = os.path.abspath(os.fspath(bindings.library_path))
+            bindings_module = sys.modules.get(type(bindings).__module__)
+            output_type = getattr(
+                bindings_module,
+                "ovrtx_render_product_render_var_output_t",
+                None,
+            )
+            name_field = getattr(output_type, "source_name", None)
+            if name_field is None:
+                name_field = getattr(output_type, "render_var_name", None)
+            handle_field = getattr(output_type, "output_handle", None)
+            if name_field is None or handle_field is None:
+                return None
+            render_var_stride = ctypes.sizeof(output_type)
+            render_var_name_offset = name_field.offset
+            render_var_handle_offset = handle_field.offset
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+        if (
+            not address
+            or not os.path.isfile(library_path)
+            or name_field.size != 16
+            or handle_field.size != 8
+            or not 0 < render_var_stride <= 4096
+            or render_var_name_offset + name_field.size > render_var_stride
+            or render_var_handle_offset + handle_field.size > render_var_stride
+        ):
+            return None
+        return (
+            address,
+            library_path,
+            render_var_stride,
+            render_var_name_offset,
+            render_var_handle_offset,
+        )
+
+    def _stop_native_frame_pacing(
+        self,
+        reason: str,
+        *,
+        capture_selected_camera: bool = False,
+        pause_render: bool = False,
+    ) -> None:
+        """Drain and join the borrower before any Python renderer operation."""
+
+        token = int(getattr(self, "_frame_pacing_token", 0) or 0)
+        self._frame_pacing_pick_snapshot = None
+        self._frame_pacing_pick_generated = False
+        self._frame_pacing_pick_association_unavailable = False
+        if not token:
+            # A pick callback can synchronously author selection while the
+            # selected-camera image is being installed. Preserve that frame's
+            # already-produced one-shot until the viewport consumes it; the
+            # beginning of the next render clears it unconditionally.
+            self._frame_pacing_needs_sync_step = True
+            return
+        self._frame_pacing_presented_snapshot = None
+        native_ui = self._frame_pacing_bindings()
+        if native_ui is None:
+            raise RuntimeError(
+                "native frame pacing bindings disappeared while renderer "
+                f"ownership was pinned before {reason}"
+            )
+        if capture_selected_camera:
+            # An active pacing pick is valid only when it can be tied to one
+            # complete selected real-frame camera. Missing/malformed state and
+            # generated selections stay fail-closed after the mandatory drain.
+            self._frame_pacing_pick_association_unavailable = True
+            try:
+                status = dict(native_ui._get_native_frame_pacing_status())
+                self._frame_pacing_pick_generated = bool(
+                    status.get("selected_image_is_generated", False)
+                )
+                selected_world = status.get("selected_camera_world")
+                projection = self._frame_pacing_projection
+                size = self._frame_pacing_size
+                if (
+                    not self._frame_pacing_pick_generated
+                    and selected_world is not None
+                    and projection is not None
+                    and size is not None
+                ):
+                    world_usd = np.asarray(
+                        selected_world, dtype=np.float64
+                    ).reshape(4, 4)
+                    selected_view = np.linalg.inv(world_usd.T)
+                    projection_array = np.asarray(
+                        projection, dtype=np.float64
+                    ).reshape(4, 4)
+                    selected_size = (int(size[0]), int(size[1]))
+                    if (
+                        np.all(np.isfinite(selected_view))
+                        and np.all(np.isfinite(projection_array))
+                        and selected_size[0] > 0
+                        and selected_size[1] > 0
+                    ):
+                        self._frame_pacing_pick_snapshot = CameraSnapshot.capture(
+                            selected_view, projection_array, selected_size
+                        )
+                        self._frame_pacing_pick_association_unavailable = False
+            except (
+                IndexError,
+                KeyError,
+                OverflowError,
+                TypeError,
+                ValueError,
+                np.linalg.LinAlgError,
+            ):
+                # A malformed diagnostic must not prevent the mandatory
+                # drain; the pick remains explicitly unavailable below.
+                self._frame_pacing_pick_snapshot = None
+        if pause_render and bool(native_ui._native_frame_pacing_pause_render(token)):
+            self._frame_pacing_render_paused = True
+            self._frame_pacing_needs_sync_step = True
+            return
+        # There is no ovrtx cancellation primitive. A failed native cleanup
+        # attempt deliberately retains its maps/results and the borrowed token
+        # so that a later attempt can release them safely. Keep retrying with a
+        # bounded pause instead of abandoning that ownership and allowing the
+        # Python renderer mutation below to race retained native resources.
+        while not bool(native_ui._native_frame_pacing_stop(token)):
+            time.sleep(0.001)
+        self._frame_pacing_token = 0
+        self._frame_pacing_render_paused = False
+        self._frame_pacing_needs_sync_step = True
+
+    def _publish_native_frame(
+        self,
+        width: int,
+        height: int,
+        view_matrix: Any,
+        proj_matrix: Any,
+    ) -> bool:
+        """Publish one complete camera intent without calling ovrtx in Python."""
+
+        if not self._frame_pacing_eligible():
+            if getattr(self, "_frame_pacing_token", 0):
+                self._stop_native_frame_pacing("capability fallback")
+            if getattr(self, "_frame_pacing_restore_overlap", False):
+                self.set_ldr_overlap_enabled(True)
+                self._frame_pacing_restore_overlap = False
+            return False
+        size = (int(width), int(height))
+        projection = np.ascontiguousarray(proj_matrix, dtype=np.float64).reshape(4, 4)
+        camera_path = self._runtime_camera_path()
+        if self._frame_pacing_token and (
+            size != self._frame_pacing_size
+            or camera_path != self._frame_pacing_camera_path
+            or self._frame_pacing_projection is None
+            # Dolly changes near/far only; ovrtx camera authoring consumes fx/fy.
+            or not np.allclose(
+                projection.diagonal()[:2],
+                self._frame_pacing_projection.diagonal()[:2],
+                rtol=0.0,
+                atol=1e-12,
+            )
+        ):
+            self._stop_native_frame_pacing(
+                "resolution or camera intrinsics change", pause_render=True
+            )
+            return False
+        native_ui = self._frame_pacing_bindings()
+        if native_ui is None:
+            return False
+        if self._frame_pacing_token and self._native_render_is_paused():
+            if self._in_flight_pick_queries:
+                return False
+            if not bool(
+                native_ui._native_frame_pacing_resume_render(
+                    self._frame_pacing_token
+                )
+            ):
+                self._stop_native_frame_pacing("failed render-worker resume")
+                return False
+            self._frame_pacing_render_paused = False
+            self._frame_pacing_needs_sync_step = False
+        if self._frame_pacing_needs_sync_step:
+            return False
+        if not self._frame_pacing_token:
+            borrow = self._borrow_native_renderer()
+            if borrow is None:
+                return False
+            # The overlap may retain a live result container from the
+            # synchronous bootstrap frame. Release it before handing sole
+            # renderer ownership to native code. Default-off pacing therefore
+            # leaves the existing overlap behavior untouched.
+            restore_overlap = getattr(self, "_ldr_overlap", None) is not None
+            self.set_ldr_overlap_enabled(False)
+            (
+                address,
+                library_path,
+                render_var_stride,
+                render_var_name_offset,
+                render_var_handle_offset,
+            ) = borrow
+            token = int(native_ui._native_frame_pacing_start(
+                address,
+                library_path,
+                render_var_stride,
+                render_var_name_offset,
+                render_var_handle_offset,
+                self._frame_pacing_provider,
+                str(self._render_product_path),
+                camera_path,
+                size[0],
+                size[1],
+            ) or 0)
+            if not token:
+                if restore_overlap:
+                    self.set_ldr_overlap_enabled(True)
+                return False
+            self._frame_pacing_restore_overlap = (
+                self._frame_pacing_restore_overlap or restore_overlap
+            )
+            self._frame_pacing_token = token
+            self._frame_pacing_size = size
+            self._frame_pacing_projection = projection.copy()
+            self._frame_pacing_camera_path = camera_path
+
+        # A Python camera record is the complete authoritative intent. Native
+        # prediction may advance from it between UI ticks, but must never feed
+        # back into a later publication: doing so compounds motion already
+        # represented by the new raw camera pose.
+        # Native code writes this record as the camera's ``omni:xform``, which
+        # ovrtx composes under the camera's parents.
+        raw_world = self._runtime_camera_xform(
+            _view_to_ovrtx_transform(view_matrix), camera_path
+        ).reshape(4, 4)
+        # Must stay perf_counter: the native coordinator differences this
+        # against std::chrono::steady_clock (NativeFramePacing.cpp writeCamera).
+        publication_time = time.perf_counter()
+        velocity = np.zeros(3, dtype=np.float64)
+        previous_world = self._frame_pacing_last_raw_world
+        previous_time = self._frame_pacing_last_intent_time
+        if previous_world is not None and publication_time > previous_time:
+            velocity = (
+                raw_world[3, :3] - previous_world[3, :3]
+            ) / (publication_time - previous_time)
+        published = bool(native_ui._native_frame_pacing_publish(
+            self._frame_pacing_token,
+            size[0],
+            size[1],
+            raw_world.reshape(-1).tolist(),
+            velocity.tolist(),
+            publication_time,
+        ))
+        if not published:
+            self._stop_native_frame_pacing("failed camera publication")
+        else:
+            self._frame_pacing_last_raw_world = raw_world.copy()
+            self._frame_pacing_last_intent_time = publication_time
+            self._frame_pacing_projection = projection.copy()
+        return published
+
     # ── Depth-one LdrColor overlap: ownership and presentation state ──
 
-    def _release_retained_output(self) -> None:
+    def _release_retained_output(self, *, keep_grouped_frames: bool = False) -> None:
         """Release the retained step result and presentation cache.
 
         MUST run immediately before every ownership-invalidating native
@@ -2782,12 +3583,110 @@ class OvRtxRendererAdapter(RendererAdapter):
         undefined (measured consequences range from stale mappings to
         renderer deadlock). Idempotent and cheap when nothing is retained.
 
+        Grouped images and camera records describe the renderer before the
+        mutation and are forgotten too, unless ``keep_grouped_frames`` (a
+        switch between products of one group, which mutates nothing).
+
         The static ownership audit verifies both the call-site coverage and
         the ordering of this call inside every boundary function.
         """
         overlap = getattr(self, "_ldr_overlap", None)
         if overlap is not None:
             overlap.release(clear_presentation=True)
+        if not keep_grouped_frames:
+            self._discard_grouped_frames()
+
+    def set_render_product_group(self, paths: Any) -> None:
+        """Step ``paths`` together; call once per host frame that shows them.
+
+        ovrtx rebuilds per-product render state whenever the set of stepped
+        RenderProducts changes (measured ~0.27 s of GPU work per product on an
+        L40), so a host that presents several products in turn, such as a quad
+        layout, must keep all of them in every step. One step then renders
+        every grouped product, and ``render_frame`` presents another grouped
+        authored product from that step while its camera is exactly the one
+        the product last rendered with. Images are shared within one host
+        frame only. An empty group restores single-product steps.
+        """
+        group = frozenset(str(path) for path in paths or () if path)
+        if group != getattr(self, "_render_product_group", frozenset()):
+            self._render_product_group = group
+            self._grouped_cameras = {}
+        self._grouped_frames = {}
+
+    def _discard_grouped_frames(self, changed_paths: Any = None) -> None:
+        """Forget grouped images and the camera records a change may outdate.
+
+        Without ``changed_paths`` any renderer state may have changed. With
+        them, only records of cameras at, below or with a property in one of
+        those paths are forgotten; images are always dropped.
+        """
+        self._grouped_frames = {}
+        cameras = getattr(self, "_grouped_cameras", {})
+        if not changed_paths:
+            self._grouped_cameras = {}
+            return
+        owners = {str(path).split(".", 1)[0] for path in changed_paths}
+        self._grouped_cameras = {
+            product: key
+            for product, key in cameras.items()
+            if not any(
+                owner == "/" or key[1] == owner or key[1].startswith(owner + "/")
+                for owner in owners
+            )
+        }
+
+    def _is_grouped_product(self, path: Any) -> bool:
+        """Whether ``path`` is an authored product of a multi-product group."""
+        group = getattr(self, "_render_product_group", ())
+        default = getattr(self, "_default_render_product_path", _RENDER_PRODUCT_PATH)
+        return len(group) > 1 and str(path) in group and path != default
+
+    def _grouped_frame_key(
+        self, camera_path: str, view_matrix: Any, proj_matrix: Any, width: int, height: int
+    ) -> Optional[tuple]:
+        """Camera state of this grouped frame, or None when it renders alone.
+
+        Consumers sharing the single per-frame LdrColor mapping (livestream,
+        zero-copy, RenderVar/PointCloud requests) and pending picks keep the
+        per-frame synchronous path.
+        """
+        zero_copy = getattr(self, "_zero_copy_state", None)
+        if (
+            not self._is_grouped_product(self._render_product_path)
+            or getattr(self, "_in_flight_pick_queries", None)
+            or getattr(self, "_frame_pacing_pick_snapshot", None) is not None
+            or getattr(self, "_livestream", None) is not None
+            or (zero_copy is not None and zero_copy.gpu_pending)
+            or getattr(self, "_point_cloud_requests", None)
+            or getattr(self, "_render_var_output_requests", None)
+        ):
+            return None
+        return (
+            str(self._render_product_path),
+            str(camera_path),
+            np.ascontiguousarray(view_matrix, dtype=np.float64).tobytes(),
+            np.ascontiguousarray(proj_matrix, dtype=np.float64).tobytes(),
+            (int(width), int(height)),
+        )
+
+    def _cache_grouped_frames(self, products: Any, key: tuple) -> None:
+        """Keep this step's images of the other grouped products.
+
+        Each rendered with the camera its product last wrote, unless a later
+        write to the same camera (a shared camera) replaced it.
+        """
+        cameras = {
+            product: other
+            for product, other in getattr(self, "_grouped_cameras", {}).items()
+            if product != key[0] and other[1] != key[1] and self._is_grouped_product(product)
+        }
+        self._grouped_frames = {
+            product: (other, self._extract_ldr_color(products, *other[4], product_path=product))
+            for product, other in cameras.items()
+        }
+        cameras[key[0]] = key
+        self._grouped_cameras = cameras
 
     @property
     def presented_camera_snapshot(self) -> Optional[CameraSnapshot]:
@@ -2800,6 +3699,9 @@ class OvRtxRendererAdapter(RendererAdapter):
         callers must then fall back to the matrices they submitted (which
         are identical to the presented ones on the synchronous path).
         """
+        one_shot = getattr(self, "_frame_pacing_presented_snapshot", None)
+        if one_shot is not None:
+            return one_shot
         overlap = getattr(self, "_ldr_overlap", None)
         return overlap.presented_snapshot if overlap is not None else None
 
@@ -2846,6 +3748,21 @@ class OvRtxRendererAdapter(RendererAdapter):
                 return False
         return True
 
+    def attach_render_product_stream(self, tap, render_product_path):
+        """Bind the existing CUDA texture tee to one explicit RenderProduct."""
+        from ovui_data_adapters.common._render_product_stream import attach
+        attach(self, tap, render_product_path)
+
+    def detach_render_product_stream(self, tap):
+        """Release this owner without affecting another stream or closing it."""
+        from ovui_data_adapters.common._render_product_stream import detach
+        detach(self, tap)
+
+    def render_product_stream_attached(self, tap):
+        """Whether this renderer still feeds the given external stream."""
+        from ovui_data_adapters.common._render_product_stream import is_attached
+        return is_attached(self, tap)
+
     @property
     def livestream(self) -> Any:
         """The optional livestream tap, or ``None`` when disabled.
@@ -2881,6 +3798,7 @@ class OvRtxRendererAdapter(RendererAdapter):
             return False
         if next_path == self._camera_path:
             return True
+        self._stop_native_frame_pacing("active camera change")
         self._camera_path = next_path
         if getattr(self, "_stage", None) is not None:
             self._reset_render_timing_state()
@@ -2925,6 +3843,31 @@ class OvRtxRendererAdapter(RendererAdapter):
             outputs=tuple(descriptors),
             active_render_product_path=self.get_active_render_product_path(),
         )
+
+    @staticmethod
+    def supported_render_var_outputs() -> list[dict[str, Any]]:
+        """Describe every RenderVar source this renderer can produce, before configuration.
+
+        ``sensor`` is false for the display color (``LdrColor``), which views
+        render but ``sensor_capture`` does not decode.
+        """
+        outputs = []
+        for name in _RENDER_VAR_SOURCE_NAMES:
+            spec = _RENDER_VAR_OUTPUT_SPECS.get(_source_token_key(name))
+            outputs.append({
+                "source_name": name,
+                "display_name": str(spec["display_name"]) if spec else "LDR Color",
+                "output_kind": spec["output_kind"].value if spec else "ldr_color",
+                "units": str(spec["units"]) if spec else "",
+                "sensor": spec is not None,
+            })
+        return outputs
+
+    @staticmethod
+    def supported_render_var_name(name: str) -> Optional[str]:
+        """Return the canonical source name for ``name`` (case-insensitive), or None."""
+        key = _source_token_key(name)
+        return next((n for n in _RENDER_VAR_SOURCE_NAMES if _source_token_key(n) == key), None)
 
     def list_render_var_outputs(
         self,
@@ -3037,6 +3980,11 @@ class OvRtxRendererAdapter(RendererAdapter):
             descriptor = _render_setting_builtin_descriptor(product_path, spec)
             if descriptor is None:
                 continue
+            builtin_scope = _render_setting_owner_scope(descriptor)
+            if builtin_scope == _RENDER_SETTINGS_OWNER_SCOPE:
+                descriptor = self._render_settings_owner_value_state(descriptor)
+            elif builtin_scope == _CAMERA_OWNER_SCOPE:
+                descriptor = self._render_settings_camera_value_state(descriptor)
             settings.append(descriptor)
             public_attr_names.add(attr_name)
             metadata = _render_setting_builtin_metadata(spec)
@@ -3078,6 +4026,122 @@ class OvRtxRendererAdapter(RendererAdapter):
             warnings=tuple(catalog_warnings),
         )
 
+    def subscribe_render_settings_changes(
+        self,
+        callback: Callable[[], None],
+    ) -> _RenderSettingsSubscription:
+        """Notify on real render-settings changes (apply/reset/external/undo).
+
+        Every returned handle owns a UNIQUE tokenized record: subscribing the
+        same callback twice yields two independently live subscriptions, and
+        cancelling one can never remove another owner's record. Cancellation
+        is idempotent.
+        """
+
+        subscribers = getattr(self, "_render_settings_subscribers", None)
+        if not isinstance(subscribers, list):
+            subscribers = []
+            self._render_settings_subscribers = subscribers
+        if not subscribers:
+            # Rebaseline on EVERY zero-to-one subscriber transition: the
+            # snapshot gate compares against the state this subscription
+            # epoch signed up under, so a change that happened while nobody
+            # listened can never surface as a false first event, and an
+            # unrelated signal cannot manufacture one either.
+            try:
+                self._render_settings_last_snapshot = (
+                    self._render_settings_state_snapshot()
+                )
+            except Exception:
+                self._render_settings_last_snapshot = None
+        token = object()
+        if callable(callback):
+            subscribers.append((token, callback))
+
+        def cancel() -> None:
+            active = getattr(self, "_render_settings_subscribers", None)
+            if isinstance(active, list):
+                self._render_settings_subscribers = [
+                    record for record in active if record[0] is not token
+                ]
+
+        return _RenderSettingsSubscription(cancel)
+
+    def _notify_render_settings_changed(self) -> None:
+        for _token, callback in tuple(
+            getattr(self, "_render_settings_subscribers", ()) or ()
+        ):
+            try:
+                callback()
+            except Exception:
+                # Observers are disposable; one raising observer cannot block
+                # later observers or invalidate the authored edit.
+                continue
+
+    def _stage_change_affects_active_product(self, resynced_paths):
+        """Whether a prim-level resync removes/replaces the active product.
+
+        A RenderProduct removal or replacement arrives as a prim resync (no
+        attribute path), which is a CATALOG change for the settings surface.
+        """
+
+        product_path = str(self.get_active_render_product_path() or "")
+        if not product_path:
+            return False
+        for raw_path in tuple(resynced_paths or ()):
+            prim_text = str(raw_path).split(".")[0]
+            if not prim_text:
+                continue
+            if product_path == prim_text or product_path.startswith(
+                prim_text.rstrip("/") + "/"
+            ):
+                return True
+        return False
+
+    def _render_settings_state_snapshot(self, catalog: Any = None) -> tuple | None:
+        """CANONICAL provider revision of the public settings state.
+
+        Deterministic recursive canonicalization of the COMPLETE catalog —
+        active product identity/label, every provider descriptor, every
+        group descriptor, every binding descriptor with all nested state,
+        the revision string, and catalog warnings — so any live semantic
+        change with an unchanged value is still a change.
+
+        ``catalog`` lets a caller that has just described this exact state,
+        with nothing mutating in between, hand that description over instead
+        of paying for an identical second one. The canonicalization itself is
+        unchanged and still covers the complete catalog.
+        """
+
+        if catalog is None:
+            try:
+                catalog = self.list_render_settings(None)
+            except Exception:
+                return None
+        catalog_revision = _RENDER_SETTINGS_CATALOG_REVISION_FN(catalog)
+        return (
+            str(self.get_active_render_product_path() or ""),
+            catalog_revision,
+        )
+
+    def _publish_render_settings_change(self, catalog: Any = None) -> None:
+        """One authoritative event per LOGICAL settings change.
+
+        Every producer (explicit apply/reset success and the USD stage-notice
+        path) funnels through this snapshot gate: the current public settings
+        state (values, availability, catalog membership) is compared against
+        the last published snapshot, so one logical edit delivered through
+        BOTH producers notifies exactly once, unchanged repeated notices are
+        suppressed, and a RenderProduct resync/removal (catalog change)
+        notifies even though no attribute path was named.
+        """
+
+        snapshot = self._render_settings_state_snapshot(catalog)
+        if snapshot == getattr(self, "_render_settings_last_snapshot", None):
+            return
+        self._render_settings_last_snapshot = snapshot
+        self._notify_render_settings_changed()
+
     def read_render_setting(
         self,
         setting_id: str,
@@ -3091,6 +4155,60 @@ class OvRtxRendererAdapter(RendererAdapter):
             setting_id,
         )
         return None if descriptor is None else descriptor.value_state
+
+    def read_render_setting_value(
+        self,
+        attr_name: str,
+        *,
+        render_product_path: Optional[str] = None,
+    ) -> Any:
+        """The effective value of ONE named setting, without the rest.
+
+        Describes exactly the one attribute through the same helpers
+        :meth:`list_render_settings` uses — the authored USD attribute when
+        the product carries it, otherwise the declared builtin corrected from
+        its real owner prim — so a caller after a single token does not pay
+        for the whole declared surface.
+        """
+
+        attr_name = str(attr_name or "")
+        stage = getattr(self, "_stage", None)
+        active_path = str(
+            render_product_path or self.get_active_render_product_path() or ""
+        )
+        if stage is None or not attr_name or not active_path:
+            return None
+        if _render_setting_public_namespace(attr_name) is None:
+            # Not a described setting at all: the catalog has no row for it.
+            return None
+        try:
+            prim = _render_settings_product_prim(stage, active_path)
+        except (ImportError, RuntimeError):
+            return None
+        if prim is None:
+            return None
+        product_path = str(prim.GetPath())
+        descriptor = None
+        try:
+            attr = prim.GetAttribute(attr_name)
+            if attr:
+                descriptor = _render_setting_descriptor(product_path, attr)
+        except Exception:
+            descriptor = None
+        if descriptor is None:
+            spec = _render_setting_builtin_spec(attr_name)
+            if spec is None:
+                return None
+            descriptor = _render_setting_builtin_descriptor(product_path, spec)
+            if descriptor is None:
+                return None
+            builtin_scope = _render_setting_owner_scope(descriptor)
+            if builtin_scope == _RENDER_SETTINGS_OWNER_SCOPE:
+                descriptor = self._render_settings_owner_value_state(descriptor)
+            elif builtin_scope == _CAMERA_OWNER_SCOPE:
+                descriptor = self._render_settings_camera_value_state(descriptor)
+        state = getattr(descriptor, "value_state", None)
+        return getattr(state, "current_value", None)
 
     def validate_render_setting(
         self,
@@ -3109,26 +4227,46 @@ class OvRtxRendererAdapter(RendererAdapter):
                 "No active RenderProduct is available.",
                 "missing_render_product",
             )
-        catalog = self.list_render_settings(active_path)
+        result, _descriptor = self._render_setting_validation_for(
+            self.list_render_settings(active_path),
+            setting_id,
+            value,
+        )
+        return result
+
+    def _render_setting_validation_for(
+        self,
+        catalog: Any,
+        setting_id: str,
+        value: Any,
+    ) -> tuple[RenderSettingValidationResult, Any]:
+        """Validate one value against a catalog the caller already holds.
+
+        The resolved descriptor comes back with the result, so a caller that
+        goes on to author the value does not have to describe the whole
+        declared setting surface a second time to find the row it has just
+        validated against.
+        """
+
         descriptor = _render_setting_for_id(catalog, setting_id)
         if descriptor is None:
             return _render_setting_reject_validation(
                 setting_id,
                 "Render setting is not available for this RenderProduct.",
                 "unknown_setting",
-            )
+            ), None
         if not descriptor.enabled or descriptor.disabled_reason:
             return _render_setting_reject_validation(
                 descriptor.setting_id,
                 descriptor.disabled_reason or "Render setting is disabled.",
                 "setting_disabled",
-            )
+            ), descriptor
         if descriptor.value_type is RenderSettingValueType.UNKNOWN:
             return _render_setting_reject_validation(
                 descriptor.setting_id,
                 "Render setting value type is not supported.",
                 "unsupported_type",
-            )
+            ), descriptor
         try:
             normalized = _render_setting_coerce_value(descriptor, value)
         except (TypeError, ValueError) as exc:
@@ -3136,7 +4274,7 @@ class OvRtxRendererAdapter(RendererAdapter):
                 descriptor.setting_id,
                 str(exc),
                 "invalid_value",
-            )
+            ), descriptor
         ok, message, code = _render_setting_value_within_constraints(
             descriptor,
             normalized,
@@ -3146,13 +4284,13 @@ class OvRtxRendererAdapter(RendererAdapter):
                 descriptor.setting_id,
                 message,
                 code,
-            )
+            ), descriptor
         return RenderSettingValidationResult.accepted_result(
             setting_id=descriptor.setting_id,
             normalized_value=normalized,
             requirement=descriptor.requirement,
             message="Render setting value is valid.",
-        )
+        ), descriptor
 
     def apply_render_setting(
         self,
@@ -3163,10 +4301,20 @@ class OvRtxRendererAdapter(RendererAdapter):
     ) -> RenderSettingApplyResult:
         """Validate then author a public RenderProduct setting value."""
 
-        validation = self.validate_render_setting(
+        stage = getattr(self, "_stage", None)
+        active_path = str(render_product_path or self.get_active_render_product_path() or "")
+        if stage is None or not active_path:
+            return _render_setting_reject_apply(
+                setting_id,
+                "No active RenderProduct is available.",
+                "missing_render_product",
+            )
+        # Validation and authoring describe the SAME pre-write state, so they
+        # read one catalog between them rather than one each.
+        validation, descriptor = self._render_setting_validation_for(
+            self.list_render_settings(active_path),
             setting_id,
             value,
-            render_product_path=render_product_path,
         )
         if not validation.accepted:
             return _render_setting_reject_apply(
@@ -3174,12 +4322,7 @@ class OvRtxRendererAdapter(RendererAdapter):
                 validation.message or "Render setting validation failed.",
                 validation.warning_code or "validation_failed",
             )
-        stage = getattr(self, "_stage", None)
-        descriptor = _render_setting_for_id(
-            self.list_render_settings(render_product_path),
-            validation.setting_id,
-        )
-        if stage is None or descriptor is None:
+        if descriptor is None:
             return _render_setting_reject_apply(
                 validation.setting_id,
                 "Render setting is not available for apply.",
@@ -3191,12 +4334,23 @@ class OvRtxRendererAdapter(RendererAdapter):
             if target_layer is not None:
                 previous_edit_target = stage.GetEditTarget()
                 stage.SetEditTarget(target_layer)
-            attr = _render_setting_attr_for_descriptor(stage, descriptor, create=True)
+            attr = _render_setting_attr_for_descriptor(
+                self._render_setting_owner_stage_for(descriptor, create=True),
+                descriptor,
+                create=True,
+            )
             if attr is None:
                 return _render_setting_reject_apply(
                     descriptor.setting_id,
                     "Render setting attribute is not available for apply.",
                     "unsupported",
+                )
+            conflict = _render_setting_native_type_conflict(attr)
+            if conflict:
+                return _render_setting_reject_apply(
+                    descriptor.setting_id,
+                    f"Render setting apply failed: {conflict}",
+                    "apply_failed",
                 )
             try:
                 previous_authored = bool(attr.HasAuthoredValue())
@@ -3231,9 +4385,22 @@ class OvRtxRendererAdapter(RendererAdapter):
                     stage.SetEditTarget(previous_edit_target)
                 except Exception:
                     pass
-        value_state = self.read_render_setting(
-            descriptor.setting_id,
-            render_product_path=descriptor.metadata.get("render_product_path"),
+        # The read-back and the publish gate describe the SAME post-write
+        # state with nothing mutating between them, so they share one
+        # description instead of building two identical ones.
+        written_product = str(descriptor.metadata.get("render_product_path") or "")
+        written = self.list_render_settings(written_product)
+        written_descriptor = _render_setting_for_id(written, descriptor.setting_id)
+        value_state = (
+            None if written_descriptor is None else written_descriptor.value_state
+        )
+        # The gate's snapshot is always of the ACTIVE product; a write aimed
+        # at any other product does not describe it, so that case still reads
+        # its own.
+        self._publish_render_settings_change(
+            written
+            if written_product == str(self.get_active_render_product_path() or "")
+            else None
         )
         return RenderSettingApplyResult.accepted_result(
             setting_id=descriptor.setting_id,
@@ -3285,12 +4452,28 @@ class OvRtxRendererAdapter(RendererAdapter):
             if target_layer is not None:
                 previous_edit_target = stage.GetEditTarget()
                 stage.SetEditTarget(target_layer)
-            attr = _render_setting_attr_for_descriptor(stage, descriptor)
+            attr = _render_setting_attr_for_descriptor(
+                self._render_setting_owner_stage_for(descriptor),
+                descriptor,
+            )
             if attr is None:
                 return _render_setting_reject_reset(
                     descriptor.setting_id,
                     "Render setting attribute is not available for reset.",
                     "unsupported",
+                )
+            # A genuinely incompatible declaration rejects for reset exactly
+            # as it does for apply: clearing it would leave the builtin's
+            # native storage in a type outside its proven role and the
+            # post-clear live write would push the default in that
+            # unsupported dtype — a silent role escape. Same deterministic
+            # contract as the OVStage twin.
+            conflict = _render_setting_native_type_conflict(attr)
+            if conflict:
+                return _render_setting_reject_reset(
+                    descriptor.setting_id,
+                    f"Render setting reset failed: {conflict}",
+                    "reset_failed",
                 )
             try:
                 previous_authored = bool(attr.HasAuthoredValue())
@@ -3337,6 +4520,7 @@ class OvRtxRendererAdapter(RendererAdapter):
                     stage.SetEditTarget(previous_edit_target)
                 except Exception:
                     pass
+        self._publish_render_settings_change()
         return RenderSettingResetResult.accepted_result(
             setting_id=descriptor.setting_id,
             reset_value=None if value_state is None else value_state.current_value,
@@ -3344,6 +4528,281 @@ class OvRtxRendererAdapter(RendererAdapter):
             requirement=descriptor.requirement,
             message="Render setting reset.",
         )
+
+    # ------------------------------------------------------------------
+    # Process-global render setting lifecycle: this adapter's PUBLIC
+    # capability, and the whole of its contribution to process-global
+    # renderer configuration.
+    #
+    # A caller that owns such a configuration channel asks whether the
+    # lifecycle a value needs can run right now, asks for it to be run once
+    # the value is written, and asks how to describe what did or did not
+    # happen. Nothing about any particular settings channel, key or ABI is
+    # known here — only what THIS provider can do to a live renderer.
+    # ------------------------------------------------------------------
+
+    def global_render_setting_lifecycle_requirement(
+        self,
+        lifecycle: RenderSettingLifecycle,
+    ) -> str:
+        """"" when ``lifecycle`` can be performed safely right now.
+
+        Otherwise a precise ``"requires <X>"`` phrase. Callers check this
+        BEFORE writing, so a value that cannot be made effective is never
+        written in the first place.
+        """
+
+        if lifecycle is RenderSettingLifecycle.NONE:
+            return "names no consumer on this build"
+        if self._renderer is None:
+            # Nothing to rebuild yet. Every one of these settings is read when a
+            # renderer is constructed, so publishing now is the CHEAPEST correct
+            # actuation: the next renderer picks it up with no rebuild at all.
+            return ""
+        # EVERY row is actuated by a renderer rebuild over the same stage (see
+        # GLOBAL_SETTING_ACTUATION_IS_RENDERER_REBUILD: on this build the
+        # settings write kills the consumer's own live subscription after the
+        # first publication). Without a loaded stage there is nothing to
+        # rebuild onto, and doing it anyway would drop the scene.
+        if getattr(self, "_stage", None) is None:
+            return "requires a loaded stage so the renderer can be rebuilt safely"
+        if self._native_scene_unresolved:
+            return (
+                "requires the unresolved native scene cleanup to be retried before "
+                "the renderer can be rebuilt"
+            )
+        fault = self._global_setting_rebuild_fault
+        if fault:
+            return (
+                "requires provider recovery: an earlier rebuild for a "
+                f"process-global setting failed and could not be undone ({fault})"
+            )
+        return ""
+
+    def perform_global_render_setting_lifecycle(
+        self,
+        lifecycle: RenderSettingLifecycle,
+        value: Any,
+    ) -> str:
+        """Make a just-written value effective. "" on success, else the fault."""
+
+        overrides: dict[str, Any] = {}
+        if lifecycle is RenderSettingLifecycle.RENDERER_CONFIG_RECREATE:
+            # This row's real owner is a public RendererConfig field; the key
+            # alone is not enough (CRenderApiImpl.cpp:404-427).
+            overrides = {
+                "enable_geometry_streaming": bool(value),
+                "enable_geometry_streaming_lod": bool(value),
+            }
+        if self._renderer is None:
+            # Pre-creation path: no rebuild is needed or possible. Carry the
+            # config override into the configuration the next renderer is built
+            # from, so the RendererConfig-owned row is not silently dropped.
+            self._renderer_config = _renderer_config_with_overrides(
+                getattr(self, "_renderer_config", None), overrides
+            )
+            return ""
+        return self._rebuild_renderer_for_global_setting(overrides)
+
+    def _drain_one_frame_for_global_setting(self) -> str:
+        """Step and drain one frame so a live consumer observes the new value."""
+
+        self._stop_native_frame_pacing("global render-setting drain")
+        renderer = self._renderer
+        if renderer is None:
+            return "no live OVRTX renderer"
+        try:
+            # Ownership: the retained step-result container must not survive a
+            # new step's native output handles.
+            self._release_retained_output()
+            renderer.step(
+                render_products={self._render_product_path},
+                delta_time=_MIN_DT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"{type(exc).__name__}: {exc}"
+        return ""
+
+    def _rebuild_renderer_for_global_setting(
+        self,
+        config_overrides: dict[str, Any],
+    ) -> str:
+        """Rebuild the renderer over the SAME stage, preserving presentation.
+
+        A process-global setting whose consumer samples during scene/resource/
+        material construction only becomes effective on a freshly built
+        renderer.  Rebuilding must not cost the user their scene, so the active
+        camera, RenderProduct and resolution are captured and restored around
+        it, and the stage is re-loaded through the adapter's own load path
+        rather than a bespoke one.
+        """
+
+        stage = getattr(self, "_stage", None)
+        if stage is None:
+            return "no loaded stage"
+        # Deliberately NOT aliased to a local: ``self._renderer`` must hold the
+        # LAST reference so clearing the field below actually destroys the
+        # native renderer. A surviving local keeps two renderers alive and the
+        # second one dies on "Out of resource descriptors".
+        if self._renderer is None:
+            return "no live OVRTX renderer"
+        self._stop_native_frame_pacing("global render-setting rebuild")
+        capture = {
+            "stage": stage,
+            "config": self._renderer_config,
+            "camera_path": self._camera_path,
+            "render_product_path": self._render_product_path,
+            "active_camera": getattr(self, "_active_camera_common_path", None),
+            "active_product": getattr(self, "_active_render_product_common_path", None),
+            "resolution": tuple(self._pending_resolution),
+            "ldr_overlap_enabled": self._ldr_overlap is not None,
+        }
+        camera_path = capture["camera_path"]
+        render_product_path = capture["render_product_path"]
+        active_camera = capture["active_camera"]
+        active_product = capture["active_product"]
+        resolution = capture["resolution"]
+        ldr_overlap_enabled = capture["ldr_overlap_enabled"]
+        try:
+            self._release_retained_output()
+            self._remove_ovrtx_layers(allow_renderer_drop=True)
+        except BaseException as exc:  # noqa: BLE001
+            # Native ownership refused to release: the current renderer and
+            # scene are intact and retryable — never leave them half-torn.
+            return f"native scene release failed: {type(exc).__name__}: {exc}"
+        get_instrumentation().release_renderer(self)
+        self._renderer = None
+        try:
+            new_config = _config_with_selection_outline_enabled(
+                _renderer_config_with_overrides(
+                    self._renderer_config, config_overrides
+                )
+            )
+            self._renderer_config = new_config
+            self._renderer = (
+                _ovrtx.Renderer(new_config) if new_config is not None else _ovrtx.Renderer()
+            )
+            self._camera_path = camera_path
+            self._render_product_path = render_product_path
+            self.load_stage(stage)
+        except BaseException as exc:  # noqa: BLE001
+            # The replacement did not come up. Losing the setting is acceptable;
+            # losing the user's session is not, so put the previous renderer
+            # back before reporting anything. A single ordinary edit must never
+            # be a one-way door.
+            fault = f"renderer rebuild failed: {type(exc).__name__}: {exc}"
+            restore_fault = self._restore_renderer_after_failed_rebuild(capture)
+            if not restore_fault:
+                return (
+                    f"{fault}. The previous renderer, scene, camera, "
+                    "RenderProduct and presentation state were restored."
+                )
+            # Restoration failed too: record the fault so every global row
+            # reports it instead of offering an edit that cannot land.
+            self._global_setting_rebuild_fault = (
+                f"{fault}; restoring the previous renderer also failed: "
+                f"{restore_fault}"
+            )
+            print(
+                "[OvRtxRendererAdapter] render-settings renderer rebuild failed "
+                "and the previous renderer could not be restored: "
+                f"{self._global_setting_rebuild_fault}",
+                file=sys.stderr,
+            )
+            return self._global_setting_rebuild_fault
+        # Restore presentation state so the rebuild is invisible to the user.
+        # Each item is restored independently and every failure is NAMED: a
+        # half-restored viewport that reports one generic error hides which part
+        # of the user's presentation state was actually lost.
+        self._render_product_path = render_product_path
+        self._camera_path = camera_path
+        if active_camera is not None:
+            self._active_camera_common_path = active_camera
+        if active_product is not None:
+            self._active_render_product_common_path = active_product
+        unrestored: list[str] = []
+        for label, restore in (
+            ("resolution", lambda: self.set_resolution(int(resolution[0]), int(resolution[1]))),
+            (
+                "presentation overlap",
+                (lambda: self.set_ldr_overlap_enabled(True))
+                if ldr_overlap_enabled
+                else None,
+            ),
+        ):
+            if restore is None:
+                continue
+            try:
+                restore()
+            except Exception as exc:  # noqa: BLE001
+                unrestored.append(f"{label} ({type(exc).__name__}: {exc})")
+        drain_fault = self._drain_one_frame_for_global_setting()
+        if unrestored:
+            return (
+                "the renderer was rebuilt and the setting is effective, but this "
+                "presentation state was not restored: " + "; ".join(unrestored)
+            )
+        return drain_fault
+
+    def _restore_renderer_after_failed_rebuild(
+        self,
+        capture: dict[str, Any],
+    ) -> str:
+        """Put the adapter back on a working renderer. "" on success.
+
+        Rebuilt from the configuration captured BEFORE the setting's override
+        was folded in, over the same stage, restoring the same camera,
+        RenderProduct, resolution and presentation overlap. The setting is
+        simply not applied; the session survives.
+        """
+
+        stage = capture.get("stage")
+        if stage is None:
+            return "no captured stage"
+        # Drop whatever half-built renderer the failed attempt left behind so
+        # only one native renderer is ever alive.
+        try:
+            self._release_retained_output()
+        except BaseException:  # noqa: BLE001 — the handle is being discarded
+            pass
+        get_instrumentation().release_renderer(self)
+        self._renderer = None
+        try:
+            previous_config = capture.get("config")
+            self._renderer_config = previous_config
+            self._renderer = (
+                _ovrtx.Renderer(previous_config)
+                if previous_config is not None
+                else _ovrtx.Renderer()
+            )
+            self._camera_path = capture["camera_path"]
+            self._render_product_path = capture["render_product_path"]
+            self._stage = stage
+            self.load_stage(stage)
+        except BaseException as exc:  # noqa: BLE001
+            return f"{type(exc).__name__}: {exc}"
+        self._render_product_path = capture["render_product_path"]
+        self._camera_path = capture["camera_path"]
+        if capture.get("active_camera") is not None:
+            self._active_camera_common_path = capture["active_camera"]
+        if capture.get("active_product") is not None:
+            self._active_render_product_common_path = capture["active_product"]
+        resolution = capture["resolution"]
+        try:
+            self.set_resolution(int(resolution[0]), int(resolution[1]))
+            if capture["ldr_overlap_enabled"]:
+                self.set_ldr_overlap_enabled(True)
+        except Exception as exc:  # noqa: BLE001
+            # The renderer and the scene ARE back; only presentation trim is
+            # missing, and that must not be reported as a lost session.
+            print(
+                "[OvRtxRendererAdapter] renderer restored after a failed "
+                f"render-settings rebuild, but presentation state was not fully "
+                f"reapplied: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        self._global_setting_rebuild_fault = ""
+        return ""
 
     def set_point_cloud_request(
         self,
@@ -3599,9 +5058,15 @@ class OvRtxRendererAdapter(RendererAdapter):
             return False
         if next_path == self._render_product_path:
             return True
+        self._stop_native_frame_pacing("active render product change")
         # Ownership: the retained step result references the OUTGOING
         # product; release it before the switch re-authors native state.
-        self._release_retained_output()
+        # Switching between authored products of one group re-authors
+        # nothing, so the group's shared images stay valid.
+        self._release_retained_output(
+            keep_grouped_frames=self._is_grouped_product(self._render_product_path)
+            and self._is_grouped_product(next_path)
+        )
         self._render_product_path = next_path
         self._sync_active_selector_state()
         return True
@@ -3708,7 +5173,11 @@ class OvRtxRendererAdapter(RendererAdapter):
             return None
         from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
 
-        catalog = UsdStageAdapter(stage).get_render_target_catalog()
+        adapter = UsdStageAdapter(stage)
+        try:
+            catalog = adapter.get_render_target_catalog()
+        finally:
+            adapter.dispose()
         target_token = str(target_id).strip() if target_id is not None else ""
         product_path = (
             str(render_product_path).strip()
@@ -3730,7 +5199,10 @@ class OvRtxRendererAdapter(RendererAdapter):
             or getattr(self, "_usd_handle", None) is None
         ):
             return
-        self._reinject_session_layer()
+        # Authored products already carry their camera, resolution and settings.
+        # Switching between them must not rebuild an unrelated owned session.
+        if self._uses_owned_render_product():
+            self._reinject_session_layer()
         self._reset_render_timing_state()
 
     def _uses_owned_camera(self) -> bool:
@@ -3749,7 +5221,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         return self._camera_path
 
     def _reset_render_timing_state(self) -> None:
-        self._dt_clock = time.monotonic()
+        self._dt_clock = time.perf_counter()
         self._last_big_delta_time = -math.inf
         self._last_reinject_time = -math.inf
         self._last_pushed_camera_intrinsics = None
@@ -4017,6 +5489,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         OvGear (Stage Browser, Property Inspector) sees OvGear's
         scaffolding prims too.
         """
+        self._stop_native_frame_pacing("stage load")
         from pxr import Usd  # lazy — module must import without pxr
 
         # A second document must never be published beside unresolved native
@@ -4037,6 +5510,10 @@ class OvRtxRendererAdapter(RendererAdapter):
         # prospective resource.
         root_usda: Optional[str] = None
         prospective_tmp_path: Optional[str] = None
+        # Globally owned (RenderSettings) opinions belong to the document that
+        # is currently loaded. A load of a DIFFERENT document must not carry
+        # them over, so they are neither exported here nor kept at commit.
+        carries_owner = stage is getattr(self, "_stage", None) and stage is not None
         try:
             if isinstance(stage, str):
                 path = stage
@@ -4062,11 +5539,32 @@ class OvRtxRendererAdapter(RendererAdapter):
                 strip_session_root = self._root_layer_has_session_scaffolding(
                     root_layer
                 )
-                if root_layer.anonymous:
+                prospective_muted_layers = self._muted_layer_identifiers(
+                    prospective_stage
+                )
+                session_layer = prospective_stage.GetSessionLayer()
+                has_session_sublayers = bool(
+                    session_layer and session_layer.subLayerPaths
+                )
+                if prospective_muted_layers or has_session_sublayers:
+                    # Muting is not authored into the root layer.  Loading the
+                    # root file or a root-layer snapshot would therefore keep
+                    # rendering the muted contribution.  Flatten the live
+                    # composed stage for this renderer load. Live collaboration
+                    # overlays in session sublayers likewise do not exist in
+                    # the root file and must survive structural reloads. The authoritative
+                    # editable stage remains ``prospective_stage``.
+                    path = self._export_composed_stage_snapshot(
+                        prospective_stage,
+                        include_render_settings_owner=carries_owner,
+                    )
+                    prospective_tmp_path = path
+                elif root_layer.anonymous:
                     if getattr(self._renderer, "open_usd_from_string", None) is not None:
                         root_usda = self._export_root_layer_to_string(
                             root_layer,
                             strip_session_root=strip_session_root,
+                            include_render_settings_owner=carries_owner,
                         )
                         path = None
                     else:
@@ -4079,6 +5577,10 @@ class OvRtxRendererAdapter(RendererAdapter):
                         root_layer.Export(tmp_path)
                         if strip_session_root:
                             self._strip_session_root_from_layer_file(tmp_path)
+                        if carries_owner:
+                            self._author_render_settings_owner_into_layer_file(
+                                tmp_path
+                            )
                         path = tmp_path
                 else:
                     # A dirty file-backed root layer means the stage composes
@@ -4088,7 +5590,20 @@ class OvRtxRendererAdapter(RendererAdapter):
                     # desynchronize the viewport from USD/Stage Browser
                     # state, so dirty layers always take the live-snapshot
                     # path.
-                    live_root_needed = use_live_root_snapshot or root_layer.dirty
+                    #
+                    # A globally owned render setting has nowhere else to
+                    # live: the renderer reads it from a prim on the root it
+                    # opened, so an otherwise clean file-backed stage must
+                    # also go through the snapshot — but ONLY while such an
+                    # opinion is actually authored.
+                    owner_root_needed = (
+                        carries_owner and self._has_render_settings_owner_opinions()
+                    )
+                    live_root_needed = (
+                        use_live_root_snapshot
+                        or root_layer.dirty
+                        or owner_root_needed
+                    )
                     if (
                         live_root_needed
                         and getattr(self._renderer, "open_usd_from_string", None) is not None
@@ -4098,12 +5613,14 @@ class OvRtxRendererAdapter(RendererAdapter):
                         root_usda = self._export_root_layer_to_string(
                             root_layer,
                             strip_session_root=strip_session_root,
+                            include_render_settings_owner=carries_owner,
                         )
                         path = None
                     elif live_root_needed or strip_session_root:
                         path = self._export_live_root_layer_snapshot(
                             root_layer,
                             strip_session_root=strip_session_root,
+                            include_render_settings_owner=carries_owner,
                         )
                         prospective_tmp_path = path
                     else:
@@ -4112,6 +5629,9 @@ class OvRtxRendererAdapter(RendererAdapter):
                 raise TypeError(
                     f"load_stage expected pxr.Usd.Stage or path str, got {type(stage).__name__}"
                 )
+            prospective_muted_layers = self._muted_layer_identifiers(
+                prospective_stage
+            )
         except BaseException:
             if prospective_tmp_path is not None:
                 try:
@@ -4129,8 +5649,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         # Any failure here — including KeyboardInterrupt/SystemExit — must
         # reclaim the prepared snapshot before it leaks: scaffolding runs
         # AFTER the dirty-root snapshot is written but BEFORE any native
-        # handle references it, so the snapshot is this adapter's to reclaim
-        # (Codex finding 2).
+        # handle references it, so the snapshot is this adapter's to reclaim.
         try:
             from ovui_data_adapters.openusd._session_authoring import (
                 ensure_camera,
@@ -4150,13 +5669,33 @@ class OvRtxRendererAdapter(RendererAdapter):
             prospective_has_lights = _stage_has_any_light(prospective_stage)
             if not prospective_has_lights:
                 ensure_dome_light(prospective_stage, _DOME_LIGHT_PATH)
+            if carries_owner:
+                product_setting_lines = (
+                    self._session_render_product_setting_lines()
+                )
+                camera_setting_lines = self._session_camera_setting_lines()
+            else:
+                # A different document: the current stage is still the
+                # previous document here, and the new one must not inherit
+                # its render settings. Only the new document's own opinions
+                # are stated.
+                product_setting_lines = self._session_owner_setting_lines(
+                    getattr(self, "_render_product_path", ""),
+                    prospective_stage,
+                    restate_published=False,
+                )
+                camera_setting_lines = self._session_owner_setting_lines(
+                    session_camera_path,
+                    prospective_stage,
+                    restate_published=False,
+                )
             prospective_session_usda = _build_session_usda(
                 self._last_resolution,
                 include_fallback_dome=not prospective_has_lights,
                 camera_path=session_camera_path,
-                render_product_setting_lines=(
-                    self._session_render_product_setting_lines()
-                ),
+                camera_projection=self._camera_projection_mode,
+                render_product_setting_lines=product_setting_lines,
+                camera_setting_lines=camera_setting_lines,
             )
         except BaseException:
             if prospective_tmp_path is not None:
@@ -4216,8 +5755,8 @@ class OvRtxRendererAdapter(RendererAdapter):
             # including on KeyboardInterrupt/SystemExit. A prospective
             # handle that cannot be removed becomes tracked cleanup debt
             # (never silently swallowed), and its snapshot file is retained
-            # rather than deleted while a handle still references it (Codex
-            # finding 1). For destructive single-root APIs the incoming
+            # rather than deleted while a handle still references it. For
+            # destructive single-root APIs the incoming
             # open already tore the old scene down, so restore it.
             if single_root_api:
                 # The destructive prospective root invalidated every old
@@ -4259,18 +5798,25 @@ class OvRtxRendererAdapter(RendererAdapter):
         # Every throwable from here on is chained: the FIRST becomes the
         # propagated primary and each later one is attached, so no
         # BaseException — pending-pick SystemExit included — is ever lost
-        # or displaced (Codex finding 3).
+        # or displaced.
         first_fault: Optional[BaseException] = None
 
-        # Drain pending picks from the OUTGOING stage as misses before the
-        # swap is visible to render_frame (Codex review of #67). A callback
-        # may raise anything, including SystemExit; defer it and keep going.
+        # Drain pending picks from the outgoing stage as misses before the
+        # swap is visible to render_frame. A callback may raise anything,
+        # including SystemExit; defer it and keep going.
         try:
             self._dispatch_pending_pick_misses()
         except BaseException as fault:
             first_fault = fault
 
+        if not carries_owner:
+            # A different document is now authoritative; its globally owned
+            # settings start from the renderer's own defaults, and nothing
+            # published for the previous document is restated for it.
+            self._discard_render_settings_owner()
+            self._published_render_settings = set()
         self._stage = prospective_stage
+        self._loaded_muted_layer_identifiers = prospective_muted_layers
         self._usd_handle = new_root_handle
         self._session_handle = new_session_handle
         self._live_resync_handles = []
@@ -4295,8 +5841,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         # root handle is gone (never delete a file a live handle still
         # references). An un-removable handle is recorded as cleanup debt +
         # unresolved state and chained — never a swallowed failure or a
-        # success reported with residual old composition (Codex findings
-        # 1 & 4).
+        # success reported with residual old composition.
         first_fault = self._chain_faults(
             first_fault,
             self._reconcile_old_native(
@@ -4456,7 +6001,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         prospective snapshot file is deleted ONLY when the root handle that
         would reference it is gone — a still-referenced file is retained as
         debt for the next teardown/shutdown rather than orphaned under a
-        live handle (Codex findings 1 & 7).
+        live handle.
         """
         self._release_retained_output()
         # ``None``/sentinel roots reference no discrete file handle, so the
@@ -4764,6 +6309,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         self, *, allow_renderer_drop: bool = False
     ) -> None:
         """Remove every native owner or raise while preserving failed ones."""
+        self._stop_native_frame_pacing("native scene teardown")
         self._ensure_native_cleanup_tracking()
         self._release_retained_output()
         first_fault: Optional[BaseException] = None
@@ -4929,14 +6475,22 @@ class OvRtxRendererAdapter(RendererAdapter):
         root_layer: Any,
         *,
         strip_session_root: bool = False,
+        include_render_settings_owner: bool = False,
     ) -> str:
-        if not strip_session_root:
+        author_owner = (
+            include_render_settings_owner
+            and self._has_render_settings_owner_opinions()
+        )
+        if not strip_session_root and not author_owner:
             return root_layer.ExportToString()
         from pxr import Sdf
         layer = Sdf.Layer.CreateAnonymous(".usda")
         if not layer.ImportFromString(root_layer.ExportToString()):
             raise RuntimeError("failed to import root layer snapshot")
-        self._strip_session_root_from_layer(layer)
+        if strip_session_root:
+            self._strip_session_root_from_layer(layer)
+        if author_owner:
+            self._author_render_settings_owner_into_layer(layer)
         return layer.ExportToString()
 
     def _export_live_root_layer_snapshot(
@@ -4944,6 +6498,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         root_layer: Any,
         *,
         strip_session_root: bool = False,
+        include_render_settings_owner: bool = False,
     ) -> str:
         """Export the live root layer to a temporary file for ovrtx reloads."""
         root_path = str(getattr(root_layer, "realPath", None) or getattr(
@@ -5005,6 +6560,11 @@ class OvRtxRendererAdapter(RendererAdapter):
                 raise RuntimeError(f"failed to export root layer snapshot: {tmp_path}")
             if strip_session_root:
                 self._strip_session_root_from_layer_file(tmp_path)
+            if (
+                include_render_settings_owner
+                and self._has_render_settings_owner_opinions()
+            ):
+                self._author_render_settings_owner_into_layer_file(tmp_path)
         except BaseException:
             # BaseException, not Exception: a KeyboardInterrupt mid-export
             # must not leak the partial snapshot either.
@@ -5016,6 +6576,65 @@ class OvRtxRendererAdapter(RendererAdapter):
         # Ownership of the snapshot is NOT taken here: the caller commits
         # it (replacing any previous owned snapshot) only after every
         # prospective load input has been prepared successfully.
+        return tmp_path
+
+    @staticmethod
+    def _muted_layer_identifiers(stage: Any) -> tuple[str, ...]:
+        """Return the deterministic stage-local mute set."""
+
+        getter = getattr(stage, "GetMutedLayers", None)
+        if not callable(getter):
+            return ()
+        return tuple(sorted(str(identifier) for identifier in getter()))
+
+    def _export_composed_stage_snapshot(
+        self,
+        stage: Any,
+        *,
+        include_render_settings_owner: bool = False,
+    ) -> str:
+        """Export the stage's current composition, including layer muting."""
+
+        flattened = stage.Flatten()
+        if flattened is None:
+            raise RuntimeError("failed to flatten the composed USD stage")
+        self._strip_session_root_from_layer(flattened)
+        if (
+            include_render_settings_owner
+            and self._has_render_settings_owner_opinions()
+        ):
+            self._author_render_settings_owner_into_layer(flattened)
+        root_layer = stage.GetRootLayer()
+        if not root_layer.anonymous:
+            # Flatten anchors asset paths from file-backed layers, but keeps
+            # relative paths authored in anonymous, session and Live layers.
+            # The stage resolves those against its root layer; the snapshot
+            # lives in the temp directory, so anchor them the same way.
+            from pxr import UsdUtils
+
+            UsdUtils.ModifyAssetPaths(
+                flattened,
+                lambda asset_path: self._anchor_asset_path(root_layer, asset_path),
+            )
+
+        # Binary Crate: the flattened production stage is written and reparsed
+        # on every structural reload, where text serialization dominates.
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".usdc",
+            prefix="ovui_widgets_composed_",
+        )
+        os.close(fd)
+        try:
+            if not flattened.Export(tmp_path):
+                raise RuntimeError(
+                    f"failed to export composed stage snapshot: {tmp_path}"
+                )
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         return tmp_path
 
     def _anchor_asset_path(self, root_layer: Any, asset_path: str) -> str:
@@ -5071,16 +6690,9 @@ class OvRtxRendererAdapter(RendererAdapter):
                 )
 
     def _strip_session_root_from_layer(self, layer: Any) -> bool:
-        spec = layer.GetPrimAtPath(_SESSION_ROOT_PATH)
-        if spec is None:
-            return False
-        if str(getattr(layer, "defaultPrim", "")) == spec.name:
-            try:
-                layer.ClearDefaultPrim()
-            except Exception:
-                layer.defaultPrim = ""
-        del layer.rootPrims[spec.name]
-        return True
+        from ovui_data_adapters.openusd._session_authoring import strip_session_root
+
+        return strip_session_root(layer)
 
     def _add_ovrtx_session_layer(self, usda: str) -> Any:
         """Compose OvGear's session layer into the ovrtx runtime stage."""
@@ -5179,20 +6791,259 @@ class OvRtxRendererAdapter(RendererAdapter):
             return np.ascontiguousarray(np.asarray([tuple(value)], dtype=np.float32))
         return OvRtxRendererAdapter._usd_value_to_write_payload(value)
 
+    def _note_published_render_setting(
+        self,
+        descriptor: RenderSettingDescriptor,
+    ) -> None:
+        """Record that this build has stated a value for the setting.
+
+        The ledger lets a later reset restate the declared default rather
+        than merely dropping the authored opinion from the recomposed
+        session, which the renderer would otherwise never observe.
+        """
+
+        attr_name = str(descriptor.metadata.get("attr_name") or "")
+        if not attr_name:
+            return
+        published = getattr(self, "_published_render_settings", None)
+        if not isinstance(published, set):
+            published = set()
+            self._published_render_settings = published
+        published.add(attr_name)
+
+    # ── Globally owned (RenderSettings) settings ──────────────────────────
+    #
+    # OVRTX reads these from ``/Render/OmniverseGlobalRenderSettings`` on its
+    # own runtime stage, which it creates itself at ``open_usd`` time — so no
+    # prefixed session reference can reach it, and an opinion on the
+    # RenderProduct or the Camera is never consulted. The only measured
+    # delivery route is the adapter-owned exported ROOT SNAPSHOT.
+    #
+    # The opinion itself is kept on a hidden in-memory stage rather than on
+    # the user's document: the OpenUSD Stage Browser walks the composed pxr
+    # stage without a runtime-prim filter, so a prim authored there — even in
+    # the session layer — would appear as user scene content.
+
+    def _render_settings_owner_stage(self, *, create: bool = False) -> Any:
+        """The hidden stage carrying globally owned render-setting opinions."""
+
+        stage = getattr(self, "_render_settings_owner_document", None)
+        if stage is not None or not create:
+            return stage
+        if getattr(self, "_stage", None) is None:
+            return None
+        from pxr import Usd, UsdGeom
+
+        stage = Usd.Stage.CreateInMemory("ovgear_render_settings_owner.usda")
+        UsdGeom.Scope.Define(stage, _RENDER_SETTINGS_OWNER_ROOT_PATH)
+        stage.DefinePrim(_RENDER_SETTINGS_OWNER_PATH, _RENDER_SETTINGS_OWNER_TYPE)
+        self._render_settings_owner_document = stage
+        return stage
+
+    def _render_setting_owner_stage_for(
+        self,
+        descriptor: RenderSettingDescriptor,
+        *,
+        create: bool = False,
+    ) -> Any:
+        """Stage that holds ``descriptor``'s owner prim."""
+
+        if _render_setting_owner_scope(descriptor) == _RENDER_SETTINGS_OWNER_SCOPE:
+            return self._render_settings_owner_stage(create=create)
+        return getattr(self, "_stage", None)
+
+    def _render_settings_owner_authored_names(self) -> Tuple[str, ...]:
+        """Names of globally owned settings that currently carry an opinion.
+
+        A reset clears the value but can leave the property spec behind, so
+        membership is decided by ``HasAuthoredValue`` — never by spec
+        existence — otherwise a reset setting would keep being delivered and
+        would keep forcing the snapshot path.
+        """
+
+        stage = self._render_settings_owner_stage()
+        if stage is None:
+            return ()
+        try:
+            prim = stage.GetPrimAtPath(_RENDER_SETTINGS_OWNER_PATH)
+            if not prim or not prim.IsValid():
+                return ()
+            return tuple(
+                str(attr.GetName())
+                for attr in prim.GetAttributes()
+                if attr.HasAuthoredValue()
+            )
+        except Exception:
+            return ()
+
+    def _has_render_settings_owner_opinions(self) -> bool:
+        """Whether any globally owned setting currently carries an opinion.
+
+        Every extra cost of this owner model — forcing a clean file-backed
+        stage onto the snapshot path, and reloading the root on write — is
+        gated on this, so a document that never touches one of these settings
+        behaves exactly as before.
+        """
+
+        return bool(self._render_settings_owner_authored_names())
+
+    def _author_render_settings_owner_into_layer(self, layer: Any) -> bool:
+        """Merge the hidden owner prim into an exported ROOT snapshot layer.
+
+        Only the properties this adapter authored are copied, so a user scene
+        that already defines ``/Render`` (or the settings prim itself) keeps
+        every opinion the adapter did not set.
+        """
+
+        authored_names = self._render_settings_owner_authored_names()
+        if not authored_names:
+            return False
+        from pxr import Sdf
+
+        source_layer = self._render_settings_owner_stage().GetRootLayer()
+        scope_spec = Sdf.CreatePrimInLayer(
+            layer, Sdf.Path(_RENDER_SETTINGS_OWNER_ROOT_PATH)
+        )
+        if scope_spec.specifier == Sdf.SpecifierOver and not scope_spec.typeName:
+            scope_spec.specifier = Sdf.SpecifierDef
+            scope_spec.typeName = "Scope"
+        owner_path = Sdf.Path(_RENDER_SETTINGS_OWNER_PATH)
+        target_spec = Sdf.CreatePrimInLayer(layer, owner_path)
+        if target_spec.specifier == Sdf.SpecifierOver and not target_spec.typeName:
+            target_spec.specifier = Sdf.SpecifierDef
+            target_spec.typeName = _RENDER_SETTINGS_OWNER_TYPE
+        for name in authored_names:
+            if not Sdf.CopySpec(
+                source_layer,
+                owner_path.AppendProperty(name),
+                layer,
+                owner_path.AppendProperty(name),
+            ):
+                raise RuntimeError(
+                    "failed to author the global render settings owner "
+                    f"property {name!r} into the root snapshot"
+                )
+        return True
+
+    def _author_render_settings_owner_into_layer_file(self, path: str) -> None:
+        from pxr import Sdf
+
+        layer = Sdf.Layer.FindOrOpen(path)
+        if layer is None:
+            raise RuntimeError(f"failed to open root layer snapshot: {path}")
+        if self._author_render_settings_owner_into_layer(layer):
+            if not layer.Save():
+                raise RuntimeError(
+                    f"failed to save root layer snapshot: {path}"
+                )
+
+    def _discard_render_settings_owner(self) -> None:
+        """Drop globally owned opinions belonging to a superseded document."""
+
+        self._render_settings_owner_document = None
+
+    def _render_settings_owner_prim_value_state(
+        self,
+        descriptor: RenderSettingDescriptor,
+        stage: Any,
+        owner_path: str,
+    ) -> RenderSettingDescriptor:
+        """Reflect the authored opinion that lives on ``owner_path``.
+
+        The builtin catalog rows are described from the RenderProduct, so an
+        opinion the renderer reads from a DIFFERENT prim would otherwise always
+        read back as the declared default with ``authored=False`` — an edit that
+        succeeds, then visibly snaps back, and a reset affordance that never
+        lights up.
+        """
+
+        if stage is None or not owner_path:
+            return descriptor
+        attr_name = str(descriptor.metadata.get("attr_name") or "")
+        if not attr_name:
+            return descriptor
+        try:
+            prim = stage.GetPrimAtPath(owner_path)
+            attr = prim.GetAttribute(attr_name) if prim and prim.IsValid() else None
+            if attr is None or not attr.IsValid() or not attr.HasAuthoredValue():
+                return descriptor
+            value = _render_setting_python_value(attr.Get())
+        except Exception:
+            return descriptor
+        if value is None:
+            return descriptor
+        state = _dataclass_replace(
+            descriptor.value_state,
+            current_value=value,
+            authored=True,
+            inherited=False,
+        )
+        return _dataclass_replace(
+            descriptor,
+            value_state=state,
+            revision_token=(
+                f"{descriptor.metadata.get('render_product_path')}"
+                f":{attr_name}:{value!r}:True"
+            ),
+        )
+
+    def _render_settings_owner_value_state(
+        self,
+        descriptor: RenderSettingDescriptor,
+    ) -> RenderSettingDescriptor:
+        """Readback for the hidden global RenderSettings owner prim."""
+
+        return self._render_settings_owner_prim_value_state(
+            descriptor,
+            self._render_settings_owner_stage(),
+            _RENDER_SETTINGS_OWNER_PATH,
+        )
+
+    def _render_settings_camera_value_state(
+        self,
+        descriptor: RenderSettingDescriptor,
+    ) -> RenderSettingDescriptor:
+        """Readback for a Camera-owned setting (the exposure/autoExposure family).
+
+        These are authored onto the Camera the active RenderProduct references,
+        never onto the product itself, so the product-shaped builtin descriptor
+        has to be corrected from the camera prim.
+        """
+
+        stage = getattr(self, "_stage", None)
+        return self._render_settings_owner_prim_value_state(
+            descriptor,
+            stage,
+            _render_setting_owner_path(stage, descriptor),
+        )
+
     def _write_render_setting_to_ovrtx(
         self,
         descriptor: RenderSettingDescriptor,
         value: Any,
     ) -> None:
+        self._stop_native_frame_pacing("render setting mutation")
         renderer = getattr(self, "_renderer", None)
+        owner_scope = _render_setting_owner_scope(descriptor)
         writer = getattr(renderer, "write_attribute", None)
-        if not callable(writer):
+        if owner_scope != _RENDER_SETTINGS_OWNER_SCOPE and not callable(writer):
             raise RuntimeError("Renderer does not support live setting writes.")
-        product_path = str(descriptor.metadata.get("render_product_path") or "")
+        owner_stage = self._render_setting_owner_stage_for(descriptor)
+        product_path = _render_setting_owner_path(owner_stage, descriptor)
         attr_name = str(descriptor.metadata.get("attr_name") or "")
         if not product_path or not attr_name:
             raise RuntimeError("Render setting target is missing.")
         self._release_retained_output()
+        if owner_scope == _RENDER_SETTINGS_OWNER_SCOPE:
+            # The renderer reads globally owned settings from a UsdPrim on the
+            # stage it opened, so the opinion only becomes effective once that
+            # root is reopened with the snapshot carrying it. A live column
+            # write is not a delivery route for these (measured: the readback
+            # is value-blind and IRenderSettingsContext reads USD, not Fabric).
+            if not self._reload_live_root_snapshot():
+                raise RuntimeError("Render setting delivery failed.")
+            self._reset_render_timing_state()
+            return
         if descriptor.requirement is RenderSettingRequirement.RENDERER_RESTART:
             reset = getattr(renderer, "reset", None)
             if product_path.startswith(f"{_SESSION_ROOT_PATH}/"):
@@ -5208,26 +7059,77 @@ class OvRtxRendererAdapter(RendererAdapter):
             attribute_name=attr_name,
             tensor=self._render_setting_value_to_write_payload(descriptor, value),
         )
+        # The owned session RenderProduct is what the renderer actually
+        # consumes these settings from, so the value only becomes effective
+        # once the session is recomposed; the live column write above alone
+        # is not observed for RenderProduct settings.
+        self._note_published_render_setting(descriptor)
         reset = getattr(renderer, "reset", None)
         if callable(reset):
             reset()
             self._reinject_session_layer()
             self._reset_render_timing_state()
 
+    def _session_camera_setting_lines(self) -> Tuple[str, ...]:
+        """Authored public render settings owned by the session Camera."""
+
+        camera_path = str(
+            getattr(self, "_default_camera_path", "") or _CAMERA_PATH
+        )
+        return self._session_owner_setting_lines(camera_path)
+
     def _session_render_product_setting_lines(self) -> Tuple[str, ...]:
         """Return authored public render settings for the owned RenderProduct."""
+        return self._session_owner_setting_lines(self._render_product_path)
+
+    def _session_owner_setting_lines(
+        self,
+        owner_path: str,
+        stage: Any = None,
+        *,
+        restate_published: bool = True,
+    ) -> Tuple[str, ...]:
+        """Authored public render settings carried by one owner prim.
+
+        ``stage`` defaults to the current document. Settings reset back to
+        their default are still stated explicitly, so the recomposed session
+        tells the renderer to return to the default rather than merely
+        dropping the opinion, which it would never observe. A different
+        document passes ``restate_published=False``: its session is built
+        from its own authored opinions only.
+        """
+        stage = stage if stage is not None else getattr(self, "_stage", None)
         if (
-            getattr(self, "_stage", None) is None
+            stage is None
             or not self._uses_owned_render_product()
+            or not owner_path
         ):
             return ()
         try:
-            prim = self._stage.GetPrimAtPath(self._render_product_path)
+            prim = stage.GetPrimAtPath(owner_path)
         except Exception:
             return ()
         if not prim or not prim.IsValid():
             return ()
         lines: list[str] = []
+        # Only restate defaults for settings this owner actually carries; a
+        # RenderProduct default must never be emitted onto the Camera.
+        is_product = owner_path == self._render_product_path
+        ledger = (
+            getattr(self, "_published_render_settings", ()) if restate_published else ()
+        )
+        published = {
+            name
+            for name in (ledger or ())
+            if (
+                str(
+                    (_render_setting_builtin_spec(name) or {}).get("owner_scope")
+                    or "RenderProduct"
+                )
+                == "RenderProduct"
+            )
+            is is_product
+        }
         try:
             attrs = tuple(prim.GetAttributes())
         except Exception:
@@ -5249,6 +7151,16 @@ class OvRtxRendererAdapter(RendererAdapter):
             line = _render_setting_usda_line(attr)
             if line:
                 lines.append(line)
+                published.discard(name)
+        # Settings published earlier in this session but no longer authored
+        # (reset to default) must still be stated explicitly. Dropping the
+        # line only removes the opinion from the recomposed session; it never
+        # tells the renderer to go back to the default, so the superseded
+        # value would keep rendering while the UI reported the default.
+        for name in sorted(published):
+            line = _render_setting_default_usda_line(name)
+            if line:
+                lines.append(line)
         return tuple(lines)
 
     def _write_property_to_ovrtx(self, prim: Any, sdf_path: Any) -> bool:
@@ -5261,6 +7173,8 @@ class OvRtxRendererAdapter(RendererAdapter):
             or property_name.startswith("xformOp:")
         ):
             return False
+        if property_name.startswith(self._non_rendering_prefixes()):
+            return True  # Nothing to render.
         attribute = prim.GetAttribute(property_name)
         if not attribute:
             return False
@@ -5271,10 +7185,21 @@ class OvRtxRendererAdapter(RendererAdapter):
         if value is None:
             return False
         try:
+            if self._stage_change_live_safe_camera_path(sdf_path):
+                # Camera schema scalars/vectors are float32, not the generic
+                # Python float64 payload. One row corresponds to one prim.
+                payload = np.asarray([value], dtype=np.float32)
+            elif self._stage_change_live_safe_input_path(sdf_path):
+                dtype, width = _LIVE_INPUT_DTYPES[str(attribute.GetTypeName())]
+                payload = np.ascontiguousarray(
+                    np.asarray([value], dtype=dtype).reshape((1, width) if width else (1,))
+                )
+            else:
+                payload = self._usd_value_to_write_payload(value)
             self._renderer.write_attribute(
                 prim_paths=[str(sdf_path.GetPrimPath())],
                 attribute_name=property_name,
-                tensor=self._usd_value_to_write_payload(value),
+                tensor=payload,
             )
             return True
         except Exception:
@@ -5284,9 +7209,20 @@ class OvRtxRendererAdapter(RendererAdapter):
         """Mirror live USD edits into ovrtx."""
         if self._stage is None or self._renderer is None:
             return
+        self._stop_native_frame_pacing("stage change publication")
         changed_paths = tuple(getattr(event, "changed_paths", ()) or ())
         resynced_paths = tuple(getattr(event, "resynced_paths", ()) or ())
         paths = changed_paths + resynced_paths
+        self._discard_grouped_frames(paths)
+        # External stage edits (other editors, USD undo/redo) that touch a
+        # public RenderProduct setting — or resync/remove/replace the active
+        # RenderProduct prim itself (a catalog change) — publish through the
+        # snapshot-deduped gate, before any early return so session-authored
+        # settings count too.
+        if _stage_change_touches_public_render_settings(
+            paths, self.get_active_render_product_path() or ""
+        ) or self._stage_change_affects_active_product(resynced_paths):
+            self._publish_render_settings_change()
         if paths and all(_stage_change_path_is_session(path) for path in paths):
             return
         if not paths:
@@ -5327,6 +7263,7 @@ class OvRtxRendererAdapter(RendererAdapter):
                 return
         seen_visibility: set[str] = set()
         seen_transform: set[str] = set()
+        live_write_failed = False
         for path in paths:
             try:
                 sdf_path = Sdf.Path(path)
@@ -5350,7 +7287,11 @@ class OvRtxRendererAdapter(RendererAdapter):
                     )
                 for sync_path, sync_prim in sync_prims:
                     imageable = UsdGeom.Imageable(sync_prim)
-                    if imageable and sync_path not in seen_visibility:
+                    if (
+                        imageable
+                        and sync_path not in seen_visibility
+                        and (not sdf_path.IsPropertyPath() or sdf_path.name == "visibility")
+                    ):
                         seen_visibility.add(sync_path)
                         # Push the prim's LOCAL visibility opinion, not the
                         # composed result: ovrtx resolves inherited visibility
@@ -5371,9 +7312,21 @@ class OvRtxRendererAdapter(RendererAdapter):
                     seen_transform.add(path_str)
                     self._write_prim_transform_to_ovrtx(prim, path_str)
                 if sdf_path.IsPropertyPath():
-                    self._write_property_to_ovrtx(prim, sdf_path)
+                    written = self._write_property_to_ovrtx(prim, sdf_path)
+                    if written and sdf_path.name in _LIVE_CAMERA_ATTRIBUTE_TYPES:
+                        # The authored lens (with its authored aperture aspect)
+                        # replaced the viewport-fitted intrinsics in ovrtx; push
+                        # those again on the next frame instead of trusting the
+                        # cache (reopened views otherwise rendered ~1.3x zoomed).
+                        self._last_pushed_camera_intrinsics = None
+                    if not written and self._stage_change_live_safe_input_path(sdf_path):
+                        # The value was classified live but OVRTX refused it:
+                        # reload rather than keep rendering a stale value.
+                        live_write_failed = True
             except Exception:
                 continue
+        if live_write_failed:
+            self._reload_live_root_snapshot()
 
     def _stage_change_live_safe_visibility_path(
         self, sdf_module: Any, path: Any, authored: Any = ()
@@ -5434,6 +7387,97 @@ class OvRtxRendererAdapter(RendererAdapter):
         # The property no longer composes: only the adapter's proven
         # visibility-authored annotation makes the removal live-safe.
         return str(sdf_path.GetPrimPath()) in (authored or ())
+
+    def stage_change_sync_decision(self, event: Any) -> str:
+        """Classify a change event as "live", "overlay" or "reload" without applying it.
+
+        Hosts use this to coalesce bursts of structural changes into one
+        reload while forwarding live value updates immediately.
+        """
+        from pxr import Sdf
+
+        changed_paths = tuple(getattr(event, "changed_paths", ()) or ())
+        resynced_paths = tuple(getattr(event, "resynced_paths", ()) or ())
+        paths = changed_paths + resynced_paths
+        if not paths:
+            return _STAGE_CHANGE_SYNC_RELOAD  # notify_stage_changed treats it as everything
+        if all(_stage_change_path_is_session(path) for path in paths):
+            return _STAGE_CHANGE_SYNC_LIVE
+        return self._stage_change_sync_decision(event, changed_paths, resynced_paths, Sdf)
+
+    def _stage_change_live_safe_input_path(self, path: Any) -> bool:
+        """Accept existing, unconnected value inputs of lights and shaders."""
+        if not path.IsPropertyPath() or not path.name.startswith("inputs:"):
+            return False
+        try:
+            from pxr import Sdf, Usd, UsdLux, UsdShade
+
+            attribute = self._stage.GetObjectAtPath(path)
+            if not isinstance(attribute, Usd.Attribute) or attribute.Get() is None:
+                return False
+            if str(attribute.GetTypeName()) not in _LIVE_INPUT_DTYPES:
+                return False
+            # A connection (or a removed one) changes the network, not a value.
+            if not all(
+                isinstance(spec, Sdf.AttributeSpec) and not spec.HasInfo("connectionPaths")
+                for spec in attribute.GetPropertyStack()
+            ):
+                return False
+            prim = attribute.GetPrim()
+            if prim.HasAPI(UsdLux.LightAPI):
+                return path.name in _LIVE_LIGHT_INPUTS
+            return bool(UsdShade.Shader(prim))
+        except Exception:
+            return False
+
+    def property_updates_live(self, property_path: str) -> bool:
+        """Whether a value edit of ``property_path`` reaches ovrtx without a reload.
+
+        Mirrors the per-property rules of ``_stage_change_sync_decision`` for
+        the stage as it is now: transforms, visibility, existing numeric camera
+        attributes, non-rendering metadata and unconnected light/shader value
+        inputs are written live; any other property reloads the scene.
+        """
+        try:
+            from pxr import Sdf
+
+            path = Sdf.Path(str(property_path))
+        except Exception:
+            return False
+        if not path.IsPropertyPath():
+            return False
+        name = path.name
+        return bool(
+            name in {"xformOpOrder", "visibility"}
+            or name.startswith("xformOp:")
+            or name.startswith(self._non_rendering_prefixes())
+            or self._stage_change_live_safe_camera_path(path)
+            or self._stage_change_live_safe_input_path(path)
+        )
+
+    def _stage_change_live_safe_camera_path(self, path: Any) -> bool:
+        """Accept only existing numeric Camera schema attributes for live writes."""
+        if not path.IsPropertyPath():
+            return False
+        expected_type = _LIVE_CAMERA_ATTRIBUTE_TYPES.get(path.name)
+        if expected_type is None:
+            return False
+        try:
+            from pxr import Sdf, Usd, UsdGeom
+
+            attribute = self._stage.GetObjectAtPath(path)
+            return (
+                isinstance(attribute, Usd.Attribute)
+                and bool(UsdGeom.Camera(attribute.GetPrim()))
+                and not attribute.IsCustom()
+                and str(attribute.GetTypeName()) == expected_type
+                # USD schema fallback can mask a malformed relationship spec.
+                and all(isinstance(spec, Sdf.AttributeSpec)
+                        for spec in attribute.GetPropertyStack())
+                and attribute.Get() is not None
+            )
+        except Exception:
+            return False
 
     def _stage_change_sync_decision(
         self,
@@ -5532,6 +7576,12 @@ class OvRtxRendererAdapter(RendererAdapter):
                     or property_name.startswith("xformOp:")
                 ):
                     continue
+                if self._stage_change_live_safe_camera_path(sdf_path):
+                    continue
+                if property_name.startswith(self._non_rendering_prefixes()):
+                    continue
+                if self._stage_change_live_safe_input_path(sdf_path):
+                    continue
                 if property_name == "visibility":
                     # Name shape alone is not visibility semantics: only a
                     # genuine live ATTRIBUTE (or an adapter-proven removed
@@ -5582,6 +7632,8 @@ class OvRtxRendererAdapter(RendererAdapter):
         if self._stage is None or self._renderer is None:
             return False
         self._release_retained_output()
+        # A reload restores authored camera values in ovrtx.
+        self._last_pushed_camera_intrinsics = None
         selected_paths = list(getattr(self, "_selected_paths", []) or [])
         try:
             self.load_stage(self._stage, use_live_root_snapshot=True)
@@ -5619,12 +7671,46 @@ class OvRtxRendererAdapter(RendererAdapter):
         except Exception:
             return False
 
+    def _runtime_camera_xform(self, world_tensor: np.ndarray, camera_path: str) -> np.ndarray:
+        """Return the ``omni:xform`` tensor that places ``camera_path`` at ``world_tensor``.
+
+        ovrtx composes ``omni:xform`` under the prim's ancestors, like any other
+        prim transform, so a scene camera under a transformed parent must
+        receive its parent-local matrix; writing the world matrix applies the
+        parent transform twice. Unparented cameras (and the owned session
+        camera) are returned unchanged.
+        """
+        stage = getattr(self, "_stage", None)
+        if stage is None or not camera_path:
+            return world_tensor
+        try:
+            from pxr import Usd, UsdGeom
+
+            xformable = UsdGeom.Xformable(stage.GetPrimAtPath(camera_path))
+            if not xformable or xformable.GetResetXformStack():
+                return world_tensor
+            parent = np.asarray(
+                xformable.ComputeParentToWorldTransform(Usd.TimeCode.Default()),
+                dtype=np.float64,
+            )
+        except Exception:
+            return world_tensor
+        if np.allclose(parent, np.eye(4), rtol=0.0, atol=1e-12):
+            return world_tensor
+        # USD row-vector convention: world = local * parentToWorld.
+        local = world_tensor.reshape(4, 4) @ np.linalg.inv(parent)
+        return np.ascontiguousarray(local, dtype=np.float64).reshape(1, 4, 4)
+
     def set_live_local_transform(self, path: str, matrix: Matrix4d) -> bool:
         """Push a prim-local transform preview into ovrtx without authoring USD."""
+        self._stop_native_frame_pacing("live transform preview")
+        self._discard_grouped_frames([str(path)])
         return self._write_local_transform_matrix_to_ovrtx(str(path), matrix)
 
     def clear_live_local_transforms(self, paths: List[str]) -> None:
         """Restore ovrtx transforms for ``paths`` from the authoritative USD stage."""
+        self._stop_native_frame_pacing("live transform restore")
+        self._discard_grouped_frames([str(path) for path in paths or []])
         stage = getattr(self, "_stage", None)
         if stage is None:
             return None
@@ -5656,13 +7742,18 @@ class OvRtxRendererAdapter(RendererAdapter):
 
     # ── Per-frame rendering ──
 
+    def instrumentation_target(self) -> Any | None:
+        """Return the native renderer for optional instrumentation."""
+
+        return self._renderer
+
     def render_frame(
         self,
         width: int,
         height: int,
         view_matrix: Any,
         proj_matrix: Any,
-    ) -> np.ndarray | GpuFrame:
+    ) -> np.ndarray | GpuFrame | None:
         """Render one frame via ovrtx.
 
         Drives the session camera from ``(view_matrix, proj_matrix)``
@@ -5673,15 +7764,41 @@ class OvRtxRendererAdapter(RendererAdapter):
         instead return a :class:`GpuFrame` carrying a live CUDA mapping for
         :class:`ImageBridge` to consume synchronously.
 
-        On any failure (missing stage, missing LdrColor var, ovrtx step
+        When native Vulkan pacing is active, a complete camera record is
+        published and ``None`` is returned; the native presenter owns the
+        provider image. On any failure (missing stage, missing LdrColor var, ovrtx step
         error) a black ``(height, width, 4)`` uint8 frame is returned
         instead of raising — a transient renderer fault must not take
         down the viewport frame loop.
         """
+        # A pacing pick may expose one synchronous selected-camera frame to
+        # the viewport overlay. It is valid for exactly the UI composition
+        # following that render and never survives into the next raw intent.
+        self._frame_pacing_presented_snapshot = None
         if self._stage is None or self._usd_handle is None:
             return np.zeros((int(height), int(width), 4), dtype=np.uint8)
         if width <= 0 or height <= 0:
             return np.zeros((max(int(height), 1), max(int(width), 1), 4), dtype=np.uint8)
+        # MuteLayer/UnmuteLayer changes composition without a useful USD
+        # ObjectsChanged notice, so the application's ordinary stage-change
+        # forwarding cannot wake this renderer.  Compare the cheap stage-local
+        # mute set before the native-pacing early return and rebuild from a
+        # flattened composed snapshot when it changes. ``load_stage`` owns an
+        # atomic transition contract, and its failures must propagate rather
+        # than becoming an indefinite series of unexplained black frames.
+        current_muted_layers = self._muted_layer_identifiers(self._stage)
+        if current_muted_layers != getattr(
+            self, "_loaded_muted_layer_identifiers", ()
+        ):
+            self.load_stage(self._stage, use_live_root_snapshot=True)
+        raw_world_tensor = _view_to_ovrtx_transform(view_matrix)
+
+        # Steady-state pacing performs no Python-side renderer operation.
+        # Lifecycle/mutation paths stop and drain the borrower first, set the
+        # synchronous-step latch, and come through the historical path below
+        # once before pacing can restart.
+        if self._publish_native_frame(width, height, view_matrix, proj_matrix):
+            return None
 
         # Pick/camera association under overlap: a pick enqueued this frame
         # resolves against THIS step, but the user aimed at the image on
@@ -5694,6 +7811,13 @@ class OvRtxRendererAdapter(RendererAdapter):
         # current visible frame follows; static clicks change nothing).
         overlap = getattr(self, "_ldr_overlap", None)
         pick_skip = False
+        pacing_pick_snapshot = getattr(
+            self, "_frame_pacing_pick_snapshot", None
+        )
+        if pacing_pick_snapshot is not None:
+            view_matrix = pacing_pick_snapshot.view
+            proj_matrix = pacing_pick_snapshot.projection
+            width, height = pacing_pick_snapshot.size
         if (overlap is not None
                 and getattr(self, "_in_flight_pick_queries", None)):
             presented = overlap.presented_snapshot
@@ -5706,6 +7830,23 @@ class OvRtxRendererAdapter(RendererAdapter):
                 proj_matrix = presented.projection
 
         runtime_camera_path = self._runtime_camera_path()
+        # A grouped product whose camera is unchanged since the group's latest
+        # step presents that step's image (see set_render_product_group).
+        grouped_key = self._grouped_frame_key(
+            runtime_camera_path, view_matrix, proj_matrix, width, height
+        )
+        if grouped_key is None:
+            # This frame writes a camera the group's records do not describe.
+            self._discard_grouped_frames()
+        else:
+            grouped = self._grouped_frames.pop(grouped_key[0], None)
+            if grouped is not None and grouped[0] == grouped_key:
+                if overlap is not None:
+                    overlap.release(clear_presentation=True)
+                return self._record_successful_frame(
+                    grouped[1], int(width), int(height)
+                )
+        self._apply_camera_projection(proj_matrix)
         # 1) Resolution change: debounced reinject of the session layer.
         # Rapid drag-resize events within a 200 ms window collapse into a
         # single reinject every 250 ms to avoid ovrtx churn; isolated
@@ -5730,7 +7871,9 @@ class OvRtxRendererAdapter(RendererAdapter):
         # Issue #22 — keep the intrinsics push paired with the xform push so
         # the rendered image and the omni.ui.scene overlay use the same
         # camera.
-        world_tensor = _view_to_ovrtx_transform(view_matrix)
+        world_tensor = self._runtime_camera_xform(
+            _view_to_ovrtx_transform(view_matrix), runtime_camera_path
+        )
         try:
             self._renderer.write_attribute(
                 prim_paths=[runtime_camera_path],
@@ -5745,8 +7888,14 @@ class OvRtxRendererAdapter(RendererAdapter):
             pass
         self._push_camera_intrinsics(proj_matrix, runtime_camera_path)
 
+        # Picks resolve against this step: keep its camera for world positions.
+        self._pick_step_camera = (
+            np.array(view_matrix, dtype=np.float64),
+            np.array(proj_matrix, dtype=np.float64),
+        )
+
         # 3) Step ovrtx with a clamped delta.
-        now = time.monotonic()
+        now = time.perf_counter()
         dt = max(_MIN_DT, min(_MAX_DT, now - self._dt_clock))
         self._dt_clock = now
         render_product_paths = self._render_products_for_step()
@@ -5768,9 +7917,33 @@ class OvRtxRendererAdapter(RendererAdapter):
                 "step_failed",
                 "Renderer step failed before RenderVar output extraction.",
             )
+            self._frame_pacing_pick_snapshot = None
+            self._frame_pacing_pick_generated = False
+            self._frame_pacing_pick_association_unavailable = False
             return np.zeros((int(height), int(width), 4), dtype=np.uint8)
 
+        self._frame_pacing_needs_sync_step = False
+        self._frame_pacing_size = (int(width), int(height))
+        self._frame_pacing_projection = np.ascontiguousarray(
+            proj_matrix, dtype=np.float64
+        ).reshape(4, 4).copy()
+        self._frame_pacing_camera_path = runtime_camera_path
+        self._frame_pacing_last_raw_world = raw_world_tensor.reshape(4, 4).copy()
+        self._frame_pacing_last_intent_time = now
+
+        if pacing_pick_snapshot is not None:
+            # This synchronous image was rendered from the exact selected
+            # view/projection/size used for its pick query. Keep that complete
+            # state for the one UI composition that installs the image.
+            self._frame_pacing_presented_snapshot = pacing_pick_snapshot
+            self._frame_pacing_pick_snapshot = None
+
         self._dispatch_pending_pick_results(products)
+        if not self._in_flight_pick_queries or pacing_pick_snapshot is not None:
+            self._frame_pacing_pick_generated = False
+            self._frame_pacing_pick_association_unavailable = False
+        if self._native_render_is_paused() and pacing_pick_snapshot is not None:
+            return None
         self._extract_requested_point_cloud_frames(products)
         self._extract_requested_render_var_output_frames(products)
 
@@ -5779,13 +7952,21 @@ class OvRtxRendererAdapter(RendererAdapter):
         # larger than ``(width, height)``. ``_extract_ldr_color`` uses the
         # CPU path for those mismatch frames so ``_normalize_rgba`` can
         # pad/crop safely before ImageBridge sees the requested size.
-        if overlap is None or not self._ldr_overlap_allowed():
+        if overlap is None or grouped_key is not None or not self._ldr_overlap_allowed():
             if overlap is not None:
                 # Gated frame (livestream / zero-copy / LdrColor output
                 # request): those paths share the single per-frame LdrColor
                 # mapping and keep their existing synchronous behavior.
+                # Grouped frames are synchronous too: the other products
+                # present this step's images after their product switches.
                 overlap.release(clear_presentation=True)
-            return self._extract_ldr_color(products, int(width), int(height))
+            if grouped_key is not None:
+                self._cache_grouped_frames(products, grouped_key)
+            return self._record_successful_frame(
+                self._extract_ldr_color(products, int(width), int(height)),
+                int(width),
+                int(height),
+            )
 
         # Depth-one overlap: present the PREVIOUS step's image (its GPU work
         # has had a full frame to finish, so the map cost is ~0.3 ms instead
@@ -5804,7 +7985,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         snapshot = CameraSnapshot.capture(
             view_matrix, proj_matrix, (int(width), int(height))
         )
-        return overlap.consume(
+        output = overlap.consume(
             products,
             retention_key,
             snapshot,
@@ -5814,6 +7995,40 @@ class OvRtxRendererAdapter(RendererAdapter):
             (int(height), int(width)),
             pick_skip,
         )
+        return self._record_successful_frame(output, int(width), int(height))
+
+    def _record_successful_frame(
+        self, output: Any, width: int, height: int
+    ) -> Any:
+        """Record a frame produced by a renderer step for inspector state."""
+
+        self._successful_frame_count = int(getattr(self, "_successful_frame_count", 0) or 0) + 1
+        if isinstance(output, np.ndarray):
+            self._last_frame_shape = tuple(int(value) for value in output.shape)
+            if output.ndim >= 3 and output.shape[-1] >= 3:
+                # Exact nonblack-pixel count; the RGBA uint8 hot path views
+                # each pixel as one machine word and masks off alpha.
+                if (output.shape[-1] == 4 and output.dtype == np.uint8
+                        and output.flags.c_contiguous):
+                    rgb_mask = np.uint32(
+                        0x00FFFFFF if sys.byteorder == "little"
+                        else 0xFFFFFF00
+                    )
+                    self._last_frame_nonblack_pixels = int(np.count_nonzero(
+                        output.reshape(-1).view(np.uint32) & rgb_mask
+                    ))
+                else:
+                    self._last_frame_nonblack_pixels = int(np.count_nonzero(
+                        np.any(output[..., :3] != 0, axis=-1)
+                    ))
+        else:
+            self._last_frame_shape = (
+                int(getattr(output, "height", height)),
+                int(getattr(output, "width", width)),
+                4,
+            )
+            self._last_frame_nonblack_pixels = None
+        return output
 
     def _ensure_point_cloud_state(self) -> None:
         if not hasattr(self, "_point_cloud_requests"):
@@ -5831,6 +8046,11 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._ensure_point_cloud_state()
         self._ensure_render_var_output_state()
         paths = {str(self._render_product_path)}
+        # A changed product set rebuilds render state: keep the group in it.
+        paths.update(getattr(self, "_render_product_group", ()))
+        # ovrtx consumes queued picks on the next step, even when another
+        # viewport is currently bound. Render their originating products too.
+        paths.update(getattr(self, "_pick_query_products", {}).values())
         for request in self._point_cloud_requests.values():
             if request.render_product_path:
                 paths.add(str(request.render_product_path))
@@ -6224,7 +8444,9 @@ class OvRtxRendererAdapter(RendererAdapter):
         previous frame's values and the next frame retries. Issue #22.
         """
         try:
-            from ovui_data_adapters.openusd._camera_writer import compute_camera_intrinsics
+            from ovui_data_adapters.openusd._camera_writer import (
+                compute_camera_intrinsics,
+            )
             focal, h_ap, v_ap, _, _ = compute_camera_intrinsics(proj_matrix)
         except Exception:
             return
@@ -6246,6 +8468,27 @@ class OvRtxRendererAdapter(RendererAdapter):
             self._last_pushed_camera_intrinsics = signature
         except Exception:
             pass
+
+    def _apply_camera_projection(self, proj_matrix: Any) -> None:
+        """Recompose the owned runtime camera when its projection changes."""
+        if not self._uses_owned_render_product():
+            return
+        try:
+            from ovui_data_adapters.openusd._camera_writer import (
+                camera_projection_from_matrix,
+            )
+
+            mode = camera_projection_from_matrix(proj_matrix)
+        except Exception:
+            return
+        if mode == self._camera_projection_mode:
+            return
+        previous = self._camera_projection_mode
+        self._camera_projection_mode = mode
+        try:
+            self._reinject_session_layer()
+        except Exception:
+            self._camera_projection_mode = previous
 
     def _apply_resolution_if_allowed(self, target: Tuple[int, int]) -> None:
         """Commit ``target`` to ovrtx Fabric iff the debounce policy allows.
@@ -6270,6 +8513,8 @@ class OvRtxRendererAdapter(RendererAdapter):
         the caller pads/crops the returned frame to the requested
         ``(width, height)`` so the on-screen image stays coherent.
         """
+        if not self._uses_owned_render_product():
+            return
         if target == self._last_resolution:
             return
         now = self._clock()
@@ -6315,9 +8560,11 @@ class OvRtxRendererAdapter(RendererAdapter):
                     self._last_resolution,
                     include_fallback_dome=not self._scene_has_lights,
                     camera_path=session_camera_path,
+                    camera_projection=self._camera_projection_mode,
                     render_product_setting_lines=(
                         self._session_render_product_setting_lines()
                     ),
+                    camera_setting_lines=self._session_camera_setting_lines(),
                 )
             )
             self._last_pushed_camera_intrinsics = None
@@ -6338,6 +8585,10 @@ class OvRtxRendererAdapter(RendererAdapter):
             self._clear_current_native_cleanup_diagnostic(
                 "current-session-install", _SESSION_INSTALL_SENTINEL
             )
+        if not getattr(self, "_selection_outline_previous_paths", set()):
+            # Recomposing with no applied membership leaves the outline pass
+            # inactive for later writes; re-arm the activation reset.
+            self._selection_outline_pass_needs_reset = True
 
         # Also reflect the new resolution into the pxr stage's session
         # render product so Property Inspector is consistent.
@@ -6375,6 +8626,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         products: Any,
         width: int,
         height: int,
+        product_path: Optional[str] = None,
     ) -> np.ndarray | GpuFrame:
         """Extract the LdrColor render var.
 
@@ -6394,9 +8646,13 @@ class OvRtxRendererAdapter(RendererAdapter):
         uint8 ndarray — the legacy tier-1 path. The mapped DLPack
         buffer is invalidated when ``map()``'s context manager exits,
         so we ``.copy()`` the numpy view before returning.
+
+        ``product_path`` selects another product of the same step result;
+        those images always take the CPU path, because the zero-copy and
+        livestream consumers follow the active product only.
         """
         try:
-            product = products[self._render_product_path]
+            product = products[product_path or self._render_product_path]
         except Exception:
             return np.zeros((height, width, 4), dtype=np.uint8)
         if not getattr(product, "frames", None):
@@ -6405,10 +8661,21 @@ class OvRtxRendererAdapter(RendererAdapter):
         render_vars = getattr(frame_out, "render_vars", None) or {}
         rv = render_vars.get(_LDR_VAR_NAME)
         if rv is None:
+            rv = next(
+                (
+                    candidate
+                    for candidate in render_vars.values()
+                    if str(getattr(candidate, "source_name", "") or "")
+                    == _LDR_VAR_NAME
+                ),
+                None,
+            )
+        if rv is None:
             return np.zeros((height, width, 4), dtype=np.uint8)
 
-        state = self._zero_copy_state
-        livestream = getattr(self, "_livestream", None)
+        state = self._zero_copy_state if product_path is None else None
+        from ovui_data_adapters.common._render_product_stream import for_current_product
+        livestream = for_current_product(self) if product_path is None else None
         committed_resolution = getattr(self, "_last_resolution", (width, height))
         gpu_size_matches = (int(width), int(height)) == committed_resolution
 
@@ -6418,7 +8685,8 @@ class OvRtxRendererAdapter(RendererAdapter):
             try:
                 mapping = rv.map(device=_ovrtx.Device.CUDA)
                 mapping.__enter__()
-                ptr = int(mapping.tensor.data)
+                tensor = _mapped_render_var_tensor(mapping)
+                ptr = int(tensor.data)
                 # Codex blocker 4: when both flags are on, tee to
                 # ovstream from the SAME mapping (one CUDA map serves
                 # both consumers — the GPU-UI ingest reads ptr directly,
@@ -6427,7 +8695,7 @@ class OvRtxRendererAdapter(RendererAdapter):
                 # cannot bubble out and break the GPU UI ingest.
                 if livestream is not None:
                     try:
-                        livestream.tee_to_ovstream(mapping.tensor, width, height)
+                        livestream.tee_to_ovstream(tensor, width, height)
                     except Exception:
                         # tee_to_ovstream is contracted to be
                         # exception-safe; but if anything escapes,
@@ -6447,12 +8715,34 @@ class OvRtxRendererAdapter(RendererAdapter):
                         pass
                 state.mark_fallback(f"CUDA map raised: {type(exc).__name__}: {exc}")
 
+        # ── Asynchronous livestream path (the ovstream reference pipeline) ──
+        # The tap validates the mapped extent itself; a frame of another size (a deferred resize)
+        # raises ValueError and takes the synchronous path below.
+        if livestream is not None and getattr(livestream, "async_enabled", False):
+            try:
+                # Frame generation (DLSS-G) returns several frames per step, generated before real,
+                # in presentation order: stream them all; the last (real) one is the CPU image.
+                rvs = [self._ldr_render_var(f) for f in product.frames]
+                rvs = [v for v in rvs if v is not None] or [rv]
+                self._frames_per_step = len(rvs)
+                image = self._tee_livestream_async(rvs, livestream, int(width), int(height))
+                # Without a CPU image the viewport keeps showing an older frame.
+                self._cpu_image_stale = image is None
+                return image
+            except ValueError:
+                pass
+            except Exception:
+                if not getattr(self, "_livestream_async_error_logged", False):
+                    import traceback as _tb
+                    _tb.print_exc()
+                    self._livestream_async_error_logged = True
+
         # ── Livestream-only path (CUDA map shared with D2H for UI) ──
         if livestream is not None:
             try:
                 with rv.map(device=_ovrtx.Device.CUDA) as mapping:
                     arr = livestream.tee_and_d2h(
-                        mapping.tensor, width, height,
+                        _mapped_render_var_tensor(mapping), width, height,
                         host_buf=getattr(self, "_livestream_host_buf", None),
                     )
                     self._livestream_host_buf = arr
@@ -6475,9 +8765,8 @@ class OvRtxRendererAdapter(RendererAdapter):
         # ── CPU map path (default + post-livestream-failure fallback) ──
         try:
             with rv.map(device=_ovrtx.Device.CPU) as mapping:
-                arr = mapping.tensor.numpy()
                 # Must copy: the DLPack buffer is unmapped on __exit__.
-                arr = np.array(arr, copy=True)
+                arr = _copy_tensor_to_host(_mapped_render_var_tensor(mapping))
         except Exception:
             return np.zeros((height, width, 4), dtype=np.uint8)
 
@@ -6487,6 +8776,78 @@ class OvRtxRendererAdapter(RendererAdapter):
                 int(arr.shape[0]),
             )
         return _normalize_rgba(arr, width, height)
+
+    @staticmethod
+    def _ldr_render_var(frame_out: Any) -> Any:
+        render_vars = getattr(frame_out, "render_vars", None) or {}
+        rv = render_vars.get(_LDR_VAR_NAME)
+        if rv is None:
+            rv = next((candidate for candidate in render_vars.values()
+                       if str(getattr(candidate, "source_name", "") or "") == _LDR_VAR_NAME), None)
+        return rv
+
+    @property
+    def frames_per_step(self) -> int:
+        """Frames the last streamed step presented: 1, or 2-4 with frame generation (DLSS-G)."""
+        return int(getattr(self, "_frames_per_step", 1) or 1)
+
+    # Hosts that consume the streamed frames only (a headless streaming application) set this so a
+    # streamed frame carries no CPU image unless one was requested: the render thread then never
+    # waits for the GPU frame. Captures call :meth:`request_cpu_image` first.
+    cpu_image_on_demand: bool = False
+
+    def request_cpu_image(self, frames: int = 1) -> bool:
+        """Ask for a CPU image of the next ``frames`` streamed frames.
+
+        Returns True while the last streamed frame has no CPU image (the renderer streams
+        asynchronously with CPU images on demand), so the caller should wait for a new frame and
+        ask again; False once the CPU image shows the last rendered frame.
+        """
+        self._cpu_image_requests = max(int(getattr(self, "_cpu_image_requests", 0) or 0), int(frames))
+        from ovui_data_adapters.common._render_product_stream import for_current_product
+        livestream = for_current_product(self)
+        return bool(self.cpu_image_on_demand and livestream is not None
+                    and getattr(livestream, "async_enabled", False)
+                    and getattr(self, "_cpu_image_stale", False))
+
+    def _tee_livestream_async(self, rvs: list, livestream: Any, width: int, height: int) -> Any:
+        """Stream a step's frames without waiting for them; return a CPU image only when wanted.
+
+        Each LdrColor output is mapped on the tap's CUDA stream, which waits for the render on the
+        GPU; the tap queues a copy into its ring and records an event; the mapping is released
+        against that event, so ovrtx keeps the buffer until the copy has read it. A CPU image
+        (``cpu_image_on_demand`` off, or requested) of the last frame waits for it on the host.
+        """
+        requests = int(getattr(self, "_cpu_image_requests", 0) or 0)
+        want_cpu = not self.cpu_image_on_demand or requests > 0
+        result = None
+        for index, rv in enumerate(rvs):
+            last = index == len(rvs) - 1
+            mapping = rv.map(device=_ovrtx.Device.CUDA, sync_stream=livestream.cuda_stream)
+            event = None
+            try:
+                tensor = _mapped_render_var_tensor(mapping)
+                event = livestream.tee_async(tensor, width, height, index, len(rvs))
+                if last and want_cpu:
+                    from ovui_data_adapters.common._livestream_tap import _tensor_cuda_device
+
+                    mapping.wait()
+                    host = getattr(self, "_livestream_host_buf", None)
+                    if host is None or host.shape != (height, width, 4):
+                        host = np.empty((height, width, 4), dtype=np.uint8)
+                    livestream._cudart.d2h(host, int(tensor.data), width * height * 4,
+                                           device=_tensor_cuda_device(tensor))
+                    self._livestream_host_buf = host
+                    self._cpu_image_requests = max(0, requests - 1)
+                    # The image bridge may keep the array; hand it a copy.
+                    result = _normalize_rgba(host.copy(), width, height)
+            finally:
+                if event is not None:
+                    mapping.unmap(event=event)
+                else:
+                    mapping.unmap()
+        self._last_render_product_resolution = (width, height)
+        return result
 
     # ── Resolution / selection / picking ──
 
@@ -6512,6 +8873,9 @@ class OvRtxRendererAdapter(RendererAdapter):
         replacement because ovrtx outline attributes may have been
         dropped while this adapter's cache still contains the selection.
         """
+        if not self._native_render_is_paused():
+            self._stop_native_frame_pacing("selection highlight mutation")
+        self._grouped_frames = {}  # Shared images predate the new outline.
         selected = list(dict.fromkeys(str(p) for p in (paths or []) if p))
         self._selected_paths = selected
         self._configure_selection_outline_styles()
@@ -6571,6 +8935,29 @@ class OvRtxRendererAdapter(RendererAdapter):
             "generation": int(getattr(self, "_selection_outline_generation", 0)),
             "stale_reason": stale_reason,
         }
+        if current & new_previous:
+            self._ensure_selection_outline_pass_active()
+
+    def _ensure_selection_outline_pass_active(self) -> None:
+        """Run the one-shot outline-pass activation reset once membership exists.
+
+        Without it a camera-static CPU-presented viewport keeps showing the
+        converged pre-selection image: the membership write alone does not
+        invalidate ovrtx's render history. A missing/failing ``reset`` keeps
+        the flag armed so the next selection sync retries.
+        """
+        if not getattr(self, "_selection_outline_pass_needs_reset", False):
+            return
+        # Ownership: reset invalidates retained output handles.
+        self._release_retained_output()
+        reset = getattr(self._renderer, "reset", None)
+        if not callable(reset):
+            return
+        try:
+            reset()
+        except Exception:
+            return
+        self._selection_outline_pass_needs_reset = False
 
     def _mark_selection_outline_state_stale(
         self,
@@ -6584,6 +8971,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         )
         if reset_previous:
             self._selection_outline_previous_paths = set()
+            self._selection_outline_pass_needs_reset = True
         if reset_styles:
             self._selection_outline_styles_configured = False
         last = dict(getattr(self, "_selection_outline_last_write", {}) or {})
@@ -6619,6 +9007,9 @@ class OvRtxRendererAdapter(RendererAdapter):
         path again after the next rendered frame.
         """
 
+        if not self._native_render_is_paused():
+            self._stop_native_frame_pacing("selection highlight refresh")
+        self._grouped_frames = {}  # Shared images predate the new outline.
         selected = list(dict.fromkeys(str(p) for p in (paths or []) if p))
         self._selected_paths = selected
         self._configure_selection_outline_styles()
@@ -6665,6 +9056,22 @@ class OvRtxRendererAdapter(RendererAdapter):
         ):
             callback(None, None)
             return
+        self._stop_native_frame_pacing(
+            "pick query", capture_selected_camera=True, pause_render=True
+        )
+        if (
+            self._frame_pacing_pick_generated
+            or self._frame_pacing_pick_association_unavailable
+        ):
+            # ovrtx 0.4 does not expose generated-image camera/timing, and a
+            # real selection is usable only with its complete camera state.
+            # Keep the callback on this UI thread and fail closed rather than
+            # associate a raw-camera ray with different visible pixels.
+            self._frame_pacing_pick_generated = False
+            self._frame_pacing_pick_snapshot = None
+            self._frame_pacing_pick_association_unavailable = False
+            callback(None, None)
+            return
         try:
             left, top, right, bottom = self._ndc_rect_to_pick_pixels(x, y, x, y)
             self._renderer.enqueue_pick_query(
@@ -6672,6 +9079,8 @@ class OvRtxRendererAdapter(RendererAdapter):
                 *self._pick_pixels_to_query_rect(left, top, right, bottom),
             )
         except Exception:
+            self._frame_pacing_pick_snapshot = None
+            self._frame_pacing_pick_association_unavailable = False
             callback(None, None)
             return
         name = str(query_name or "viewport_click")
@@ -6681,6 +9090,10 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._in_flight_pick_queries.append(
             [self._pick_seq, "point", name, callback, None, None]
         )
+        if not hasattr(self, "_pick_query_ndc"):
+            self._pick_query_ndc = {}
+        self._pick_query_ndc[self._pick_seq] = (float(x), float(y))
+        self._remember_pick_product()
         self._pick_enqueue_count += 1
         self._last_pick_pixel_rect = (left, top, right, bottom)
 
@@ -6721,6 +9134,18 @@ class OvRtxRendererAdapter(RendererAdapter):
         ):
             callback([])
             return
+        self._stop_native_frame_pacing(
+            "rectangle pick query", capture_selected_camera=True, pause_render=True
+        )
+        if (
+            self._frame_pacing_pick_generated
+            or self._frame_pacing_pick_association_unavailable
+        ):
+            self._frame_pacing_pick_generated = False
+            self._frame_pacing_pick_snapshot = None
+            self._frame_pacing_pick_association_unavailable = False
+            callback([])
+            return
         try:
             left, top, right, bottom = self._ndc_rect_to_pick_pixels(x0, y0, x1, y1)
             self._renderer.enqueue_pick_query(
@@ -6728,6 +9153,8 @@ class OvRtxRendererAdapter(RendererAdapter):
                 *self._pick_pixels_to_query_rect(left, top, right, bottom),
             )
         except Exception:
+            self._frame_pacing_pick_snapshot = None
+            self._frame_pacing_pick_association_unavailable = False
             callback([])
             return
         self._pick_seq += 1
@@ -6735,6 +9162,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._in_flight_pick_queries.append(
             [self._pick_seq, "rect", name, callback, None, None]
         )
+        self._remember_pick_product()
         self._pick_enqueue_count += 1
         self._last_pick_pixel_rect = (left, top, right, bottom)
 
@@ -6948,10 +9376,16 @@ class OvRtxRendererAdapter(RendererAdapter):
             width, height = _DEFAULT_RESOLUTION
         return (max(1, int(width)), max(1, int(height)))
 
+    def _remember_pick_product(self) -> None:
+        if not hasattr(self, "_pick_query_products"):
+            self._pick_query_products = {}
+        self._pick_query_products[self._pick_seq] = str(self._render_product_path)
+
     def _cache_hits_for_replacement_pick(
         self,
         name: str,
         hits: List[Tuple[str, Tuple[float, float, float]]],
+        product_path: Optional[str] = None,
     ) -> None:
         """Attach collapsed ovrtx 0.3 hits to the live replacement pick.
 
@@ -6968,16 +9402,22 @@ class OvRtxRendererAdapter(RendererAdapter):
         if not queue:
             return
         for entry in reversed(queue):
-            if entry[1] == "point" and entry[2] == name and entry[3] is not None:
+            entry_product = getattr(self, "_pick_query_products", {}).get(
+                entry[0], self._render_product_path
+            )
+            if (
+                entry[1] == "point" and entry[2] == name and entry[3] is not None
+                and entry_product == (product_path or self._render_product_path)
+            ):
                 entry[5] = list(hits)
                 return
 
     def _dispatch_pending_pick_results(self, products: Any) -> None:
-        """Drain the oldest in-flight pick query and dispatch its result.
+        """Drain one in-flight pick per rendered product and dispatch results.
 
         ovrtx surfaces queued pick queries one frame at a time and we
         cannot tell results apart by inspecting the buffer, so each
-        frame consumes exactly the head of the FIFO. Entries whose
+        frame consumes exactly the head of each product's FIFO. Entries whose
         callback was cleared by :meth:`cancel_pick` (or by a same-name
         replacement pick) still pop their result slot here without
         dispatching — that is what keeps a stale canceled hit from
@@ -6989,19 +9429,61 @@ class OvRtxRendererAdapter(RendererAdapter):
         queue = getattr(self, "_in_flight_pick_queries", None)
         if not queue:
             return
-        hits = self._read_pick_hits(products)
-        entry = queue.popleft()
+        # Keep FIFO ordering within each product. Different products can return
+        # in the same GPU step and must each have their own result consumed.
+        product_paths = getattr(self, "_pick_query_products", {})
+        waits = getattr(self, "_pick_query_waits", {})
+        self._pick_query_waits = waits
+        drained = set()
+        for entry in list(queue):
+            if entry not in queue:
+                continue  # A preceding callback can tear down/reset the queue.
+            product_path = product_paths.get(entry[0], self._render_product_path)
+            if product_path in drained:
+                continue
+            drained.add(product_path)
+            available = True
+            if products is not None:
+                try:
+                    available = products[product_path] is not None
+                except Exception:
+                    available = False
+            if not available:
+                waits[entry[0]] = waits.get(entry[0], 0) + 1
+                if waits[entry[0]] < 3:
+                    continue
+                # A vanished product must not leave a mouse callback pending
+                # indefinitely. Use the adapter's existing unavailable/miss
+                # result after three steps, rather than clearing on first gap.
+            hits = [] if not available else (
+                self._read_pick_hits(products) if product_path == self._render_product_path
+                else self._read_pick_hits(products, product_path=product_path)
+            )
+            queue.remove(entry)
+            product_paths.pop(entry[0], None)
+            waits.pop(entry[0], None)
+            self._dispatch_pick_entry(entry, hits, product_path)
+
+    def _dispatch_pick_entry(self, entry, hits, product_path) -> None:
         _seq, kind, _name, cb, cancel_reason, cached_hits = entry
         self._pick_result_count = getattr(self, "_pick_result_count", 0) + 1
         effective_hits = hits or (cached_hits or [])
         if kind == "point":
             point_path = effective_hits[0][0] if effective_hits else None
             point_world = effective_hits[0][1] if effective_hits else None
+            ndc = getattr(self, "_pick_query_ndc", {}).pop(_seq, None)
+            camera = getattr(self, "_pick_step_camera", None)
+            if point_path and point_world is None and ndc and camera is not None:
+                # The renderer gave no position: ray-cast the picked prim in USD
+                # with the camera of the frame the pick resolved against.
+                point_world = _pick_surface_point(
+                    getattr(self, "_stage", None), point_path, camera[0], camera[1], *ndc
+                )
             self._last_pick_path = point_path
             self._last_pick_world_point = point_world
             if cb is None:
                 if cancel_reason == _PICK_CANCEL_REPLACED:
-                    self._cache_hits_for_replacement_pick(_name, hits)
+                    self._cache_hits_for_replacement_pick(_name, hits, product_path)
                 return
             try:
                 cb(point_path, point_world)
@@ -7026,6 +9508,9 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._last_pick_world_point = None
         entries = list(queue)
         queue.clear()
+        getattr(self, "_pick_query_ndc", {}).clear()
+        getattr(self, "_pick_query_products", {}).clear()
+        getattr(self, "_pick_query_waits", {}).clear()
         for _seq, kind, _name, cb, _cancel_reason, _cached_hits in entries:
             if cb is None:
                 continue
@@ -7040,6 +9525,8 @@ class OvRtxRendererAdapter(RendererAdapter):
     def _read_pick_hits(
         self,
         products: Any,
+        *,
+        product_path: Optional[str] = None,
     ) -> List[Tuple[str, Tuple[float, float, float]]]:
         """Read the pick-hit buffer using ovrtx's context-manager map protocol.
 
@@ -7052,7 +9539,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         as a miss (Codex review of #67). Always use ``with`` here.
         """
         try:
-            product = products[self._render_product_path]
+            product = products[product_path or self._render_product_path]
             frame = product.frames[0]
             render_vars = getattr(frame, "render_vars", None) or {}
             rv = render_vars.get(
@@ -7126,14 +9613,27 @@ class OvRtxRendererAdapter(RendererAdapter):
             prim_paths = np.from_dlpack(mapping["primPath"]).copy().reshape(-1)
             world_positions = np.from_dlpack(mapping["worldPositionM"]).copy()
             world_positions = world_positions.reshape((-1, 3))
+            world_normals = (
+                np.from_dlpack(mapping["worldNormal"]).copy().reshape((-1, 3))
+                if "worldNormal" in tensor_names
+                else None
+            )
         except Exception:
             return []
 
-        hits: List[Tuple[str, Tuple[float, float, float]]] = []
+        hits: List[Tuple[str, Optional[Tuple[float, float, float]]]] = []
         count = min(int(hit_count), len(prim_paths), len(world_positions))
         for i in range(count):
             path = self._resolve_ovrtx_prim_path(int(prim_paths[i]))
             if not path:
+                continue
+            # A real hit has a unit surface normal. ovrtx 0.4 leaves both
+            # position and normal zero: report the position as unavailable
+            # rather than a fabricated origin.
+            if world_normals is not None and (
+                i >= len(world_normals) or not np.linalg.norm(world_normals[i]) > 1e-6
+            ):
+                hits.append((path, None))
                 continue
             wx, wy, wz = world_positions[i]
             hits.append((path, (float(wx), float(wy), float(wz))))
@@ -7231,6 +9731,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         callbacks (and whatever they captured) until GC eventually
         cleared the renderer adapter.
         """
+        self._stop_native_frame_pacing("renderer shutdown")
         # Ownership: a retained step-result container must never outlive the
         # native renderer handle (dropping ``_renderer`` below is the LAST
         # reference and triggers native teardown).
@@ -7244,7 +9745,10 @@ class OvRtxRendererAdapter(RendererAdapter):
             self._dispatch_pending_pick_misses()
         except BaseException as error:  # noqa: BLE001
             first_fault = self._chain_faults(first_fault, error)
-        livestream = getattr(self, "_livestream", None)
+        from ovui_data_adapters.common._render_product_stream import release_for_shutdown
+
+        # A borrowed RenderProduct stream is released, never closed, here.
+        livestream = release_for_shutdown(self)
         if livestream is not None:
             try:
                 livestream.close()
@@ -7295,8 +9799,9 @@ class OvRtxRendererAdapter(RendererAdapter):
             raise RuntimeError("native renderer shutdown remains unresolved")
 
         # ``ovrtx.Renderer.__del__`` destroys the GPU handle — dropping
-        # our reference by setting the attribute is enough; the refcount
-        # falling to zero triggers the destructor.
+        # instrumentation's cached references as well lets the refcount fall
+        # to zero and trigger the destructor.
+        get_instrumentation().release_renderer(self)
         self._renderer = None
         if restore is not None:
             snapshot = restore.prospective_snapshot
@@ -7320,6 +9825,8 @@ class OvRtxRendererAdapter(RendererAdapter):
             self._native_restore_obligation = None
         self._drop_owned_tmp_path()
         self._stage = None
+        self._loaded_muted_layer_identifiers = ()
+        self._discard_render_settings_owner()
         self._refresh_native_cleanup_state()
         if first_fault is not None:
             raise first_fault

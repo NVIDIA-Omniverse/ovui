@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """
 ovui
@@ -79,6 +72,7 @@ Widgets
     * :class:`omni.ui.Button`
     * :class:`omni.ui.Image`
     * :class:`omni.ui.Label`
+    * :class:`omni.ui.TimelinePlot`
 
 * Shapes
     * :class:`omni.ui.Circle`
@@ -141,23 +135,32 @@ import os as _os
 if _sys.platform == "win32" and hasattr(_os, "add_dll_directory"):
     _pkg_dir = _os.path.dirname(_os.path.abspath(__file__))
     _os.add_dll_directory(_pkg_dir)
-    # omniui_standalone.dll depends on ovuiscene.dll, which lives in the
-    # sibling omni/ui_scene/ package directory.
+    # omni.ui.scene.dll lives in the sibling omni/ui_scene/ package directory.
     _scene_dir = _os.path.join(_os.path.dirname(_pkg_dir), "ui_scene")
     if _os.path.isdir(_scene_dir):
         _os.add_dll_directory(_scene_dir)
-    # CUDA runtime (cudart64_XXX.dll) lives in the toolkit's bin dir, which
-    # is not usually on PATH. Pick it up from the usual env vars if set.
-    for _cuda_env in ("CUDA_PATH", "CUDAToolkit_ROOT", "CUDA_HOME"):
-        _cuda_root = _os.environ.get(_cuda_env)
-        if _cuda_root:
-            _cuda_bin = _os.path.join(_cuda_root, "bin")
-            if _os.path.isdir(_cuda_bin):
-                _os.add_dll_directory(_cuda_bin)
-                break
+    # The CUDA runtime the backend was built against ships next to it, so a
+    # machine with only the NVIDIA driver can load the package. Fall back to a
+    # locally installed toolkit only when the wheel carries no runtime, and
+    # never in preference to the packaged one: a different toolkit version on
+    # the search path can shadow it.
+    import glob as _glob
+    if not _glob.glob(_os.path.join(_pkg_dir, "cudart64_*.dll")):
+        for _cuda_env in ("CUDA_PATH", "CUDAToolkit_ROOT", "CUDA_HOME"):
+            _cuda_root = _os.environ.get(_cuda_env)
+            if _cuda_root:
+                _cuda_bin = _os.path.join(_cuda_root, "bin")
+                if _os.path.isdir(_cuda_bin):
+                    _os.add_dll_directory(_cuda_bin)
+                    break
 
 # Detect whether we are running inside Kit or standalone
 from ._compat import _IN_KIT
+
+# The standalone bridge registers its platform hooks before `_ui` loads, so
+# `_ui` gains the standalone entry points (`_standalone_init`, ...).
+if _sys.platform != "emscripten":
+    from . import _standalone  # noqa: F401
 
 # The browser WebAssembly build links `_ui` as a built-in CPython extension
 # module. Register it under the package-qualified name before relative imports.
@@ -277,12 +280,18 @@ if _sys.platform == "emscripten":
 elif not _IN_KIT:
     from .standalone import (
         FrameInfo,
+        _record_synchronous_content_selection,
+        _record_synchronous_renderer_completion,
+        _reset_frame_throughput_metrics,
+        get_frame_pacing_status,
         get_max_frame_rate,
+        get_present_rate,
         init,
         next_frame,
         request_wakeup,
         run,
         run_async,
+        set_present_rate,
         set_max_frame_rate,
         shutdown,
     )

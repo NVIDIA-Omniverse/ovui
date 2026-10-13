@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the Step C.3 rotate gizmo.
 
@@ -122,7 +115,7 @@ class TestConstants:
         assert RING_RADIUS == pytest.approx(1.0)
 
     def test_ring_thickness_matches_translate_thin_look(self):
-        # The "thin and elegant, not chunky" design directive bounds this.
+        # The "thin and elegant, not chunky" design requirement bounds this.
         assert 1.0 <= RING_THICKNESS <= 3.0
 
     def test_intersection_thickness_is_grabbable(self):
@@ -351,6 +344,38 @@ class TestPrimRotateChangedGestureLifecycle:
         g = PrimRotateChangedGesture(model=wired_model, axis=(0.0, 0.0, 1.0))
         g._on_ended(_fake_arc_sender(0.0))
         wired_model._stage.end_undo_group.assert_not_called()
+
+    def test_overlapping_rings_activate_one_drag(self, scene_view, wired_model):
+        with scene_view.scene:
+            manipulator = TransformManipulator(model=wired_model, tool=TOOL_ROTATE)
+            manipulator.on_build()
+
+        x_drag = manipulator._rotate_drags[0]
+        z_drag = manipulator._rotate_drags[2]
+        manipulator._rotate_hovers[0]._on_began()
+        manipulator._rotate_hovers[2]._on_began()
+        x_drag._on_began(_fake_arc_sender(0.0))
+        z_drag._on_began(_fake_arc_sender(0.0))
+
+        active_drags = [drag for drag in (x_drag, z_drag) if drag.is_active]
+        assert len(active_drags) == 1
+        active_drag = active_drags[0]
+
+        x_drag._on_changed(_fake_arc_sender(math.pi / 2))
+        z_drag._on_changed(_fake_arc_sender(math.pi / 2))
+        x_drag._on_ended(_fake_arc_sender(math.pi / 2))
+        z_drag._on_ended(_fake_arc_sender(math.pi / 2))
+
+        assert not any(drag.is_active for drag in (x_drag, z_drag))
+        wired_model._stage.begin_undo_group.assert_called_once_with("Rotate Prims")
+        wired_model._stage.end_undo_group.assert_called_once()
+        assert wired_model._undo.open_group_depth == 0
+        assert len(wired_model._undo._undo_stack) == 1
+        rotated = wired_model._transform.get_local_transform("/World/Cube")
+        axis_index = 0 if active_drag is x_drag else 2
+        changed_component = rotated[1][2] if active_drag is x_drag else rotated[0][1]
+        assert rotated[axis_index][axis_index] == pytest.approx(1.0)
+        assert abs(changed_component) == pytest.approx(1.0)
 
 
 # -- Undo integration -----------------------------------------------------

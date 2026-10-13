@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Stage adapter scaffold for the registered ovstage provider."""
 
@@ -14,7 +7,10 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass, field
+import importlib.metadata
+import importlib.util
 import math
+from pathlib import Path
 import struct
 import sys
 from typing import Any, Callable, Iterable, List, Optional
@@ -28,7 +24,16 @@ from ovui_data_adapters.common import (
     BindMaterialResult,
     ChangeEvent,
     Command,
+    CoreMaterialBindingPolicy,
+    CoreMaterialCatalog,
+    CoreMaterialDescriptor,
     CoreMaterialErrorCode,
+    CoreMaterialFamily,
+    CoreMaterialGroupDescriptor,
+    CoreMaterialKind,
+    CoreMaterialRequirement,
+    CoreMaterialWarning,
+    CoreMaterialWarningSeverity,
     ContextManager,
     CoreMaterialsAdapter,
     CreateActionCatalog,
@@ -40,6 +45,9 @@ from ovui_data_adapters.common import (
     CreateActionWarning,
     CreateActionWarningSeverity,
     CreateActionsAdapter,
+    CreateAndBindMaterialResult,
+    CreateMaterialRequest,
+    CreateMaterialResult,
     CreatePlacementPolicy,
     CreateRequest,
     CreateResult,
@@ -66,14 +74,18 @@ from ovui_data_adapters.ovstage._authoring import (
 )
 from ovui_data_adapters.ovstage._errors import raise_not_ready
 from ovui_data_adapters.ovstage._native import read_matrix_attribute
+from ovui_data_adapters.ovstage._native import read_path_attribute_records
+from ovui_data_adapters.ovstage._native import read_population_meters_per_unit
 from ovui_data_adapters.ovstage._native import read_population_up_axis
 from ovui_data_adapters.ovstage._native import read_token_attribute
 from ovui_data_adapters.ovstage._native import resolve_query_names
 from ovui_data_adapters.ovstage._native import resolve_token_id
+from ovui_data_adapters.ovstage._scene import _kit_type_records
 from ovui_data_adapters.ovstage._structural import (
     NativeCreatePrimsCommand,
     NativeMovePrimsCommand,
 )
+from ovui_data_adapters.ovstage.runtime_import import import_ovstage_runtime_module
 from ovui_data_adapters.ovstage._stage_write import (
     supports_native_stage_writes,
     write_token_attribute,
@@ -83,6 +95,7 @@ from ovui_data_adapters.ovstage._stage_write import (
 _ROOT_PATH = "/"
 _ROOT_QUERY_PATH = ""
 _VISIBILITY_ATTR = "visibility"
+_WORLD_VISIBILITY_ATTR = "_worldVisibility"
 _VISIBILITY_INHERITED = "inherited"
 _VISIBILITY_INVISIBLE = "invisible"
 _VISIBILITY_TOKENS = frozenset({_VISIBILITY_INHERITED, _VISIBILITY_INVISIBLE})
@@ -148,6 +161,7 @@ _NATIVE_CREATE_SPECS: tuple[_NativeCreateSpec, ...] = (
     _NativeCreateSpec("create.xform", "Xform", CreateActionCategory.TRANSFORMS, "Xform", "xform", 0, "Xform"),
     _NativeCreateSpec("create.material.usd-preview-surface", "USD Preview Surface", CreateActionCategory.MATERIALS, "Material", "material", 0, "PreviewSurface", "/World/Looks"),
     _NativeCreateSpec("create.render_product", "Render Product", CreateActionCategory.RENDER_PRODUCTS, "RenderProduct", "render_product", 0, "RenderProduct", "/Render/Products"),
+    _NativeCreateSpec("create.render_var", "AOV", CreateActionCategory.RENDER_PRODUCTS, "RenderVar", "render_var", 10, "LdrColor", "/Render/Vars"),
     _NativeCreateSpec("create.sensor.generic-lidar", "Generic Lidar Sensor", CreateActionCategory.SENSORS, "OmniLidar", "sensor", 0, "Lidar"),
     _NativeCreateSpec("create.decal", "Decal", CreateActionCategory.DECALS, "Decal", "decal", 0, "Decal"),
     _NativeCreateSpec("create.projector", "Projector", CreateActionCategory.PROJECTORS, "Projector", "projector", 0, "Projector"),
@@ -168,6 +182,9 @@ _NATIVE_CREATE_SPECS: tuple[_NativeCreateSpec, ...] = (
 _SUPPORTED_GENERIC_TYPES = frozenset(
     spec.type_name for spec in _NATIVE_CREATE_SPECS if spec.type_name
 )
+_USD_PREVIEW_SURFACE_MATERIAL_ID = "core_material.usd_preview_surface"
+_USD_PREVIEW_SURFACE_CREATE_ACTION_ID = "create.material.usd-preview-surface"
+_USD_PREVIEW_SURFACE_BIND_ACTION_ID = "create.material.usd-preview-surface.bind"
 
 
 def _is_below(path: str, root: str) -> bool:
@@ -219,6 +236,7 @@ class _OvstageStageItem:
 
 _TYPE_CATEGORY_MAP: dict[str, str] = {
     "mesh": "Mesh",
+    "meshinstance": "Mesh",
     "sphere": "Mesh",
     "cube": "Mesh",
     "cone": "Mesh",
@@ -331,6 +349,349 @@ _MATERIAL_BINDING_DESCRIPTOR = NativeValueDescriptor(
     native_is_array=True,
     logical_is_array=True,
 )
+_ASSET_DESCRIPTOR = NativeValueDescriptor(
+    name="inputs:texture:file",
+    dtype=(1, 8, 1),
+    semantic=1,
+    native_is_array=True,
+    logical_is_array=False,
+)
+
+
+def _token_descriptor(name: str) -> NativeValueDescriptor:
+    return NativeValueDescriptor(
+        name=name,
+        dtype=(1, 64, 1),
+        semantic=2,
+        native_is_array=False,
+        logical_is_array=False,
+    )
+
+
+def _float_descriptor(name: str) -> NativeValueDescriptor:
+    return NativeValueDescriptor(
+        name=name,
+        dtype=(2, 32, 1),
+        semantic=0,
+        native_is_array=False,
+        logical_is_array=False,
+    )
+
+
+def _color3f_descriptor(name: str) -> NativeValueDescriptor:
+    return NativeValueDescriptor(
+        name=name,
+        dtype=(2, 32, 3),
+        semantic=8,
+        native_is_array=False,
+        logical_is_array=False,
+    )
+
+
+_LIGHT_DEFAULT_VALUES: dict[str, tuple[tuple[NativeValueDescriptor, Any], ...]] = {
+    "create.light.dome": (
+        (_ASSET_DESCRIPTOR, ""),
+        (_color3f_descriptor("inputs:color"), (1.0, 1.0, 1.0)),
+        (_float_descriptor("inputs:intensity"), 1000.0),
+        (_token_descriptor("inputs:texture:format"), "latlong"),
+    ),
+    "create.light.rect": (
+        (_float_descriptor("inputs:height"), 1.0),
+        (_float_descriptor("inputs:width"), 1.0),
+    ),
+    "create.light.disk": ((_float_descriptor("inputs:radius"), 0.5),),
+    "create.light.sphere": ((_float_descriptor("inputs:radius"), 0.5),),
+    "create.light.cylinder": (
+        (_float_descriptor("inputs:length"), 1.0),
+        (_float_descriptor("inputs:radius"), 0.5),
+    ),
+}
+_OPENPBR_MATERIAL_ID = "core_material.open_pbr"
+_OPENPBR_GROUP = CoreMaterialGroupDescriptor(
+    group_id="base",
+    label="Base",
+    order=100,
+)
+_USD_MATERIALS_GROUP = CoreMaterialGroupDescriptor(
+    group_id="usd_materials",
+    label="USD Materials",
+    order=200,
+)
+
+
+def _ovstage_openpbr_base_class_asset() -> Path | None:
+    candidates: list[Path] = []
+    try:
+        distribution = importlib.metadata.distribution("ovrtx")
+        candidates.append(
+            Path(
+                distribution.locate_file(
+                    "ovrtx/bin/library/mdl/OpenPBR/open_pbr_uber_base_class.usda"
+                )
+            )
+        )
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    try:
+        spec = importlib.util.find_spec("ovrtx")
+        for location in getattr(spec, "submodule_search_locations", ()) or ():
+            candidates.append(
+                Path(location)
+                / "bin/library/mdl/OpenPBR/open_pbr_uber_base_class.usda"
+            )
+    except (ImportError, ModuleNotFoundError, ValueError):
+        pass
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _openpbr_reference_layer(asset: Path) -> str:
+    asset_path = str(asset).replace("\\", "/")
+    return (
+        '#usda 1.0\n'
+        '(defaultPrim = "OpenPBR")\n'
+        'def Material "OpenPBR" (\n'
+        f'    prepend references = @{asset_path}@</open_pbr_uber_base>\n'
+        ') {}\n'
+    )
+
+
+class _CreateOpenPbrMaterialCommand(Command):
+    """Create the composed OpenPBR material through OVStage population."""
+
+    def __init__(
+        self,
+        scene: Any,
+        material_path: str,
+        payload: str,
+        *,
+        bind_command: Command | None = None,
+        event_paths: Iterable[str] = (),
+    ) -> None:
+        self._scene = scene
+        self._stage = getattr(scene, "_stage", None)
+        self._material_path = str(material_path)
+        self._payload = str(payload)
+        self._bind_command = bind_command
+        self._event_paths = tuple(
+            dict.fromkeys((self._material_path, *(str(path) for path in event_paths)))
+        )
+        self._reference_handle: int | None = None
+
+    def do(self) -> None:
+        self._require_scene()
+        stream = self._scene.change_stream
+        with stream.suppress_notifications():
+            self._add_reference()
+            try:
+                if self._bind_command is not None:
+                    self._bind_command.do()
+            except BaseException as operation_error:
+                try:
+                    self._remove_reference()
+                except BaseException as rollback_error:
+                    _add_cleanup_note(
+                        operation_error,
+                        "OpenPBR population rollback failed",
+                        rollback_error,
+                    )
+                raise
+        with stream.committed_edge_publication():
+            stream.publish_resync_change(
+                self._event_paths,
+                source="material:create-openpbr",
+            )
+
+    def undo(self) -> None:
+        self._require_scene()
+        stream = self._scene.change_stream
+        with stream.suppress_notifications():
+            if self._bind_command is not None:
+                self._bind_command.undo()
+            try:
+                self._remove_reference()
+            except BaseException as operation_error:
+                if self._bind_command is not None:
+                    try:
+                        self._bind_command.do()
+                    except BaseException as rollback_error:
+                        _add_cleanup_note(
+                            operation_error,
+                            "OpenPBR binding compensation failed",
+                            rollback_error,
+                        )
+                raise
+        with stream.committed_edge_publication():
+            stream.publish_resync_change(
+                self._event_paths,
+                source="material:create-openpbr",
+            )
+
+    def _add_reference(self) -> None:
+        if self._reference_handle is not None:
+            raise RuntimeError("OpenPBR population reference is already active")
+        stage_module = import_ovstage_runtime_module("ovstage")
+        population = getattr(stage_module, "population", None)
+        if population is None:
+            raise RuntimeError("OVStage population support is unavailable")
+        stage = self._stage
+        ordinal = int(stage.begin_frame())
+        handle: int | None = None
+        try:
+            handle = int(
+                population.add_usd_reference_from_string(
+                    stage,
+                    self._payload,
+                    self._material_path,
+                )
+            )
+            population.apply_usd_changes(stage, ordinal)
+            stage.end_frame(ordinal)
+        except BaseException as operation_error:
+            if handle is not None:
+                try:
+                    population.remove_usd(stage, handle)
+                except BaseException as rollback_error:
+                    _add_cleanup_note(
+                        operation_error,
+                        "OpenPBR reference removal failed",
+                        rollback_error,
+                    )
+            abort = getattr(stage, "abort_frame", None)
+            if callable(abort):
+                try:
+                    abort(ordinal)
+                except BaseException as rollback_error:
+                    _add_cleanup_note(
+                        operation_error,
+                        "OpenPBR frame abort failed",
+                        rollback_error,
+                    )
+            raise
+        if read_token_attribute(stage, self._material_path, "usd-prim-type") != "Material":
+            self._reference_handle = handle
+            self._remove_reference()
+            raise RuntimeError(
+                f"OpenPBR population did not create a Material at {self._material_path}"
+            )
+        self._reference_handle = handle
+        self._scene._topology_revision += 1
+
+    def _remove_reference(self) -> None:
+        handle = self._reference_handle
+        if handle is None:
+            raise RuntimeError("OpenPBR population reference is not active")
+        stage_module = import_ovstage_runtime_module("ovstage")
+        population = getattr(stage_module, "population", None)
+        if population is None:
+            raise RuntimeError("OVStage population support is unavailable")
+        stage = self._stage
+        ordinal = int(stage.begin_frame())
+        try:
+            population.remove_usd(stage, handle)
+            population.apply_usd_changes(stage, ordinal)
+            stage.end_frame(ordinal)
+        except BaseException as operation_error:
+            abort = getattr(stage, "abort_frame", None)
+            if callable(abort):
+                try:
+                    abort(ordinal)
+                except BaseException as rollback_error:
+                    _add_cleanup_note(
+                        operation_error,
+                        "OpenPBR removal frame abort failed",
+                        rollback_error,
+                    )
+            raise
+        self._reference_handle = None
+        self._scene._topology_revision += 1
+
+    def _require_scene(self) -> None:
+        if (
+            self._stage is None
+            or getattr(self._scene, "_stage", None) is not self._stage
+            or not getattr(self._scene, "is_open", False)
+        ):
+            raise RuntimeError(
+                "OpenPBR material history belongs to a closed or replaced OVStage scene"
+            )
+
+
+class _CreateWithNativeDefaultsCommand(Command):
+    """One native structural create plus required schema-default columns."""
+
+    def __init__(
+        self,
+        scene: Any,
+        create_command: Command,
+        value_commands: Iterable[Command],
+        event_paths: Iterable[str],
+    ) -> None:
+        self._scene = scene
+        self._stage = getattr(scene, "_stage", None)
+        self._create_command = create_command
+        self._value_commands = tuple(value_commands)
+        self._event_paths = tuple(dict.fromkeys(str(path) for path in event_paths))
+
+    def do(self) -> None:
+        self._require_scene()
+        completed: list[Command] = []
+        stream = self._scene.change_stream
+        with stream.suppress_notifications():
+            self._create_command.do()
+            try:
+                for command in self._value_commands:
+                    command.do()
+                    completed.append(command)
+            except BaseException as operation_error:
+                for command in reversed(completed):
+                    try:
+                        command.undo()
+                    except BaseException as rollback_error:
+                        _add_cleanup_note(
+                            operation_error,
+                            "native create-default rollback failed",
+                            rollback_error,
+                        )
+                try:
+                    self._create_command.undo()
+                except BaseException as rollback_error:
+                    _add_cleanup_note(
+                        operation_error,
+                        "native defaulted-create rollback failed",
+                        rollback_error,
+                    )
+                raise
+        with stream.committed_edge_publication():
+            stream.publish_resync_change(
+                self._event_paths,
+                source="structural:create-defaults",
+            )
+
+    def undo(self) -> None:
+        self._require_scene()
+        stream = self._scene.change_stream
+        with stream.suppress_notifications():
+            for command in reversed(self._value_commands):
+                command.undo()
+            self._create_command.undo()
+        with stream.committed_edge_publication():
+            stream.publish_resync_change(
+                self._event_paths,
+                source="structural:create-defaults",
+            )
+
+    def _require_scene(self) -> None:
+        if (
+            self._stage is None
+            or getattr(self._scene, "_stage", None) is not self._stage
+            or not getattr(self._scene, "is_open", False)
+        ):
+            raise RuntimeError(
+                "defaulted native create history belongs to a closed or replaced scene"
+            )
 
 
 class _CreateAndBindMaterialCommand(Command):
@@ -503,6 +864,28 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         if record is None:
             return "Prim"
         return record.icon_name
+
+    def get_light_shape_attributes(self, item: AdapterItem) -> dict[str, float]:
+        record = self._record_for_item(item)
+        if record is None or record.type_category != "Light":
+            return {}
+        stage = self._stage_or_none()
+        if stage is None:
+            return {}
+        names = ("inputs:width", "inputs:height", "inputs:radius", "inputs:length")
+        attributes = read_path_attribute_records(stage, record.path, names)
+        values: dict[str, float] = {}
+        for name in names:
+            native = attributes.get(name)
+            if native is None:
+                continue
+            try:
+                value = float(native.value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values[name.removeprefix("inputs:")] = value
+        return values
 
     def get_badge_flags(self, item: AdapterItem) -> BadgeFlags:
         del item
@@ -786,8 +1169,40 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
             )
         target_path = self._next_unique_child_path(parent_path, child_name)
         rows = (*parent_rows, (target_path, type_name))
-        create_command = NativeCreatePrimsCommand(self._scene, rows)
+        token_attributes = None
+        if action.prim_kind == "render_var":
+            token_attributes = {target_path: {"sourceName": "LdrColor"}}
+        create_command = NativeCreatePrimsCommand(
+            self._scene,
+            rows,
+            token_attributes=token_attributes,
+            promoted_paths=(
+                ("/Render",)
+                if action.prim_kind == "render_var"
+                and (target_path == "/Render" or target_path.startswith("/Render/"))
+                else ()
+            ),
+        )
         command: Command = create_command
+        light_defaults = _LIGHT_DEFAULT_VALUES.get(action.action_id, ())
+        if light_defaults:
+            value_commands = tuple(
+                NativeValueEditCommand(
+                    self._scene,
+                    (target_path,),
+                    descriptor,
+                    (MISSING,),
+                    (value,),
+                    source="structural:create-defaults",
+                )
+                for descriptor, value in light_defaults
+            )
+            command = _CreateWithNativeDefaultsCommand(
+                self._scene,
+                create_command,
+                value_commands,
+                (path for path, _created_type in rows),
+            )
         if action.prim_kind == "material_bind":
             selection_paths = tuple(dict.fromkeys(request.selection_paths))
             try:
@@ -829,6 +1244,13 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         if actual_type != type_name:
             return self._rejected_create(
                 f"Native create did not expose requested type {type_name!r} at {target_path}.",
+                CreateActionErrorCode.CREATE_FAILED,
+            )
+        if action.prim_kind == "render_var" and read_token_attribute(
+            self._require_stage(), target_path, "sourceName"
+        ) != "LdrColor":
+            return self._rejected_create(
+                f"Native RenderVar did not expose sourceName 'LdrColor' at {target_path}.",
                 CreateActionErrorCode.CREATE_FAILED,
             )
         created_paths = tuple(path for path, _type_name in rows)
@@ -1023,13 +1445,152 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         *,
         selection_paths: Iterable[str] | None = None,
     ) -> Any:
-        return CoreMaterialsAdapter.list_core_materials(
-            self,
-            selection_paths=selection_paths,
+        selection_tuple = tuple(str(path) for path in (selection_paths or ()))
+        scene = self._scene
+        if scene is None or not getattr(scene, "is_open", False):
+            message = "No active OVStage scene is available."
+            return CoreMaterialCatalog(
+                selection_paths=selection_tuple,
+                warnings=(
+                    CoreMaterialWarning(
+                        code=CoreMaterialErrorCode.NO_ACTIVE_STAGE.value,
+                        message=message,
+                        severity=CoreMaterialWarningSeverity.ERROR,
+                    ),
+                ),
+            )
+
+        asset = _ovstage_openpbr_base_class_asset()
+        disabled_reason = ""
+        if asset is None:
+            disabled_reason = (
+                "The renderer OpenPBR base-class asset is not available in this build."
+            )
+        bindable_selection_paths = tuple(
+            path
+            for path in selection_tuple
+            if (
+                (record := self._record_for_item(self.get_item_at_path(path)))
+                is not None
+                and _is_imageable(record)
+            )
+        )
+        material = CoreMaterialDescriptor(
+            material_id=_OPENPBR_MATERIAL_ID,
+            label="OpenPBR",
+            group_id=_OPENPBR_GROUP.group_id,
+            family=CoreMaterialFamily.MATERIALX,
+            kind=CoreMaterialKind.OPENPBR,
+            shader_type="open_pbr_uber_base",
+            order=20,
+            capabilities=("materialx.openpbr", "ovstage.population"),
+            requirements=(
+                CoreMaterialRequirement.ACTIVE_STAGE,
+                CoreMaterialRequirement.BACKEND_CAPABILITY,
+            ),
+            default_scope_path="/World/Looks",
+            default_name="OpenPBR",
+            binding_policy=CoreMaterialBindingPolicy.OPTIONAL_BIND_TO_SELECTION,
+            create_supported=not disabled_reason,
+            bind_supported=bool(not disabled_reason and bindable_selection_paths),
+            enabled=not disabled_reason,
+            disabled_reason=disabled_reason,
+            metadata={
+                "schema_family": "openpbr",
+                "openpbr_base_class_asset": str(asset or ""),
+                "provider": "ovstage",
+            },
+        )
+        preview_material = CoreMaterialDescriptor(
+            material_id=_USD_PREVIEW_SURFACE_MATERIAL_ID,
+            label="USD Preview Surface",
+            group_id=_USD_MATERIALS_GROUP.group_id,
+            family=CoreMaterialFamily.USD,
+            kind=CoreMaterialKind.USD_PREVIEW_SURFACE,
+            shader_type="UsdPreviewSurface",
+            order=0,
+            capabilities=("usdshade.preview_surface",),
+            requirements=(CoreMaterialRequirement.ACTIVE_STAGE,),
+            default_scope_path="/World/Looks",
+            default_name="PreviewSurface",
+            binding_policy=CoreMaterialBindingPolicy.OPTIONAL_BIND_TO_SELECTION,
+            create_supported=True,
+            bind_supported=bool(
+                selection_tuple and bindable_selection_paths == selection_tuple
+            ),
+            metadata={
+                "native_structural_identity_only": True,
+                "native_relationship_binding": bool(
+                    selection_tuple and bindable_selection_paths == selection_tuple
+                ),
+                "provider": "ovstage",
+            },
+        )
+        return CoreMaterialCatalog(
+            groups=(_OPENPBR_GROUP, _USD_MATERIALS_GROUP),
+            materials=(material, preview_material),
+            active_stage_id=str(getattr(scene, "source_path", "") or id(self.stage)),
+            edit_target_id="ovstage-native",
+            selection_paths=selection_tuple,
+            bindable_selection_paths=bindable_selection_paths,
+            revision=(
+                f"{int(getattr(scene, 'current_ordinal', 0) or 0)}:"
+                f"{int(getattr(scene, 'topology_revision', 0) or 0)}"
+            ),
         )
 
     def create_material(self, request: Any) -> Any:
-        return CoreMaterialsAdapter.create_material(self, request)
+        if (
+            isinstance(request, CreateMaterialRequest)
+            and request.material_id == _USD_PREVIEW_SURFACE_MATERIAL_ID
+        ):
+            result = self.create_prim(
+                CreateRequest(
+                    action_id=_USD_PREVIEW_SURFACE_CREATE_ACTION_ID,
+                    requested_parent_path=request.requested_scope_path,
+                    requested_name=request.requested_name,
+                    selection_paths=request.selection_paths,
+                    options=request.options,
+                    correlation_id=request.correlation_id,
+                )
+            )
+            if not result.accepted:
+                return CreateMaterialResult.rejected_result(
+                    message=result.message,
+                    error_code=self._core_material_error_code(result.error_code),
+                )
+            return CreateMaterialResult.accepted_result(
+                created_material_path=result.primary_path,
+                created_paths=result.created_paths,
+                selection_paths=result.selection_paths,
+                focus_path=result.focus_path,
+                message=result.message,
+                metadata=result.metadata,
+            )
+        prepared = self._prepare_openpbr_material(request)
+        if isinstance(prepared, CreateMaterialResult):
+            return prepared
+        material_path, payload = prepared
+        command = _CreateOpenPbrMaterialCommand(
+            self._scene,
+            material_path,
+            payload,
+        )
+        try:
+            _dispatch_command(self._undo_manager, command)
+        except Exception as exc:
+            return self._rejected_openpbr_create(
+                f"Native OpenPBR create failed: {type(exc).__name__}: {exc}",
+                CoreMaterialErrorCode.CREATE_FAILED,
+            )
+        return CreateMaterialResult.accepted_result(
+            created_material_path=material_path,
+            created_paths=(material_path,),
+            selection_paths=(material_path,),
+            focus_path=material_path,
+            message=f"Created native OpenPBR material {material_path}.",
+            metadata={"provider": "ovstage"},
+        )
 
     def bind_material(self, request: Any) -> Any:
         if not isinstance(request, BindMaterialRequest):
@@ -1108,7 +1669,169 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         )
 
     def create_and_bind_material(self, request: Any) -> Any:
-        return CoreMaterialsAdapter.create_and_bind_material(self, request)
+        if not isinstance(request, CreateMaterialRequest):
+            return CreateAndBindMaterialResult.rejected_result(
+                message="Invalid native OpenPBR create-and-bind request.",
+                error_code=CoreMaterialErrorCode.VALIDATION_FAILED,
+            )
+        if request.material_id == _USD_PREVIEW_SURFACE_MATERIAL_ID:
+            result = self.create_prim(
+                CreateRequest(
+                    action_id=_USD_PREVIEW_SURFACE_BIND_ACTION_ID,
+                    requested_parent_path=request.requested_scope_path,
+                    requested_name=request.requested_name,
+                    selection_paths=request.selection_paths,
+                    options=request.options,
+                    correlation_id=request.correlation_id,
+                )
+            )
+            if not result.accepted:
+                return CreateAndBindMaterialResult.rejected_result(
+                    failed_prim_paths=request.selection_paths,
+                    message=result.message,
+                    error_code=self._core_material_error_code(result.error_code),
+                )
+            return CreateAndBindMaterialResult.accepted_result(
+                created_material_path=result.primary_path,
+                created_paths=result.created_paths,
+                bound_prim_paths=request.selection_paths,
+                selection_paths=result.selection_paths,
+                focus_path=result.focus_path,
+                binding_applied=result.binding_applied,
+                message=result.message,
+                metadata=result.metadata,
+            )
+        prepared = self._prepare_openpbr_material(request)
+        if isinstance(prepared, CreateMaterialResult):
+            return CreateAndBindMaterialResult.rejected_result(
+                failed_prim_paths=request.selection_paths,
+                message=prepared.message,
+                error_code=prepared.error_code,
+                warnings=prepared.warnings,
+            )
+        material_path, payload = prepared
+        selection_paths = tuple(dict.fromkeys(request.selection_paths))
+        try:
+            old_bindings = self._material_binding_values(selection_paths)
+        except ValueError as exc:
+            return CreateAndBindMaterialResult.rejected_result(
+                failed_prim_paths=selection_paths,
+                message=str(exc),
+                error_code=CoreMaterialErrorCode.VALIDATION_FAILED,
+            )
+        bind_command = NativeValueEditCommand(
+            self._scene,
+            selection_paths,
+            _MATERIAL_BINDING_DESCRIPTOR,
+            old_bindings,
+            tuple((material_path,) for _path in selection_paths),
+            source="material:create-bind",
+        )
+        command = _CreateOpenPbrMaterialCommand(
+            self._scene,
+            material_path,
+            payload,
+            bind_command=bind_command,
+            event_paths=selection_paths,
+        )
+        try:
+            _dispatch_command(self._undo_manager, command)
+        except Exception as exc:
+            return CreateAndBindMaterialResult.rejected_result(
+                failed_prim_paths=selection_paths,
+                message=(
+                    "Native OpenPBR create-and-bind failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                error_code=CoreMaterialErrorCode.CREATE_FAILED,
+            )
+        return CreateAndBindMaterialResult.accepted_result(
+            created_material_path=material_path,
+            created_paths=(material_path,),
+            bound_prim_paths=selection_paths,
+            selection_paths=(material_path,),
+            focus_path=material_path,
+            binding_applied=True,
+            message=(
+                f"Created native OpenPBR material {material_path} and bound "
+                f"{len(selection_paths)} prim(s)."
+            ),
+            metadata={"provider": "ovstage"},
+        )
+
+    def _prepare_openpbr_material(
+        self,
+        request: Any,
+    ) -> tuple[str, str] | CreateMaterialResult:
+        if not isinstance(request, CreateMaterialRequest):
+            return self._rejected_openpbr_create(
+                "Invalid native OpenPBR material request.",
+                CoreMaterialErrorCode.VALIDATION_FAILED,
+            )
+        catalog = self.list_core_materials(selection_paths=request.selection_paths)
+        material = catalog.material(request.material_id)
+        if material is None:
+            return self._rejected_openpbr_create(
+                f"Unknown native core material: {request.material_id}",
+                CoreMaterialErrorCode.UNSUPPORTED,
+            )
+        if not material.is_available:
+            return self._rejected_openpbr_create(
+                material.disabled_reason or "Native OpenPBR material is unavailable.",
+                CoreMaterialErrorCode.DISABLED,
+            )
+        scope_path = self._normalize_path(
+            request.requested_scope_path or material.default_scope_path
+        )
+        if not scope_path:
+            return self._rejected_openpbr_create(
+                "Native OpenPBR scope must be a canonical absolute prim path.",
+                CoreMaterialErrorCode.VALIDATION_FAILED,
+            )
+        raw_name = request.requested_name or material.default_name
+        if request.requested_name and not request.requested_name.strip():
+            return self._rejected_openpbr_create(
+                "Native OpenPBR material name must not be blank.",
+                CoreMaterialErrorCode.VALIDATION_FAILED,
+            )
+        child_name = self.normalize_name(raw_name)
+        if not child_name:
+            return self._rejected_openpbr_create(
+                f"Native OpenPBR material name is invalid: {raw_name!r}",
+                CoreMaterialErrorCode.VALIDATION_FAILED,
+            )
+        material_path = self._next_unique_child_path(scope_path, child_name)
+        asset = Path(str(material.metadata.get("openpbr_base_class_asset") or ""))
+        if not asset.is_file():
+            return self._rejected_openpbr_create(
+                "The renderer OpenPBR base-class asset is unavailable.",
+                CoreMaterialErrorCode.DISABLED,
+            )
+        return material_path, _openpbr_reference_layer(asset)
+
+    @staticmethod
+    def _rejected_openpbr_create(
+        message: str,
+        error_code: CoreMaterialErrorCode,
+    ) -> CreateMaterialResult:
+        return CreateMaterialResult.rejected_result(
+            message=message,
+            error_code=error_code,
+            warnings=(
+                CoreMaterialWarning(
+                    code=error_code.value,
+                    message=message,
+                    severity=CoreMaterialWarningSeverity.ERROR,
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _core_material_error_code(value: str) -> CoreMaterialErrorCode:
+        try:
+            return CoreMaterialErrorCode(value)
+        except ValueError:
+            return CoreMaterialErrorCode.CREATE_FAILED
 
     def _material_binding_values(
         self,
@@ -1500,6 +2223,19 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
             return axis
         return StageAdapter.read_stage_up_axis(self)
 
+    def read_stage_meters_per_unit(self) -> float:
+        """Return native population stage units for viewport-scale consumers."""
+        stage = getattr(self._scene, "_stage", None)
+        if stage is None:
+            return StageAdapter.read_stage_meters_per_unit(self)
+        try:
+            meters_per_unit = read_population_meters_per_unit(stage)
+        except Exception:
+            meters_per_unit = None
+        if meters_per_unit is not None:
+            return meters_per_unit
+        return StageAdapter.read_stage_meters_per_unit(self)
+
     def list_cameras(self) -> List[StageChoice]:
         """Return native OVStage Camera prims as common selector choices."""
         return self._list_choices_for_prim_types(("Camera", "UsdGeomCamera"))
@@ -1533,12 +2269,16 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
             forward = (0.0, 0.0, -1.0)
         target = _read_camera_target_offset(stage, normalized_path, eye, forward)
         fov_degrees = _camera_fov_degrees(stage, normalized_path)
+        projection = read_token_attribute(stage, normalized_path, "projection") or "perspective"
         return BoundCameraPose(
             eye=eye,
             target=target,
             up_axis=self.read_stage_up_axis(),
             fov_degrees=fov_degrees,
             prim_path=normalized_path,
+            projection=projection,
+            orthographic_height=((_read_scalar(stage, normalized_path, "verticalAperture") or 15.2908) * 0.1
+                                 if projection == "orthographic" else None),
         )
 
     def write_camera_pose_from_matrices(
@@ -1563,6 +2303,8 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         snapshot = native_catalog_snapshot(self._scene)
         targets: list[RenderTargetDescriptor] = []
         for product_path in snapshot.paths_of_type("RenderProduct", "UsdRenderProduct"):
+            if self._is_secondary_viewport_path(product_path):
+                continue
             product = snapshot.prim(product_path)
             if product is None:
                 continue
@@ -1670,6 +2412,16 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
             revision=_catalog_revision(snapshot),
         )
 
+    def preview_aov_authoring(self, request: Any) -> Any:
+        from ovui_data_adapters.ovstage.aov_authoring import preview_aov_authoring
+
+        return preview_aov_authoring(self, request)
+
+    def author_aov_graph(self, request: Any) -> Any:
+        from ovui_data_adapters.ovstage.aov_authoring import author_aov_graph
+
+        return author_aov_graph(self, request)
+
     @property
     def stage(self) -> Any:
         scene = self._scene
@@ -1756,10 +2508,8 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
                     and previous.icon_name == icon_name
                     and previous.applied_schemas == applied_schemas
                 ):
-                    # Kit currently exposes the committed ordinal as its
-                    # topology version.  Preserve item identity across ordinary
-                    # value writes so selection does not disappear merely
-                    # because a transform or property changed.
+                    # Preserve selection handles for unchanged rows when a
+                    # structural edit elsewhere invalidates the hierarchy.
                     item = previous
                 else:
                     item = _OvstageStageItem(
@@ -1792,6 +2542,11 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         cls,
         stage: Any,
     ) -> dict[str, tuple[str, tuple[str, ...]]]:
+        if (
+            getattr(stage, "_ovui_query_prims_source", None)
+            == "native Kit query/read_attributes"
+        ):
+            return _kit_type_records(stage, int(stage.current_ordinal))
         records: dict[str, tuple[str, tuple[str, ...]]] = {}
         query_result = stage.query_prims(int(stage.current_ordinal))
         for group in query_result.get("groups", ()):
@@ -1929,6 +2684,14 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
                 pass
         return _read_matrix_attribute(self._require_stage(), path, "worldMatrix")
 
+    def _is_secondary_viewport_path(self, path: str) -> bool:
+        # Keep secondary viewport prims in their own viewport. Preserve Main
+        # and user prims with the same names.
+        return any(
+            path in (f"{root}/Render/Cameras/Secondary", f"{root}/Render/ViewportSecondary")
+            for root in getattr(self._scene, "presentation_root_paths", ())
+        )
+
     def _list_choices_for_prim_types(
         self,
         type_names: tuple[str, ...],
@@ -1939,6 +2702,7 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         return [
             StageChoice(path=path, display_name=self._display_name_from_path(path))
             for path in snapshot.paths_of_type(*type_names)
+            if not self._is_secondary_viewport_path(path)
         ]
 
 
@@ -1987,6 +2751,27 @@ def _catalog_revision(snapshot: Any) -> str:
 
 def _read_raw_visibility(stage: Any, path: str) -> str:
     try:
+        if (
+            getattr(stage, "_ovui_read_attribute_source", None)
+            == "native Kit read_attributes"
+        ):
+            # The compatibility read_attribute rebuilds a whole-scene cache.
+            # An eye icon only needs visibility columns for this exact path.
+            records = read_path_attribute_records(
+                stage, path, (_VISIBILITY_ATTR, _WORLD_VISIBILITY_ATTR),
+            )
+            record = records.get(_VISIBILITY_ATTR)
+            if record is not None:
+                token = record.value
+                if isinstance(token, int):
+                    token = resolve_token_id(stage, token)
+                return token if token in _VISIBILITY_TOKENS else _VISIBILITY_INHERITED
+            world = records.get(_WORLD_VISIBILITY_ATTR)
+            return (
+                _VISIBILITY_INVISIBLE
+                if world is not None and world.value == 0
+                else _VISIBILITY_INHERITED
+            )
         raw_value = bytes(
             stage.read_attribute(
                 int(stage.current_ordinal),
@@ -2001,6 +2786,19 @@ def _read_raw_visibility(stage: Any, path: str) -> str:
 
 
 def _read_raw_purpose(stage: Any, path: str) -> str:
+    if (
+        getattr(stage, "_ovui_read_attribute_source", None)
+        == "native Kit read_attributes"
+    ):
+        try:
+            records = read_path_attribute_records(stage, path, (_PURPOSE_ATTR,))
+            record = records.get(_PURPOSE_ATTR)
+            value = record.value if record is not None else None
+            if isinstance(value, int):
+                value = resolve_token_id(stage, value)
+        except Exception:
+            value = None
+        return str(value) if value else "geometry"
     value = read_token_attribute(stage, path, _PURPOSE_ATTR)
     return str(value) if value else "geometry"
 

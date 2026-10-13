@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """PathField — dual-mode breadcrumb / inline text-edit navigation widget.
 
@@ -941,8 +934,7 @@ class PathField:
 
         Each entry becomes a clickable :class:`ui.Button` row so mouse
         clicks commit the selection and apply-navigate to it (Bug C —
-        the review requirement that clicking a suggestion should change
-        directory).
+        the requirement that "clicking a suggestion should change directory").
         The currently keyboard-highlighted row carries the
         ``Content.PathBar.Autocomplete.Item::selected`` variant so the
         theme paints it with the accent colour; the others use

@@ -1,17 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Source-layout invariants for the dash-form data-adapters folder.
 
-Naming requirement: the *visible* repository folder must use the
-dash-form name ``ovui-data-adapters``, not ``ovui_data_adapters``.
+The repository folder uses the project name ``ovui-data-adapters``.
 
 Python identifiers cannot contain dashes, so the import package name
 must remain ``ovui_data_adapters``; only the *visible* repository
@@ -55,6 +47,7 @@ co-located project layout.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import importlib.util
 import os
 import pathlib
@@ -89,6 +82,24 @@ SERVICES_CONTENT_NAVIGATION_FILE = SERVICES_CONTENT_PACKAGE_DIR / "navigation.py
 SERVICES_BACKENDS_PACKAGE_DIR = SERVICES_CONTENT_PACKAGE_DIR / "backends"
 OPENUSD_PACKAGE_DIR = DASH_PARENT / "ovui_data_adapters" / "openusd"
 OVSTAGE_PACKAGE_DIR = DASH_PARENT / "ovui_data_adapters" / "ovstage"
+_INSTALLED_RELEASE_TESTS = os.environ.get("OVUI_TEST_INSTALLED_RELEASE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _expected_import_location(
+    source_path: pathlib.Path,
+    distribution: str,
+) -> pathlib.Path:
+    if not _INSTALLED_RELEASE_TESTS:
+        return source_path.resolve()
+    relative_path = source_path.relative_to(DASH_PARENT)
+    return pathlib.Path(
+        importlib.metadata.distribution(distribution).locate_file(relative_path)
+    ).resolve()
 
 
 def _load_pyproject(path: pathlib.Path) -> dict:
@@ -229,17 +240,25 @@ def test_underscore_imports_still_resolve():
     common = importlib.import_module("ovui_data_adapters.common")
     assert common.__name__ == "ovui_data_adapters.common"
     common_file = pathlib.Path(common.__file__).resolve()
-    assert common_file.is_relative_to(COMMON_PACKAGE_DIR), (
+    expected_common_dir = _expected_import_location(
+        COMMON_PACKAGE_DIR,
+        "ovui-data-adapters-common",
+    )
+    assert common_file.is_relative_to(expected_common_dir), (
         f"common package resolved outside its unified import-package root: "
-        f"{common_file} not under {COMMON_PACKAGE_DIR}"
+        f"{common_file} not under {expected_common_dir}"
     )
 
     services = importlib.import_module("ovui_data_adapters.services")
     assert services.__name__ == "ovui_data_adapters.services"
     services_file = pathlib.Path(services.__file__).resolve()
-    assert services_file.is_relative_to(SERVICES_PACKAGE_DIR), (
+    expected_services_dir = _expected_import_location(
+        SERVICES_PACKAGE_DIR,
+        "ovui-data-adapters-services",
+    )
+    assert services_file.is_relative_to(expected_services_dir), (
         f"services package resolved outside its unified import-package root: "
-        f"{services_file} not under {SERVICES_PACKAGE_DIR}"
+        f"{services_file} not under {expected_services_dir}"
     )
 
     content_backends = importlib.import_module(
@@ -247,10 +266,14 @@ def test_underscore_imports_still_resolve():
     )
     assert content_backends.LocalFSBackend().supports_url("file:///tmp")
     content_backends_file = pathlib.Path(content_backends.__file__).resolve()
-    assert content_backends_file.is_relative_to(SERVICES_BACKENDS_PACKAGE_DIR), (
+    expected_backends_dir = _expected_import_location(
+        SERVICES_BACKENDS_PACKAGE_DIR,
+        "ovui-data-adapters-services",
+    )
+    assert content_backends_file.is_relative_to(expected_backends_dir), (
         "content backend service package resolved outside its unified "
         f"import-package root: {content_backends_file} not under "
-        f"{SERVICES_BACKENDS_PACKAGE_DIR}"
+        f"{expected_backends_dir}"
     )
 
     content_asset_types = importlib.import_module(
@@ -258,10 +281,14 @@ def test_underscore_imports_still_resolve():
     )
     assert content_asset_types.get_category("scene.usd").name == "USD"
     content_asset_types_file = pathlib.Path(content_asset_types.__file__).resolve()
-    assert content_asset_types_file == SERVICES_ASSET_TYPES_FILE.resolve(), (
+    expected_asset_types_file = _expected_import_location(
+        SERVICES_ASSET_TYPES_FILE,
+        "ovui-data-adapters-services",
+    )
+    assert content_asset_types_file == expected_asset_types_file, (
         "content metadata/classification service resolved outside its unified "
         f"import-package root: {content_asset_types_file} != "
-        f"{SERVICES_ASSET_TYPES_FILE.resolve()}"
+        f"{expected_asset_types_file}"
     )
 
     content_navigation = importlib.import_module(
@@ -271,10 +298,14 @@ def test_underscore_imports_still_resolve():
     recent.add("/new.usd")
     assert recent.get_ordered() == ["/new.usd", "/old.usd"]
     content_navigation_file = pathlib.Path(content_navigation.__file__).resolve()
-    assert content_navigation_file == SERVICES_CONTENT_NAVIGATION_FILE.resolve(), (
+    expected_navigation_file = _expected_import_location(
+        SERVICES_CONTENT_NAVIGATION_FILE,
+        "ovui-data-adapters-services",
+    )
+    assert content_navigation_file == expected_navigation_file, (
         "content navigation/persistence service resolved outside its unified "
         f"import-package root: {content_navigation_file} != "
-        f"{SERVICES_CONTENT_NAVIGATION_FILE.resolve()}"
+        f"{expected_navigation_file}"
     )
 
     content_clipboard = importlib.import_module(
@@ -284,10 +315,13 @@ def test_underscore_imports_still_resolve():
     clip.save_to_clipboard(["/a.usd"], is_cut=True)
     assert clip.is_path_cut("/a.usd") is True
     content_clipboard_file = pathlib.Path(content_clipboard.__file__).resolve()
-    assert content_clipboard_file == SERVICES_CONTENT_CLIPBOARD_FILE.resolve(), (
+    expected_clipboard_file = _expected_import_location(
+        SERVICES_CONTENT_CLIPBOARD_FILE,
+        "ovui-data-adapters-services",
+    )
+    assert content_clipboard_file == expected_clipboard_file, (
         "content internal clipboard service resolved outside its unified "
-        f"import-package root: {content_clipboard_file} != "
-        f"{SERVICES_CONTENT_CLIPBOARD_FILE.resolve()}"
+        f"import-package root: {content_clipboard_file} != {expected_clipboard_file}"
     )
 
     content_file_operations = importlib.import_module(
@@ -300,46 +334,62 @@ def test_underscore_imports_still_resolve():
     content_file_operations_file = pathlib.Path(
         content_file_operations.__file__
     ).resolve()
-    assert content_file_operations_file == (
-        SERVICES_CONTENT_FILE_OPERATIONS_FILE.resolve()
-    ), (
+    expected_file_operations_file = _expected_import_location(
+        SERVICES_CONTENT_FILE_OPERATIONS_FILE,
+        "ovui-data-adapters-services",
+    )
+    assert content_file_operations_file == expected_file_operations_file, (
         "content file-operation service resolved outside its unified "
         f"import-package root: {content_file_operations_file} != "
-        f"{SERVICES_CONTENT_FILE_OPERATIONS_FILE.resolve()}"
+        f"{expected_file_operations_file}"
     )
 
     services_settings = importlib.import_module("ovui_data_adapters.services.settings")
     assert services_settings.Settings().get("ui.theme") is None
     services_settings_file = pathlib.Path(services_settings.__file__).resolve()
-    assert services_settings_file == SERVICES_SETTINGS_FILE.resolve(), (
+    expected_settings_file = _expected_import_location(
+        SERVICES_SETTINGS_FILE,
+        "ovui-data-adapters-services",
+    )
+    assert services_settings_file == expected_settings_file, (
         "generic settings/observer service resolved outside its unified "
-        f"import-package root: {services_settings_file} != "
-        f"{SERVICES_SETTINGS_FILE.resolve()}"
+        f"import-package root: {services_settings_file} != {expected_settings_file}"
     )
 
     services_undo = importlib.import_module("ovui_data_adapters.services.undo")
     assert services_undo.UndoManager.null().can_undo() is False
     services_undo_file = pathlib.Path(services_undo.__file__).resolve()
-    assert services_undo_file == SERVICES_UNDO_FILE.resolve(), (
+    expected_undo_file = _expected_import_location(
+        SERVICES_UNDO_FILE,
+        "ovui-data-adapters-services",
+    )
+    assert services_undo_file == expected_undo_file, (
         "undo service resolved outside its unified import-package root: "
-        f"{services_undo_file} != {SERVICES_UNDO_FILE.resolve()}"
+        f"{services_undo_file} != {expected_undo_file}"
     )
 
     services_selection = importlib.import_module("ovui_data_adapters.services.selection")
     assert services_selection.SelectionBus().get_snapshot().paths() == []
     services_selection_file = pathlib.Path(services_selection.__file__).resolve()
-    assert services_selection_file == SERVICES_SELECTION_FILE.resolve(), (
+    expected_selection_file = _expected_import_location(
+        SERVICES_SELECTION_FILE,
+        "ovui-data-adapters-services",
+    )
+    assert services_selection_file == expected_selection_file, (
         "selection service resolved outside its unified import-package root: "
-        f"{services_selection_file} != {SERVICES_SELECTION_FILE.resolve()}"
+        f"{services_selection_file} != {expected_selection_file}"
     )
 
     services_transforms = importlib.import_module("ovui_data_adapters.services.transforms")
     assert services_transforms.BatchTransformCommand.__name__ == "BatchTransformCommand"
     services_transforms_file = pathlib.Path(services_transforms.__file__).resolve()
-    assert services_transforms_file == SERVICES_TRANSFORMS_FILE.resolve(), (
+    expected_transforms_file = _expected_import_location(
+        SERVICES_TRANSFORMS_FILE,
+        "ovui-data-adapters-services",
+    )
+    assert services_transforms_file == expected_transforms_file, (
         "transform operation command service resolved outside its unified "
-        f"import-package root: {services_transforms_file} != "
-        f"{SERVICES_TRANSFORMS_FILE.resolve()}"
+        f"import-package root: {services_transforms_file} != {expected_transforms_file}"
     )
 
     services_testing = importlib.import_module("ovui_data_adapters.services.testing")
@@ -352,10 +402,14 @@ def test_underscore_imports_still_resolve():
     assert services_testing.MockTransformAdapter().can_transform("/A") is True
     assert services_testing.MockRendererAdapter.__name__ == "MockRendererAdapter"
     services_testing_file = pathlib.Path(services_testing.__file__).resolve()
-    assert services_testing_file.is_relative_to(SERVICES_TESTING_PACKAGE_DIR), (
+    expected_testing_dir = _expected_import_location(
+        SERVICES_TESTING_PACKAGE_DIR,
+        "ovui-data-adapters-services",
+    )
+    assert services_testing_file.is_relative_to(expected_testing_dir), (
         "adapter testing fixture service resolved outside its unified "
         f"import-package root: {services_testing_file} not under "
-        f"{SERVICES_TESTING_PACKAGE_DIR}"
+        f"{expected_testing_dir}"
     )
 
     services_layer_commands = importlib.import_module(
@@ -365,12 +419,14 @@ def test_underscore_imports_still_resolve():
     services_layer_commands_file = pathlib.Path(
         services_layer_commands.__file__
     ).resolve()
-    assert services_layer_commands_file.is_relative_to(
-        SERVICES_LAYER_COMMANDS_PACKAGE_DIR
-    ), (
+    expected_layer_commands_dir = _expected_import_location(
+        SERVICES_LAYER_COMMANDS_PACKAGE_DIR,
+        "ovui-data-adapters-services",
+    )
+    assert services_layer_commands_file.is_relative_to(expected_layer_commands_dir), (
         "layer command service resolved outside its unified import-package "
         f"root: {services_layer_commands_file} not under "
-        f"{SERVICES_LAYER_COMMANDS_PACKAGE_DIR}"
+        f"{expected_layer_commands_dir}"
     )
 
 
@@ -405,7 +461,7 @@ def test_dist_pyproject_where_points_two_levels_up():
             )
 
 
-def test_data_adapter_dependencies_do_not_require_ovrtx():
+def test_data_adapter_dependencies_do_not_require_ovrtx(declared_dependencies):
     """Installing any data-adapter distribution must not pull ovrtx."""
 
     for project_dir in (
@@ -415,8 +471,7 @@ def test_data_adapter_dependencies_do_not_require_ovrtx():
         OVSTAGE_PROJECT,
     ):
         path = project_dir / "pyproject.toml"
-        data = _load_pyproject(path)
-        dependencies = data.get("project", {}).get("dependencies", [])
+        dependencies = declared_dependencies(project_dir)
         offenders = [
             dep
             for dep in dependencies
@@ -425,7 +480,7 @@ def test_data_adapter_dependencies_do_not_require_ovrtx():
         assert offenders == [], f"{path} must not depend on ovrtx: {offenders!r}"
 
 
-def test_app_and_data_adapter_dependencies_do_not_install_ovstage_runtime():
+def test_app_and_data_adapter_dependencies_do_not_install_ovstage_runtime(declared_dependencies):
     """Installing our app/data-adapter wheels must not pull ovstage runtimes."""
 
     runtime_package_names = ("ovstage", "ovhierarchy", "ovpopulation", "ovphysx")
@@ -438,8 +493,7 @@ def test_app_and_data_adapter_dependencies_do_not_install_ovstage_runtime():
         OVSTAGE_PROJECT,
     ):
         path = project_dir / "pyproject.toml"
-        data = _load_pyproject(path)
-        dependencies = data.get("project", {}).get("dependencies", [])
+        dependencies = declared_dependencies(project_dir)
         offenders = []
         for dep in dependencies:
             normalized = dep.split(";", 1)[0].strip().lower()
@@ -450,27 +504,77 @@ def test_app_and_data_adapter_dependencies_do_not_install_ovstage_runtime():
         )
 
 
-def test_aggregate_installs_standalone_openusd_without_changing_plain_adapter():
+def test_dist_pyprojects_declare_the_core_ovui_license():
+    """Every first-party sub-wheel must ship the same license metadata as ``ovui``.
+
+    setuptools does not inherit ``license`` across projects, so a missing
+    field silently produces a wheel whose METADATA declares no license.
+    """
+    expected = _load_pyproject(MONOREPO_ROOT / "ovui" / "pyproject.toml")["project"]["license"]
+    paths = sorted(
+        [*OVUI_WIDGETS_PARENT.glob("dist/*/pyproject.toml"), *DASH_PARENT.glob("dist/*/pyproject.toml")]
+    )
+    assert paths
+    offenders = [
+        str(path.relative_to(MONOREPO_ROOT))
+        for path in paths
+        if _load_pyproject(path).get("project", {}).get("license") != expected
+    ]
+    assert offenders == [], f"license must be {expected!r} in: {offenders!r}"
+
+
+def test_aggregate_installs_standalone_openusd_without_changing_plain_adapter(
+    declared_dependencies,
+):
     """The full standalone stack supplies pxr without contaminating Kit installs."""
 
-    aggregate = _load_pyproject(OVUI_WIDGETS_ALL_PROJECT / "pyproject.toml")["project"]
+    version = (MONOREPO_ROOT / "VERSION.md").read_text(encoding="utf-8").strip()
     openusd = _load_pyproject(OPENUSD_PROJECT / "pyproject.toml")["project"]
 
     aggregate_openusd = [
         dependency
-        for dependency in aggregate["dependencies"]
+        for dependency in declared_dependencies(OVUI_WIDGETS_ALL_PROJECT)
         if dependency.startswith("ovui-data-adapters-openusd")
     ]
     assert aggregate_openusd == [
-        "ovui-data-adapters-openusd[standalone]>=0.2.0"
+        f"ovui-data-adapters-openusd[standalone]=={version}"
     ]
     assert all(
         not dependency.startswith("usd-core")
-        for dependency in openusd["dependencies"]
+        for dependency in declared_dependencies(OPENUSD_PROJECT)
     )
     assert openusd["optional-dependencies"]["standalone"] == [
         "usd-core==25.11"
     ]
+
+
+def test_first_party_dependencies_pin_the_release_version(declared_dependencies):
+    """First-party packages require each other at exactly ``VERSION.md``.
+
+    All first-party packages are released together and change their APIs
+    together. A lower bound such as ``>=0.1.0`` lets ``pip install --upgrade``
+    keep an older ``ovui`` or ``ovui-data-adapters-common`` next to new
+    packages, and ``pip check`` does not report it (NVBug 6881459).
+    """
+    version = (MONOREPO_ROOT / "VERSION.md").read_text(encoding="utf-8").strip()
+    project_dirs = sorted(
+        [
+            *OVUI_WIDGETS_PARENT.glob("dist/*"),
+            *DASH_PARENT.glob("dist/*"),
+        ]
+    )
+    first_party = []
+    offenders = []
+    for project_dir in project_dirs:
+        for dependency in declared_dependencies(project_dir):
+            name = dependency.split("[", 1)[0].split("=", 1)[0].split(">", 1)[0]
+            if not name.strip().startswith("ovui"):
+                continue
+            first_party.append(dependency)
+            if not dependency.endswith(f"=={version}") or dependency.count("==") != 1:
+                offenders.append(f"{project_dir.relative_to(MONOREPO_ROOT)}: {dependency}")
+    assert first_party
+    assert offenders == [], f"first-party requirements must be =={version}: {offenders!r}"
 
 
 def test_subprocess_inherits_pythonpath_for_data_adapters():

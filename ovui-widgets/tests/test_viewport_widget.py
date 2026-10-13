@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for ViewportWidget ZStack layout (Step 40)."""
 
@@ -27,12 +20,13 @@ from ovui_widgets.common.testing.mock_renderer import MockRendererAdapter
 from ovui_widgets.common.testing.mock_stage import MockStageAdapter
 from ovui_widgets.common.testing.mock_transform import MockTransformAdapter
 from ovui_widgets.common.undo import UndoManager
+from ovui_widgets.viewport import viewport_widget as viewport_mod
 from ovui_widgets.viewport.camera_navigation_state import CameraNavigationState
 from ovui_widgets.viewport.image_bridge import ImageBridge
+from ovui_widgets.viewport.light_manipulator import normalized_light_geometry
 from ovui_widgets.viewport.pick_gesture import PickGesture, PickRectGesture
 from ovui_widgets.viewport.toolbar_hooks import ViewportStatusBadge, ViewportToolbarAction
 from ovui_widgets.viewport.transform_manipulator import TOOL_ROTATE, TOOL_TRANSLATE
-from ovui_widgets.viewport import viewport_widget as viewport_mod
 from ovui_widgets.viewport.viewport_hooks import (
     ViewportAnchoredPanel,
     ViewportOutputPreset,
@@ -43,6 +37,21 @@ from ovui_widgets.viewport.viewport_widget import (
     ViewportSurface,
     ViewportWidget,
 )
+
+
+def test_selection_mode_survives_lazy_build_and_layout_rebuild():
+    vp = ViewportWidget(services=None, renderer=MockRendererAdapter())
+    try:
+        vp.set_transform_manipulator_visible(False)
+        vp._build_ui()
+        assert not vp._transform_manipulator.visible
+        vp._build_ui()
+        assert not vp._transform_manipulator.visible
+        vp.set_transform_manipulator_visible(True)
+        vp._build_ui()
+        assert vp._transform_manipulator.visible
+    finally:
+        vp.destroy()
 
 
 class _FakeCameraStageAdapter:
@@ -450,6 +459,74 @@ def fake_camera_menu(monkeypatch):
 
 
 class TestViewportWidgetCreation:
+    def test_light_geometry_uses_authored_world_dimensions_and_stage_units(self):
+        rect_default = normalized_light_geometry(
+            "RectLight",
+            {"width": 100.0, "height": 100.0, "meters_per_unit": 0.01},
+        )
+        rect_wide = normalized_light_geometry(
+            "RectLight",
+            {"width": 300.0, "height": 100.0, "meters_per_unit": 0.01},
+        )
+        assert rect_wide[0] == pytest.approx(rect_default[0] * 3.0)
+        assert rect_wide[1:] == pytest.approx(rect_default[1:])
+
+        for light_type in ("SphereLight", "DiskLight"):
+            default = normalized_light_geometry(
+                light_type,
+                {"radius": 50.0, "meters_per_unit": 0.01},
+            )
+            larger = normalized_light_geometry(
+                light_type,
+                {"radius": 150.0, "meters_per_unit": 0.01},
+            )
+            assert larger[:2] == pytest.approx(
+                (default[0] * 3.0, default[1] * 3.0)
+            )
+            assert larger[2] == pytest.approx(default[2])
+            meter_default = normalized_light_geometry(
+                light_type,
+                {"radius": 0.5, "meters_per_unit": 1.0},
+            )
+            meter_larger = normalized_light_geometry(
+                light_type,
+                {"radius": 1.5, "meters_per_unit": 1.0},
+            )
+            assert meter_larger[:2] == pytest.approx(
+                (meter_default[0] * 3.0, meter_default[1] * 3.0)
+            )
+            assert meter_larger[2] == pytest.approx(meter_default[2])
+
+        cylinder_default = normalized_light_geometry(
+            "CylinderLight",
+            {"radius": 5.0, "length": 100.0, "meters_per_unit": 0.01},
+        )
+        cylinder_long = normalized_light_geometry(
+            "CylinderLight",
+            {"radius": 5.0, "length": 300.0, "meters_per_unit": 0.01},
+        )
+        cylinder_wide = normalized_light_geometry(
+            "CylinderLight",
+            {"radius": 15.0, "length": 100.0, "meters_per_unit": 0.01},
+        )
+        assert cylinder_long[:2] == pytest.approx(cylinder_default[:2])
+        assert cylinder_long[2] == pytest.approx(cylinder_default[2] * 3.0)
+        assert cylinder_wide[:2] == pytest.approx(
+            (cylinder_default[0] * 3.0, cylinder_default[1] * 3.0)
+        )
+        assert cylinder_wide[2] == pytest.approx(cylinder_default[2])
+
+        for light_type in ("DomeLight", "DistantLight"):
+            centimeter_geometry = normalized_light_geometry(
+                light_type, {"meters_per_unit": 0.01}
+            )
+            meter_geometry = normalized_light_geometry(
+                light_type, {"meters_per_unit": 1.0}
+            )
+            assert centimeter_geometry == pytest.approx(
+                tuple(value * 100.0 for value in meter_geometry)
+            )
+
     def test_viewport_surface_is_public_package_export(self):
         import ovui_widgets.viewport as viewport_pkg
 
@@ -564,7 +641,7 @@ class TestViewportSelectionHighlightExpansion:
         vp._image = _VisibleViewportImage()
         try:
             initial_call_count = len(renderer.highlight_calls)
-            bus.publish(["/World/GroupA/MeshA"], source="qa_tools.create_prims")
+            bus.publish(["/World/GroupA/MeshA"], source="extension.create_prims")
 
             assert renderer.highlight_calls[-1] == ["/World/GroupA/MeshA"]
             assert len(renderer.highlight_calls) == initial_call_count + 1
@@ -617,6 +694,96 @@ class TestViewportWidgetLayout:
         assert renderer.render_call_count == 1
         assert surface._last_resolution == (640, 360)
         surface.destroy()
+
+    def test_build_wires_camera_near_plane_gate_to_transform_manipulator(
+        self,
+        monkeypatch,
+    ):
+        surface = ViewportSurface(
+            services=None,
+            renderer=MockRendererAdapter(),
+            chrome_options=_hidden_chrome_options(),
+        )
+        frame = _FakeFrame()
+        surface.build_into(frame)
+
+        _build_viewport(surface, frame.build_fn)
+
+        assert surface._transform_manipulator._front_fn == surface._gizmo_pivot_in_front
+
+        cancellations = []
+        monkeypatch.setattr(
+            surface,
+            "cancel_active_transform_drag",
+            lambda *, reason: cancellations.append(reason),
+        )
+        surface._transform_manipulator._cancel_drag_fn()
+
+        assert cancellations == ["near_plane_transition"]
+        surface.destroy()
+
+    def test_gizmo_gate_requires_pivot_beyond_dynamic_near_plane(self):
+        class Camera:
+            state = SimpleNamespace(distance=1000.0)
+
+            @staticmethod
+            def _get_eye():
+                return (0.0, 0.0, 0.0)
+
+            @staticmethod
+            def _get_basis():
+                return (
+                    (1.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0),
+                    (0.0, 0.0, -1.0),
+                )
+
+        surface = object.__new__(ViewportSurface)
+        surface._camera = Camera()
+
+        assert surface._gizmo_pivot_in_front((0.0, 0.0, -1.0)) is False
+        assert surface._gizmo_pivot_in_front((0.0, 0.0, -1.001)) is True
+
+    def test_gizmo_gate_uses_presented_camera_during_frame_overlap(self):
+        view = np.eye(4, dtype=float)
+        view[2, 3] = 10.0
+        projection = np.zeros((4, 4), dtype=float)
+        projection[0, 0] = 1.0
+        projection[1, 1] = 1.0
+        projection[2, 2] = -101.0 / 99.0
+        projection[2, 3] = -200.0 / 99.0
+        projection[3, 2] = -1.0
+
+        class Camera:
+            state = SimpleNamespace(distance=1.0)
+
+            @staticmethod
+            def _get_eye():
+                return (0.0, 0.0, 0.0)
+
+            @staticmethod
+            def _get_basis():
+                return (
+                    (1.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0),
+                    (0.0, 0.0, -1.0),
+                )
+
+        surface = object.__new__(ViewportSurface)
+        surface._camera = Camera()
+        surface._renderer = SimpleNamespace(
+            presented_camera_snapshot=SimpleNamespace(
+                view=view,
+                projection=projection,
+                size=(640, 480),
+            )
+        )
+
+        # The live camera sees both points well in front of its 0.01 near
+        # plane. The visible overlapped frame uses a translated view and a
+        # near plane at 1.0, placing them 0.5 and 1.001 units ahead instead.
+        assert surface._gizmo_pivot_in_front((0.0, 0.0, -10.5)) is False
+        assert surface._gizmo_pivot_in_front((0.0, 0.0, -11.001)) is True
 
     def test_viewport_surface_rejects_non_frame_embedding_target(self):
         surface = ViewportSurface(services=None, renderer=MockRendererAdapter())
@@ -798,6 +965,8 @@ class TestViewportWidgetLayout:
         assert rotate.enabled is True
         assert snapshot.active_camera_path == "/World/CameraA"
         assert [(camera.path, camera.label, camera.active) for camera in snapshot.cameras] == [
+            ("ovui:perspective", "Perspective", False),
+            ("ovui:orthographic", "Ortho", False),
             ("/World/CameraA", "Camera A", True)
         ]
         toolbar_by_id = {item.id: item for item in snapshot.toolbar_contributions}
@@ -808,12 +977,12 @@ class TestViewportWidgetLayout:
         output_by_id = {item.id: item for item in snapshot.output_contributions}
         assert output_by_id["rendervar.depth"].label == "Depth"
         assert snapshot.hud.scene == "sample.usda"
-        assert snapshot.hud.fps_text == "10"
+        assert snapshot.hud.fps_text == "10/-"
         assert snapshot.hud.resolution == (640, 360)
         assert snapshot.hud.resolution_text == "640×360"
         assert snapshot.hud.stream_state == "LISTENING"
         assert snapshot.hud.stream_text == "Listening :49100/47999"
-        assert "PathTracing" not in snapshot.hud.stream_text
+        assert "backend mode" not in snapshot.hud.stream_text
         assert not hasattr(snapshot.hud, "render_progress")
         assert not hasattr(snapshot.hud, "path_tracing_status")
         surface.destroy()
@@ -1263,7 +1432,7 @@ class TestViewportWidgetLayout:
         def spy_invisible_button(*args, **kwargs):
             identifier = str(kwargs.get("identifier") or "")
             if identifier.startswith("viewport_toolbar_") or identifier.startswith(
-                "qa_tools_"
+                "extension_"
             ):
                 order.append(identifier)
             return original_invisible_button(*args, **kwargs)
@@ -1277,11 +1446,11 @@ class TestViewportWidgetLayout:
         )
         vp.toolbar_hooks.add(
             ViewportToolbarMenu(
-                id="qa_tools.render_target_picker",
+                id="extension.render_target_picker",
                 label="Render Target",
                 tooltip="Render Target",
                 icon_path=get_icon_path("content_gear"),
-                widget_name="qa_tools_render_target_menu",
+                widget_name="extension_render_target_menu",
             )
         )
         vp._build_ui()
@@ -1289,7 +1458,7 @@ class TestViewportWidgetLayout:
         assert vp._toolbar_frame is None
         assert vp._pre_tools_toolbar_hooks.iter_contributions() == ()
         assert [entry.widget_name for entry in vp.toolbar_hooks.iter_contributions()] == [
-            "qa_tools_render_target_menu"
+            "extension_render_target_menu"
         ]
         assert order == []
         assert vp._scene_value_label is not None
@@ -1309,7 +1478,7 @@ class TestViewportWidgetLayout:
         def spy_invisible_button(*args, **kwargs):
             identifier = str(kwargs.get("identifier") or "")
             if identifier.startswith("viewport_toolbar_") or identifier.startswith(
-                "qa_tools_"
+                "extension_"
             ):
                 order.append(identifier)
             return original_invisible_button(*args, **kwargs)
@@ -1323,11 +1492,11 @@ class TestViewportWidgetLayout:
         )
         vp.toolbar_hooks.add(
             ViewportToolbarMenu(
-                id="qa_tools.render_target_picker",
+                id="extension.render_target_picker",
                 label="Render Target",
                 tooltip="Render Target",
                 icon_path=get_icon_path("content_gear"),
-                widget_name="qa_tools_render_target_menu",
+                widget_name="extension_render_target_menu",
             )
         )
         vp._build_ui()
@@ -1339,7 +1508,7 @@ class TestViewportWidgetLayout:
             "viewport_toolbar_rotate",
             "viewport_toolbar_scale",
             "viewport_toolbar_camera",
-            "qa_tools_render_target_menu",
+            "extension_render_target_menu",
         ]
         assert vp._scene_value_label is not None
         assert vp._livestream_row is not None
@@ -1697,7 +1866,7 @@ class TestViewportHUDOverlay:
         vp._last_fps = 24.0
         vp._last_resolution = (1920, 1080)
         vp._refresh_hud()
-        assert vp._fps_value_label.text == "24"
+        assert vp._fps_value_label.text == "24/-"
         assert vp._resolution_value_label.text == "1920×1080"
         vp.destroy()
 
@@ -1891,6 +2060,11 @@ class TestViewportToolbar:
         return self._latest_viewport_menu().submenus[0]
 
     def _assert_settings_menu_closed(self, vp, settings_menu):
+        # A control callback runs inside the frame, so the menu is hidden
+        # there and destroyed by the next update(), outside the frame.
+        assert settings_menu.hidden is True
+        assert settings_menu.destroyed is False
+        vp.update(1.0 / 60.0)
         assert settings_menu.destroyed is True
         assert (
             viewport_mod.VIEWPORT_RESOLUTION_ATTACHMENT_ID
@@ -1959,11 +2133,11 @@ class TestViewportToolbar:
         try:
             vp.toolbar_hooks.add(
                 ViewportToolbarMenu(
-                    id="qa_tools.render_target_picker",
+                    id="extension.render_target_picker",
                     label="Render Target",
                     tooltip="Render Target",
                     icon_path=get_icon_path("content_gear"),
-                    widget_name="qa_tools_render_target_menu",
+                    widget_name="extension_render_target_menu",
                 )
             )
 
@@ -1983,7 +2157,7 @@ class TestViewportToolbar:
             assert leading_contributions[0].icon_path.endswith("content_gear.png")
             assert callable(leading_contributions[0].build_fn)
             assert [entry.widget_name for entry in external_contributions] == [
-                "qa_tools_render_target_menu"
+                "extension_render_target_menu"
             ]
         finally:
             vp.destroy()
@@ -2183,6 +2357,47 @@ class TestViewportToolbar:
             assert menu.destroyed is True
             assert vp._pre_tools_toolbar_hooks._menus == {}
             assert pick_calls == []
+        finally:
+            vp.destroy()
+
+    def test_settings_menu_hidden_by_control_does_not_consume_viewport_pick(
+        self, fake_camera_menu
+    ):
+        from ovui_widgets.common.settings import Settings
+        from ovui_widgets.viewport.resolution_settings import (
+            write_viewport_instance_resolution,
+        )
+        from ovui_widgets.viewport.resolution_state import RESOLUTION_MODE_FIXED
+
+        settings = Settings()
+        pick_calls = []
+        vp = ViewportWidget(
+            services=SimpleNamespace(settings=settings, selection_bus=None),
+            renderer=MockRendererAdapter(),
+        )
+        vp._renderer.pick = lambda *args, **kwargs: pick_calls.append("pick")
+        vp._renderer.pick_rect = lambda *args, **kwargs: pick_calls.append("rect")
+        vp._image = _VisibleViewportImage()
+        try:
+            write_viewport_instance_resolution(settings, vp.viewport_id, [1920, 1080])
+            vp.set_resolution_state(
+                mode=RESOLUTION_MODE_FIXED,
+                requested_size=(1920, 1080),
+                selected_label="HD1080P",
+            )
+            settings_menu = self._open_settings_menu(vp)
+            render_scale = self._viewport_item(settings_menu.submenus[0], "Render Scale")
+            selected_index = render_scale.kwargs["render_scale_options"].index("50%")
+            assert render_scale.kwargs["render_scale_changed_fn"](selected_index) is True
+            assert settings_menu.hidden is True
+
+            # A host can render without update(), so the hidden menu can
+            # still be retained when the user next clicks the viewport.
+            vp._on_pick(0.0, 0.0, "replace")
+            vp._on_pick_rect(-0.1, -0.1, 0.1, 0.1, "replace")
+
+            assert pick_calls == ["pick", "rect"]
+            self._assert_settings_menu_closed(vp, settings_menu)
         finally:
             vp.destroy()
 
@@ -6317,8 +6532,8 @@ class TestViewportToolbar:
     ):
         from ovui_widgets.common.settings import Settings
         from ovui_widgets.viewport.resolution_settings import (
-            ResolutionSettingsChange,
             SETTING_CUSTOM_RESOLUTION_LIST,
+            ResolutionSettingsChange,
             viewport_resolution_key,
         )
 
@@ -6673,8 +6888,8 @@ class TestViewportToolbar:
     ):
         from ovui_widgets.common.settings import Settings
         from ovui_widgets.viewport.resolution_settings import (
-            ResolutionSettingsChange,
             SETTING_RENDER_SCALE_LIST,
+            ResolutionSettingsChange,
         )
 
         settings = Settings()
@@ -7880,14 +8095,14 @@ class TestViewportToolbar:
         fake_camera_menu,
     ):
         pytest.importorskip("pxr")
-        from pxr import Usd, UsdGeom, UsdRender
-
         from ovui_data_adapters.openusd.renderer_adapter import (
             _CAMERA_PATH,
             _LDR_VAR_PATH,
             _RENDER_PRODUCT_PATH,
             OvRtxRendererAdapter,
         )
+        from pxr import Usd, UsdGeom, UsdRender
+
         from ovui_widgets.common.settings import Settings
         from ovui_widgets.viewport.resolution_settings import viewport_resolution_scale_key
 
@@ -8755,11 +8970,13 @@ class TestViewportToolbar:
 
         settings = Settings()
         renderer = MockRendererAdapter()
+        renderer._frame_pacing_token = 1
         vp = ViewportWidget(
             services=SimpleNamespace(settings=settings, selection_bus=None),
             renderer=renderer,
         )
         vp._image = _VisibleViewportImage()
+        vp._last_resolution = (640, 360)
         try:
             render_resolution_menu = self._open_render_resolution_menu(vp)
             hd1080p = [
@@ -9664,15 +9881,24 @@ class TestViewportToolbar:
         assert "delegate" in menu.kwargs
         assert menu.shown_at == (17.0, 29.0)
         assert [item.label for item in menu.items] == [
+            "Perspective",
+            "Ortho",
             "Main Camera",
             "Shot Camera",
         ]
         assert all(item.kwargs.get("checkable") is True for item in menu.items)
-        assert all(item.kwargs.get("checked") is False for item in menu.items)
+        assert [item.kwargs.get("checked") for item in menu.items] == [
+            True,
+            False,
+            False,
+            False,
+        ]
         assert all(callable(item.kwargs.get("triggered_fn")) for item in menu.items)
         vp.destroy()
 
-    def test_camera_menu_empty_state_is_disabled_item(self, fake_camera_menu):
+    def test_camera_menu_without_stage_cameras_keeps_working_defaults(
+        self, fake_camera_menu
+    ):
         adapter = _FakeCameraStageAdapter()
         vp = ViewportWidget(
             services=None,
@@ -9680,9 +9906,19 @@ class TestViewportToolbar:
             stage_adapter_provider=lambda: adapter,
         )
         menu = vp._show_camera_menu_at(0, 0)
-        assert [item.label for item in menu.items] == ["(no cameras)"]
-        assert menu.items[0].kwargs.get("enabled") is False
-        assert "triggered_fn" not in menu.items[0].kwargs
+        assert [item.label for item in menu.items] == ["Perspective", "Ortho"]
+        assert menu.items[0].kwargs.get("checked") is True
+        assert menu.items[1].kwargs.get("checked") is False
+
+        assert menu.items[1].trigger() is True
+        _, ortho_projection = vp._camera.get_matrices(800, 600)
+        assert vp._active_camera_path is None
+        assert vp._camera.projection_mode == "orthographic"
+        assert ortho_projection[3, 3] == pytest.approx(1.0)
+
+        menu = vp._show_camera_menu_at(0, 0)
+        assert menu.items[0].kwargs.get("checked") is False
+        assert menu.items[1].kwargs.get("checked") is True
         vp.destroy()
 
     def test_camera_menu_selection_applies_pose_and_tracks_active_path(
@@ -9719,7 +9955,7 @@ class TestViewportToolbar:
             stage_adapter_provider=lambda: adapter,
         )
         menu = vp._show_camera_menu_at(0, 0)
-        assert menu.items[0].trigger() is True
+        assert menu.items[2].trigger() is True
         assert adapter.read_paths == ["/World/MainCamera"]
         assert vp._active_camera_path == "/World/MainCamera"
         assert renderer.get_active_camera_path() == "/World/MainCamera"
@@ -9731,8 +9967,8 @@ class TestViewportToolbar:
         assert vp._camera.fov_degrees == pytest.approx(60.0)
 
         menu = vp._show_camera_menu_at(0, 0)
-        assert menu.items[0].label == "Main Camera"
-        assert menu.items[0].kwargs.get("checked") is True
+        assert menu.items[2].label == "Main Camera"
+        assert menu.items[2].kwargs.get("checked") is True
         vp.destroy()
 
     def test_stage_up_axis_and_restored_camera_sync_manipulator_model(self):
@@ -9770,11 +10006,13 @@ class TestViewportToolbar:
             renderer=MockRendererAdapter(),
             stage_adapter_provider=lambda: adapter,
         )
+        assert vp.active_camera_path is None
 
         assert vp.select_camera_path("/World/MainCamera") is True
 
         assert adapter.read_paths == ["/World/MainCamera"]
         assert vp._active_camera_path == "/World/MainCamera"
+        assert vp.active_camera_path == "/World/MainCamera"
         assert vp._camera.state.target == pytest.approx([4.0, 5.0, 6.0])
         vp.destroy()
 
@@ -10634,6 +10872,66 @@ class TestViewportNotifyStageChanged:
         vp.notify_stage_changed(object())  # must not propagate
         vp.destroy()
 
+    def test_selected_resync_retries_renderer_membership(self):
+        from unittest.mock import MagicMock
+
+        from ovui_data_adapters.common import ChangeEvent, ChangeEventType
+
+        from ovui_widgets.common.selection import SelectionBus
+
+        renderer = MagicMock(
+            spec=[
+                "render_frame",
+                "shutdown",
+                "notify_stage_changed",
+                "set_selection_highlight",
+                "refresh_selection_highlight",
+                "set_resolution",
+                "load_stage",
+                "pick",
+                "pick_rect",
+                "cancel_pick",
+            ]
+        )
+        bus = SelectionBus()
+        vp = ViewportWidget(services=None, renderer=renderer, bus=bus)
+        bus.publish(["/World/LaterCube"], source="test")
+        renderer.refresh_selection_highlight.reset_mock()
+
+        vp.notify_stage_changed(
+            ChangeEvent(
+                changed_paths=(),
+                resynced_paths=("/World/LaterCube",),
+                event_type=ChangeEventType.RESYNC,
+            )
+        )
+
+        renderer.refresh_selection_highlight.assert_called_once_with(
+            ["/World/LaterCube"]
+        )
+        vp.destroy()
+
+
+class TestViewportDevelopmentInstrumentation:
+    def test_profile_hook_unavailable_preserves_call_result(self):
+        viewport = SimpleNamespace(_renderer=None)
+        assert ViewportWidget._profile_ovui_call(
+            viewport, "ViewportWidget._refresh_hud", lambda value: value + 1, 4
+        ) == 5
+
+    def test_call_delegates_to_existing_renderer_profile_hook(self):
+        calls = []
+
+        def profile(name, function, *args, **kwargs):
+            calls.append(name)
+            return function(*args, **kwargs)
+
+        viewport = SimpleNamespace(_renderer=SimpleNamespace(_profile_ovui_call=profile))
+        assert ViewportWidget._profile_ovui_call(
+            viewport, "ViewportWidget._refresh_hud", lambda value: value, value=7
+        ) == 7
+        assert calls == ["ViewportWidget._refresh_hud"]
+
 
 class TestViewportWidgetResizeClamping:
     """Step A.5 — widget clamps computed size before calling render_frame.
@@ -10643,6 +10941,57 @@ class TestViewportWidgetResizeClamping:
     ``_on_frame`` must clamp to [64, 3840] × [64, 2160] before invoking the
     renderer so the renderer never has to deal with absurd buffer sizes.
     """
+
+    def test_gizmo_world_scale_uses_displayed_viewport_height(self):
+        surface = object.__new__(ViewportSurface)
+        surface._transform_model = SimpleNamespace(
+            get_pivot_world=lambda: (0.0, 0.0, 0.0)
+        )
+        surface._camera = SimpleNamespace(
+            _get_eye=lambda: (0.0, 0.0, 100.0),
+            state=SimpleNamespace(distance=100.0),
+        )
+        surface._get_raw_viewport_frame_size = lambda: (730, 400)
+        surface._get_viewport_size = lambda: (1920, 1080)
+
+        displayed_scale = surface._get_gizmo_world_scale()
+        surface._get_viewport_size = lambda: (640, 360)
+        assert surface._get_gizmo_world_scale() == pytest.approx(displayed_scale)
+
+        surface._get_raw_viewport_frame_size = lambda: (730, 800)
+        assert surface._get_gizmo_world_scale() == pytest.approx(displayed_scale / 2.0)
+
+    @pytest.mark.parametrize("fov", [19.0, 45.0, 70.0])
+    def test_gizmo_keeps_its_screen_size_for_the_camera_field_of_view(self, fov):
+        import math
+
+        surface = object.__new__(ViewportSurface)
+        surface._transform_model = SimpleNamespace(get_pivot_world=lambda: (0.0, 0.0, 0.0))
+        surface._camera = SimpleNamespace(
+            _get_eye=lambda: (0.0, 0.0, 10.0),
+            state=SimpleNamespace(distance=10.0),
+            fov_degrees=fov,
+            projection_mode="perspective",
+        )
+        surface._get_raw_viewport_frame_size = lambda: (640, 360)
+        # 80 px of a 360 px view at the pivot, for the camera's actual FOV.
+        visible_height = 2 * 10.0 * math.tan(math.radians(fov) / 2)
+        assert surface._get_gizmo_world_scale() == pytest.approx(visible_height * 80 / 360)
+
+    def test_orthographic_gizmo_follows_the_view_extent(self):
+        import math
+
+        surface = object.__new__(ViewportSurface)
+        surface._transform_model = SimpleNamespace(get_pivot_world=lambda: (0.0, 0.0, 0.0))
+        surface._camera = SimpleNamespace(
+            _get_eye=lambda: (0.0, 0.0, 500.0),  # far away: ortho size ignores it
+            state=SimpleNamespace(distance=10.0),
+            fov_degrees=45.0,
+            projection_mode="orthographic",
+        )
+        surface._get_raw_viewport_frame_size = lambda: (640, 360)
+        visible_height = 2 * 10.0 * math.tan(math.radians(45.0) / 2)
+        assert surface._get_gizmo_world_scale() == pytest.approx(visible_height * 80 / 360)
 
     @staticmethod
     def _vp_with_fake_image(renderer, w: float, h: float):
@@ -11745,6 +12094,8 @@ class TestGenerationTransaction:
         finally:
             viewport_mod.PickGesture = real_pick
             viewport_mod.ToolRegistry = real_registry
+        if "ovui_scene_opengl" in str(excinfo.value):
+            pytest.xfail("standalone OpenGL scene package unavailable")
         assert "late build failure" in str(excinfo.value)
         # the failed transaction disposed every partial resource ...
         assert vp.lifecycle_state == "unavailable"

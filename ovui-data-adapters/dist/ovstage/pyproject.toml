@@ -1,16 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-data-adapters-ovstage"
-dynamic = ["version"]
+license = {text = "Apache-2.0"}
+# Dependencies are in setup.py: first-party packages are pinned to VERSION.md.
+dynamic = ["version", "dependencies"]
 description = "ovstage data-adapter package boundary."
-readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "ovui-data-adapters-common>=0.1.0",
-]
 
 [project.entry-points."ovui_data_adapters.adapters"]
 ovstage = "ovui_data_adapters.ovstage.register:register"

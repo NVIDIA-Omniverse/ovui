@@ -801,9 +801,10 @@ local package to satisfy `usd-core` metadata, so there is no separate
 
 ### 8.6 Install OVUI data adapters
 
-Install common first, then the remaining runtime dependency that does not come
-from Section 8.4. Install the OpenUSD adapter without dependency resolution so
-`pip` does not fetch PyPI `usd-core` into this source-built USD environment:
+Install common and services first, then the remaining runtime dependency that
+does not come from Section 8.4. Install the OpenUSD adapter without dependency
+resolution so `pip` does not fetch PyPI `usd-core` into this source-built USD
+environment:
 
 ```bash
 : "${WORKDIR:?Set WORKDIR first}"
@@ -812,6 +813,9 @@ export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 "$VENV/bin/python" -m pip install -e \
     "$WORKDIR/ovui/ovui-data-adapters/dist/common"
+
+"$VENV/bin/python" -m pip install -e \
+    "$WORKDIR/ovui/ovui-data-adapters/dist/services"
 
 "$VENV/bin/python" -m pip install numpy
 

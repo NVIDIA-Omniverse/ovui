@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -16,6 +9,7 @@
 #include <omni/ui/Profile.h>
 #include <omni/ui/Types.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -40,10 +34,38 @@ enum class DockPreference : uint32_t
     eLeftBottom
 };
 
+// The callback boundary retains/releases across the native module boundary. The
+// shared_ptr handles below own one such reference, not the native allocation.
+class CallbackObject
+{
+public:
+    virtual ~CallbackObject() = default;
+    virtual size_t addRef() { return ++m_references; }
+    virtual size_t release()
+    {
+        const size_t remaining = --m_references;
+        if (!remaining) delete this;
+        return remaining;
+    }
+private:
+    std::atomic<size_t> m_references{1};
+};
+
+template <class T> std::shared_ptr<T> takeCallbackReference(T* object)
+{
+    return {object, [](T* value) { if (value) value->release(); }};
+}
+
+template <class T> std::shared_ptr<T> retainCallbackReference(T* object)
+{
+    if (object) object->addRef();
+    return takeCallbackReference(object);
+}
+
 /**
  * Interface to implement for event listener.
  */
-class IEventListener
+class IEventListener : public CallbackObject
 {
 public:
     virtual ~IEventListener() = default;
@@ -54,7 +76,7 @@ using IEventListenerPtr = std::shared_ptr<IEventListener>;
 
 struct WindowSet;
 
-class IWindowCallback
+class IWindowCallback : public CallbackObject
 {
 public:
     virtual ~IWindowCallback() = default;
@@ -74,15 +96,30 @@ using IWindowCallbackPtr = std::shared_ptr<IWindowCallback>;
 class IWindowCallbackManager
 {
 public:
-    virtual ~IWindowCallbackManager() = default;
+    // Stable native service identity; it does not require a platform SDK header.
+    struct InterfaceId
+    {
+        const char* name;
+        struct Version { uint32_t major, minor; } version;
+        template <class Descriptor> constexpr operator Descriptor() const
+        {
+            return {name, {version.major, version.minor}};
+        }
+    };
+    static constexpr InterfaceId getInterfaceDesc() noexcept
+    {
+        return {"omni::ui::windowmanager::IWindowCallbackManager", {0, 3}};
+    }
+    static constexpr InterfaceId getLatestInterfaceDesc() noexcept { return getInterfaceDesc(); }
+
 
     virtual IWindowCallback* createWindowCallbackPtr(
         const char* title, uint32_t width, uint32_t height, DockPreference dockPreference, IEventListener* listener) = 0;
 
-    virtual IWindowCallbackPtr createWindowCallback(
+    IWindowCallbackPtr createWindowCallback(
         const char* title, uint32_t width, uint32_t height, DockPreference dockPreference, IEventListener* listener)
     {
-        return IWindowCallbackPtr(this->createWindowCallbackPtr(title, width, height, dockPreference, listener));
+        return takeCallbackReference(this->createWindowCallbackPtr(title, width, height, dockPreference, listener));
     }
 
     virtual void removeWindowCallback(IWindowCallback* windowCallback) = 0;
@@ -112,14 +149,14 @@ public:
                                                         DockPreference dockPreference,
                                                         IEventListener* listener) = 0;
 
-    virtual IWindowCallbackPtr createWindowSetCallback(WindowSet* windowSet,
+    IWindowCallbackPtr createWindowSetCallback(WindowSet* windowSet,
                                                const char* title,
                                                uint32_t width,
                                                uint32_t height,
                                                DockPreference dockPreference,
                                                IEventListener* listener)
     {
-        return IWindowCallbackPtr(this->createWindowSetCallbackPtr(windowSet, title, width, height, dockPreference, listener));
+        return takeCallbackReference(this->createWindowSetCallbackPtr(windowSet, title, width, height, dockPreference, listener));
     }
 
     IWindowCallbackPtr createAppWindowCallback(omni::ui::AppWindowHandle appWindow,

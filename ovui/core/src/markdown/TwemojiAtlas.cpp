@@ -1,20 +1,13 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "TwemojiAtlas.h"
 
-#include <stb_image.h>
-
-#include <glad/glad.h>
+#include <omni/ui/platform/IUiFileIO.h>
+#include <omni/ui/platform/IUiRenderer.h>
+#include <omni/ui/platform/PlatformRegistry.h>
 
 #include <cstring>
 #include <fstream>
@@ -115,12 +108,9 @@ uint64_t TwemojiAtlas::hashSequence(const uint32_t* codepoints, int count)
 
 bool TwemojiAtlas::init(const char* atlasPath, const char* manifestPath)
 {
-    // The emoji atlas is uploaded via raw OpenGL. When ovui runs on a
-    // non-GL backend (Vulkan headless) glad is never loaded, so the GL
-    // entry points are still NULL and calling them dereferences address 0.
-    // Detect that here and bail cleanly — MarkdownWidget treats a failed
-    // init() as "no emoji atlas" and renders without emoji glyphs.
-    if (glad_glGenTextures == nullptr)
+    auto* renderer = PlatformRegistry::instance().renderer();
+    auto* fileIO = PlatformRegistry::instance().fileIO();
+    if (!renderer || !fileIO)
         return false;
 
     std::ifstream mf(manifestPath);
@@ -144,30 +134,12 @@ bool TwemojiAtlas::init(const char* atlasPath, const char* manifestPath)
     std::vector<uint8_t> buf(static_cast<size_t>(size));
     af.read(reinterpret_cast<char*>(buf.data()), size);
 
-    int w = 0, h = 0, ch = 0;
-    unsigned char* pixels = stbi_load_from_memory(buf.data(), static_cast<int>(buf.size()), &w, &h, &ch, 4);
-    if (!pixels)
+    auto image = fileIO->decodeImage(buf.data(), buf.size());
+    if (image.pixels.empty())
         return false;
-
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
-    if (tex == 0)
-    {
-        stbi_image_free(pixels);
+    m_texId = renderer->createTexture(image.width, image.height, TextureFormat::eRGBA8, image.pixels.data());
+    if (!m_texId)
         return false;
-    }
-
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    stbi_image_free(pixels);
-
-    m_texId = static_cast<ImTextureID>(tex);
     m_loaded = true;
     return true;
 }
@@ -176,12 +148,18 @@ void TwemojiAtlas::destroy()
 {
     if (m_texId != 0)
     {
-        GLuint tex = static_cast<GLuint>(m_texId);
-        glDeleteTextures(1, &tex);
+        if (auto* renderer = PlatformRegistry::instance().renderer())
+            renderer->destroyTexture(m_texId);
         m_texId = 0;
     }
     m_codepointToIndex.clear();
     m_loaded = false;
+}
+
+ImTextureID TwemojiAtlas::textureId() const
+{
+    auto* renderer = PlatformRegistry::instance().renderer();
+    return renderer ? reinterpret_cast<ImTextureID>(renderer->getImGuiTextureId(m_texId)) : 0;
 }
 
 bool TwemojiAtlas::lookup(uint64_t key, ImVec2& uv0, ImVec2& uv1) const

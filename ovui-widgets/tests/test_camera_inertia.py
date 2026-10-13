@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for :mod:`ovui_widgets.viewport.camera_inertia` — Step B.4.
 
@@ -23,6 +16,7 @@ over 300 ms that the viewport behavior specifies.
 """
 
 import math
+import time
 from typing import List
 
 import pytest
@@ -366,6 +360,34 @@ class TestAngularVelocityTracker:
 
     def test_default_max_age(self):
         assert DEFAULT_MAX_HANDOFF_AGE == pytest.approx(0.1)
+
+    def test_unresolvable_gap_yields_no_velocity(self):
+        """Two events the clock cannot tell apart produce no velocity.
+
+        ``record`` divides by the gap, so its ``dt > 1e-6`` guard discards
+        the sample and the previous value stands. This is the failure mode a
+        clock coarser than the 1-8 ms spacing of mouse events causes, and it
+        is silent: the handoff reads a stale velocity rather than erroring.
+        """
+        clock = _FakeClock()  # does not advance between the two records
+        t = AngularVelocityTracker(clock=clock)
+        t.record(1.0, 0.0)
+        t.record(1.0, 0.0)
+        assert t._last_velocity == (0.0, 0.0)
+
+    def test_default_clock_resolves_gaps_finer_than_mouse_events(self):
+        """The default clock must distinguish reads well under a millisecond.
+
+        Granularity is measured by busy-waiting for the first change rather
+        than sleeping, so the result depends on the clock alone and not on
+        scheduler behaviour or machine load.
+        """
+        clock = AngularVelocityTracker()._clock
+        start = clock()
+        now = clock()
+        while now == start:
+            now = clock()
+        assert now - start < 0.001
 
 
 # ---------------------------------------------------------------------------

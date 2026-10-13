@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -84,6 +77,29 @@ public:
      * `len(positions)-1` segments.
      */
     OMNIUI_PROPERTY(std::vector<Vector3>, positions, READ, getPositions, WRITE, setPositions, NOTIFY, _setPositionsChangedFn);
+
+    /**
+     * Optional counts partitioning positions into independent linear polylines.
+     * Empty preserves the original single-curve behavior. Otherwise every count
+     * must be at least two, their sum must equal positions.size(), and curveType
+     * must be linear. Invalid partitions draw nothing. Colors and thicknesses
+     * retain their existing interpolation across the flattened positions array.
+     * Gesture distances exclude gaps between polylines.
+     * Stored privately to preserve the published Curve object layout and vtable.
+     */
+    OMNIUI_SCENE_API
+    const std::vector<uint32_t>& getVertexCounts() const;
+    OMNIUI_SCENE_API
+    void setVertexCounts(const std::vector<uint32_t>& counts);
+
+    /** Optional raster coverage transition width in pixels. Zero preserves
+     * renderer defaults. Standard OpenGL supports positive finite widths;
+     * other draw systems may retain their existing antialiasing behavior.
+     * Stored privately to preserve the Curve layout and vtable. */
+    OMNIUI_SCENE_API
+    float getAntialiasingWidth() const;
+    OMNIUI_SCENE_API
+    void setAntialiasingWidth(float width);
 
     /**
      * @brief The list of colors which defines color per vertex. It has the same length as positions

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Provider-neutral ovstream tap for OVRTX or composed ovui frames.
 
@@ -113,7 +106,7 @@ _DEFAULT_MEDIA_PORT = 47999
 # cushion for several 30 fps encoder/WebRTC frame intervals; the env var
 # keeps that tradeoff adjustable on tighter GPUs.
 _MIN_RING_LEN = 2
-_DEFAULT_RING_LEN = 8
+_DEFAULT_RING_LEN = 12  # the async publisher keeps up to 8 in flight plus the slot being re-sent
 _MAX_RING_LEN = 64
 
 
@@ -175,6 +168,23 @@ def _validate_rgba8_mapping_tensor(
     return shape
 
 
+def _tensor_cuda_device(mapping_tensor: Any) -> Optional[int]:
+    """Return the CUDA device ordinal of a DLPack tensor, when it reports one."""
+    try:
+        device_type, device_id = mapping_tensor.__dlpack_device__()
+    except Exception:
+        return None
+    return int(device_id) if int(device_type) == 2 else None  # kDLCUDA
+
+
+def _encoder_width(width: int) -> int:
+    """NVENC encodes an 8-pixel-aligned width; the rightmost columns are dropped.
+
+    The source row pitch is unchanged, so a frame of any width can be streamed.
+    """
+    return width - width % 8 if width >= 8 else width
+
+
 def _enabled() -> bool:
     return os.environ.get(_ENABLED_ENV_VAR, "").strip().lower() in ("1", "true", "yes")
 
@@ -192,6 +202,182 @@ def _format_fix_enabled() -> bool:
     if raw is None:
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _async_enabled() -> bool:
+    """Stream through the asynchronous pipeline (``tee_async``). ``OVUI_STREAM_ASYNC=0`` restores
+    the synchronous tee (host waits for the frame, D2D + in-place swap + stream sync)."""
+    return os.environ.get("OVUI_STREAM_ASYNC", "1").strip().lower() not in ("0", "false", "no")
+
+
+def _timestamps_enabled() -> bool:
+    """Pass capture timestamps with each frame (``OVUI_STREAM_TIMESTAMPS=1``, experimental)."""
+    return os.environ.get("OVUI_STREAM_TIMESTAMPS", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _repeat_enabled() -> bool:
+    """Re-send the last frame on a publish tick with no new frame (``OVUI_STREAM_REPEAT=0`` disables)."""
+    return os.environ.get("OVUI_STREAM_REPEAT", "1").strip().lower() not in ("0", "false", "no")
+
+
+class _Publisher:
+    """Submit frames to ovstream from one thread, paced by when they were rendered.
+
+    The ovstream reference pipeline (``examples/python/app_stream`` in ovstream 0.5): the producer
+    queues a copy into a scratch slot on its own CUDA stream and records an event; this thread
+    submits the frame once its copy has completed (events are polled, never awaited one at a time:
+    on a saturated GPU a copy completes only after the next render).
+
+    Frames are sent in order at ``produced + slot offset + latency budget``: a frame-generation
+    step's frames are spaced one period apart, and the budget follows the 98th percentile of copy
+    completion (one to four periods), so send spacing follows the render cadence. A free-running
+    send clock beat against the render clock and sent every other frame several milliseconds late
+    (120 Hz: send interval p95 12.4 ms for 8.33). The last frame is re-sent only when nothing was
+    sent for 2.5 periods (``OVUI_STREAM_REPEAT=0`` disables). Slots in flight or being re-sent are
+    never handed back to the producer.
+    """
+
+    # Frames whose copy may still be running. On a saturated GPU a copy completes only after the next
+    # render, and frame generation posts two frames per render: at 120 Hz four was too few, and the
+    # oldest frame was evicted before its copy finished, so almost none were ever sent.
+    MAX_IN_FLIGHT = 8
+
+    def __init__(self, tap: "LivestreamTap", fps: int) -> None:
+        self._tap = tap
+        self._period = 1.0 / max(1, int(fps))
+        self._repeat = _repeat_enabled()
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        # (slot, event, width, height, seq, t_produced, offset), oldest first
+        self._in_flight: list = []
+        self._last: Optional[tuple] = None
+        self._ready_at: Optional[float] = None
+        self._copy_latency: list = []
+        self.budget = self._period
+        self._stop = False
+        self.new_frames = 0
+        self.repeated_frames = 0
+        self.dropped_frames = 0
+        self.submit_seconds = 0.0
+        self.wait_seconds = 0.0
+        self.call_seconds = 0.0
+        # The render thread runs long stretches of Python; keep the GIL hand-off short so the send
+        # lands on time (the default switch interval is 5 ms).
+        self._switch_interval = sys.getswitchinterval()
+        try:
+            sys.setswitchinterval(float(os.environ.get("OVUI_STREAM_SWITCH_INTERVAL", "0.0005")))
+        except ValueError:
+            pass
+        self._thread = threading.Thread(target=self._run, name="ovui-stream-publisher", daemon=True)
+        self._thread.start()
+
+    def busy_slots(self) -> set:
+        with self._lock:
+            busy = {frame[0] for frame in self._in_flight}
+            if self._last is not None:
+                busy.add(self._last[0])
+            return busy
+
+    def post(self, slot: int, event: int, width: int, height: int, seq: int = 0,
+             produced: float = 0.0, offset: float = 0.0) -> None:
+        dropped = 0
+        with self._lock:
+            self._in_flight.append((slot, event, width, height, seq, produced, offset))
+            while len(self._in_flight) > self.MAX_IN_FLIGHT:
+                self._in_flight.pop(0)
+                dropped += 1
+            self.dropped_frames += dropped
+        trace = getattr(self._tap, "_trace", None)
+        if dropped and trace is not None:
+            trace.dropped(dropped)
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop = True
+        self._wake.set()
+        self._thread.join(timeout=2.0)
+        sys.setswitchinterval(self._switch_interval)
+
+    def _next(self) -> Optional[tuple]:
+        """The oldest frame whose copy completed; frames more than two periods overdue are skipped."""
+        query = self._tap._cudart.event_query
+        with self._lock:
+            if not self._in_flight or not query(self._in_flight[0][1]):
+                return None
+            done = 1
+            while done < len(self._in_flight) and query(self._in_flight[done][1]):
+                done += 1
+            now = time.perf_counter()
+            skip = 0
+            # Catch up after a stall: keep at most the two newest of the completed, overdue frames.
+            while skip < done - 2 and self._due(self._in_flight[skip + 1]) < now - 2 * self._period:
+                skip += 1
+            frame = self._in_flight[skip]
+            del self._in_flight[: skip + 1]
+            self.dropped_frames += skip
+        self._ready_at = now
+        trace = getattr(self._tap, "_trace", None)
+        if skip and trace is not None:
+            trace.dropped(skip)
+        return frame
+
+    def _due(self, frame: tuple) -> float:
+        return frame[5] + frame[6] + self.budget
+
+    def _learn(self, frame: tuple) -> None:
+        """Track copy completion latency; the budget is its 98th percentile, 1-4 periods."""
+        self._copy_latency.append(self._ready_at - frame[5] - frame[6])
+        if len(self._copy_latency) >= 30:
+            ordered = sorted(self._copy_latency[-120:])
+            # 98th percentile: a frame whose copy finishes after its due time is sent late and the
+            # next one early, and two frames closer than a display refresh show as one (a skip).
+            p98 = ordered[int(0.98 * (len(ordered) - 1))]
+            self.budget = min(4 * self._period, max(self._period, p98 + 0.001))
+            del self._copy_latency[:-120]
+
+    def _run(self) -> None:
+        last_sent: Optional[float] = None
+        while not self._stop:
+            trace = getattr(self._tap, "_trace", None)
+            if trace is not None:
+                trace.tick()
+            frame = self._next()
+            now = time.perf_counter()
+            fresh = frame is not None
+            if frame is None:
+                if not (self._repeat and self._last is not None and last_sent is not None
+                        and now - last_sent >= 2.5 * self._period):
+                    self._wake.wait(0.0005)
+                    self._wake.clear()
+                    continue
+                frame = self._last
+            else:
+                self._learn(frame)
+                due = self._due(frame)
+                if last_sent is not None:
+                    # Never closer than 0.9 periods: at 60 fps a 12.5 ms gap (the former 0.75 floor)
+                    # put two frames in one 16.7 ms display refresh, and the browser skipped one.
+                    due = max(due, last_sent + 0.9 * self._period)
+                delay = due - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+            if self._stop:
+                break
+            started = time.perf_counter()
+            ok = self._tap._publish(frame, fresh)
+            finished = time.perf_counter()
+            last_sent = started
+            if ok:
+                if fresh:
+                    self.new_frames += 1
+                else:
+                    self.repeated_frames += 1
+                if trace is not None:
+                    trace.sent(frame[4], fresh, frame[5], self._ready_at if fresh else None, finished,
+                               finished - started, len(self._in_flight))
+            self.submit_seconds += finished - started
+            with self._lock:
+                self._last = frame
 
 
 def _resolve_buffer_ring_len() -> int:
@@ -369,6 +555,66 @@ class _Cudart:
         # stream to drain (Step 1.6 fix — see ``stream_synchronize``).
         self._lib.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
         self._lib.cudaStreamSynchronize.restype = ctypes.c_int
+        self._lib.cudaSetDevice.argtypes = [ctypes.c_int]
+        self._lib.cudaSetDevice.restype = ctypes.c_int
+        self._lib.cudaMemcpyPeer.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t,
+        ]
+        self._lib.cudaMemcpyPeer.restype = ctypes.c_int
+        # Asynchronous stream/event pipeline (``LivestreamTap.tee_async``).
+        self._lib.cudaStreamCreateWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+        self._lib.cudaStreamCreateWithFlags.restype = ctypes.c_int
+        self._lib.cudaStreamDestroy.argtypes = [ctypes.c_void_p]
+        self._lib.cudaStreamDestroy.restype = ctypes.c_int
+        self._lib.cudaEventCreateWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+        self._lib.cudaEventCreateWithFlags.restype = ctypes.c_int
+        self._lib.cudaEventDestroy.argtypes = [ctypes.c_void_p]
+        self._lib.cudaEventDestroy.restype = ctypes.c_int
+        self._lib.cudaEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self._lib.cudaEventRecord.restype = ctypes.c_int
+        self._lib.cudaEventSynchronize.argtypes = [ctypes.c_void_p]
+        self._lib.cudaEventSynchronize.restype = ctypes.c_int
+        self._lib.cudaEventQuery.argtypes = [ctypes.c_void_p]
+        self._lib.cudaEventQuery.restype = ctypes.c_int
+
+    STREAM_NON_BLOCKING = 1
+    EVENT_DISABLE_TIMING = 2
+
+    def create_stream(self) -> int:
+        stream = ctypes.c_void_p(0)
+        rc = self._lib.cudaStreamCreateWithFlags(ctypes.byref(stream), self.STREAM_NON_BLOCKING)
+        if rc != 0:
+            raise RuntimeError(f"cudaStreamCreateWithFlags failed rc={rc}")
+        return int(stream.value or 0)
+
+    def destroy_stream(self, stream: int) -> None:
+        if stream:
+            self._lib.cudaStreamDestroy(ctypes.c_void_p(stream))
+
+    def create_event(self) -> int:
+        event = ctypes.c_void_p(0)
+        rc = self._lib.cudaEventCreateWithFlags(ctypes.byref(event), self.EVENT_DISABLE_TIMING)
+        if rc != 0:
+            raise RuntimeError(f"cudaEventCreateWithFlags failed rc={rc}")
+        return int(event.value or 0)
+
+    def destroy_event(self, event: int) -> None:
+        if event:
+            self._lib.cudaEventDestroy(ctypes.c_void_p(event))
+
+    def record_event(self, event: int, stream: int) -> None:
+        rc = self._lib.cudaEventRecord(ctypes.c_void_p(event), ctypes.c_void_p(stream))
+        if rc != 0:
+            raise RuntimeError(f"cudaEventRecord failed rc={rc}")
+
+    def event_query(self, event: int) -> bool:
+        """True when the event has completed (cudaSuccess); False while pending (cudaErrorNotReady)."""
+        return self._lib.cudaEventQuery(ctypes.c_void_p(event)) == 0
+
+    def event_synchronize(self, event: int) -> None:
+        rc = self._lib.cudaEventSynchronize(ctypes.c_void_p(event))
+        if rc != 0:
+            raise RuntimeError(f"cudaEventSynchronize failed rc={rc}")
 
     @staticmethod
     def _load_libcudart() -> Any:
@@ -390,17 +636,65 @@ class _Cudart:
             raise last_exc
         raise OSError("libcudart not found")
 
-    def d2h(self, host: np.ndarray, device_ptr: int, nbytes: int) -> None:
-        rc = self._lib.cudaMemcpy(
-            host.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_void_p(device_ptr),
-            nbytes,
-            self.D2H,
-        )
+    def d2h(
+        self, host: np.ndarray, device_ptr: int, nbytes: int, device: Optional[int] = None,
+    ) -> None:
+        """Copy to host; ``device`` names the GPU holding ``device_ptr``."""
+        current = self.current_device() if device is not None else None
+        if current is not None and device != current:
+            # The renderer may place a RenderProduct on another GPU; its
+            # memory is only addressable from that device.
+            if self._lib.cudaSetDevice(int(device)) != 0:
+                raise RuntimeError(f"cudaSetDevice({device}) failed")
+        try:
+            rc = self._lib.cudaMemcpy(
+                host.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_void_p(device_ptr),
+                nbytes,
+                self.D2H,
+            )
+        finally:
+            if current is not None and device != current:
+                self._lib.cudaSetDevice(current)
         if rc != 0:
             raise RuntimeError(f"cudaMemcpy D2H failed rc={rc}")
 
-    def d2d(self, dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    def current_context(self) -> int:
+        """Return the producer's CUDA context for ovstream own-context input."""
+        if self._lib.cudaFree(ctypes.c_void_p()) != 0:
+            raise RuntimeError("Could not initialize the producer CUDA context")
+        driver = ctypes.CDLL("nvcuda.dll" if os.name == "nt" else "libcuda.so.1")
+        driver.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        driver.cuCtxGetCurrent.restype = ctypes.c_int
+        context = ctypes.c_void_p()
+        if driver.cuCtxGetCurrent(ctypes.byref(context)) != 0 or not context.value:
+            raise RuntimeError("No current producer CUDA context")
+        return int(context.value)
+
+    def current_device(self) -> int:
+        self._lib.cudaGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        self._lib.cudaGetDevice.restype = ctypes.c_int
+        device = ctypes.c_int()
+        if self._lib.cudaGetDevice(ctypes.byref(device)) != 0:
+            raise RuntimeError("Could not resolve the producer CUDA device")
+        return device.value
+
+    def d2d(
+        self, dst_ptr: int, src_ptr: int, nbytes: int, src_device: Optional[int] = None,
+    ) -> None:
+        """Copy into ``dst_ptr`` on the current device from ``src_device``."""
+        if src_device is not None:
+            current = self.current_device()
+            if src_device != current:
+                rc = self._lib.cudaMemcpyPeer(
+                    ctypes.c_void_p(dst_ptr), current,
+                    ctypes.c_void_p(src_ptr), int(src_device), nbytes,
+                )
+                if rc != 0:
+                    raise RuntimeError(
+                        f"cudaMemcpyPeer from device {src_device} failed rc={rc}"
+                    )
+                return
         rc = self._lib.cudaMemcpy(
             ctypes.c_void_p(dst_ptr),
             ctypes.c_void_p(src_ptr),
@@ -490,19 +784,35 @@ class LivestreamTap:
             print(f"[ovgear/livestream] disabled — init failed: {exc}", file=sys.stderr)
             return None
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        cuda_context: Optional[int] = None,
+        config: Optional[dict] = None,
+        manage_sdk: bool = True,
+        trace_directory: Optional[Any] = None,
+    ) -> None:
         import ovstream
         self._ovstream = ovstream
+        # An owner that keeps the process-level SDK alive across streams
+        # passes manage_sdk=False; this tap then neither initializes nor
+        # shuts it down.
+        self._manage_sdk = manage_sdk
         self._cudart = _Cudart()
+        self._cuda_context = cuda_context
 
-        signal_port, media_port = _resolve_ports()
-        fps = int(os.environ.get("OVGEAR_LIVESTREAM_FPS", "30"))
-        protocol_raw = os.environ.get(_PROTOCOL_ENV_VAR, _DEFAULT_PROTOCOL)
-        # `webrtc_public_ip` is an Optional[str] on ServerConfig; pass
-        # the env value through verbatim, or None if unset. Setting this
-        # disables ICE on the SDK side and pins the announced IP — the
-        # right knob for non-localhost demos behind a fixed router.
-        public_ip = os.environ.get(_PUBLIC_IP_ENV_VAR) or None
+        # Explicit application controls are isolated from environment defaults.
+        if config is None:
+            signal_port, media_port = _resolve_ports()
+            fps = int(os.environ.get("OVGEAR_LIVESTREAM_FPS", "30"))
+            protocol_raw = os.environ.get(_PROTOCOL_ENV_VAR, _DEFAULT_PROTOCOL)
+            public_ip = os.environ.get(_PUBLIC_IP_ENV_VAR) or None
+        else:
+            protocol_raw = config["protocol"]
+            signal_port = config["signal_port"]
+            media_port = config["media_port"]
+            fps = config["fps"]
+            public_ip = config.get("public_ip")
         self._signal_port = signal_port
         self._media_port = media_port
         self._fps = fps
@@ -530,10 +840,11 @@ class LivestreamTap:
 
         # Initialize ovstream once. Re-init on second call raises in the
         # C lib; tolerate that for hot-reload scenarios.
-        try:
-            ovstream.initialize(log_fn=self._log)
-        except Exception:
-            pass
+        if manage_sdk:
+            try:
+                ovstream.initialize(log_fn=self._log)
+            except Exception:
+                pass
 
         self._server: Any = None
         self._size: Tuple[int, int] = (0, 0)
@@ -572,6 +883,17 @@ class LivestreamTap:
         # leg is then bypassed for the rest of the session; the UI
         # path keeps running.
         self._disabled = False
+        # Asynchronous pipeline (``tee_async``): a CUDA stream owned by the tap, one event per
+        # scratch slot, and the publish thread. Created with the server. Its copy always swaps R/B:
+        # with the format fix off (a diagnostic), frames take the synchronous tee, which honors it.
+        self._async = _async_enabled() and self._format_fix
+        self._cuda_stream: int = 0
+        self._slot_events: list = []
+        self._publisher: Optional[_Publisher] = None
+        # Stream performance trace (``_stream_trace``): created with the server, kept across resizes.
+        self._trace_directory = trace_directory
+        self._trace: Any = None
+        self._seq = 0
 
         self._first_push_logged = False
         self._d2d_error_logged = False
@@ -668,6 +990,10 @@ class LivestreamTap:
                     self._status_state = _STATE_LISTENING
                 # If a client drops while others remain, state stays
                 # STREAMING — no transition.
+            clients = self._status_n_clients
+        trace = self._trace
+        if trace is not None:
+            trace.connection(bool(connected), clients)
 
     # ── Tier 3 input callbacks (Step 3.6) ──
 
@@ -775,6 +1101,21 @@ class LivestreamTap:
     # ── Static accessors for the Step-1.7 status overlay ──
 
     @property
+    def extent(self) -> Tuple[int, int]:
+        """Dimensions of the encoded stream, including renderer-driven resizes.
+
+        The width is the aligned width actually encoded (``_encoder_width``),
+        which can be up to seven columns narrower than the source.
+        """
+        width, height = self._size
+        return (_encoder_width(width), height)
+
+    @property
+    def submitted_frames(self) -> int:
+        """Frames accepted by the sender; this is not receiver decode proof."""
+        return self._frames_pushed
+
+    @property
     def protocol(self) -> str:
         """The configured protocol name (`"webrtc"` / `"native"` /
         `"rtsp"`). Resolved at construction; immutable for the
@@ -814,9 +1155,16 @@ class LivestreamTap:
         :meth:`_teardown_linear_ring`, called on linear-ring resize
         and from :meth:`close`.
         """
+        if self._publisher is not None:
+            # stream_video must not overlap Server.stop/close.
+            self._publisher.stop()
+            self._publisher = None
         if self._server is not None:
             try:
                 self._server.stop()
+            except Exception:
+                pass
+            try:
                 self._server.close()
             except Exception:
                 pass
@@ -842,6 +1190,12 @@ class LivestreamTap:
             self._scratch_ring = []
             self._scratch_size = (0, 0)
             self._scratch_index = -1
+        for event in self._slot_events:
+            try:
+                self._cudart.destroy_event(event)
+            except Exception:
+                pass
+        self._slot_events = []
 
     def _teardown_linear_ring(self) -> None:
         """Drain and free the linear (pitched) scratch ring. Idempotent.
@@ -868,6 +1222,12 @@ class LivestreamTap:
         self._linear_size = (0, 0)
         self._linear_pitch = 0
         self._linear_index = -1
+
+    def start(self, width: int, height: int) -> None:
+        """Start explicitly, propagating failures to a control-plane caller."""
+        if self._closed:
+            raise RuntimeError("Cannot restart a closed LivestreamTap; create a new tap")
+        self._ensure_server(width, height)
 
     def _ensure_server(self, width: int, height: int) -> None:
         """Bring the server + scratch ring up at ``(width, height)``.
@@ -897,12 +1257,14 @@ class LivestreamTap:
             ovstream = self._ovstream
             new_server = ovstream.Server(self._server_type)
             cfg = ovstream.ServerConfig(
-                width=width,
+                width=_encoder_width(width),
                 height=height,
                 target_fps=self._fps,
                 stream_port=self._media_port,
                 webrtc_signal_port=self._signal_port,
                 webrtc_public_ip=self._public_ip,
+                **({"cuda_context": self._cuda_context, "cuda_device": self._cudart.current_device()}
+                   if self._cuda_context is not None else {}),
             )
             # Step 1.4: register the connection callback BEFORE start().
             # The SDK guards its callback table with a mutex, so setting
@@ -919,7 +1281,7 @@ class LivestreamTap:
             # before any event can fire.
             if self._input_bridge is not None:
                 try:
-                    self._input_bridge.set_extents(width, height)
+                    self._input_bridge.set_extents(_encoder_width(width), height)
                 except Exception as exc:
                     print(
                         f"[ovgear/livestream] input bridge set_extents "
@@ -934,6 +1296,8 @@ class LivestreamTap:
             # land on a null callback pointer on the C side.
             if self._message_dispatcher is not None:
                 new_server.on_message = self._message_dispatcher.on_message
+            if hasattr(type(new_server), "on_qos"):  # ovstream >= 0.5
+                new_server.on_qos = self._on_qos
             new_server.start(cfg)
         except Exception:
             # Clean up partial state before propagating. Critically,
@@ -961,6 +1325,21 @@ class LivestreamTap:
         self._scratch_index = -1
         self._server = new_server
         self._size = (width, height)
+        if self._trace is None:
+            from ovui_data_adapters.common._stream_trace import StreamTrace
+
+            self._trace = StreamTrace(self._fps, self._trace_directory)
+        self._trace.write({"event": "server", "width": width, "height": height, "fps": self._fps,
+                           "async": self._async, "protocol": self._protocol})
+        if self._async:
+            try:
+                if not self._cuda_stream:
+                    self._cuda_stream = self._cudart.create_stream()
+                self._slot_events = [self._cudart.create_event() for _ in new_ring]
+            except Exception as exc:
+                self._async = False
+                print(f"[ovgear/livestream] async pipeline unavailable ({exc}); using the synchronous tee",
+                      file=sys.stderr)
         # Status atom transitions OFF → LISTENING. The on_connection
         # callback will move it to STREAMING the moment the first client
         # connects (Step 1.4).
@@ -1033,6 +1412,7 @@ class LivestreamTap:
         # an odd height (e.g. 411), drop the last row rather than letting
         # the SDK silently adjust the negotiated resolution to height-1
         # and then reject every submitted frame for dimension mismatch.
+        # The width is aligned the same way (``_encoder_width``).
         if height & 1:
             height -= 1
 
@@ -1074,9 +1454,12 @@ class LivestreamTap:
         scratch = self._scratch_ring[self._scratch_index]
 
         try:
-            self._cudart.d2d(scratch, ptr, nbytes)
+            self._cudart.d2d(
+                scratch, ptr, nbytes, src_device=_tensor_cuda_device(mapping_tensor),
+            )
         except RuntimeError as exc:
             self._frames_skipped += 1
+            self._set_error_status(f"D2D copy failed: {exc}")
             if not self._d2d_error_logged:
                 print(f"[ovgear/livestream] D2D copy failed: {exc}", file=sys.stderr)
                 self._d2d_error_logged = True
@@ -1145,7 +1528,7 @@ class LivestreamTap:
         try:
             frame = self._ovstream.VideoFrame(
                 buffer=int(scratch),
-                width=int(width),
+                width=_encoder_width(int(width)),
                 height=int(height),
                 pitch_bytes=int(pitch_bytes),
             )
@@ -1358,7 +1741,7 @@ class LivestreamTap:
         try:
             frame = self._ovstream.VideoFrame(
                 buffer=int(dev_ptr),
-                width=int(width),
+                width=_encoder_width(int(width)),
                 height=int(height),
                 pitch_bytes=int(pitch_bytes),
             )
@@ -1387,6 +1770,147 @@ class LivestreamTap:
                 )
                 self._stream_error_logged = True
             self._maybe_report()
+            return False
+
+    @property
+    def perf(self) -> Optional[dict]:
+        """Stream performance: the last per-second summary, totals, QoS and the trace log path."""
+        return self._trace.snapshot() if self._trace is not None else None
+
+    def _on_qos(self, status: Any) -> None:
+        if self._trace is not None:
+            self._trace.on_qos(status)
+
+    @property
+    def async_enabled(self) -> bool:
+        """Whether frames go through :meth:`tee_async` (the caller maps on :attr:`cuda_stream`)."""
+        return self._async and not self._disabled and not self._closed
+
+    @property
+    def cuda_stream(self) -> int:
+        """The tap's CUDA stream; map the renderer output with ``sync_stream`` set to it."""
+        if not self._cuda_stream:
+            self._cuda_stream = self._cudart.create_stream()
+        return self._cuda_stream
+
+    @property
+    def repeated_frames(self) -> int:
+        """Ticks on which the publisher re-sent the last frame (no new frame was ready)."""
+        return self._publisher.repeated_frames if self._publisher else 0
+
+    def tee_async(self, mapping_tensor: Any, width: int, height: int, index: int = 0,
+                  frames: int = 1) -> Optional[int]:
+        """Queue this frame for the stream without waiting for it on the host.
+
+        The caller mapped the render output with ``sync_stream=self.cuda_stream``, so the copy below
+        runs after the render completes. It swizzles RGBA to BGRA into a scratch slot in one kernel
+        and records the slot's event; the publish thread sends it. Returns the event, which the
+        caller passes to ``mapping.unmap(event=...)`` so the renderer keeps its buffer until the copy
+        has read it, or ``None`` when nothing was queued (no client, failure): unmap normally then.
+        """
+        self._tee_attempts += 1
+        if not self.async_enabled:
+            return None
+        shape = _validate_rgba8_mapping_tensor(mapping_tensor, width, height)
+        if height & 1:
+            height -= 1
+        try:
+            self._ensure_server(width, height)
+        except Exception as exc:
+            print(f"[ovgear/livestream] server bring-up failed: {exc}", file=sys.stderr)
+            self._frames_skipped += 1
+            return None
+        try:
+            connected = self._server.is_client_connected
+        except Exception:
+            connected = False
+        if not connected:
+            self._frames_skipped += 1
+            self._maybe_report()
+            return None
+        if self._publisher is None:
+            # Started with the first frame for a client, not with the server: a tap that never
+            # streams (or is never closed) must not keep a thread running.
+            self._publisher = _Publisher(self, self._fps)
+        busy = self._publisher.busy_slots()
+        for _ in range(len(self._scratch_ring)):
+            self._scratch_index = (self._scratch_index + 1) % len(self._scratch_ring)
+            if self._scratch_index not in busy:
+                break
+        else:
+            self._frames_skipped += 1
+            return None
+        slot = self._scratch_index
+        pitch = width * 4
+        try:
+            _swap_kernel.copy_swap_rb(
+                int(mapping_tensor.data), pitch, self._scratch_ring[slot], pitch,
+                width, height, stream=self._cuda_stream,
+            )
+            event = self._slot_events[slot]
+            self._cudart.record_event(event, self._cuda_stream)
+        except Exception as exc:
+            self._async = False
+            self._frames_skipped += 1
+            self._set_error_status(f"async copy failed: {type(exc).__name__}: {exc}")
+            print(f"[ovgear/livestream] async copy failed ({exc}); using the synchronous tee",
+                  file=sys.stderr)
+            return None
+        if not self._first_push_logged:
+            self._first_push_logged = True
+            print(f"[ovgear/livestream] first async push: shape={shape} rgba8 pitch={pitch}B "
+                  f"(copy+swizzle on the tap stream, event-synchronized submit)", file=sys.stderr)
+        self._seq += 1
+        produced = time.perf_counter()
+        if self._trace is not None:
+            self._trace.produced(self._seq, produced, index, frames)
+        # Frame generation: the step's frames are presented one stream period apart, in order.
+        self._publisher.post(slot, event, width, height, self._seq, produced, index / max(1, self._fps))
+        self._maybe_report()
+        return event
+
+    def _publish(self, frame: Tuple[int, int, int, int], fresh: bool) -> bool:
+        """Publish thread: submit one queued slot. Never raises."""
+        slot, event, width, height, _seq, produced, _offset = frame
+        server = self._server
+        if server is None or slot >= len(self._scratch_ring):
+            return False
+        try:
+            # Wait for the copy here (ctypes releases the GIL), then submit a ready buffer: the
+            # submit's own staging copy is then not queued behind this frame's render.
+            started = time.perf_counter()
+            self._cudart.event_synchronize(event)
+            waited = time.perf_counter()
+            stamps = {}
+            if _timestamps_enabled() and self._trace is not None:
+                # Capture start (frame produced) and end (copy complete), wall-clock ns.
+                stamps = {"start_timestamp_ns": int(self._trace.wall(produced) * 1e9),
+                          "ended_timestamp_ns": time.time_ns()}
+            video = self._ovstream.VideoFrame(
+                buffer=int(self._scratch_ring[slot]),
+                width=_encoder_width(int(width)),
+                height=int(height),
+                pitch_bytes=int(width) * 4,
+                **stamps,
+            )
+            server.stream_video(video)
+            publisher = self._publisher
+            if publisher is not None:
+                publisher.wait_seconds += waited - started
+                publisher.call_seconds += time.perf_counter() - waited
+            if fresh:
+                self._frames_pushed += 1
+            return True
+        except self._ovstream.OvstreamError:
+            self._frames_skipped += 1
+            return False
+        except Exception as exc:
+            self._frames_skipped += 1
+            self._set_error_status(f"stream_video failed: {type(exc).__name__}: {exc}")
+            if not self._stream_error_logged:
+                print(f"[ovgear/livestream] async stream_video failed ({type(exc).__name__}: {exc})",
+                      file=sys.stderr)
+                self._stream_error_logged = True
             return False
 
     def tee_and_d2h(
@@ -1431,12 +1955,15 @@ class LivestreamTap:
         if host_buf is None or host_buf.shape != (height, width, 4) or host_buf.dtype != np.uint8:
             host_buf = np.empty((height, width, 4), dtype=np.uint8)
         try:
-            self._cudart.d2h(host_buf, ptr, nbytes)
+            self._cudart.d2h(
+                host_buf, ptr, nbytes, device=_tensor_cuda_device(mapping_tensor),
+            )
         except RuntimeError as exc:
             # CUDA-level failure on the UI leg is a real renderer
             # problem; black the frame rather than leaking the
             # exception (the adapter would just turn it black anyway).
             print(f"[ovgear/livestream] D2H failed: {exc}", file=sys.stderr)
+            self._set_error_status(f"D2H readback failed: {exc}")
             host_buf.fill(0)
 
         return host_buf
@@ -1461,7 +1988,16 @@ class LivestreamTap:
         self._close_count += 1
         self._teardown_server_and_scratch()
         self._teardown_linear_ring()
-        try:
-            self._ovstream.shutdown()
-        except Exception:
-            pass
+        if self._trace is not None:
+            self._trace.close()
+        if self._cuda_stream:
+            try:
+                self._cudart.destroy_stream(self._cuda_stream)
+            except Exception:
+                pass
+            self._cuda_stream = 0
+        if self._manage_sdk:
+            try:
+                self._ovstream.shutdown()
+            except Exception:
+                pass

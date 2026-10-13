@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Abstract base classes for all OvGear adapters.
 
@@ -32,6 +25,13 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Ty
 # while __init__ is still being initialized would re-enter a partially
 # constructed namespace. The private path is what ``_undo_manager`` uses too.
 from ovui_data_adapters.common._bound_camera_pose import BoundCameraPose
+from ovui_data_adapters.common._subscription import SubscriptionProtocol
+from ovui_data_adapters.common.point_cloud import (
+    PointCloudFrame,
+    PointCloudOutputCatalog,
+    PointCloudRequest,
+    PointCloudRequestResult,
+)
 from ovui_data_adapters.common.render_targets import (
     RenderTargetActivationResult,
     RenderTargetCatalog,
@@ -44,13 +44,6 @@ from ovui_data_adapters.common.render_vars import (
     RenderVarProbeRequest,
     RenderVarProbeResult,
 )
-from ovui_data_adapters.common.point_cloud import (
-    PointCloudFrame,
-    PointCloudOutputCatalog,
-    PointCloudRequest,
-    PointCloudRequestResult,
-)
-from ovui_data_adapters.common._subscription import SubscriptionProtocol
 
 if TYPE_CHECKING:
     import numpy as np
@@ -89,6 +82,36 @@ ContextManager = Any   # Return type alias for suppress_change_notifications().
 # semantic: an RGBA uint8 buffer or zero-copy GPU pointer (concrete
 # implementation: :class:`ovui_data_adapters.common.GpuFrame`).
 GpuFrameHandle = Any
+
+
+@dataclass(frozen=True)
+class RenderFrameMetadata:
+    """Identity carried from viewport submission through presentation.
+
+    ``sequence`` orders completed renderer steps, while ``generation`` is
+    owned by the viewport and changes whenever its presentation contract
+    (currently the render extent) changes.  Consumers must discard a frame
+    whose generation no longer matches the viewport.  Camera matrices are
+    the exact matrices used for this frame and therefore also define the
+    picking/overlay coordinate space of the presented image.
+    """
+
+    sequence: int
+    generation: int
+    viewport_id: str
+    render_product_path: str
+    extent: Tuple[int, int]
+    view_matrix: Matrix4d
+    projection_matrix: Matrix4d
+    ordinal: int
+
+
+@dataclass(frozen=True)
+class RenderFrameResult:
+    """One completed presentation image plus its submission metadata."""
+
+    image: Any
+    metadata: RenderFrameMetadata
 
 # Axis-aligned bounding box returned by :meth:`StageAdapter.compute_world_aabb`
 # and :meth:`StageAdapter.compute_prim_world_aabb_with_extent_fallback`. The
@@ -572,6 +595,15 @@ class StageAdapter(ABC):
     @abstractmethod
     def get_icon_name(self, item: AdapterItem) -> str: ...
 
+    def get_light_shape_attributes(self, item: AdapterItem) -> Dict[str, float]:
+        """Return authored dimensions that define a light's visible shape.
+
+        The empty default keeps providers without concrete light geometry
+        source-compatible. Backends should return only supported numeric
+        values from ``width``, ``height``, ``radius``, and ``length``.
+        """
+        return {}
+
     @abstractmethod
     def get_badge_flags(self, item: AdapterItem) -> BadgeFlags: ...
 
@@ -710,6 +742,15 @@ class StageAdapter(ABC):
         """
         return "Y"
 
+    def read_stage_meters_per_unit(self) -> float:
+        """Return the stage-unit scale in meters.
+
+        The default matches USD's effective fallback and keeps lightweight
+        adapters compatible. Concrete USD and OVStage adapters override it
+        when their active stage exposes authored unit metadata.
+        """
+        return 1.0
+
     # ── Viewport selector defaults ───────────────────────────────────────────
     #
     # Selector menus should be able to query any StageAdapter without forcing
@@ -772,6 +813,14 @@ class StageAdapter(ABC):
         """
         return RenderTargetCatalog()
 
+    def preview_aov_authoring(self, request: Any) -> Any:
+        """Return an exact graph preview when this provider supports AOV authoring."""
+        return None
+
+    def author_aov_graph(self, request: Any) -> Any:
+        """Author one provider-native AOV graph through the shared history owner."""
+        return None
+
 
 class TransformAdapter(ABC):
     """3D transform read/write adapter used by viewport manipulation."""
@@ -787,6 +836,23 @@ class TransformAdapter(ABC):
     @abstractmethod
     def set_local_transform(self, path: str, matrix: List[List[float]]) -> None:
         """Set local transform. Does NOT push to undo — caller manages group."""
+
+    def capture_local_transform_state(self, path: str) -> Any:
+        """Capture adapter-native authored state for an exact history restore.
+
+        Matrix-only adapters can keep the default ``None`` result. Providers
+        with a richer authoring model return an opaque value accepted by
+        :meth:`restore_local_transform_state`.
+        """
+        return None
+
+    def restore_local_transform_state(self, path: str, state: Any) -> bool:
+        """Restore a state returned by :meth:`capture_local_transform_state`.
+
+        Returns ``False`` when native-state restoration is unsupported so the
+        command layer can fall back to the captured matrix.
+        """
+        return False
 
     @abstractmethod
     def can_transform(self, path: str) -> bool:
@@ -982,7 +1048,7 @@ class RendererAdapter(ABC):
         When ``True``, the application reuses this already-attached renderer
         for a document replacement instead of constructing a second renderer
         that would run alongside it — two live GPU renderers contending for
-        native scene/RenderSettings resolution can freeze the frame loop.
+        native scene resolution can freeze the frame loop.
         The default declines so renderers that require a fresh instance per
         stage (e.g. a borrow-mode renderer that cannot swap an attached
         scene) keep the construct-fresh path. Implementations that return
@@ -1076,6 +1142,10 @@ class RendererAdapter(ABC):
 
         return RenderVarOutputCatalog()
 
+    def get_aov_authoring_catalog(self) -> Any:
+        """Return a version-qualified AOV creation catalog, if supported."""
+        return None
+
     def set_render_var_output_request(
         self,
         viewport_id: str,
@@ -1099,6 +1169,11 @@ class RendererAdapter(ABC):
 
     def clear_render_var_output_request(self, viewport_id: str) -> None:
         """Clear a viewport RenderVar visualization request, if supported."""
+
+        return None
+
+    def instrumentation_target(self) -> Any | None:
+        """Return the native renderer for optional instrumentation, if any."""
 
         return None
 

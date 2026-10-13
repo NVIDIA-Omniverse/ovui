@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """View/projection-matrix → USD camera attribute writer.
 
@@ -47,6 +40,7 @@ from pxr import Gf, Sdf, Usd, UsdGeom
 # and derive focal length + vertical aperture from the projection matrix
 # so scenes authored against that reference frame identically.
 _FIXED_HORIZONTAL_APERTURE = 20.955
+_ORTHOGRAPHIC_FOCAL_LENGTH = 50.0
 
 
 def _decompose_perspective(proj: np.ndarray) -> Tuple[float, float, float, float]:
@@ -96,6 +90,40 @@ def _decompose_perspective(proj: np.ndarray) -> Tuple[float, float, float, float
     return float(fovy_rad), float(aspect), float(near), float(far)
 
 
+def _decompose_orthographic(
+    proj: np.ndarray,
+) -> Tuple[float, float, float, float]:
+    """Extract ``(half_width, half_height, near, far)`` from centered GL ortho."""
+    proj = np.asarray(proj, dtype=np.float64)
+    if proj.shape != (4, 4):
+        raise ValueError(f"proj must be 4x4, got {proj.shape}")
+    if not np.isclose(proj[3, 3], 1.0) or not np.isclose(proj[3, 2], 0.0):
+        raise ValueError("projection matrix is not a standard GL orthographic matrix")
+    m00, m11, m22, m23 = (
+        float(proj[0, 0]),
+        float(proj[1, 1]),
+        float(proj[2, 2]),
+        float(proj[2, 3]),
+    )
+    if m00 <= 0.0 or m11 <= 0.0 or abs(m22) <= 1.0e-12:
+        raise ValueError("orthographic projection matrix is degenerate")
+    near = (m23 + 1.0) / m22
+    far = (m23 - 1.0) / m22
+    return 1.0 / m00, 1.0 / m11, float(near), float(far)
+
+
+def camera_projection_from_matrix(proj_matrix: np.ndarray) -> str:
+    """Return the USD camera projection token represented by a GL matrix."""
+    proj = np.asarray(proj_matrix, dtype=np.float64)
+    if proj.shape != (4, 4):
+        raise ValueError(f"proj must be 4x4, got {proj.shape}")
+    if np.isclose(proj[3, 3], 1.0) and np.isclose(proj[3, 2], 0.0):
+        _decompose_orthographic(proj)
+        return "orthographic"
+    _decompose_perspective(proj)
+    return "perspective"
+
+
 def _numpy_to_gf_matrix4d(world_np: np.ndarray) -> Gf.Matrix4d:
     """Convert a 4×4 numpy column-vector matrix to a ``Gf.Matrix4d`` row-vector matrix."""
     # numpy column-vector → Gf row-vector means transpose. Gf.Matrix4d
@@ -130,6 +158,16 @@ def compute_camera_intrinsics(
     (which pushes the same values into ovrtx Fabric every frame so the
     rendered image and the ``omni.ui.scene`` overlay use the same camera).
     """
+    projection = camera_projection_from_matrix(proj_matrix)
+    if projection == "orthographic":
+        half_width, half_height, near, far = _decompose_orthographic(proj_matrix)
+        return (
+            _ORTHOGRAPHIC_FOCAL_LENGTH,
+            20.0 * half_width,
+            20.0 * half_height,
+            near,
+            far,
+        )
     fovy_rad, aspect, near, far = _decompose_perspective(proj_matrix)
     fovx = 2.0 * math.atan(math.tan(fovy_rad * 0.5) * aspect)
     h_aperture = _FIXED_HORIZONTAL_APERTURE
@@ -204,6 +242,12 @@ def write_camera_from_matrices(
         cam.GetHorizontalApertureAttr().Set(float(h_aperture))
         cam.GetVerticalApertureAttr().Set(float(v_aperture))
         cam.GetClippingRangeAttr().Set(Gf.Vec2f(float(near), float(far)))
+        projection = camera_projection_from_matrix(proj_matrix)
+        cam.GetProjectionAttr().Set(
+            UsdGeom.Tokens.orthographic
+            if projection == "orthographic"
+            else UsdGeom.Tokens.perspective
+        )
 
 
 def write_scene_camera_pose_from_matrices(

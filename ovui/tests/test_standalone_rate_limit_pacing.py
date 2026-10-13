@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Interruptible max-FPS pacing in the standalone run loops.
 
@@ -30,7 +23,7 @@ import asyncio
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from omni.ui import standalone
 
@@ -49,7 +42,7 @@ class _PumpHarness:
         self._patches = [
             patch.object(
                 standalone._ui, "_standalone_tick",
-                lambda: self.tick_times.append(time.monotonic()),
+                lambda: self.tick_times.append(time.perf_counter()),
             ),
             patch.object(
                 standalone._ui, "_standalone_should_close",
@@ -70,10 +63,44 @@ class _PumpHarness:
 
     def __exit__(self, *exc):
         standalone._initialized = False
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         for p in reversed(self._patches):
             p.__exit__(*exc)
         return False
+
+
+class TestHighResolutionFrameBudget(unittest.TestCase):
+    def test_overrun_does_not_wait_when_coarse_clock_has_not_advanced(self):
+        for runner in ("run", "run_async"):
+            with self.subTest(runner=runner), _PumpHarness() as pump, patch.object(
+                standalone, "time"
+            ) as clock, patch.object(
+                standalone._ui, "_standalone_tick"
+            ) as tick, patch.object(
+                standalone._ui, "_standalone_shutdown"
+            ), patch.object(
+                standalone._wakeup_event, "wait", return_value=False
+            ) as blocking_wait, patch.object(
+                standalone, "_get_async_wakeup_event"
+            ) as get_async_event:
+                # Windows Python 3.12's monotonic clock can stay unchanged
+                # across a 9 ms tick, which already exceeds a 120 FPS budget.
+                # Distinct epochs also catch mixing the two clock sources.
+                clock.monotonic.return_value = 1000.0
+                clock.perf_counter.side_effect = lambda: 1.0 + tick.call_count * 0.009
+                tick.side_effect = lambda: pump.close() if tick.call_count == 2 else None
+                async_wait = AsyncMock(side_effect=asyncio.TimeoutError)
+                get_async_event.return_value.wait = async_wait
+                standalone.set_max_frame_rate(120.0)
+
+                if runner == "run":
+                    standalone.run()
+                else:
+                    asyncio.run(standalone.run_async())
+
+                self.assertEqual(tick.call_count, 2)
+                blocking_wait.assert_not_called()
+                async_wait.assert_not_called()
 
 
 class TestRunAsyncInFlightRateChange(unittest.TestCase):
@@ -99,7 +126,7 @@ class TestRunAsyncInFlightRateChange(unittest.TestCase):
                 await changer
                 await runner
 
-            start = time.monotonic()
+            start = time.perf_counter()
             self._run(scenario())
             first_interval = pump.tick_times[1] - pump.tick_times[0]
             self.assertLess(
@@ -146,9 +173,9 @@ class TestRunAsyncInFlightRateChange(unittest.TestCase):
                 await asyncio.sleep(0.005)
                 pump.close()
                 standalone.request_wakeup()
-                start = time.monotonic()
+                start = time.perf_counter()
                 await runner
-                return time.monotonic() - start
+                return time.perf_counter() - start
 
             release = self._run(scenario())
             self.assertLess(
@@ -166,7 +193,7 @@ class TestRunAsyncInFlightRateChange(unittest.TestCase):
             original = standalone._ui._standalone_tick
 
             def slow_second_tick():
-                pump.tick_times.append(time.monotonic())
+                pump.tick_times.append(time.perf_counter())
                 if len(pump.tick_times) == 2 and not overran["done"]:
                     overran["done"] = True
                     time.sleep(0.030)  # iteration overruns its budget
@@ -196,6 +223,32 @@ class TestRunAsyncInFlightRateChange(unittest.TestCase):
                 )
 
 
+class TestDefaultAutoInitialization(unittest.TestCase):
+    def test_auto_initialized_run_has_no_pacing_budget(self):
+        """A caller that omits init() must not inherit a hidden UI cap."""
+        saved_initialized = standalone._initialized
+        saved_rate = standalone._max_frame_rate
+        saved_stop = standalone._stop_requested
+        try:
+            standalone._initialized = False
+            standalone._stop_requested = False
+            # A stale host value makes this deletion-sensitive: the auto-init
+            # path must actively establish the uncapped factory policy.
+            standalone.set_max_frame_rate(2.0)
+            with patch.object(
+                standalone._ui, "_standalone_init", lambda *_: True
+            ):
+                self.assertTrue(standalone._ensure_initialized_for_run())
+            self.assertIsNone(standalone.get_max_frame_rate())
+            self.assertEqual(
+                standalone._max_fps_remaining_since(time.monotonic()), 0.0
+            )
+        finally:
+            standalone._initialized = saved_initialized
+            standalone._max_frame_rate = saved_rate
+            standalone._stop_requested = saved_stop
+
+
 class TestBlockingRunWaitPrimitives(unittest.TestCase):
     """run()'s pacing uses the threading.Event wait; verify wakeup works
     cross-thread (the only way a change can land mid-wait there)."""
@@ -206,9 +259,9 @@ class TestBlockingRunWaitPrimitives(unittest.TestCase):
         woke = {}
 
         def waiter():
-            start = time.monotonic()
+            start = time.perf_counter()
             standalone._wakeup_event.wait(0.5)
-            woke["after"] = time.monotonic() - start
+            woke["after"] = time.perf_counter() - start
 
         t = threading.Thread(target=waiter)
         t.start()
@@ -218,7 +271,7 @@ class TestBlockingRunWaitPrimitives(unittest.TestCase):
         self.assertIn("after", woke)
         self.assertLess(woke["after"], 0.2)
         self.assertFalse(standalone._consume_wakeup_break())
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
     def test_request_wakeup_with_active_run_sets_break_flag(self):
@@ -251,7 +304,7 @@ class TestWakeStateLifecycle(unittest.TestCase):
         state = {"close": False}
         with patch.object(
             standalone._ui, "_standalone_tick",
-            lambda: ticks.append(time.monotonic()),
+            lambda: ticks.append(time.perf_counter()),
         ), patch.object(
             standalone._ui, "_standalone_should_close",
             lambda: state["close"],
@@ -330,7 +383,7 @@ class TestActiveShutdown(unittest.TestCase):
         ticks = []
         with patch.object(
             standalone._ui, "_standalone_tick",
-            lambda: ticks.append(time.monotonic()),
+            lambda: ticks.append(time.perf_counter()),
         ), patch.object(
             standalone._ui, "_standalone_should_close", lambda: False
         ), patch.object(
@@ -344,10 +397,10 @@ class TestActiveShutdown(unittest.TestCase):
                 while len(ticks) < 1:
                     await asyncio.sleep(0.001)
                 await asyncio.sleep(0.005)  # 5 ms into the 500 ms wait
-                t0 = time.monotonic()
+                t0 = time.perf_counter()
                 standalone.shutdown()
                 await runner
-                return (time.monotonic() - t0) * 1000
+                return (time.perf_counter() - t0) * 1000
 
             latency = asyncio.run(scenario())
         self.assertLess(
@@ -359,7 +412,7 @@ class TestActiveShutdown(unittest.TestCase):
         self.assertFalse(standalone._wakeup_break)
         self.assertFalse(standalone._wakeup_event.is_set())
         self.assertIsNone(standalone._async_wakeup_event)
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
     def test_sync_shutdown_from_thread_releases_active_wait_promptly(self):
@@ -367,7 +420,7 @@ class TestActiveShutdown(unittest.TestCase):
         result = {}
         with patch.object(
             standalone._ui, "_standalone_tick",
-            lambda: ticks.append(time.monotonic()),
+            lambda: ticks.append(time.perf_counter()),
         ), patch.object(
             standalone._ui, "_standalone_should_close", lambda: False
         ), patch.object(
@@ -380,13 +433,13 @@ class TestActiveShutdown(unittest.TestCase):
                 while len(ticks) < 1:
                     time.sleep(0.001)
                 time.sleep(0.005)
-                result["t0"] = time.monotonic()
+                result["t0"] = time.perf_counter()
                 standalone.shutdown()
 
             t = threading.Thread(target=killer)
             t.start()
             standalone.run()
-            done = time.monotonic()
+            done = time.perf_counter()
             t.join(timeout=5.0)
         latency = (done - result["t0"]) * 1000
         self.assertLess(
@@ -395,7 +448,7 @@ class TestActiveShutdown(unittest.TestCase):
         )
         self.assertFalse(standalone._run_active)
         self.assertFalse(standalone._wakeup_break)
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
     def test_init_and_run_work_after_active_shutdown(self):
@@ -406,7 +459,7 @@ class TestActiveShutdown(unittest.TestCase):
         state = {"close": False}
         with patch.object(
             standalone._ui, "_standalone_tick",
-            lambda: ticks.append(time.monotonic()),
+            lambda: ticks.append(time.perf_counter()),
         ), patch.object(
             standalone._ui, "_standalone_should_close",
             lambda: state["close"],
@@ -427,7 +480,7 @@ class TestActiveShutdown(unittest.TestCase):
         ]
         for interval in intervals:
             self.assertGreaterEqual(interval, 18.0, intervals)
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
 
 
 class TestConcurrentRuns(unittest.TestCase):
@@ -439,7 +492,7 @@ class TestConcurrentRuns(unittest.TestCase):
         close = {"v": False}
         with patch.object(
             standalone._ui, "_standalone_tick",
-            lambda: ticks.append(time.monotonic()),
+            lambda: ticks.append(time.perf_counter()),
         ), patch.object(
             standalone._ui, "_standalone_should_close", lambda: close["v"]
         ):
@@ -455,11 +508,11 @@ class TestConcurrentRuns(unittest.TestCase):
                 # Runner A's lifecycle state is untouched by the rejection.
                 self.assertTrue(standalone._run_active)
                 await asyncio.sleep(0.005)
-                t0 = time.monotonic()
+                t0 = time.perf_counter()
                 close["v"] = True
                 standalone.request_wakeup()  # must still reach runner A
                 await runner_a
-                return (time.monotonic() - t0) * 1000
+                return (time.perf_counter() - t0) * 1000
 
             latency = asyncio.run(scenario())
             standalone._initialized = False
@@ -468,7 +521,7 @@ class TestConcurrentRuns(unittest.TestCase):
             f"surviving runner lost wake delivery: {latency:.1f} ms",
         )
         self.assertFalse(standalone._run_active)
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
     def test_sync_run_rejected_while_async_runner_active(self):
@@ -476,7 +529,7 @@ class TestConcurrentRuns(unittest.TestCase):
         close = {"v": False}
         with patch.object(
             standalone._ui, "_standalone_tick",
-            lambda: ticks.append(time.monotonic()),
+            lambda: ticks.append(time.perf_counter()),
         ), patch.object(
             standalone._ui, "_standalone_should_close", lambda: close["v"]
         ):
@@ -497,7 +550,7 @@ class TestConcurrentRuns(unittest.TestCase):
             asyncio.run(scenario())
             standalone._initialized = False
         self.assertFalse(standalone._run_active)
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
 
@@ -575,7 +628,7 @@ class TestSimultaneousAdmissionStress(unittest.TestCase):
             _sys.setswitchinterval(prev_interval)
             standalone._run_active = False
             standalone._reset_pacing_wake_state()
-            standalone.set_max_frame_rate(60.0)
+            standalone.set_max_frame_rate(None)
 
     def test_sync_sync(self):
         self._stress(["sync", "sync"])
@@ -591,7 +644,7 @@ class TestSimultaneousAdmissionStress(unittest.TestCase):
         close = {"v": False}
         with patch.object(
             standalone._ui, "_standalone_tick",
-            lambda: ticks.append(time.monotonic()),
+            lambda: ticks.append(time.perf_counter()),
         ), patch.object(
             standalone._ui, "_standalone_should_close", lambda: close["v"]
         ), patch.object(
@@ -617,11 +670,11 @@ class TestSimultaneousAdmissionStress(unittest.TestCase):
                 t.start()
                 t.join(timeout=5.0)
                 await asyncio.sleep(0.005)
-                t0 = time.monotonic()
+                t0 = time.perf_counter()
                 close["v"] = True
                 standalone.request_wakeup()
                 await runner
-                return (time.monotonic() - t0) * 1000
+                return (time.perf_counter() - t0) * 1000
 
             latency = asyncio.run(scenario())
             standalone._initialized = False
@@ -630,7 +683,7 @@ class TestSimultaneousAdmissionStress(unittest.TestCase):
             latency, 100.0,
             f"survivor lost wake delivery after overlap: {latency:.1f} ms",
         )
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
 
@@ -680,7 +733,7 @@ class TestTeardownTickExclusion(unittest.TestCase):
             "tick", after,
             f"native tick after teardown: {log}",
         )
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
     def test_sync_runner_guard_to_tick_race(self):
@@ -726,20 +779,20 @@ class TestReentrantShutdown(unittest.TestCase):
             standalone._initialized = True
             standalone.set_max_frame_rate(100.0)
             runner = threading.Thread(target=standalone.run)
-            t0 = time.monotonic()
+            t0 = time.perf_counter()
             runner.start()
             runner.join(3.0)
             self.assertFalse(
                 runner.is_alive(),
                 "shutdown() from a native tick callback deadlocked",
             )
-        self.assertLess(time.monotonic() - t0, 3.0)
+        self.assertLess(time.perf_counter() - t0, 3.0)
         # Native work finished BEFORE teardown; exactly one tick ran.
         self.assertEqual(log, ["tick-begin", "tick-end", "teardown"])
         self.assertFalse(standalone._initialized)
         self.assertFalse(standalone._run_active)
         self.assertFalse(standalone._shutdown_requested_in_tick)
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
 
@@ -767,7 +820,7 @@ class TestShutdownDuringAdmittedStartup(unittest.TestCase):
             lambda: log.append("teardown"),
         ), patch.object(
             standalone._ui, "_standalone_init",
-            lambda *a: log.append("init"),
+            lambda *a: log.append("init") or True,
         ), patch.object(
             standalone, "_ensure_initialized_for_run", gated_ensure
         ):
@@ -786,7 +839,7 @@ class TestShutdownDuringAdmittedStartup(unittest.TestCase):
         self.assertNotIn("tick", log[marker:])
         self.assertFalse(standalone._run_active)
         self.assertFalse(standalone._initialized)
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
 
@@ -857,7 +910,7 @@ class TestOwnershipThroughCleanup(unittest.TestCase):
             standalone.run(close_soon())
             self.assertIn("tick", log)
         standalone._initialized = False
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
 
@@ -880,7 +933,7 @@ class TestShutdownUnderNativeExceptions(unittest.TestCase):
             standalone._ui, "_standalone_shutdown",
             lambda: log.append("teardown"),
         ), patch.object(
-            standalone._ui, "_standalone_init", lambda *a: log.append("init")
+            standalone._ui, "_standalone_init", lambda *a: log.append("init") or True
         ):
             standalone._initialized = True
             standalone.set_max_frame_rate(100.0)
@@ -921,7 +974,7 @@ class TestShutdownUnderNativeExceptions(unittest.TestCase):
             self.assertEqual(log.count("teardown"), 1)  # A's only
             self.assertEqual(log.count("init"), 1)      # B's fresh init
         standalone._initialized = False
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
     def test_tick_and_deferred_teardown_both_fail_keeps_tick_exception(self):
@@ -962,7 +1015,7 @@ class TestShutdownUnderNativeExceptions(unittest.TestCase):
             self.assertFalse(standalone._initialized)
             self.assertFalse(standalone._shutdown_requested_in_tick)
             self.assertFalse(standalone._run_active)
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
     def test_teardown_exception_still_releases_async_waiter(self):
@@ -974,7 +1027,7 @@ class TestShutdownUnderNativeExceptions(unittest.TestCase):
 
         with patch.object(
             standalone._ui, "_standalone_tick",
-            lambda: ticks.append(time.monotonic()),
+            lambda: ticks.append(time.perf_counter()),
         ), patch.object(
             standalone._ui, "_standalone_should_close", lambda: close["v"]
         ), patch.object(
@@ -988,14 +1041,14 @@ class TestShutdownUnderNativeExceptions(unittest.TestCase):
                 while len(ticks) < 1:
                     await asyncio.sleep(0.001)
                 await asyncio.sleep(0.005)
-                t0 = time.monotonic()
+                t0 = time.perf_counter()
                 with self.assertRaisesRegex(
                     RuntimeError, "native teardown failed"
                 ):
                     standalone.shutdown()
                 close["v"] = True
                 await runner
-                return (time.monotonic() - t0) * 1000
+                return (time.perf_counter() - t0) * 1000
 
             latency = asyncio.run(scenario())
         self.assertLess(
@@ -1007,7 +1060,7 @@ class TestShutdownUnderNativeExceptions(unittest.TestCase):
         # Repeated shutdown after a failed teardown: teardown is not
         # retried (initialized already False) and nothing raises.
         standalone.shutdown()
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
     def test_teardown_exception_still_releases_sync_waiter(self):
@@ -1019,7 +1072,7 @@ class TestShutdownUnderNativeExceptions(unittest.TestCase):
 
         with patch.object(
             standalone._ui, "_standalone_tick",
-            lambda: ticks.append(time.monotonic()),
+            lambda: ticks.append(time.perf_counter()),
         ), patch.object(
             standalone._ui, "_standalone_should_close", lambda: False
         ), patch.object(
@@ -1032,7 +1085,7 @@ class TestShutdownUnderNativeExceptions(unittest.TestCase):
                 while len(ticks) < 1:
                     time.sleep(0.001)
                 time.sleep(0.005)
-                result["t0"] = time.monotonic()
+                result["t0"] = time.perf_counter()
                 try:
                     standalone.shutdown()
                 except RuntimeError as exc:
@@ -1041,7 +1094,7 @@ class TestShutdownUnderNativeExceptions(unittest.TestCase):
             t = threading.Thread(target=killer)
             t.start()
             standalone.run()  # its own finally-shutdown skips (already down)
-            done = time.monotonic()
+            done = time.perf_counter()
             t.join(timeout=5.0)
         self.assertEqual(result.get("exc"), "native teardown failed")
         latency = (done - result["t0"]) * 1000
@@ -1050,7 +1103,7 @@ class TestShutdownUnderNativeExceptions(unittest.TestCase):
             f"run() stranded after teardown exception: {latency:.1f} ms",
         )
         self.assertFalse(standalone._run_active)
-        standalone.set_max_frame_rate(60.0)
+        standalone.set_max_frame_rate(None)
         standalone._reset_pacing_wake_state()
 
 

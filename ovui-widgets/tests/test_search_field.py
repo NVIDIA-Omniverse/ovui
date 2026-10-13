@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for :class:`SearchField` (the content browser implementation step 27).
 
@@ -311,7 +304,7 @@ class TestDebounceWithApplication:
         self, ephemeral_window, headless_app,
     ):
         """A frame update before the 200 ms due time leaves the handle
-        pending — ``call_later`` uses ``monotonic()`` under the hood,
+        pending — ``call_later`` uses ``perf_counter()`` under the hood,
         so a ``_on_frame_update(0.0)`` with the original due time does
         not trigger the callback."""
         calls: List[str] = []

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for UsdTransformAdapter (skipped when USD is unavailable)."""
 
@@ -95,6 +88,36 @@ class TestSetLocalTransform:
 
     def test_set_invalid_path_no_crash(self, adapter):
         adapter.set_local_transform("/DoesNotExist", [[1, 0, 0, 0]] * 4)
+
+
+class TestAuthoredTransformHistory:
+    def test_undo_redo_round_trips_authored_xform_structure(self):
+        from ovui_data_adapters.openusd import UsdTransformAdapter
+
+        from ovui_widgets.common.undo import BatchTransformCommand, UndoManager
+
+        stage = Usd.Stage.CreateInMemory()
+        prim = UsdGeom.Xform.Define(stage, "/Object")
+        common = UsdGeom.XformCommonAPI(prim)
+        common.SetTranslate((1.0, 2.0, 3.0))
+        common.SetRotate((10.0, 20.0, 30.0))
+        common.SetScale((1.0, 2.0, 3.0))
+        adapter = UsdTransformAdapter(stage)
+        initial = adapter.get_local_transform("/Object")
+        final = [row[:] for row in initial]
+        final[3][0] += 4.0
+        layer = stage.GetRootLayer()
+        authored_before = layer.ExportToString()
+
+        undo = UndoManager()
+        undo.push(BatchTransformCommand(adapter, "/Object", initial, final))
+        authored_after = layer.ExportToString()
+        assert authored_after != authored_before
+
+        assert undo.undo() is True
+        assert layer.ExportToString() == authored_before
+        assert undo.redo() is True
+        assert layer.ExportToString() == authored_after
 
 
 class TestCanTransform:

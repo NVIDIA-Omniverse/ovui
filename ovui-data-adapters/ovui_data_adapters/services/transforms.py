@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Frontend-neutral transform operation commands.
 
@@ -39,11 +32,23 @@ class BatchTransformCommand(Command):
         self._path = path
         self._initial = [row[:] for row in initial]
         self._final = [row[:] for row in final]
+        self._initial_state = adapter.capture_local_transform_state(path)
+        self._final_state = None
 
     def do(self) -> None:
+        if self._final_state is not None and self._adapter.restore_local_transform_state(
+            self._path, self._final_state
+        ):
+            return
         self._adapter.set_local_transform(self._path, self._final)
+        if self._initial_state is not None:
+            self._final_state = self._adapter.capture_local_transform_state(self._path)
 
     def undo(self) -> None:
+        if self._initial_state is not None and self._adapter.restore_local_transform_state(
+            self._path, self._initial_state
+        ):
+            return
         self._adapter.set_local_transform(self._path, self._initial)
 
 

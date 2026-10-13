@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for Phase D selection-mode wiring in :class:`ViewportWidget`.
 
@@ -206,4 +199,36 @@ class TestMergeSelectionHelper:
         vp = ViewportWidget(services=None, renderer=renderer, bus=bus)
         merged = vp._merge_selection(["/A", "/A", "/B"], "add")
         assert merged == ["/A", "/B"]
+        vp.destroy()
+
+
+class TestToggleMode:
+    """``toggle`` (advertised by the Inspector pick) flips each hit's membership."""
+
+    def _viewport(self, current):
+        bus = SelectionBus()
+        bus.publish(current, source="init")
+        return ViewportWidget(services=None, renderer=MockRendererAdapter(), bus=bus)
+
+    def test_toggle_removes_a_selected_hit(self):
+        vp = self._viewport(["/World/Red", "/World/Blue"])
+        assert vp._merge_selection(["/World/Red"], "toggle") == ["/World/Blue"]
+        vp.destroy()
+
+    def test_toggle_adds_an_unselected_hit(self):
+        vp = self._viewport(["/World/Blue"])
+        assert vp._merge_selection(["/World/Red"], "toggle") == ["/World/Blue", "/World/Red"]
+        vp.destroy()
+
+    def test_toggle_on_empty_space_keeps_the_selection(self):
+        vp = self._viewport(["/World/Blue"])
+        assert vp._merge_selection([], "toggle") == ["/World/Blue"]
+        vp.destroy()
+
+    def test_pick_result_applies_toggle_through_the_bus(self):
+        vp = self._viewport(["/World/Red", "/World/Blue"])
+        vp.apply_pick_selection("/World/Red", "toggle")
+        assert vp._bus.get_snapshot().paths() == ["/World/Blue"]
+        vp.apply_pick_selection("/World/Blue", "toggle")
+        assert vp._bus.get_snapshot().paths() == []
         vp.destroy()

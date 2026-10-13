@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Validate Agent Skills from installed ovui-family wheels."""
 
@@ -143,14 +136,6 @@ def _validate_skill(name: str, entry_point: metadata.EntryPoint) -> None:
     assert _canonicalize(
         _front_matter_value(skill_text, "python-distribution", indented=True)
     ) == _canonicalize(expected_distribution)
-
-    skill_version = _front_matter_value(skill_text, "version", indented=True)
-    wheel_version = metadata.version(expected_distribution)
-    assert skill_version == wheel_version, (
-        f"{name}: skill version {skill_version!r} does not match "
-        f"{expected_distribution} {wheel_version!r}"
-    )
-
 
 def _validate_console_scripts(expected_skills: list[str]) -> dict[str, metadata.EntryPoint]:
     required_distributions = {

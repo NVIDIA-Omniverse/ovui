@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "StandaloneRasterImageLoader.h"
@@ -92,30 +85,53 @@ void generateMipChain(const uint8_t* basePixels,
 
 } // anonymous namespace
 
+StandaloneRasterImageLoader::CacheEntry::~CacheEntry()
+{
+    if (!gpuState)
+        return;
+    if (auto* gpu = PlatformRegistry::instance().byteImageGpu())
+        gpu->destroyState(gpuState);
+    gpuState = nullptr;
+}
+
 StandaloneRasterImageLoader::~StandaloneRasterImageLoader()
 {
-    // Release every cached GPU state before IByteImageGpu goes away.
-    auto* gpu = PlatformRegistry::instance().byteImageGpu();
+    shutdown();
+}
+
+void StandaloneRasterImageLoader::shutdown()
+{
+    // Drop every reference while IByteImageGpu is still registered, so each
+    // entry destroys its GPU state before the backend goes away. Unpublished
+    // entries are reached through the instances that still hold them.
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (gpu)
-    {
-        for (auto& kv : m_cache)
-        {
-            if (kv.second && kv.second->gpuState)
-            {
-                gpu->destroyState(kv.second->gpuState);
-                kv.second->gpuState = nullptr;
-            }
-        }
-    }
-    m_cache.clear();
+    m_shutdown = true;
     m_instances.clear();
+    m_cache.clear();
+}
+
+void StandaloneRasterImageLoader::_releaseInstance(std::unordered_map<void*, InstanceState>::iterator it)
+{
+    // Caller holds m_mutex.
+    auto entry = it->second.entry;
+    if (entry && --entry->refCount <= 0)
+    {
+        // Only drop the published slot when it still points at this entry; a
+        // reload may already have replaced it with a freshly decoded one.
+        auto cacheIt = m_cache.find(it->second.cacheKey);
+        if (cacheIt != m_cache.end() && cacheIt->second == entry)
+            m_cache.erase(cacheIt);
+    }
+    m_instances.erase(it);
 }
 
 std::shared_ptr<StandaloneRasterImageLoader::CacheEntry>
 StandaloneRasterImageLoader::_loadOrGetCached(const std::string& url, size_t maxMipLevels)
 {
-    // Caller holds m_mutex.
+    // Caller holds m_mutex. Only successful loads are published below, so a
+    // hit here always has a texture to share. A failure is never remembered:
+    // the file may appear or become readable later, and every load attempt
+    // must be free to find it, whoever else is holding the same URL.
     auto it = m_cache.find(url);
     if (it != m_cache.end())
     {
@@ -130,7 +146,6 @@ StandaloneRasterImageLoader::_loadOrGetCached(const std::string& url, size_t max
     {
         fprintf(stderr, "StandaloneRasterImageLoader: no IByteImageGpu registered; cannot load '%s'\n",
                 url.c_str());
-        m_cache[url] = entry;
         return entry;
     }
 
@@ -140,7 +155,6 @@ StandaloneRasterImageLoader::_loadOrGetCached(const std::string& url, size_t max
     if (!file)
     {
         fprintf(stderr, "StandaloneRasterImageLoader: cannot open '%s'\n", url.c_str());
-        m_cache[url] = entry;
         return entry;
     }
     std::vector<uint8_t> fileBytes((std::istreambuf_iterator<char>(file)),
@@ -148,7 +162,6 @@ StandaloneRasterImageLoader::_loadOrGetCached(const std::string& url, size_t max
     if (fileBytes.empty())
     {
         fprintf(stderr, "StandaloneRasterImageLoader: empty file '%s'\n", url.c_str());
-        m_cache[url] = entry;
         return entry;
     }
 
@@ -162,7 +175,6 @@ StandaloneRasterImageLoader::_loadOrGetCached(const std::string& url, size_t max
         fprintf(stderr, "StandaloneRasterImageLoader: stbi_load_from_memory failed for '%s': %s\n",
                 url.c_str(), stbi_failure_reason() ? stbi_failure_reason() : "unknown");
         if (pixels) stbi_image_free(pixels);
-        m_cache[url] = entry;
         return entry;
     }
 
@@ -190,7 +202,6 @@ StandaloneRasterImageLoader::_loadOrGetCached(const std::string& url, size_t max
         for (size_t mip = 1; mip < mipBuffers.size(); ++mip)
             ::free(const_cast<uint8_t*>(mipBuffers[mip]));
         stbi_image_free(pixels);
-        m_cache[url] = entry;
         return entry;
     }
 
@@ -214,7 +225,6 @@ StandaloneRasterImageLoader::_loadOrGetCached(const std::string& url, size_t max
     {
         gpu->destroyState(state);
         fprintf(stderr, "StandaloneRasterImageLoader: GPU upload failed for '%s'\n", url.c_str());
-        m_cache[url] = entry;
         return entry;
     }
 
@@ -241,42 +251,34 @@ StandaloneRasterImageLoader::beginLoad(void* instanceKey, const std::string& url
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
-
-    // If this instance already has state for a different URL, drop it first.
-    auto instIt = m_instances.find(instanceKey);
-    if (instIt != m_instances.end() && instIt->second.cacheKey != url)
-    {
-        auto oldIt = m_cache.find(instIt->second.cacheKey);
-        if (oldIt != m_cache.end() && oldIt->second)
-        {
-            if (--oldIt->second->refCount <= 0)
-            {
-                auto* gpu = PlatformRegistry::instance().byteImageGpu();
-                if (gpu && oldIt->second->gpuState)
-                    gpu->destroyState(oldIt->second->gpuState);
-                m_cache.erase(oldIt);
-            }
-        }
-        m_instances.erase(instIt);
-    }
-
-    auto entry = _loadOrGetCached(url, /*maxMipLevels*/ 3);
-    if (entry->failed)
+    if (m_shutdown)
     {
         out.status = LoadResult::eFailed;
-        InstanceState s;
-        s.cacheKey = url;
-        s.status = LoadResult::eFailed;
-        m_instances[instanceKey] = s;
         return out;
     }
 
+    // Drop whatever this instance held before, so its reference is counted
+    // once no matter how often it re-begins the same or another URL.
+    auto instIt = m_instances.find(instanceKey);
+    if (instIt != m_instances.end())
+    {
+        _releaseInstance(instIt);
+    }
+
+    auto entry = _loadOrGetCached(url, /*maxMipLevels*/ 3);
     ++entry->refCount;
 
     InstanceState s;
     s.cacheKey = url;
-    s.status = LoadResult::eCached;
+    s.entry = entry;
+    s.status = entry->failed ? LoadResult::eFailed : LoadResult::eCached;
     m_instances[instanceKey] = s;
+
+    if (entry->failed)
+    {
+        out.status = LoadResult::eFailed;
+        return out;
+    }
 
     out.status = LoadResult::eCached;
     out.imGuiReference = entry->imGuiReference;
@@ -303,17 +305,19 @@ StandaloneRasterImageLoader::poll(void* instanceKey,
 
     out.cacheKey = it->second.cacheKey;
 
-    auto cacheIt = m_cache.find(it->second.cacheKey);
-    if (cacheIt == m_cache.end() || !cacheIt->second || cacheIt->second->failed)
+    // Report this instance's own entry: a reload by another consumer may have
+    // replaced the published entry for the same URL.
+    const auto& entry = it->second.entry;
+    if (!entry || entry->failed)
     {
         out.status = LoadResult::eFailed;
         return out;
     }
 
     out.status = LoadResult::eReady;
-    out.imGuiReference = cacheIt->second->imGuiReference;
-    out.imageSize = cacheIt->second->size;
-    out.imageFormat = cacheIt->second->format;
+    out.imGuiReference = entry->imGuiReference;
+    out.imageSize = entry->size;
+    out.imageFormat = entry->format;
     out.managedResource = nullptr;
     return out;
 }
@@ -329,34 +333,31 @@ void StandaloneRasterImageLoader::releaseLoad(void* instanceKey)
     auto it = m_instances.find(instanceKey);
     if (it == m_instances.end())
         return;
-
-    auto cacheIt = m_cache.find(it->second.cacheKey);
-    if (cacheIt != m_cache.end() && cacheIt->second)
-    {
-        if (--cacheIt->second->refCount <= 0)
-        {
-            auto* gpu = PlatformRegistry::instance().byteImageGpu();
-            if (gpu && cacheIt->second->gpuState)
-                gpu->destroyState(cacheIt->second->gpuState);
-            m_cache.erase(cacheIt);
-        }
-    }
-    m_instances.erase(it);
+    _releaseInstance(it);
 }
 
 void StandaloneRasterImageLoader::releaseGpuResource(const std::string& cacheKey)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // Giving a reference back. Per-instance references are counted in
+    // releaseLoad(), which already erases the slot when the last one goes, so
+    // this only has to drop an entry nothing references any more. A slot that
+    // other consumers still hold stays published and keeps being shared: one
+    // consumer going away does not make the file worth decoding twice.
     auto it = m_cache.find(cacheKey);
-    if (it == m_cache.end() || !it->second)
-        return;
-    if (it->second->refCount <= 0)
-    {
-        auto* gpu = PlatformRegistry::instance().byteImageGpu();
-        if (gpu && it->second->gpuState)
-            gpu->destroyState(it->second->gpuState);
+    if (it != m_cache.end() && (!it->second || it->second->refCount <= 0))
         m_cache.erase(it);
-    }
+}
+
+void StandaloneRasterImageLoader::invalidateCacheEntry(const std::string& cacheKey)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    // The file behind this URL may have changed, so the next load must read it
+    // again. Unpublish the entry unconditionally: any consumer still drawing it
+    // keeps it alive through its own reference and goes on showing the pixels
+    // it asked for, while a later load of the same URL decodes the current file
+    // instead of returning the old texture.
+    m_cache.erase(cacheKey);
 }
 
 } // namespace standalone

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION is strictly
-# prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OVStage-native hierarchy, path, display, and selection contracts."""
 
@@ -21,6 +14,7 @@ from typing import Any, Iterator
 import pytest
 
 from ovui_data_adapters.common import BadgeFlags, ItemFlags
+from ovui_data_adapters.ovstage import _scene as scene_module
 from ovui_data_adapters.ovstage._scene import _native_path_exists
 from ovui_data_adapters.ovstage._constants import (
     PROVIDER_ENTRY_POINT_VALUE,
@@ -61,6 +55,7 @@ def Xform "World"
             int[] faceVertexIndices = [0, 1, 2]
             point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
         }
+        def MeshInstance "InstancedShape" {}
         def "Untyped" {}
     }
 }
@@ -171,6 +166,7 @@ def test_static_hierarchy_paths_types_display_and_flags_are_native(
     ]
     assert _child_paths(adapter, adapter.get_item_at_path("/World/Group_Unicode")) == [
         "/World/Group_Unicode/Café_Δ",
+        "/World/Group_Unicode/InstancedShape",
         "/World/Group_Unicode/MeshShape",
         "/World/Group_Unicode/PlainShape",
         "/World/Group_Unicode/RoundShape",
@@ -185,6 +181,7 @@ def test_static_hierarchy_paths_types_display_and_flags_are_native(
         "/World/Cameras/RealCamera": "Camera",
         "/World/Group_Unicode": "Xform",
         "/World/Group_Unicode/Café_Δ": "Xform",
+        "/World/Group_Unicode/InstancedShape": "MeshInstance",
         "/World/Group_Unicode/MeshShape": "Mesh",
         "/World/Group_Unicode/PlainShape": "Cube",
         "/World/Group_Unicode/RoundShape": "Sphere",
@@ -214,6 +211,8 @@ def test_static_hierarchy_paths_types_display_and_flags_are_native(
     untyped = adapter.get_item_at_path("/World/Group_Unicode/Untyped")
     assert adapter.get_type_category(untyped) == "Other"
     assert adapter.get_icon_name(untyped) == "Prim"
+    mesh_instance = adapter.get_item_at_path("/World/Group_Unicode/InstancedShape")
+    assert adapter.get_type_category(mesh_instance) == "Mesh"
     assert _native_path_exists(scene._stage, "/_OvuiRuntime") is True
 
 
@@ -407,6 +406,15 @@ class _GroupProxy:
     def raw(self) -> Any:
         return self._group.raw
 
+    @property
+    def prim_list(self) -> Any:
+        # Topology-only reads copy a group's prim list and never touch its
+        # value arrays, so the prim list is that group's whole payload.
+        if self.released:
+            raise AssertionError("native read group prim list was used after release")
+        self._events.append(f"group.{self._number}.copy")
+        return self._group.prim_list
+
     def array(self, index: int) -> Any:
         if self.released:
             raise AssertionError("native read group array was used after release")
@@ -467,7 +475,7 @@ def test_native_query_read_results_are_waited_copied_and_released(
 
     items = _walk(adapter)
     assert adapter.get_type_name(adapter.get_item_at_path("/World/BoxPretender")) == "Xform"
-    assert len(items) == 15
+    assert len(items) == 16
     assert query_count > 0
     assert read_count > 0
     assert group_count > 0
@@ -483,6 +491,99 @@ def test_native_query_read_results_are_waited_copied_and_released(
         )
     for number in range(1, group_count + 1):
         assert events.index(f"group.{number}.copy") < events.index(f"group.{number}.release")
+
+
+def test_unanswered_native_hierarchy_read_never_becomes_the_topology(
+    opened_a: tuple[Any, Any, Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read that did not answer must never pass for a childless parent.
+
+    ``_hierarchy_kit_child_paths`` reports a genuinely childless parent as
+    ``()`` and a read that did not answer as ``None``.  Where the whole-stage
+    walk backs the Stage Tree, mistaking the second for the first drops that
+    subtree from a result that still looks complete, and the ordinal-keyed
+    snapshot then caches it — so the prims stay missing for the rest of the
+    ordinal even once the read recovers.
+    """
+
+    _session, scene, _adapter, _selection = opened_a
+    stage = scene._stage
+    ordinal = int(stage.current_ordinal)
+    unreadable = "/World/Group_Unicode"
+
+    complete = set(scene_module._kit_topology_snapshot(stage, ordinal).path_order)
+    assert {path for path in complete if path.startswith(unreadable + "/")}
+
+    real_child_paths = scene_module._hierarchy_kit_child_paths
+
+    def unanswered_for_one_parent(
+        stage_arg: Any,
+        parent_path: str,
+        ordinal_arg: int,
+    ) -> tuple[str, ...] | None:
+        if str(parent_path) == unreadable:
+            return None
+        return real_child_paths(stage_arg, parent_path, ordinal_arg)
+
+    monkeypatch.setattr(
+        scene_module,
+        "_hierarchy_kit_child_paths",
+        unanswered_for_one_parent,
+    )
+
+    # Unusable, not "a stage that happens to stop there".
+    assert scene_module._hierarchy_kit_path_order(stage, ordinal) is None
+
+    stage._ovui_kit_topology_snapshot = None
+    published = scene_module._kit_topology_snapshot(stage, ordinal)
+    assert set(published.path_order) == complete
+    assert published.child_paths_for_parent(unreadable)
+
+
+def test_empty_column_read_is_only_empty_when_the_hierarchy_agrees(
+    opened_a: tuple[Any, Any, Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One dead source must not read as a stage whose prims are gone.
+
+    Past the population ordinal the whole-stage columns are the only content
+    source, so a column read that answers nothing looks exactly like a stage
+    that emptied.  The hierarchy surface tells them apart: it tracks deletions,
+    so it stops reporting a root once the prims really are gone and keeps
+    reporting one while a source is merely down.
+    """
+
+    _session, scene, _adapter, _selection = opened_a
+    stage = scene._stage
+    ordinal = int(stage.current_ordinal)
+    populated = scene_module._kit_topology_snapshot(stage, ordinal).path_order
+    assert populated
+
+    # Both content sources answer nothing; the hierarchy surface stays up.
+    monkeypatch.setattr(
+        scene_module,
+        "_merge_kit_read_groups",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(stage, "fetch_read_next", lambda *_a, **_k: None)
+    stage._ovui_kit_stage_bridge_cache = None
+
+    # Hierarchy still reports a root: a source is down, not an empty stage.
+    assert scene_module._hierarchy_kit_child_paths(stage, "/", ordinal)
+    unreadable = scene_module._kit_topology_snapshot(stage, ordinal + 1)
+    assert unreadable.readable is False
+    assert unreadable.path_order == populated
+
+    # Hierarchy reports no root: the stage really is empty.
+    monkeypatch.setattr(
+        scene_module,
+        "_hierarchy_kit_child_paths",
+        lambda *_args, **_kwargs: (),
+    )
+    emptied = scene_module._kit_topology_snapshot(stage, ordinal + 2)
+    assert emptied.readable is True
+    assert emptied.path_order == ()
 
 
 _BLOCKED_SUBPROCESS = r'''

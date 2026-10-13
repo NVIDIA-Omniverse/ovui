@@ -1,16 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Zero-copy GPU ingest state + GPU frame marker.
 
-Tier-2 of the strata#16 zero-copy path. When `OVGEAR_ZERO_COPY=1` is set
+Tier-2 of the strata#16 zero-copy path. Unless `OVGEAR_ZERO_COPY=0` is set
 in the environment, the renderer maps the LdrColor render variable on the
 CUDA device and hands the raw device pointer to ovui via
 `ByteImageProvider.set_bytes_data_from_gpu`. This avoids the GPU→CPU
@@ -36,7 +29,7 @@ from typing import Optional
 
 
 class _Mode(Enum):
-    DISABLED = "disabled"   # env flag not set or zero-copy not requested
+    DISABLED = "disabled"   # zero-copy explicitly disabled
     PROBING = "probing"     # env flag set; first GPU push will probe stderr
     ENABLED = "enabled"     # probe succeeded; GPU ingest works
     FALLBACK = "fallback"   # probe found standalone no-op; tier-1 forever
@@ -56,9 +49,9 @@ class ZeroCopyState:
 
     @classmethod
     def from_env(cls) -> "ZeroCopyState":
-        if os.environ.get("OVGEAR_ZERO_COPY") == "1":
-            return cls(mode=_Mode.PROBING)
-        return cls(mode=_Mode.DISABLED)
+        if os.environ.get("OVGEAR_ZERO_COPY") == "0":
+            return cls(mode=_Mode.DISABLED)
+        return cls(mode=_Mode.PROBING)
 
     @property
     def gpu_pending(self) -> bool:

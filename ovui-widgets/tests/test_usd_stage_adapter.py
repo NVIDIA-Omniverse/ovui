@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for UsdStageAdapter — hierarchy traversal (Step 22).
 
@@ -19,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 try:
-    from pxr import Gf, Sdf, Usd, UsdGeom
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux
     try:
         from pxr import UsdShade
         HAS_USD_SHADE = True
@@ -76,12 +69,41 @@ def empty_stage():
     return Usd.Stage.CreateInMemory()
 
 
+def _write_mdl_library(library_dir):
+    """Write Kit MDL modules and the renderer's OpenPBR class asset."""
+    base_dir = library_dir / "Base"
+    base_dir.mkdir(parents=True)
+    for filename in ("OmniSurface.mdl", "OmniGlass.mdl", "OmniPBR.mdl"):
+        (base_dir / filename).write_text("// test MDL module\n", encoding="utf-8")
+    openpbr_dir = library_dir / "OpenPBR"
+    openpbr_dir.mkdir()
+    (openpbr_dir / "open_pbr_uber_base_class.usda").write_text(
+        '''#usda 1.0
+(
+    defaultPrim = "open_pbr_uber_base"
+)
+
+class "open_pbr_uber_base"
+{
+    float inputs:base_weight = 1 (
+        displayGroup = "Base"
+        displayName = "Base Weight"
+    )
+    color3f inputs:base_color = (0.8, 0.8, 0.8) (
+        displayGroup = "Base"
+        displayName = "Base Color"
+    )
+}
+''',
+        encoding="utf-8",
+    )
+    return base_dir
+
+
 @pytest.fixture
 def available_mdl_library(tmp_path, monkeypatch):
-    """Expose the three Kit-named MDL modules to availability-sensitive tests."""
-    for filename in ("OmniSurface.mdl", "OmniGlass.mdl", "OmniPBR.mdl"):
-        (tmp_path / filename).write_text("// test MDL module\n", encoding="utf-8")
-    monkeypatch.setenv("OVUI_MDL_LIBRARY_PATH", str(tmp_path))
+    """Expose Kit MDL modules and the renderer's OpenPBR class asset."""
+    monkeypatch.setenv("OVUI_MDL_LIBRARY_PATH", str(_write_mdl_library(tmp_path)))
 
 
 @pytest.fixture
@@ -261,6 +283,36 @@ class TestGetTypeCategory:
         a = UsdStageAdapter(stage)
         prim = stage.GetPrimAtPath("/Untyped")
         assert a.get_type_category(prim) == "Other"
+
+
+class TestGetLightShapeAttributes:
+    def test_reads_authored_geometry_for_supported_light_shapes(self, empty_stage):
+        rect = UsdLux.RectLight.Define(empty_stage, "/Rect")
+        rect.CreateWidthAttr(300.0)
+        rect.CreateHeightAttr(100.0)
+        sphere = UsdLux.SphereLight.Define(empty_stage, "/Sphere")
+        sphere.CreateRadiusAttr(150.0)
+        disk = UsdLux.DiskLight.Define(empty_stage, "/Disk")
+        disk.CreateRadiusAttr(125.0)
+        cylinder = UsdLux.CylinderLight.Define(empty_stage, "/Cylinder")
+        cylinder.CreateRadiusAttr(15.0)
+        cylinder.CreateLengthAttr(300.0)
+        adapter = UsdStageAdapter(empty_stage)
+
+        assert adapter.get_light_shape_attributes(rect.GetPrim()) == {
+            "width": 300.0,
+            "height": 100.0,
+        }
+        assert adapter.get_light_shape_attributes(sphere.GetPrim()) == {
+            "radius": 150.0,
+        }
+        assert adapter.get_light_shape_attributes(disk.GetPrim()) == {
+            "radius": 125.0,
+        }
+        assert adapter.get_light_shape_attributes(cylinder.GetPrim()) == {
+            "radius": 15.0,
+            "length": 300.0,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +893,11 @@ class TestCoreMaterialCatalog:
         ] == ["core_material.omni_surface"]
         assert [
             material.material_id for material in catalog.materials_for_group("base")
-        ] == ["core_material.omni_glass", "core_material.omni_pbr"]
+        ] == [
+            "core_material.omni_glass",
+            "core_material.omni_pbr",
+            "core_material.open_pbr",
+        ]
         assert [
             material.material_id
             for material in catalog.materials_for_group("usd_materials")
@@ -859,6 +915,7 @@ class TestCoreMaterialCatalog:
         omni_surface = self._material(catalog, "core_material.omni_surface")
         omni_glass = self._material(catalog, "core_material.omni_glass")
         omni_pbr = self._material(catalog, "core_material.omni_pbr")
+        open_pbr = self._material(catalog, "core_material.open_pbr")
 
         assert omni_surface.group_id == "advanced"
         assert omni_surface.family is CoreMaterialFamily.MDL
@@ -875,6 +932,36 @@ class TestCoreMaterialCatalog:
         assert omni_pbr.kind is CoreMaterialKind.OMNI_PBR
         assert omni_pbr.metadata["mdl_source_asset"] == "OmniPBR.mdl"
         assert omni_pbr.is_available
+        assert open_pbr.group_id == "base"
+        assert open_pbr.family is CoreMaterialFamily.MATERIALX
+        assert open_pbr.kind is CoreMaterialKind.OPENPBR
+        assert Path(open_pbr.metadata["openpbr_base_class_asset"]).parts[-2:] == (
+            "OpenPBR",
+            "open_pbr_uber_base_class.usda",
+        )
+        assert open_pbr.is_available
+
+    def test_catalog_finds_mdl_materials_under_ovrtx_root(
+        self,
+        empty_stage,
+        tmp_path,
+        monkeypatch,
+    ):
+        _write_mdl_library(tmp_path / "bin" / "library" / "mdl")
+        for env_name in stage_mod._MDL_SEARCH_ENV_VARS:
+            monkeypatch.delenv(env_name, raising=False)
+        monkeypatch.setattr(stage_mod.importlib.util, "find_spec", lambda name: None)
+        monkeypatch.setenv("OVRTX_ROOT", str(tmp_path))
+
+        catalog = UsdStageAdapter(empty_stage).list_core_materials()
+
+        for material_id in (
+            "core_material.omni_surface",
+            "core_material.omni_glass",
+            "core_material.omni_pbr",
+            "core_material.open_pbr",
+        ):
+            assert self._material(catalog, material_id).is_available, material_id
 
     def test_catalog_disables_kit_named_mdl_materials_without_modules(
         self,
@@ -1092,6 +1179,31 @@ class TestCoreMaterialCreation:
         assert material.GetAttribute("outputs:mdl:surface").GetConnections() == [
             Sdf.Path(f"{material_path}/Shader.outputs:out")
         ]
+
+    def test_create_openpbr_composes_usable_authoring_inputs(
+        self,
+        empty_stage,
+        available_mdl_library,
+    ):
+        result = UsdStageAdapter(empty_stage).create_material(
+            CreateMaterialRequest("core_material.open_pbr")
+        )
+
+        assert result.accepted
+        assert result.created_material_path == "/World/Looks/OpenPBR"
+        assert result.created_paths == ("/World/Looks/OpenPBR",)
+        material = self._material_prim(empty_stage, "/World/Looks/OpenPBR")
+        assert material.GetTypeName() == "Material"
+        assert material.GetAttribute("inputs:base_weight").Get() == 1.0
+        assert material.GetAttribute("inputs:base_weight").GetMetadata(
+            "displayGroup"
+        ) == "Base"
+        assert material.GetAttribute("inputs:base_color").Get() == Gf.Vec3f(
+            0.8, 0.8, 0.8
+        )
+        authored = empty_stage.GetRootLayer().ExportToString()
+        assert "open_pbr_uber_base_class.usda" in authored
+        assert "</open_pbr_uber_base>" in authored
 
     def test_create_material_generates_unique_material_name(self, empty_stage):
         adapter = UsdStageAdapter(empty_stage)
@@ -1484,6 +1596,7 @@ class TestCreateActionCatalog:
         cube = self._action(catalog, "create.geometry.mesh.cube")
         camera = self._action(catalog, "create.camera")
         render_product = self._action(catalog, "create.render_product")
+        render_var = self._action(catalog, "create.render_var")
         assert cube.is_available
         assert cube.label == "Cube"
         assert cube.target_prim_type == "Mesh"
@@ -1494,6 +1607,9 @@ class TestCreateActionCatalog:
         assert render_product.is_available
         assert render_product.category_id == CreateActionCategory.RENDER_PRODUCTS.value
         assert render_product.target_prim_type == "RenderProduct"
+        assert render_var.label == "AOV"
+        assert render_var.target_prim_type == "RenderVar"
+        assert render_var.default_parent_path == "/Render/Vars"
         assert empty_stage.GetPseudoRoot().GetChildren() == []
 
     def test_mesh_and_shape_categories_are_split_for_kit_create_layout(self, empty_stage):
@@ -1991,6 +2107,20 @@ class TestCreateActionCatalog:
         assert "render product authoring failed" in result.message
         assert empty_stage.GetRootLayer().ExportToString() == before
 
+    def test_create_render_var_authors_useful_aov_default(self, empty_stage):
+        if not HAS_USD_RENDER:
+            pytest.skip("UsdRender is unavailable in this OpenUSD build")
+        adapter = UsdStageAdapter(empty_stage)
+
+        result = adapter.create_prim(CreateRequest("create.render_var"))
+
+        assert result.accepted is True
+        assert result.primary_path == "/Render/Vars/LdrColor"
+        prim = empty_stage.GetPrimAtPath(result.primary_path)
+        assert prim.GetTypeName() == "RenderVar"
+        assert prim.GetAttribute("sourceName").Get() == "LdrColor"
+        assert result.selection_paths == (result.primary_path,)
+
     def test_create_prim_disabled_decal_action_rejects_without_mutation(self, empty_stage):
         before = empty_stage.GetRootLayer().ExportToString()
         result = UsdStageAdapter(empty_stage).create_prim(CreateRequest("create.decal"))
@@ -2064,6 +2194,222 @@ class TestCreateActionCatalog:
         assert not result.accepted
         assert result.error_code == CreateActionErrorCode.UNSUPPORTED.value
         assert empty_stage.GetRootLayer().ExportToString() == before
+
+    def test_create_prim_is_one_undo_step_after_earlier_edit(self):
+        from ovui_widgets.common.undo import UndoManager
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.Xform.Define(stage, "/World")
+        sphere = UsdGeom.Sphere.Define(stage, "/World/Sphere").GetPrim()
+        layer = stage.GetRootLayer()
+        undo = UndoManager()
+        adapter = UsdStageAdapter(stage, undo_manager=undo)
+        adapter.set_visibility(sphere, False)
+        before = layer.ExportToString()
+
+        result = adapter.create_prim(CreateRequest("create.geometry.mesh.cube"))
+        after = layer.ExportToString()
+
+        assert result.accepted
+        assert len(undo._undo_stack) == 2
+        assert undo._undo_stack[-1].label == "Create Cube"
+        assert undo.undo()
+        assert not stage.GetPrimAtPath(result.primary_path)
+        assert layer.ExportToString() == before
+        assert UsdGeom.Imageable(sphere).ComputeVisibility() == UsdGeom.Tokens.invisible
+        assert undo.redo()
+        assert stage.GetPrimAtPath(result.primary_path)
+        assert layer.ExportToString() == after
+
+    @pytest.mark.parametrize(
+        ("action_id", "selection_paths"),
+        [
+            ("create.render_var", ()),
+            ("create.render_product", ("/World/Camera",)),
+            ("create.material.usd-preview-surface.bind", ("/World/Cube",)),
+        ],
+    )
+    def test_create_prim_undo_redo_restores_exact_layer(
+        self, simple_stage, action_id, selection_paths
+    ):
+        from ovui_widgets.common.undo import UndoManager
+
+        if not (HAS_USD_RENDER and HAS_USD_SHADE):
+            pytest.skip("UsdRender or UsdShade not available")
+        layer = simple_stage.GetRootLayer()
+        undo = UndoManager()
+        adapter = UsdStageAdapter(simple_stage, undo_manager=undo)
+        before = layer.ExportToString()
+
+        result = adapter.create_prim(
+            CreateRequest(action_id, selection_paths=selection_paths)
+        )
+        after = layer.ExportToString()
+
+        assert result.accepted
+        assert undo.undo()
+        assert layer.ExportToString() == before
+        assert undo.redo()
+        assert layer.ExportToString() == after
+
+    def test_create_prim_undo_keeps_later_edits_to_other_prims(self, simple_stage):
+        from ovui_widgets.common.undo import UndoManager
+
+        undo = UndoManager()
+        adapter = UsdStageAdapter(simple_stage, undo_manager=undo)
+        result = adapter.create_prim(CreateRequest("create.xform"))
+        camera = simple_stage.GetPrimAtPath("/World/Camera")
+        UsdGeom.Camera(camera).CreateFocalLengthAttr().Set(35.0)
+
+        assert result.accepted
+        assert undo.undo()
+        assert not simple_stage.GetPrimAtPath(result.primary_path)
+        assert UsdGeom.Camera(camera).GetFocalLengthAttr().Get() == 35.0
+
+    def test_create_prim_undo_keeps_later_edit_to_an_existing_child(self):
+        from ovui_widgets.common.undo import UndoManager
+
+        if not HAS_USD_SHADE:
+            pytest.skip("UsdShade not available")
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.Xform.Define(stage, "/World")
+        group = UsdGeom.Xform.Define(stage, "/World/Group").GetPrim()
+        camera = UsdGeom.Camera.Define(stage, "/World/Group/Camera")
+        camera.CreateFocalLengthAttr().Set(50.0)
+        undo = UndoManager()
+        adapter = UsdStageAdapter(stage, undo_manager=undo)
+
+        result = adapter.create_prim(CreateRequest(
+            "create.material.usd-preview-surface.bind",
+            selection_paths=("/World/Group",),
+        ))
+        # The create binds the material on /World/Group. The camera below it
+        # is not part of the create.
+        camera.GetFocalLengthAttr().Set(35.0)
+
+        assert result.accepted
+        assert undo.undo()
+        assert camera.GetFocalLengthAttr().Get() == 35.0
+        assert not stage.GetPrimAtPath(result.primary_path)
+        assert not group.GetRelationship("material:binding").GetTargets()
+        assert undo.redo()
+        assert camera.GetFocalLengthAttr().Get() == 35.0
+        assert group.GetRelationship("material:binding").GetTargets() == [
+            Sdf.Path(result.primary_path)
+        ]
+
+    def test_create_prim_undo_keeps_later_edit_to_a_sibling_in_a_sublayer(self):
+        from ovui_widgets.common.undo import UndoManager
+
+        base = Sdf.Layer.CreateAnonymous()
+        base_stage = Usd.Stage.Open(base)
+        UsdGeom.Xform.Define(base_stage, "/World")
+        UsdGeom.Xform.Define(base_stage, "/World/Parent")
+        UsdGeom.Camera.Define(base_stage, "/World/Other").CreateFocalLengthAttr().Set(50.0)
+        root = Sdf.Layer.CreateAnonymous()
+        root.subLayerPaths = [base.identifier]
+        stage = Usd.Stage.Open(root)
+        undo = UndoManager()
+        adapter = UsdStageAdapter(stage, undo_manager=undo)
+
+        # The edit layer holds no spec yet, so the create also authors the
+        # ancestors /World and /World/Parent there.
+        result = adapter.create_prim(CreateRequest(
+            "create.xform",
+            requested_parent_path="/World/Parent",
+        ))
+        sibling = UsdGeom.Camera(stage.GetPrimAtPath("/World/Other"))
+        sibling.CreateFocalLengthAttr().Set(35.0)
+        root.comment = "later"
+
+        assert result.accepted
+        assert undo.undo()
+        assert not stage.GetPrimAtPath(result.primary_path)
+        assert sibling.GetFocalLengthAttr().Get() == 35.0
+        assert root.comment == "later"
+        assert undo.redo()
+        assert stage.GetPrimAtPath(result.primary_path)
+        assert sibling.GetFocalLengthAttr().Get() == 35.0
+        assert root.comment == "later"
+
+    def test_create_prim_undo_keeps_a_later_field_on_an_added_ancestor(self):
+        from ovui_widgets.common.undo import UndoManager
+
+        base = Sdf.Layer.CreateAnonymous()
+        base_stage = Usd.Stage.Open(base)
+        UsdGeom.Xform.Define(base_stage, "/World")
+        UsdGeom.Xform.Define(base_stage, "/World/Parent")
+        root = Sdf.Layer.CreateAnonymous()
+        root.subLayerPaths = [base.identifier]
+        stage = Usd.Stage.Open(root)
+        undo = UndoManager()
+        adapter = UsdStageAdapter(stage, undo_manager=undo)
+
+        # The create authors /World and /World/Parent in the edit layer as
+        # ancestors of the new prim. A later edit to a field of one of them
+        # is the user's, not the create's.
+        result = adapter.create_prim(CreateRequest(
+            "create.xform",
+            requested_parent_path="/World/Parent",
+        ))
+        world = stage.GetPrimAtPath("/World")
+        world.SetMetadata("documentation", "later user edit")
+        parent = stage.GetPrimAtPath("/World/Parent")
+        parent.SetMetadata("comment", "later parent comment")
+
+        assert result.accepted
+        assert undo.undo()
+        assert not stage.GetPrimAtPath(result.primary_path)
+        assert world.GetMetadata("documentation") == "later user edit"
+        assert parent.GetMetadata("comment") == "later parent comment"
+        assert undo.redo()
+        assert stage.GetPrimAtPath(result.primary_path)
+        assert world.GetMetadata("documentation") == "later user edit"
+        assert parent.GetMetadata("comment") == "later parent comment"
+
+    def test_create_prim_undo_keeps_a_later_property_on_the_parent(self, empty_stage):
+        from ovui_widgets.common.undo import UndoManager
+
+        world = UsdGeom.Xform.Define(empty_stage, "/World").GetPrim()
+        undo = UndoManager()
+        adapter = UsdStageAdapter(empty_stage, undo_manager=undo)
+
+        result = adapter.create_prim(CreateRequest(
+            "create.xform",
+            requested_parent_path="/World",
+        ))
+        world.CreateAttribute("myAttr", Sdf.ValueTypeNames.Float).Set(7.0)
+
+        assert result.accepted
+        assert undo.undo()
+        assert not empty_stage.GetPrimAtPath(result.primary_path)
+        assert world.GetAttribute("myAttr").Get() == 7.0
+
+    def test_create_prim_undo_redo_inside_a_variant_edit_target(self, empty_stage):
+        from ovui_widgets.common.undo import UndoManager
+
+        world = UsdGeom.Xform.Define(empty_stage, "/World").GetPrim()
+        variants = world.GetVariantSets().AddVariantSet("model")
+        variants.AddVariant("one")
+        variants.SetVariantSelection("one")
+        with variants.GetVariantEditContext():
+            UsdGeom.Xform.Define(empty_stage, "/World/Parent")
+            layer = empty_stage.GetEditTarget().GetLayer()
+            undo = UndoManager()
+            adapter = UsdStageAdapter(empty_stage, undo_manager=undo)
+            before = layer.ExportToString()
+
+            result = adapter.create_prim(CreateRequest(
+                "create.xform",
+                requested_parent_path="/World/Parent",
+            ))
+            after = layer.ExportToString()
+
+            assert result.accepted
+            assert undo.undo()
+            assert layer.ExportToString() == before
+            assert undo.redo()
+            assert layer.ExportToString() == after
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ovrtx root loading must render the composed live layer, not the disk file.
 
@@ -32,6 +25,10 @@ import pytest
 pxr = pytest.importorskip("pxr")
 from pxr import Sdf, Usd, UsdGeom  # noqa: E402
 
+from ovui_data_adapters.common.instrumentation import (  # noqa: E402
+    Instrumentation,
+    set_instrumentation,
+)
 from ovui_data_adapters.openusd.renderer_adapter import (  # noqa: E402
     OvRtxRendererAdapter,
 )
@@ -60,7 +57,7 @@ def _no_snapshot_residue():
     These tests build ``__new__``-based adapters and call ``load_stage`` on
     dirty stages, each of which writes a relocated snapshot to the temp dir.
     A single-load test that never reaches a second load or ``shutdown``
-    would otherwise orphan its owned snapshot (Codex finding 7). This
+    would otherwise orphan its owned snapshot. This
     fixture reclaims any snapshot file a test created but did not itself
     tear down, so the whole suite leaves zero net residue. The teardown
     contract of production code is verified explicitly and independently by
@@ -153,6 +150,66 @@ def _snapshot_text(path: str) -> str:
 
 
 class TestDirtyRootLayerSnapshot:
+    def test_session_live_overlay_survives_insertion_motion_and_removal(self, tmp_path):
+        root_path = _write_scene(tmp_path, "live_root.usda")
+        original = open(root_path, "rb").read()
+        stage = Usd.Stage.Open(root_path)
+        live = Sdf.Layer.CreateAnonymous("participant.usda")
+        stage.GetSessionLayer().subLayerPaths.append(live.identifier)
+        renderer = _RecordingRenderer()
+        adapter = _make_adapter(renderer)
+        presented = None
+        try:
+            with Usd.EditContext(stage, live):
+                avatar = UsdGeom.Sphere.Define(stage, "/Participants/One")
+                avatar.AddTranslateOp().Set((2, 0, 1))
+                stage.GetPrimAtPath("/World/Sphere").GetAttribute("radius").Set(1.25)
+            adapter.load_stage(stage)
+            presented = Usd.Stage.Open(renderer.opened_paths[-1])
+            assert presented.GetPrimAtPath("/Participants/One")
+            assert presented.GetPrimAtPath("/World/Sphere").GetAttribute("radius").Get() == 1.25
+            assert presented.GetPrimAtPath("/Participants/One").GetAttribute("xformOp:translate").Get() == (2, 0, 1)
+            with Usd.EditContext(stage, live):
+                stage.RemovePrim("/Participants/One")
+            adapter.load_stage(stage, use_live_root_snapshot=True)
+            assert not Usd.Stage.Open(renderer.opened_paths[-1]).GetPrimAtPath("/Participants/One")
+            assert open(root_path, "rb").read() == original
+        finally:
+            # Windows cannot delete a Crate snapshot that USD still has open.
+            presented = None
+            for path in renderer.opened_paths:
+                if path != root_path and os.path.exists(path):
+                    os.unlink(path)
+
+    def test_muted_sublayer_loads_the_live_composed_stage(self, tmp_path) -> None:
+        sublayer_path = tmp_path / "muted_contribution.usda"
+        sublayer_path.write_text(
+            '#usda 1.0\n\nover "World"\n{\n    def Cube "FromMutedLayer" {}\n}\n',
+            encoding="utf-8",
+        )
+        root_path = tmp_path / "mute_root.usda"
+        root_path.write_text(
+            '#usda 1.0\n(\n    subLayers = [@./muted_contribution.usda@]\n)\n\n'
+            'def Xform "World"\n{\n    def Sphere "AlwaysComposed" {}\n}\n',
+            encoding="utf-8",
+        )
+        stage = Usd.Stage.Open(str(root_path))
+        muted_identifier = str(sublayer_path)
+        assert stage.GetPrimAtPath("/World/FromMutedLayer").IsValid()
+
+        stage.MuteLayer(muted_identifier)
+        renderer = _RecordingRenderer()
+        adapter = _make_adapter(renderer)
+        adapter.load_stage(stage)
+
+        assert len(renderer.opened_paths) == 1
+        opened_stage = Usd.Stage.Open(renderer.opened_paths[0])
+        assert opened_stage.GetPrimAtPath("/World/AlwaysComposed").IsValid()
+        assert not opened_stage.GetPrimAtPath("/World/FromMutedLayer").IsValid()
+        assert tuple(
+            os.path.normpath(identifier) for identifier in adapter._loaded_muted_layer_identifiers
+        ) == (os.path.normpath(muted_identifier),)
+
     def test_dirty_file_backed_stage_loads_live_snapshot_not_disk_file(
         self, tmp_path
     ) -> None:
@@ -322,8 +379,8 @@ def Xform "Child"
 class TestSnapshotCompositionFidelity:
     """A dirty-root snapshot must compose exactly what the live stage does.
 
-    Reviewer finding: when the snapshot cannot be created beside the
-    original root (non-writable directory) and falls back elsewhere,
+    When the snapshot cannot be created beside the original root
+    (non-writable directory) and falls back elsewhere,
     relative composition arcs silently stopped resolving and ovrtx received
     an incomplete scene. These tests pin the guarantee for relative
     references, payloads, and sublayers under a non-writable anchor, keep
@@ -585,8 +642,8 @@ def Xform "World"
 class TestAtomicPreparationOwnership:
     """Failed prospective loads must not mutate current ownership.
 
-    Reviewer finding: preparation of a prospective dirty-stage load released
-    the retained output, dispatched pending picks, deleted the previous
+    Preparing a prospective dirty-stage load must not release retained
+    output, dispatch pending picks, delete the previous
     owned snapshot, and reassigned ``_stage`` BEFORE the prospective inputs
     were proven usable — a failure left the adapter split-brained (old
     renderer scene, new stage identity, old resources gone). Preparation is
@@ -776,7 +833,7 @@ def Xform "World"
 class TestUriIdentifierPreservation:
     """Relocated snapshots must not corrupt URI/resolver identifiers.
 
-    Reviewer finding: ``ComputeAbsolutePath`` "normalized"
+    ``ComputeAbsolutePath`` can otherwise normalize
     ``https://assets.example.test/a.usda`` into
     ``https:/assets.example.test/a.usda``. Already-absolute URI and
     resolver identifiers must be preserved byte-for-byte; only genuinely
@@ -971,8 +1028,8 @@ class TestNativeTransitionAtomicity:
     """The whole load transition — including fallible NATIVE root/session
     installation — must be atomic for every Exception and BaseException.
 
-    Reviewer finding: preparation was atomic but the commit phase mutated
-    ownership (released output, drained picks, destroyed old native layers,
+    The commit phase must not mutate ownership (release output, drain picks,
+    destroy old native layers,
     dropped the old snapshot, swapped the stage) BEFORE the fallible native
     open/session calls; ``_reload_live_root_snapshot`` therefore converted a
     failed transition into a corrupted ``False``. These tests drive the REAL
@@ -1189,8 +1246,8 @@ def _rich_adapter(renderer):
 class TestCompleteStateTransaction:
     """Complete-old-state-or-complete-new-state across the WHOLE operation.
 
-    Fourth-review reproductions: (1) single-root trials destroyed overlays
-    and outline bookkeeping before the prospective session was proven;
+    Covered failure boundaries: (1) single-root trials must not destroy
+    overlays and outline bookkeeping before the prospective session is proven;
     (2) rollback double faults were silently swallowed while the adapter
     kept the old document identity over a rootless renderer; (3) a
     SystemExit while pending picks were drained left old+new layers mixed
@@ -1374,7 +1431,7 @@ class TestCompleteStateTransaction:
         reports clean success: the new scene is the authoritative committed
         document, the un-removable old handle is tracked cleanup debt +
         unresolved state, its snapshot file is retained (not orphaned), and
-        a later teardown/shutdown drains the debt (Codex finding 1)."""
+        a later teardown/shutdown drains the debt."""
 
         renderer = _HandleApiOvrtxFull()
         adapter, stage, fired = self._loaded_rich(tmp_path, renderer)
@@ -1447,8 +1504,9 @@ class TestCompleteStateTransaction:
 
 
 class TestCleanupFaultRecovery:
-    """Fifth-review family: the transaction stays truthful and recoverable
-    even when CLEANUP itself fails — failed prospective-handle removal,
+    """The transaction stays truthful and recoverable when cleanup fails.
+
+    Covered failures include prospective-handle removal,
     scaffolding snapshot leaks, chained deferred/commit faults, and
     self-teardown snapshot residue."""
 
@@ -1721,9 +1779,8 @@ class TestSingleRootReuseReconcile:
 class TestNativeCleanupRefusalAndIdentity:
     """Native cleanup is an owned, retryable transaction, including faults.
 
-    These are durable versions of the external worker-phase-0 A/B/C probes.
-    They use real dirty OpenUSD stages and the complete adapter lifecycle; only
-    the two native API shapes are deterministic doubles.
+    These cases use real dirty OpenUSD stages and the complete adapter
+    lifecycle; only the two native API shapes are deterministic doubles.
     """
 
     def _dirty_scene(self, tmp_path, tag):
@@ -1858,11 +1915,19 @@ class TestNativeCleanupRefusalAndIdentity:
         assert renderer.layers == {}
 
     def test_current_root_and_session_failures_refuse_without_abandoning(
-        self, tmp_path
+        self, tmp_path, request
     ):
         renderer = _HandleApiOvrtxFull()
         adapter, stage = self._loaded(tmp_path, renderer)
         renderer_identity = renderer
+        released = []
+
+        class _Instrumentation(Instrumentation):
+            def release_renderer(self, owner):
+                released.append(owner)
+
+        set_instrumentation(_Instrumentation())
+        request.addfinalizer(lambda: set_instrumentation(None))
         root = adapter._usd_handle
         session = adapter._session_handle
         snapshot = adapter._owned_tmp_path
@@ -1883,6 +1948,7 @@ class TestNativeCleanupRefusalAndIdentity:
             adapter.shutdown()
         assert refused.value is session_error
         assert adapter._renderer is renderer_identity
+        assert released == []
         assert adapter._stage is stage
         assert adapter._usd_handle is root
         assert adapter._session_handle is session
@@ -1912,6 +1978,7 @@ class TestNativeCleanupRefusalAndIdentity:
         adapter.shutdown()
         assert renderer.layers == {}
         assert adapter._renderer is None
+        assert released == [adapter]
         assert adapter._stage is None
         assert adapter._usd_handle is None
         assert adapter._session_handle is None
@@ -2159,3 +2226,266 @@ class TestNativeCleanupRefusalAndIdentity:
         assert adapter._session_handle in renderer.layers
         assert adapter.native_cleanup_diagnostics == ()
         adapter.shutdown()
+
+
+class TestGloballyOwnedRenderSettingDelivery:
+    """A globally owned setting must reach OVRTX's own owner prim, and only it.
+
+    OVRTX resolves globally scoped settings from a RenderSettings prim on the
+    stage it opened; a `RenderProduct`/`Camera` opinion is never read
+    (`IRenderSettingsContext` fetches those from different owner slots), and
+    the user's own layers must stay untouched.
+    """
+
+    def test_globally_owned_value_reaches_the_owner_prim_and_nothing_else(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from ovui_data_adapters.openusd import renderer_adapter as module
+
+        scene_path = tmp_path / "globally_owned.usda"
+        scene_path.write_text(
+            _SCENE
+            + """
+def Camera "Cam"
+{
+}
+
+def RenderProduct "Product"
+{
+    rel camera = </Cam>
+    uniform int2 resolution = (64, 64)
+}
+""",
+            encoding="utf-8",
+        )
+        stage = Usd.Stage.Open(str(scene_path))
+
+        attr_name = "omni:probe:globalOnly"
+        for name, value in (
+            ("_RENDER_SETTINGS_PROVIDER_ID", "probe"),
+            ("_RENDER_SETTINGS_PUBLIC_NAMESPACES", ("omni:probe:",)),
+            ("_RENDER_SETTINGS_METADATA_KEY", "probe"),
+            ("_RENDER_SETTINGS_GROUP_FALLBACK", "probe"),
+            (
+                "_RENDER_SETTINGS_BUILTIN_SPECS",
+                ({
+                    "attr_name": attr_name,
+                    "usd_type": "bool",
+                    "owner_scope": module._RENDER_SETTINGS_OWNER_SCOPE,
+                    "default": False,
+                },),
+            ),
+        ):
+            monkeypatch.setattr(module, name, value)
+        monkeypatch.setattr(
+            module,
+            "_RENDER_SETTINGS_BUILTIN_SPEC_INDEX",
+            {attr_name: module._RENDER_SETTINGS_BUILTIN_SPECS[0]},
+        )
+
+        renderer = _RecordingRenderer()
+        adapter = _make_adapter(renderer)
+        adapter._latest_point_cloud_frames = {}
+        adapter.load_stage(stage)
+        adapter._render_product_path = "/Product"
+
+        result = adapter.apply_render_setting(f"/Product:{attr_name}", True)
+        assert result.accepted, result.message
+
+        # The renderer was handed a root carrying the opinion at the prim
+        # OVRTX itself resolves for globally owned settings.
+        delivered = _snapshot_text(renderer.opened_paths[-1])
+        owner_layer = Sdf.Layer.CreateAnonymous(".usda")
+        assert owner_layer.ImportFromString(delivered)
+        owner_spec = owner_layer.GetPrimAtPath(
+            module._RENDER_SETTINGS_OWNER_PATH
+        )
+        assert owner_spec is not None, (
+            "the globally owned setting never reached OVRTX's owner prim"
+        )
+        assert attr_name in {prop.name for prop in owner_spec.properties}
+
+        # It must never be authored where the renderer would not read it,
+        # nor into any layer of the user's document.
+        for path in ("/Product", "/Cam"):
+            prim = stage.GetPrimAtPath(path)
+            assert not prim.GetAttribute(attr_name).IsValid(), (
+                f"a globally owned setting was authored onto {path}"
+            )
+        for layer in (stage.GetRootLayer(), stage.GetSessionLayer()):
+            assert layer.GetPrimAtPath(
+                module._RENDER_SETTINGS_OWNER_ROOT_PATH
+            ) is None, "the hidden owner prim leaked into the user's document"
+
+
+def test_camera_owned_setting_reads_back_from_the_camera_not_the_render_product() -> None:
+    """A setting the renderer reads from the Camera must be READ from the Camera.
+
+    The builtin catalog rows are described from the RenderProduct. A Camera-owned
+    row (the exposure / autoExposure family) is authored onto the Camera the
+    product references, so describing it from the product reports the declared
+    default with ``authored=False`` after every successful edit: the row visibly
+    snaps back, the no-op comparison uses the wrong previous value, and the
+    reset affordance never lights up for the entire owner class."""
+
+    from pxr import Sdf, Usd, UsdGeom, UsdRender
+
+    from ovui_data_adapters.openusd import renderer_adapter as module
+
+    camera_attr = "omni:rtx:probe:cameraOwned"
+    product_attr = "omni:rtx:probe:productOwned"
+    previous = (
+        module._RENDER_SETTINGS_PROVIDER_ID,
+        module._RENDER_SETTINGS_PROVIDER_LABEL,
+        module._RENDER_SETTINGS_PUBLIC_NAMESPACES,
+        module._RENDER_SETTINGS_METADATA_KEY,
+        module._RENDER_SETTINGS_GROUP_FALLBACK,
+        module._RENDER_SETTINGS_GROUP_LABEL_FALLBACK,
+        module._RENDER_SETTINGS_BUILTIN_SPECS,
+    )
+    module.configure_render_settings_schema(
+        provider_id="test",
+        provider_label="Test",
+        public_namespaces=("omni:rtx:",),
+        metadata_key=previous[3],
+        group_fallback="test",
+        group_label_fallback="Test",
+        builtin_specs=(
+            {"attr_name": camera_attr, "usd_type": "float", "owner_scope": "Camera",
+             "default": 1.5, "label": "Camera Owned"},
+            {"attr_name": product_attr, "usd_type": "float",
+             "owner_scope": "RenderProduct", "default": 2.5, "label": "Product Owned"},
+        ),
+    )
+    try:
+        stage = Usd.Stage.CreateInMemory()
+        camera = UsdGeom.Camera.Define(stage, "/Session/Cameras/Main")
+        product = UsdRender.Product.Define(stage, "/Session/Render/Viewport")
+        product.GetPrim().CreateRelationship("camera").SetTargets(
+            [Sdf.Path("/Session/Cameras/Main")]
+        )
+        camera.GetPrim().CreateAttribute(
+            camera_attr, Sdf.ValueTypeNames.Float, custom=True
+        ).Set(303.5)
+
+        adapter = module.OvRtxRendererAdapter.__new__(module.OvRtxRendererAdapter)
+        adapter._stage = stage
+        adapter._render_product_path = "/Session/Render/Viewport"
+        adapter._renderer = None
+        adapter._session_handle = None
+
+        catalog = adapter.list_render_settings()
+        by_attr = {
+            str(row.metadata.get("attr_name")): row for row in catalog.settings
+        }
+
+        camera_row = by_attr[camera_attr]
+        assert camera_row.value_state.current_value == 303.5
+        assert camera_row.value_state.authored is True
+        # and the value is nowhere near the RenderProduct
+        assert not product.GetPrim().GetAttribute(camera_attr).IsValid()
+
+        product_row = by_attr[product_attr]
+        assert product_row.value_state.current_value == 2.5
+        assert product_row.value_state.authored is False
+    finally:
+        module.configure_render_settings_schema(
+            provider_id=previous[0],
+            provider_label=previous[1],
+            public_namespaces=previous[2],
+            metadata_key=previous[3],
+            group_fallback=previous[4],
+            group_label_fallback=previous[5],
+            builtin_specs=previous[6],
+        )
+
+
+def test_single_setting_read_reports_what_the_catalog_reports() -> None:
+    """One value read must agree with the catalog it stands in for.
+
+    ``read_render_setting_value`` exists so a caller after a single token does
+    not have to describe the whole declared surface to reach it. It is only
+    useful if it is interchangeable with the catalog, so every declared row is
+    compared against the catalog's own answer — across all three owner scopes,
+    and in both the authored and the unauthored branch."""
+
+    from pxr import Sdf, Usd, UsdGeom, UsdRender
+
+    from ovui_data_adapters.openusd import renderer_adapter as module
+
+    camera_attr = "omni:rtx:probe:cameraOwned"
+    product_attr = "omni:rtx:probe:productOwned"
+    global_attr = "omni:rtx:probe:globallyOwned"
+    previous = (
+        module._RENDER_SETTINGS_PROVIDER_ID,
+        module._RENDER_SETTINGS_PROVIDER_LABEL,
+        module._RENDER_SETTINGS_PUBLIC_NAMESPACES,
+        module._RENDER_SETTINGS_METADATA_KEY,
+        module._RENDER_SETTINGS_GROUP_FALLBACK,
+        module._RENDER_SETTINGS_GROUP_LABEL_FALLBACK,
+        module._RENDER_SETTINGS_BUILTIN_SPECS,
+    )
+    module.configure_render_settings_schema(
+        provider_id="test",
+        provider_label="Test",
+        public_namespaces=("omni:rtx:",),
+        metadata_key=previous[3],
+        group_fallback="test",
+        group_label_fallback="Test",
+        builtin_specs=(
+            {"attr_name": camera_attr, "usd_type": "float", "owner_scope": "Camera",
+             "default": 1.5, "label": "Camera Owned"},
+            {"attr_name": product_attr, "usd_type": "float",
+             "owner_scope": "RenderProduct", "default": 2.5, "label": "Product Owned"},
+            {"attr_name": global_attr, "usd_type": "float",
+             "owner_scope": "RenderSettings", "default": 3.5,
+             "label": "Globally Owned"},
+        ),
+    )
+    try:
+        stage = Usd.Stage.CreateInMemory()
+        camera = UsdGeom.Camera.Define(stage, "/Session/Cameras/Main")
+        product = UsdRender.Product.Define(stage, "/Session/Render/Viewport")
+        product.GetPrim().CreateRelationship("camera").SetTargets(
+            [Sdf.Path("/Session/Cameras/Main")]
+        )
+        adapter = module.OvRtxRendererAdapter.__new__(module.OvRtxRendererAdapter)
+        adapter._stage = stage
+        adapter._render_product_path = "/Session/Render/Viewport"
+        adapter._renderer = None
+        adapter._session_handle = None
+
+        def catalog_agrees() -> None:
+            for row in adapter.list_render_settings().settings:
+                attr_name = str(row.metadata.get("attr_name") or "")
+                assert adapter.read_render_setting_value(attr_name) == (
+                    row.value_state.current_value
+                ), f"single read disagrees with the catalog for {attr_name}"
+
+        # every row unauthored
+        catalog_agrees()
+
+        # the camera-owned row authored on the camera, the product-owned row
+        # authored on the product
+        camera.GetPrim().CreateAttribute(
+            camera_attr, Sdf.ValueTypeNames.Float, custom=True
+        ).Set(303.5)
+        product.GetPrim().CreateAttribute(
+            product_attr, Sdf.ValueTypeNames.Float, custom=True
+        ).Set(404.5)
+        catalog_agrees()
+        assert adapter.read_render_setting_value(camera_attr) == 303.5
+        assert adapter.read_render_setting_value(product_attr) == 404.5
+
+        # a name the schema never declared has no row and therefore no value
+        assert adapter.read_render_setting_value("omni:rtx:probe:absent") is None
+    finally:
+        module.configure_render_settings_schema(
+            provider_id=previous[0],
+            provider_label=previous[1],
+            public_namespaces=previous[2],
+            metadata_key=previous[3],
+            group_fallback=previous[4],
+            group_label_fallback=previous[5],
+            builtin_specs=previous[6],
+        )

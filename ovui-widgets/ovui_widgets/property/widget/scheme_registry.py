@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """``PropertySchemeRegistry`` — scheme-keyed widget & delegate registry.
 
@@ -80,6 +73,7 @@ baseline ("default" scheme → AttributesWidget) as production.
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple
 
@@ -145,11 +139,14 @@ class _WidgetSubscription:
     evaporating at garbage-collection time.
 
     ``cancel`` drops the ``(scheme, name)`` entry on first call and
-    self-nulls — a second ``cancel`` is a no-op. That makes the
-    happy-path sequence (``cancel`` → someone else registers a
-    replacement under the same ``(scheme, name)`` → forgotten
-    ``cancel`` on the stale handle fires again) safe: the second
-    ``cancel`` no-ops and the replacement survives.
+    self-nulls — a second ``cancel`` is a no-op. The handle is bound to
+    its exact registration generation (the unique entry record created
+    by this ``register_widget`` call), so a stale ``cancel`` — after
+    the entry was authoritatively removed and an independent owner
+    registered a replacement under the same key, even one reusing the
+    same factory object or class — no-ops instead of removing the
+    replacement: re-registering the same object creates a NEW entry
+    record that an old handle cannot match.
     """
 
     def __init__(
@@ -157,18 +154,25 @@ class _WidgetSubscription:
         registry: "PropertySchemeRegistry",
         scheme: str,
         name: str,
+        entry: "_WidgetEntry",
     ) -> None:
         self._registry: Optional["PropertySchemeRegistry"] = registry
         self._scheme: Optional[str] = scheme
         self._name: Optional[str] = name
+        self._entry: Optional["_WidgetEntry"] = entry
 
     def cancel(self) -> None:
-        if self._registry is None or self._scheme is None or self._name is None:
+        if (
+            self._registry is None
+            or self._scheme is None
+            or self._entry is None
+        ):
             return
-        self._registry._unregister_widget(self._scheme, self._name)
+        self._registry._remove_widget_entry(self._scheme, self._entry)
         self._registry = None
         self._scheme = None
         self._name = None
+        self._entry = None
 
 
 class _DelegateSubscription:
@@ -177,7 +181,10 @@ class _DelegateSubscription:
     Mirrors :class:`_WidgetSubscription` exactly — separate class so
     callers can tell widget and delegate subscriptions apart in type
     annotations / ``isinstance`` checks, which becomes relevant in
-    Step 6.6 when delegates drive widget visibility.
+    When delegates drive widget visibility, this registry, like the widget
+    handle, it is bound to its exact registration generation (entry
+    record) and never removes a same-key replacement, even one reusing
+    the same delegate instance.
     """
 
     def __init__(
@@ -185,18 +192,25 @@ class _DelegateSubscription:
         registry: "PropertySchemeRegistry",
         scheme: str,
         name: str,
+        entry: "_DelegateEntry",
     ) -> None:
         self._registry: Optional["PropertySchemeRegistry"] = registry
         self._scheme: Optional[str] = scheme
         self._name: Optional[str] = name
+        self._entry: Optional["_DelegateEntry"] = entry
 
     def cancel(self) -> None:
-        if self._registry is None or self._scheme is None or self._name is None:
+        if (
+            self._registry is None
+            or self._scheme is None
+            or self._entry is None
+        ):
             return
-        self._registry._unregister_delegate(self._scheme, self._name)
+        self._registry._remove_delegate_entry(self._scheme, self._entry)
         self._registry = None
         self._scheme = None
         self._name = None
+        self._entry = None
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +245,14 @@ class PropertySchemeRegistry:
         # delegate registrations so a stable cross-scheme registration
         # order survives the merge in :meth:`get_widgets_for_payload`.
         self._counter: int = 0
+        # Weak identity ledger of every widget instance this registry
+        # has handed out from :meth:`get_widgets_for_payload`. Detects
+        # factories that return the same (singleton) instance across
+        # dispatches — which would share per-window state — without
+        # ever keeping a widget alive.
+        self._issued_widgets: (
+            "weakref.WeakValueDictionary[int, PropertyWidget]"
+        ) = weakref.WeakValueDictionary()
 
     @classmethod
     def instance(cls) -> "PropertySchemeRegistry":
@@ -279,7 +301,12 @@ class PropertySchemeRegistry:
         ``widget_factory`` is a zero-argument callable returning a
         :class:`PropertyWidget`. It is invoked fresh on every
         :meth:`get_widgets_for_payload` call, so per-window state is
-        never shared across :class:`PropertyWindow` rebuilds.
+        never shared across :class:`PropertyWindow` rebuilds. Returning
+        a fresh, unshared ``PropertyWidget`` per invocation is a
+        REQUIRED registrar precondition: dispatch rejects ``None``,
+        non-``PropertyWidget`` results, instances shared with another
+        factory in the same dispatch, and instances the factory already
+        issued earlier (see :meth:`get_widgets_for_payload`).
 
         ``order`` is the primary sort key (lower = earlier); ``100`` is
         the conventional "middle of the stack" position matching Kit's
@@ -299,17 +326,16 @@ class PropertySchemeRegistry:
                 f"PropertySchemeRegistry: widget {name!r} already "
                 f"registered for scheme {scheme!r}"
             )
-        entries.append(
-            _WidgetEntry(
-                name=name,
-                factory=widget_factory,
-                order=order,
-                top_stack=top_stack,
-                insertion=self._counter,
-            )
+        entry = _WidgetEntry(
+            name=name,
+            factory=widget_factory,
+            order=order,
+            top_stack=top_stack,
+            insertion=self._counter,
         )
+        entries.append(entry)
         self._counter += 1
-        return _WidgetSubscription(self, scheme, name)
+        return _WidgetSubscription(self, scheme, name, entry)
 
     def register_scheme_delegate(
         self,
@@ -340,15 +366,14 @@ class PropertySchemeRegistry:
                 f"PropertySchemeRegistry: delegate {name!r} already "
                 f"registered for scheme {scheme!r}"
             )
-        entries.append(
-            _DelegateEntry(
-                name=name,
-                delegate=delegate,
-                insertion=self._counter,
-            )
+        entry = _DelegateEntry(
+            name=name,
+            delegate=delegate,
+            insertion=self._counter,
         )
+        entries.append(entry)
         self._counter += 1
-        return _DelegateSubscription(self, scheme, name)
+        return _DelegateSubscription(self, scheme, name, entry)
 
     # ------------------------------------------------------------------
     # Query API
@@ -406,7 +431,98 @@ class PropertySchemeRegistry:
             entry for entry in entries
             if entry.name in wanted or entry.name not in unwanted
         ]
-        return [entry.factory() for entry in survivors]
+        # Construction is an ownership transaction with an enforced
+        # freshness contract: every factory result must be a fresh,
+        # previously unproduced PropertyWidget instance, unshared within
+        # this dispatch — a REQUIRED registrar precondition, rejected
+        # here rather than surfacing as a less precise host failure
+        # later. Each accepted identity is retired into the weak ledger
+        # IMMEDIATELY — before the next factory runs — so an instance
+        # destroyed by this transaction's rollback can never be handed
+        # out by a later dispatch (use-after-destroy). A later factory
+        # or validation failure destroys every unique earlier instance
+        # exactly once (all destruction attempted, even hostile objects
+        # whose ``destroy`` lookup raises) before the initiating
+        # factory/validation error — always the primary exception —
+        # propagates. Without this, a widget built by an earlier
+        # factory would belong to nobody: the registry had returned it
+        # and the window never received the list.
+        widgets: List["PropertyWidget"] = []
+        try:
+            for entry in survivors:
+                widget = entry.factory()
+                self._validate_fresh_widget(entry.name, widget, widgets)
+                self._retire_widget_identity(widget)
+                widgets.append(widget)
+        except BaseException:
+            destroyed_ids: Set[int] = set()
+            for widget in widgets:
+                if id(widget) in destroyed_ids:
+                    continue
+                destroyed_ids.add(id(widget))
+                try:
+                    destroy = getattr(widget, "destroy", None)
+                    if callable(destroy):
+                        destroy()
+                except BaseException:
+                    # Rollback failures never mask the initiating error.
+                    pass
+            raise
+        return widgets
+
+    def _retire_widget_identity(self, widget: "PropertyWidget") -> None:
+        """Record ``widget`` as produced, whether or not it is returned.
+
+        Retirement happens at acceptance time, not on transaction
+        success: a rolled-back instance stays in the ledger for as long
+        as it is alive, so a singleton-style factory can never get the
+        registry to return an already-destroyed widget.
+        """
+        try:
+            self._issued_widgets[id(widget)] = widget
+        except TypeError:
+            # Non-weak-referenceable instances cannot be tracked for
+            # cross-dispatch reuse; within-dispatch freshness still
+            # holds.
+            pass
+
+    def _validate_fresh_widget(
+        self,
+        name: str,
+        widget: object,
+        transaction: List["PropertyWidget"],
+    ) -> None:
+        """Enforce the fresh-``PropertyWidget`` factory contract.
+
+        Rejects ``None``/foreign results (``TypeError``), an instance
+        already produced earlier in the same dispatch (``ValueError``),
+        and an instance produced in ANY earlier dispatch — returned or
+        destroyed by that dispatch's rollback alike — handed back again
+        by a singleton-style factory (``ValueError``, via the weak
+        identity ledger).
+        """
+        from ovui_widgets.property.widget.property_widget import PropertyWidget
+
+        if not isinstance(widget, PropertyWidget):
+            raise TypeError(
+                f"PropertySchemeRegistry: factory for widget {name!r} "
+                f"returned {widget!r} instead of a fresh PropertyWidget "
+                "instance"
+            )
+        if any(existing is widget for existing in transaction):
+            raise ValueError(
+                f"PropertySchemeRegistry: factory for widget {name!r} "
+                "returned an instance already produced by another factory "
+                "in this dispatch; factories must return unshared widgets"
+            )
+        if self._issued_widgets.get(id(widget)) is widget:
+            raise ValueError(
+                f"PropertySchemeRegistry: factory for widget {name!r} "
+                "returned an instance it already issued in an earlier "
+                "dispatch (possibly destroyed by that dispatch's "
+                "rollback); factories must construct a fresh widget per "
+                "call"
+            )
 
     def _collect_delegate_names(
         self,
@@ -435,7 +551,141 @@ class PropertySchemeRegistry:
         return wanted, unwanted
 
     # ------------------------------------------------------------------
-    # Subscription internals — only called from the subscription handles
+    # Authoritative inspection/removal
+    #
+    # Registration owners that must recover from failed handle
+    # cancellation (or a registration that mutated the registry before
+    # its handle could be returned) need a way to verify and clean the
+    # actual registry state. Recovery must use the atomic
+    # ``remove_*_if_matches`` operations: ownership comparison (exact
+    # object identity of the registered factory/delegate) and removal
+    # happen in one registry call with no reentrant gap, so stale
+    # cleanup can never remove an independently installed replacement —
+    # not even one of the same class. A split ``find_*`` +
+    # key-only ``remove_*`` sequence cannot make that guarantee and the
+    # key-only removers exist for administrative use only.
+    # ------------------------------------------------------------------
+
+    def find_widget(
+        self, scheme: str, name: str
+    ) -> Optional[Callable[[], "PropertyWidget"]]:
+        """Return the registered factory for ``(scheme, name)``, or ``None``."""
+        for entry in self._widgets.get(scheme, []):
+            if entry.name == name:
+                return entry.factory
+        return None
+
+    def find_scheme_delegate(
+        self, scheme: str, name: str
+    ) -> Optional["PropertySchemeDelegate"]:
+        """Return the registered delegate for ``(scheme, name)``, or ``None``."""
+        for entry in self._delegates.get(scheme, []):
+            if entry.name == name:
+                return entry.delegate
+        return None
+
+    def remove_widget_if_matches(
+        self,
+        scheme: str,
+        name: str,
+        expected_factory: Callable[[], "PropertyWidget"],
+    ) -> bool:
+        """Atomically remove ``(scheme, name)`` iff ``expected_factory`` owns it.
+
+        Returns ``True`` only when the registered entry's factory *is*
+        ``expected_factory`` (object identity) and it was removed. This
+        is the recovery operation for owners whose handle cancellation
+        failed or whose registration mutated the registry before its
+        handle was returned. PRECONDITION: the caller must register a
+        unique factory object per registration generation (as
+        ``_SchemeRegistration``-style owners do) — object identity
+        cannot distinguish generations when the same callable is
+        removed and re-registered, so reused objects would make a stale
+        recovery remove the newer generation. Handle cancellation does
+        not have this caveat: handles bind to the entry record itself.
+        """
+        entries = self._widgets.get(scheme, [])
+        for entry in entries:
+            if entry.name == name:
+                if entry.factory is not expected_factory:
+                    return False
+                self._widgets[scheme] = [e for e in entries if e is not entry]
+                return True
+        return False
+
+    def remove_delegate_if_matches(
+        self,
+        scheme: str,
+        name: str,
+        expected_delegate: "PropertySchemeDelegate",
+    ) -> bool:
+        """Atomically remove the delegate iff ``expected_delegate`` owns it.
+
+        Object-identity counterpart of :meth:`remove_widget_if_matches`
+        for delegate entries.
+        """
+        entries = self._delegates.get(scheme, [])
+        for entry in entries:
+            if entry.name == name:
+                if entry.delegate is not expected_delegate:
+                    return False
+                self._delegates[scheme] = [e for e in entries if e is not entry]
+                return True
+        return False
+
+    def remove_widget(self, scheme: str, name: str) -> bool:
+        """Remove the widget entry for ``(scheme, name)`` by key alone.
+
+        Administrative operation: it asserts no ownership, so recovery
+        paths must use :meth:`remove_widget_if_matches` instead — a
+        key-only removal after a separate ownership check can delete a
+        replacement installed between the two calls.
+        """
+        entries = self._widgets.get(scheme, [])
+        if not any(entry.name == name for entry in entries):
+            return False
+        self._widgets[scheme] = [entry for entry in entries if entry.name != name]
+        return True
+
+    def remove_scheme_delegate(self, scheme: str, name: str) -> bool:
+        """Remove the delegate entry for ``(scheme, name)`` by key alone.
+
+        Administrative counterpart of :meth:`remove_widget`; recovery
+        paths must use :meth:`remove_delegate_if_matches`.
+        """
+        entries = self._delegates.get(scheme, [])
+        if not any(entry.name == name for entry in entries):
+            return False
+        self._delegates[scheme] = [entry for entry in entries if entry.name != name]
+        return True
+
+    # ------------------------------------------------------------------
+    # Generation-conditional removal — only called from the
+    # subscription handles. The entry record IS the registration
+    # generation: re-registering the same factory/delegate object under
+    # the same key creates a new record, so a stale handle's removal
+    # no-ops instead of dropping the new generation.
+    # ------------------------------------------------------------------
+
+    def _remove_widget_entry(self, scheme: str, entry: _WidgetEntry) -> bool:
+        entries = self._widgets.get(scheme, [])
+        if not any(existing is entry for existing in entries):
+            return False
+        self._widgets[scheme] = [e for e in entries if e is not entry]
+        return True
+
+    def _remove_delegate_entry(self, scheme: str, entry: _DelegateEntry) -> bool:
+        entries = self._delegates.get(scheme, [])
+        if not any(existing is entry for existing in entries):
+            return False
+        self._delegates[scheme] = [e for e in entries if e is not entry]
+        return True
+
+    # ------------------------------------------------------------------
+    # Administrative internals — key-only removal for tests/tooling.
+    # Subscription handles do NOT route through these; they use the
+    # generation-conditional removal above so a stale cancel can never
+    # drop a same-key replacement.
     # ------------------------------------------------------------------
 
     def _unregister_widget(self, scheme: str, name: str) -> None:

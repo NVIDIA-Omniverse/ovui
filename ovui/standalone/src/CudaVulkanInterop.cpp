@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "CudaVulkanInterop.h"
@@ -43,11 +36,67 @@ inline void closeExtMemHandle(HANDLE h) { if (h) ::CloseHandle(h); }
 #else
 inline void closeExtMemHandle(int fd) { if (fd >= 0) ::close(fd); }
 #endif
+
+// Return the CUDA device that is the same physical adapter as the given Vulkan
+// physical device, or -1 when none is.
+//
+// The two APIs do not agree on device order, so importing memory exported by
+// Vulkan adapter A into a CUDA context on adapter B either fails or reads
+// unrelated memory. They also do not agree on how to name an adapter:
+//
+//   * on Windows the driver reports a LUID, and cudaDeviceProp::uuid is *not*
+//     comparable with VkPhysicalDeviceIDProperties::deviceUUID. Matching on
+//     UUID there never succeeds, so the correlation has to use the LUID that
+//     both APIs do expose;
+//   * everywhere else the UUID is the shared identity.
+int matchCudaDeviceImpl(VkPhysicalDevice physicalDevice)
+{
+    int cudaDeviceCount = 0;
+    if (cudaGetDeviceCount(&cudaDeviceCount) != cudaSuccess || cudaDeviceCount == 0)
+        return -1;
+
+    VkPhysicalDeviceIDProperties idProps = {};
+    idProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDeviceProperties2 props2 = {};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &idProps;
+    vkGetPhysicalDeviceProperties2(physicalDevice, &props2);
+
+#if defined(_WIN32)
+    // The LUID names the adapter; the node mask names the node within a linked
+    // adapter. Both are needed: two nodes of one linked adapter share a LUID,
+    // so comparing the LUID alone can select the wrong CUDA device.
+    if (idProps.deviceLUIDValid != VK_TRUE)
+        return -1;
+#endif
+
+    for (int i = 0; i < cudaDeviceCount; i++)
+    {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, i) != cudaSuccess)
+            continue;
+#if defined(_WIN32)
+        if (memcmp(prop.luid, idProps.deviceLUID, sizeof(prop.luid)) == 0 &&
+            prop.luidDeviceNodeMask == idProps.deviceNodeMask)
+            return i;
+#else
+        if (memcmp(prop.uuid.bytes, idProps.deviceUUID, sizeof(prop.uuid.bytes)) == 0)
+            return i;
+#endif
+    }
+    return -1;
+}
 } // namespace
 
 namespace omni {
 namespace ui {
 namespace standalone {
+
+int matchCudaDeviceForVulkan(VkPhysicalDevice physicalDevice)
+{
+    return matchCudaDeviceImpl(physicalDevice);
+}
+
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -183,6 +232,7 @@ void CudaVulkanInterop::shutdown()
         }
     }
     m_initialized = false;
+    m_vkQueue = VK_NULL_HANDLE;
 }
 
 bool CudaVulkanInterop::init(VulkanBackend& backend)
@@ -197,38 +247,30 @@ bool CudaVulkanInterop::init(VulkanBackend& backend)
     m_vkQueue = backend.getQueue();
     backend.getFramebufferSize(&m_width, &m_height);
 
-    // Initialize CUDA — pick the GPU that matches the Vulkan device UUID
-    int cudaDeviceCount = 0;
-    cudaGetDeviceCount(&cudaDeviceCount);
-    if (cudaDeviceCount == 0)
+    // Initialize CUDA on the adapter Vulkan is rendering with. Importing the
+    // exported allocation into a context for any other adapter reads unrelated
+    // memory, so an uncorrelated adapter is refused rather than guessed at —
+    // the same decision the byte-image import path already makes.
+    const int selectedCudaDev = matchCudaDeviceImpl(backend.getPhysicalDevice());
+    if (selectedCudaDev < 0)
     {
-        fprintf(stderr, "CudaVulkanInterop: no CUDA devices found\n");
+        fprintf(stderr,
+                "CudaVulkanInterop: no CUDA device corresponds to the Vulkan "
+                "adapter, so frame export is unavailable. This needs an NVIDIA "
+                "GPU that the driver exposes to both APIs under one identity; a "
+                "software Vulkan implementation, or a partitioned device that "
+                "reports different identities to Vulkan and CUDA, cannot be "
+                "correlated.\n");
         return false;
-    }
-
-    // Get Vulkan device UUID
-    VkPhysicalDeviceIDProperties idProps = {};
-    idProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
-    VkPhysicalDeviceProperties2 props2 = {};
-    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    props2.pNext = &idProps;
-    vkGetPhysicalDeviceProperties2(backend.getPhysicalDevice(), &props2);
-
-    // Find matching CUDA device
-    int selectedCudaDev = 0;
-    for (int i = 0; i < cudaDeviceCount; i++)
-    {
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, i);
-        if (memcmp(prop.uuid.bytes, idProps.deviceUUID, sizeof(prop.uuid.bytes)) == 0)
-        {
-            selectedCudaDev = i;
-            fprintf(stdout, "CudaVulkanInterop: matched CUDA device %d (%s)\n", i, prop.name);
-            break;
-        }
     }
     if (!checkCuda(cudaSetDevice(selectedCudaDev), "cudaSetDevice"))
         return false;
+    {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, selectedCudaDev) == cudaSuccess)
+            fprintf(stdout, "CudaVulkanInterop: using CUDA device %d (%s)\n",
+                    selectedCudaDev, prop.name);
+    }
 
     if (!importVulkanMemory(backend))
         return false;
@@ -637,49 +679,20 @@ bool importVkImageMemoryToCudaWithFormat(VkDevice device,
 
     *outImport = CudaImageImport{};
 
-    // Match CUDA device to the Vulkan physical device by UUID. Mirrors the
-    // setup in CudaVulkanInterop::init (CudaVulkanInterop.cpp:115-146): on
-    // multi-GPU hosts CUDA's "device 0" and Vulkan's "physical device 0"
-    // need not agree, and importing external memory exported by Vulkan GPU
-    // A into CUDA context for GPU B silently fails or corrupts.
-    int cudaDeviceCount = 0;
-    cudaGetDeviceCount(&cudaDeviceCount);
-    if (cudaDeviceCount == 0)
-    {
-        fprintf(stderr, "importVkImageMemoryToCuda: no CUDA devices found\n");
-        return false;
-    }
-
-    VkPhysicalDeviceIDProperties idProps = {};
-    idProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
-    VkPhysicalDeviceProperties2 props2 = {};
-    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    props2.pNext = &idProps;
-    vkGetPhysicalDeviceProperties2(physicalDevice, &props2);
-
-    int matchedCudaDev = -1;
-    for (int i = 0; i < cudaDeviceCount; i++)
-    {
-        cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, i) != cudaSuccess)
-            continue;
-        if (memcmp(prop.uuid.bytes, idProps.deviceUUID,
-                   sizeof(prop.uuid.bytes)) == 0)
-        {
-            matchedCudaDev = i;
-            break;
-        }
-    }
+    // Match CUDA device to the Vulkan physical device. On multi-GPU hosts
+    // CUDA's "device 0" and Vulkan's "physical device 0" need not agree, and
+    // importing external memory exported by Vulkan GPU A into a CUDA context
+    // for GPU B silently fails or corrupts.
+    const int matchedCudaDev = matchCudaDeviceImpl(physicalDevice);
     if (matchedCudaDev < 0)
     {
         fprintf(stderr,
-                "importVkImageMemoryToCuda: no CUDA device matches Vulkan "
-                "physical device UUID — refusing to import memory across "
-                "mismatched GPUs\n");
+                "importVkImageMemoryToCuda: no CUDA device matches the Vulkan "
+                "adapter — refusing to import memory across mismatched GPUs\n");
         return false;
     }
     if (!checkCuda(cudaSetDevice(matchedCudaDev),
-                   "cudaSetDevice (matched-by-UUID)"))
+                   "cudaSetDevice (Vulkan-correlated adapter)"))
         return false;
 
     cudaExternalMemoryHandleDesc extMemDesc = {};

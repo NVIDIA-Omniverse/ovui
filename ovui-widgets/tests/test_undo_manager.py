@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Unit tests for UndoManager — Step 58.
 
@@ -25,6 +18,7 @@ redo() defaults to do() if not overridden.
 
 
 from ovui_data_adapters.services.undo import Subscription
+
 from ovui_widgets.common.undo import Command, UndoManager
 
 # ---------------------------------------------------------------------------
@@ -161,6 +155,22 @@ class TestGroupOperations:
         mgr.end_group()
         assert not mgr.can_undo()
         assert len(mgr._undo_stack) == 0
+
+    def test_nested_empty_group_preserves_redo_history(self):
+        mgr = UndoManager()
+        counter = [0]
+        mgr.push(IncrCommand(counter, 1))
+        mgr.undo()
+
+        mgr.begin_group("outer")
+        mgr.begin_group("unchanged edit")
+        mgr.end_group()
+        mgr.end_group()
+
+        assert not mgr.can_undo()
+        assert mgr.can_redo()
+        assert mgr.redo()
+        assert counter[0] == 1
 
     def test_commands_inside_group_execute_immediately(self):
         mgr = UndoManager()

@@ -1,14 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-widgets-content"
-dynamic = ["version"]
+license = {text = "Apache-2.0"}
+# Dependencies are in setup.py: first-party packages are pinned to VERSION.md.
+dynamic = ["version", "dependencies"]
 description = "ovui-widgets Content Browser"
-readme = "README.md"
+readme = {content-type = "text/markdown", text = """
+# ovui-widgets-content
+
+Content Browser package for ovui-widgets. It provides file-navigation UI,
+bookmarks, recent files, local filesystem backend support, file picker dialogs,
+import/export helpers, search, grid/list presentation, rename and delete flows,
+and the explicit open-file handoff used by the USD Viewer application.
+
+The browser is backend-oriented, so storage behavior can be replaced behind the
+same visible widget surface.
+"""}
 requires-python = ">=3.10"
-dependencies = ["ovui-widgets-common>=0.1.0"]
 
 [tool.setuptools.packages.find]
 namespaces = true

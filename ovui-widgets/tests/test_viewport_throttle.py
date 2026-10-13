@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the viewport's update/render split and the central FrameClock.
 
@@ -24,7 +17,8 @@ The few residual tests that still call the legacy ``_on_frame`` shim assert
 that it routes through the new methods.
 """
 
-from unittest.mock import MagicMock
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 from ovui_widgets.app.frame_clock import FrameClock
 from ovui_widgets.common.testing.mock_renderer import MockRendererAdapter
@@ -79,12 +73,17 @@ class TestConfiguredMaxFps:
         assert not hasattr(ViewportWidget, "MAX_FPS_FOREGROUND")
         assert not hasattr(ViewportWidget, "MAX_FPS_BACKGROUND")
 
-    def test_default_is_120(self):
+    def test_default_legacy_tick_path_never_defers_available_work(self):
         from ovui_widgets.common.settings import Settings
 
         Settings.set_instance(None)
         try:
-            assert ViewportWidget._configured_max_fps() == 120.0
+            renderer = MagicMock()
+            vp = _vp_with_fake_image(renderer, 800, 600)
+            vp._on_frame(0.000001)
+            vp._on_frame(0.000001)
+            assert renderer.render_frame.call_count == 2
+            vp.destroy()
         finally:
             Settings.set_instance(None)
 
@@ -112,7 +111,7 @@ class TestConfiguredMaxFps:
         settings.set(RATE_LIMIT_FPS_SETTING_KEY, "bogus")
         Settings.set_instance(settings)
         try:
-            assert ViewportWidget._configured_max_fps() == 120.0
+            assert ViewportWidget._configured_max_fps() is None
         finally:
             Settings.set_instance(None)
 
@@ -140,7 +139,7 @@ class TestMockRendererTracking:
 class TestFrameClock:
     def test_first_call_returns_zero_dt(self):
         """Very first ``should_render`` returns 0.0 — first frame paints
-        immediately without a fake ``time.monotonic() - 0.0`` interval."""
+        immediately without a fake ``time.perf_counter() - 0.0`` interval."""
         clock = FrameClock(target_fps=60.0)
         assert clock.should_render(now=100.0) == 0.0
 
@@ -413,9 +412,13 @@ class TestRender:
         vp.render(0.1)
 
         if vp._fps_label is not None:
-            fps = int(vp._fps_label.text)
+            ui_text, _, render_text = vp._fps_label.text.partition("/")
+            fps = int(ui_text)
             assert fps > 40
             assert fps != 10
+            # No native pacing session here, so the render side stays honest
+            # rather than repeating the UI rate.
+            assert render_text == "-"
         vp.destroy()
 
     def test_render_clamps_resolution(self):
@@ -514,11 +517,22 @@ class TestApplicationRenderCadence:
 
 class TestLegacyOnFrameShim:
     def test_small_dt_skips_render(self):
+        from ovui_widgets.common.settings import (
+            RATE_LIMIT_FPS_SETTING_KEY,
+            Settings,
+        )
+
+        settings = Settings()
+        settings.set(RATE_LIMIT_FPS_SETTING_KEY, 120.0)
+        Settings.set_instance(settings)
         renderer = MagicMock()
         vp = _vp_with_fake_image(renderer, 800, 600)
-        vp._on_frame(1.0 / 240)  # below the default 120 FPS cap period
-        renderer.render_frame.assert_not_called()
-        vp.destroy()
+        try:
+            vp._on_frame(1.0 / 240)  # below the explicit 120 FPS period
+            renderer.render_frame.assert_not_called()
+        finally:
+            vp.destroy()
+            Settings.set_instance(None)
 
     def test_dt_at_or_above_target_paints(self):
         renderer = MagicMock()
@@ -530,6 +544,14 @@ class TestLegacyOnFrameShim:
     def test_direct_render_stress_cannot_exceed_cap(self):
         """Repeated resize/resolution-style direct renders share one cadence
         budget: a burst of events yields at most one render per period."""
+        from ovui_widgets.common.settings import (
+            RATE_LIMIT_FPS_SETTING_KEY,
+            Settings,
+        )
+
+        settings = Settings()
+        settings.set(RATE_LIMIT_FPS_SETTING_KEY, 120.0)
+        Settings.set_instance(settings)
         renderer = MagicMock()
         vp = _vp_with_fake_image(renderer, 800, 600)
         try:
@@ -538,6 +560,7 @@ class TestLegacyOnFrameShim:
             assert renderer.render_frame.call_count == 1
         finally:
             vp.destroy()
+            Settings.set_instance(None)
 
     def test_direct_render_uses_injected_shared_clock(self):
         """With the Application's clock injected, direct renders draw from
@@ -590,4 +613,377 @@ class TestLegacyOnFrameShim:
         renderer = MockRendererAdapter()
         vp = ViewportWidget(services=None, renderer=renderer)
         vp._on_frame(0.016)  # _image is None — must not crash
+        vp.destroy()
+
+
+# ---------------------------------------------------------------------------
+# HUD render-rate sampling
+# ---------------------------------------------------------------------------
+
+
+class TestHudRenderRate:
+    """The right-hand HUD value must belong to this viewport and to the live
+    pacing session, and must never survive the session or its own sampling."""
+
+    OWNED = 7
+
+    @staticmethod
+    def _vp(token: int) -> ViewportWidget:
+        renderer = MockRendererAdapter()
+        renderer._frame_pacing_token = token
+        vp = ViewportWidget(services=None, renderer=renderer)
+        vp._last_fps = 60.0
+        return vp
+
+    @staticmethod
+    def _sample(vp: ViewportWidget, status, clock) -> None:
+        import ovui_widgets.viewport.viewport_widget as module
+
+        with patch.object(module.ui, "get_frame_pacing_status", status, create=True):
+            with patch.object(module.time, "perf_counter", clock):
+                vp._record_render_update_sample()
+
+    @staticmethod
+    def _text(vp: ViewportWidget, clock, status=None) -> str:
+        """Read the HUD text the way the app does: live status is readable."""
+        import ovui_widgets.viewport.viewport_widget as module
+
+        reader = status if status is not None else dict
+        with patch.object(module.ui, "get_frame_pacing_status", reader, create=True):
+            with patch.object(module.time, "perf_counter", clock):
+                return vp._hud_fps_text()
+
+    @classmethod
+    def _status(cls, session: dict) -> Any:
+        return lambda: {
+            "active": True,
+            "session_token": session["token"],
+            "renderer_completions": session["updates"],
+        }
+
+    def test_owner_reports_render_updates_over_wall_time(self):
+        vp = self._vp(self.OWNED)
+        session = {"token": self.OWNED, "updates": 1000}
+        status = self._status(session)
+        self._sample(vp, status, lambda: 100.0)
+        assert self._text(vp, lambda: 100.0, status) == "60/-"  # anchor only
+        session["updates"] = 1240
+        self._sample(vp, status, lambda: 102.0)
+        assert self._text(vp, lambda: 102.0, status) == "60/120"
+        vp.destroy()
+
+    def test_synchronous_renderer_reports_completions_while_pacing_is_off(self):
+        vp = self._vp(0)
+        status = {
+            "active": False,
+            "metrics_epoch": 3,
+            "renderer_completions": 1000,
+        }
+        self._sample(vp, lambda: dict(status), lambda: 100.0)
+        status["renderer_completions"] = 1240
+        self._sample(vp, lambda: dict(status), lambda: 102.0)
+        assert self._text(vp, lambda: 102.0, lambda: dict(status)) == "60/120"
+        vp.destroy()
+
+    def test_non_owner_never_shows_another_viewports_rate(self):
+        """A second viewport sees the same process-global status but owns no
+        borrow, so it must not report the owner's rendering updates."""
+        session = {"token": self.OWNED, "updates": 1000}
+        status = self._status(session)
+        owner = self._vp(self.OWNED)
+        bystander = self._vp(0)
+        for vp in (owner, bystander):
+            self._sample(vp, status, lambda: 100.0)
+        session["updates"] = 1240
+        for vp in (owner, bystander):
+            self._sample(vp, status, lambda: 102.0)
+        assert self._text(owner, lambda: 102.0, status) == "60/120"
+        assert self._text(bystander, lambda: 102.0, status) == "60/-"
+        owner.destroy()
+        bystander.destroy()
+
+    def test_foreign_active_session_is_not_reported(self):
+        """Owning a stale token while a different session is active must not
+        borrow that session's counters."""
+        vp = self._vp(self.OWNED)
+        session = {"token": self.OWNED, "updates": 1000}
+        self._sample(vp, self._status(session), lambda: 100.0)
+        session.update(token=self.OWNED + 1, updates=1240)
+        self._sample(vp, self._status(session), lambda: 102.0)
+        assert self._text(vp, lambda: 102.0, self._status(session)) == "60/-"
+        vp.destroy()
+
+    def test_session_restart_does_not_spike_across_the_old_anchor(self):
+        """A restarted session brings a fresh counter that must not be
+        differenced against the previous session's anchor."""
+        vp = self._vp(self.OWNED)
+        session = {"token": self.OWNED, "updates": 1000}
+        self._sample(vp, self._status(session), lambda: 100.0)
+        session["updates"] = 1240
+        self._sample(vp, self._status(session), lambda: 102.0)
+        assert self._text(vp, lambda: 102.0, self._status(session)) == "60/120"
+        # Restart: new token, and a counter above the old anchor.
+        vp._renderer._frame_pacing_token = self.OWNED + 1
+        session.update(token=self.OWNED + 1, updates=5000)
+        self._sample(vp, self._status(session), lambda: 103.0)
+        assert self._text(vp, lambda: 103.0, self._status(session)) == "60/-"
+        session["updates"] = 5060
+        self._sample(vp, self._status(session), lambda: 104.0)
+        assert self._text(vp, lambda: 104.0, self._status(session)) == "60/60"
+        vp.destroy()
+
+    def test_inactive_session_shows_placeholder(self):
+        vp = self._vp(self.OWNED)
+        self._sample(
+            vp,
+            lambda: {"active": False, "session_token": 0,
+                     "renderer_completions": 900},
+            lambda: 100.0,
+        )
+        assert self._text(vp, lambda: 100.0) == "60/-"
+        vp.destroy()
+
+    def test_malformed_update_counts_are_not_rendered_as_zero(self):
+        vp = self._vp(self.OWNED)
+        for value in ({}, {"renderer_completions": None},
+                      {"renderer_completions": "120"},
+                      {"renderer_completions": -3}):
+            payload = {"active": True, "session_token": self.OWNED}
+            payload.update(value)
+            self._sample(vp, lambda p=payload: p, lambda: 100.0)
+            self._sample(vp, lambda p=payload: p, lambda: 102.0)
+            assert self._text(vp, lambda: 102.0, lambda p=payload: p) == "60/-", value
+        vp.destroy()
+
+    def test_status_failure_shows_placeholder(self):
+        vp = self._vp(self.OWNED)
+
+        def boom():
+            raise RuntimeError("status unavailable")
+
+        self._sample(vp, boom, lambda: 100.0)
+        assert self._text(vp, lambda: 100.0, boom) == "60/-"
+        vp.destroy()
+
+    def test_rate_expires_when_an_update_stops_sampling_it(self):
+        """Hidden/zero-sized/disposed updates never sample, so a previously
+        real rate must not stay on screen."""
+        vp = self._vp(self.OWNED)
+        session = {"token": self.OWNED, "updates": 1000}
+        status = self._status(session)
+        self._sample(vp, status, lambda: 100.0)
+        session["updates"] = 1240
+        self._sample(vp, status, lambda: 102.0)
+        assert self._text(vp, lambda: 102.0, status) == "60/120"
+        # No further samples: the viewport update stopped succeeding.
+        assert self._text(
+            vp, lambda: 102.0 + vp.RENDER_FPS_MAX_AGE_SECONDS + 0.1, status
+        ) == "60/-"
+        vp.destroy()
+
+    def test_losing_the_borrow_drops_the_rate_immediately(self):
+        vp = self._vp(self.OWNED)
+        session = {"token": self.OWNED, "updates": 1000}
+        status = self._status(session)
+        self._sample(vp, status, lambda: 100.0)
+        session["updates"] = 1240
+        self._sample(vp, status, lambda: 102.0)
+        assert self._text(vp, lambda: 102.0, status) == "60/120"
+        vp._renderer._frame_pacing_token = 0  # borrow revoked
+        assert self._text(vp, lambda: 102.0, status) == "60/-"
+        vp.destroy()
+
+    def test_snapshot_render_fps_matches_the_displayed_value(self):
+        """Backend readers must not see a rate the HUD refuses to show."""
+        vp = self._vp(self.OWNED)
+        session = {"token": self.OWNED, "updates": 1000}
+        status = self._status(session)
+        self._sample(vp, status, lambda: 100.0)
+        session["updates"] = 1240
+        self._sample(vp, status, lambda: 102.0)
+        vp._renderer._frame_pacing_token = 0  # borrow revoked
+        import ovui_widgets.viewport.viewport_widget as module
+
+        with patch.object(module.ui, "get_frame_pacing_status", status, create=True):
+            with patch.object(module.time, "perf_counter", lambda: 102.0):
+                snapshot = vp._build_hud_state_snapshot()
+        assert snapshot.render_fps is None
+        assert snapshot.fps_text == "60/-"
+        vp.destroy()
+
+
+class TestHudRenderRateStaysHonestOnScreen:
+    """A rate that has already been painted must disappear from the label the
+    moment it stops being real, including on updates that return early and so
+    never resample."""
+
+    OWNED = 11
+
+    @staticmethod
+    def _painted(session: dict) -> Any:
+        """Viewport whose label really shows a sampled rate, via the ordinary
+        sampling path rather than by assigning the value."""
+        import ovui_widgets.viewport.viewport_widget as module
+
+        renderer = MockRendererAdapter()
+        renderer._frame_pacing_token = TestHudRenderRateStaysHonestOnScreen.OWNED
+        vp = ViewportWidget(services=None, renderer=renderer)
+        vp._build_ui()
+        vp._last_fps = 60.0
+        status = lambda: dict(session)
+        with patch.object(module.ui, "get_frame_pacing_status", status, create=True):
+            for clock, updates in ((100.0, 1000), (102.0, 1240)):
+                session["renderer_completions"] = updates
+                with patch.object(module.time, "perf_counter", lambda c=clock: c):
+                    vp._record_render_update_sample()
+            with patch.object(module.time, "perf_counter", lambda: 102.0):
+                vp._refresh_hud()
+        assert vp._fps_value_label.text == "60/120"
+        return vp
+
+    @staticmethod
+    def _update(vp: Any, session: dict, now: float) -> bool:
+        """Run a viewport update that returns early (no visible image)."""
+        import ovui_widgets.viewport.viewport_widget as module
+
+        vp._image = None
+        with patch.object(module.ui, "get_frame_pacing_status",
+                          lambda: dict(session), create=True):
+            with patch.object(module.time, "perf_counter", lambda: now):
+                return vp.render(0.016)
+
+    @staticmethod
+    def _session() -> dict:
+        return {
+            "active": True,
+            "session_token": TestHudRenderRateStaysHonestOnScreen.OWNED,
+            "renderer_completions": 1240,
+            "render_loop_fatal": False,
+            "render_loop_exited": False,
+        }
+
+    def test_early_return_update_clears_painted_rate_when_session_goes_inactive(self):
+        session = self._session()
+        vp = self._painted(session)
+        session["active"] = False
+        assert self._update(vp, session, 102.0) is False
+        assert vp._fps_value_label.text == "60/-"
+        vp.destroy()
+
+    def test_early_return_update_clears_painted_rate_when_borrow_is_revoked(self):
+        session = self._session()
+        vp = self._painted(session)
+        vp._renderer._frame_pacing_token = 0
+        assert self._update(vp, session, 102.0) is False
+        assert vp._fps_value_label.text == "60/-"
+        vp.destroy()
+
+    def test_early_return_update_clears_painted_rate_after_expiry(self):
+        session = self._session()
+        vp = self._painted(session)
+        expired = 102.0 + vp.RENDER_FPS_MAX_AGE_SECONDS + 0.1
+        assert self._update(vp, session, expired) is False
+        assert vp._fps_value_label.text == "60/-"
+        vp.destroy()
+
+    def test_early_return_update_clears_painted_rate_when_status_unavailable(self):
+        import ovui_widgets.viewport.viewport_widget as module
+
+        vp = self._painted(self._session())
+        vp._image = None
+        with patch.object(module.ui, "get_frame_pacing_status", None, create=True):
+            with patch.object(module.time, "perf_counter", lambda: 102.0):
+                assert vp.render(0.016) is False
+        assert vp._fps_value_label.text == "60/-"
+        vp.destroy()
+
+    def test_early_return_update_clears_painted_rate_on_fatal_or_exited_session(self):
+        for failure in ("render_loop_fatal", "render_loop_exited"):
+            session = self._session()
+            vp = self._painted(session)
+            session[failure] = True
+            assert self._update(vp, session, 102.0) is False
+            assert vp._fps_value_label.text == "60/-", failure
+            vp.destroy()
+
+    def test_malformed_activity_and_token_fields_do_not_keep_the_rate(self):
+        for malformed in ({"active": "false"}, {"session_token": "11"},
+                          {"session_token": 11.0},
+                          {"renderer_completions": "1300"}):
+            session = self._session()
+            vp = self._painted(session)
+            session.update(malformed)
+            assert self._update(vp, session, 102.0) is False
+            assert vp._fps_value_label.text == "60/-", malformed
+            vp.destroy()
+
+    def test_live_session_keeps_the_painted_rate_across_early_returns(self):
+        """The guard must not blank a rate that is still genuine."""
+        session = self._session()
+        vp = self._painted(session)
+        assert self._update(vp, session, 102.5) is False
+        assert vp._fps_value_label.text == "60/120"
+        vp.destroy()
+
+    def test_explicit_refresh_and_snapshot_drop_an_inactive_rate(self):
+        """Reads that never go through an update — an explicit HUD refresh and
+        a state snapshot — must not repaint or expose a dead session's rate."""
+        import ovui_widgets.viewport.viewport_widget as module
+
+        session = self._session()
+        vp = self._painted(session)
+        session["active"] = False
+        with patch.object(module.ui, "get_frame_pacing_status",
+                          lambda: dict(session), create=True):
+            with patch.object(module.time, "perf_counter", lambda: 102.0):
+                vp._refresh_hud()
+                snapshot = vp._build_hud_state_snapshot()
+        assert vp._fps_value_label.text == "60/-"
+        assert snapshot.fps_text == "60/-"
+        assert snapshot.render_fps is None
+        assert snapshot.fps == 60.0  # left-hand rate untouched
+        vp.destroy()
+
+    def test_counter_reset_within_the_same_session_clears_the_rate(self):
+        """A counter that rolls back under an unchanged token cannot be
+        differenced against the existing anchor."""
+        session = self._session()
+        vp = self._painted(session)
+        session["renderer_completions"] = 5  # restarted beneath us
+        assert self._update(vp, session, 102.0) is False
+        assert vp._fps_value_label.text == "60/-"
+        vp.destroy()
+
+    def test_failed_update_that_raises_clears_the_painted_rate(self):
+        """The rate must not survive an update the application aborts with an
+        exception while the session is fatal."""
+        import ovui_widgets.viewport.viewport_widget as module
+
+        session = self._session()
+        vp = self._painted(session)
+        # Healthy when the update starts; the session dies as the work fails.
+        failed = {"yet": False}
+
+        def status() -> dict:
+            current = dict(session)
+            current["render_loop_fatal"] = failed["yet"]
+            return current
+
+        def explode(_self):
+            failed["yet"] = True
+            raise RuntimeError("renderer lost")
+
+        image = MagicMock()
+        image.visible = True
+        type(image).computed_width = property(explode)
+        vp._image = image
+        with patch.object(module.ui, "get_frame_pacing_status", status, create=True):
+            with patch.object(module.time, "perf_counter", lambda: 102.0):
+                try:
+                    vp.render(0.016)
+                except RuntimeError:
+                    pass  # the application catches and continues
+        assert failed["yet"] is True
+        assert vp._fps_value_label.text == "60/-"
+        assert vp._resolution_render_in_progress is False
         vp.destroy()

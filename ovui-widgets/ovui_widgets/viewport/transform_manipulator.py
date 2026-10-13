@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """TransformManipulator — ``sc.Manipulator`` subclass for the transform gizmo.
 
@@ -37,6 +30,7 @@ visible during QA without pre-empting the real gizmo work.
 
 from __future__ import annotations
 
+import math
 from typing import Any, List, Optional, Tuple
 
 from omni.ui_scene import scene as sc
@@ -55,6 +49,15 @@ class TransformGestureBase(sc.DragGesture):
     marquee pick gestures).
     """
 
+    def _acquire_drag(self) -> bool:
+        owner = getattr(self, "_gesture_owner", None)
+        return owner is None or owner.acquire(self)
+
+    def _release_drag(self) -> None:
+        owner = getattr(self, "_gesture_owner", None)
+        if owner is not None:
+            owner.release(self)
+
     def cancel_active_drag(self) -> bool:
         """Cancel this gesture's in-flight drag; a later mouse-up
         cannot commit. ``False`` when nothing active."""
@@ -65,26 +68,33 @@ class TransformGestureBase(sc.DragGesture):
         if hasattr(self, "_drag_start_point"):
             self._drag_start_point = None
         if hasattr(self, "_accumulated"):
-            self._accumulated = [0.0, 0.0, 0.0]
+            accumulated = self._accumulated
+            self._accumulated = (
+                [0.0 for _ in accumulated]
+                if isinstance(accumulated, list)
+                else 0.0
+            )
         model = getattr(self, "_model", None)
         cancel = getattr(model, "on_drag_cancelled", None)
-        if callable(cancel):
-            try:
+        try:
+            if callable(cancel):
                 cancel()
-            except Exception as exc:
-                # The model finalized in its ``finally``; shield-report.
-                try:
-                    from ovui_widgets.common.error_reporter import (
-                        ErrorReporter,
-                    )
-                    ErrorReporter.log_error(
-                        "TransformGesture",
-                        "drag cancellation reported an error; preview "
-                        "may need recovery",
-                        exc,
-                    )
-                except BaseException:
-                    pass
+        except Exception as exc:
+            # The model finalized in its ``finally``; shield-report.
+            try:
+                from ovui_widgets.common.error_reporter import (
+                    ErrorReporter,
+                )
+                ErrorReporter.log_error(
+                    "TransformGesture",
+                    "drag cancellation reported an error; preview "
+                    "may need recovery",
+                    exc,
+                )
+            except BaseException:
+                pass
+        finally:
+            self._release_drag()
         return True
 
 
@@ -108,9 +118,47 @@ class PreventOthers(sc.GestureManager):
       manager because the viewport's ``PickGesture`` /
       ``PickRectGesture`` don't need an order of their own.
 
-    The manager is stateless — one instance can be shared across every
-    gesture in the gizmo, which keeps construction cheap.
+    The shared manager also owns one gizmo drag at a time. A hovered handle
+    wins an overlapping mouse-down, preventing competing transform gestures
+    from opening nested history groups.
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._active_drag: TransformGestureBase | None = None
+        self._hovered_drags: List[TransformGestureBase] = []
+
+    def bind(self, drag: TransformGestureBase, hover: Any) -> None:
+        """Associate one drag with its visible hover feedback."""
+        drag._gesture_owner = self
+        previous = getattr(hover, "_on_state_change", None)
+
+        def _state_changed(hovered: bool) -> None:
+            if callable(previous):
+                previous(hovered)
+            self.set_hovered(drag, hovered)
+
+        hover._on_state_change = _state_changed
+
+    def set_hovered(self, drag: TransformGestureBase, hovered: bool) -> None:
+        self._hovered_drags = [item for item in self._hovered_drags if item is not drag]
+        if hovered:
+            self._hovered_drags.append(drag)
+
+    def acquire(self, drag: TransformGestureBase) -> bool:
+        if self._active_drag is drag:
+            return True
+        if self._active_drag is not None:
+            return False
+        preferred = self._hovered_drags[-1] if self._hovered_drags else None
+        if preferred is not None and preferred is not drag:
+            return False
+        self._active_drag = drag
+        return True
+
+    def release(self, drag: TransformGestureBase) -> None:
+        if self._active_drag is drag:
+            self._active_drag = None
 
     def can_be_prevented(self, gesture: Any) -> bool:
         state = gesture.state
@@ -126,10 +174,10 @@ class PreventOthers(sc.GestureManager):
             and preventer.state in (sc.GestureState.BEGAN, sc.GestureState.CHANGED)
         ):
             if isinstance(gesture, TransformGestureBase):
-                # Two gizmo gestures competing — let both fire (no order
-                # semantics in OvGear yet; Kit's ``order`` / ``ray_distance``
-                # comparison would go here).
-                return False
+                preferred = self._active_drag
+                if preferred is None and self._hovered_drags:
+                    preferred = self._hovered_drags[-1]
+                return preferred is preventer and gesture is not preferred
             return True
         return False
 
@@ -141,6 +189,10 @@ class PreventOthers(sc.GestureManager):
 # docstring and the viewport behavior Tuned for a refined look against a
 # ray-traced background — reference Maya/Blender manipulator proportions.
 GIZMO_SIZE_SCALE: float = 0.05
+
+# |cos| between an axis and the view ray above which that axis shaft has no
+# usable screen length (under about 3 degrees) and is built without gestures.
+VIEW_ALIGNED_COS: float = 0.9986
 
 TOOL_TRANSLATE = "translate"
 TOOL_ROTATE = "rotate"
@@ -201,6 +253,17 @@ class TransformManipulator(sc.Manipulator):
         provided and the model has a selection, the gizmo is positioned
         there. Defaults to returning ``(0, 0, 0)`` — C.5 will supply the
         real pivot from ``TransformAdapter.get_world_matrix``.
+    front_fn:
+        Optional predicate accepting the world-space pivot. Returning
+        ``False`` hides the gizmo at or behind the camera near plane.
+        Predicate failures fail open so the gizmo remains usable.
+    view_dir_fn:
+        Optional callable accepting the world-space pivot and returning the
+        world-space view-ray direction through it. Translate and scale shafts
+        along that ray are drawn without gestures. Failures fail open.
+    cancel_drag_fn:
+        Optional callback that cancels and rolls back an active transform
+        drag before a front-to-behind transition removes the gizmo geometry.
     """
 
     def __init__(
@@ -210,6 +273,9 @@ class TransformManipulator(sc.Manipulator):
         pivot_fn: Optional[Any] = None,
         size_fn: Optional[Any] = None,
         generation: Any = None,
+        front_fn: Optional[Any] = None,
+        cancel_drag_fn: Optional[Any] = None,
+        view_dir_fn: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
         if tool not in VALID_TOOLS:
@@ -219,6 +285,11 @@ class TransformManipulator(sc.Manipulator):
         self._prim_model = model
         self._tool: str = tool
         self._pivot_fn = pivot_fn or (lambda: (0.0, 0.0, 0.0))
+        self._front_fn = front_fn
+        self._cancel_drag_fn = cancel_drag_fn
+        self._last_front = True
+        self._view_dir_fn = view_dir_fn
+        self._last_view_aligned: Tuple[bool, bool, bool] = (False, False, False)
         # Optional callable returning the per-frame world-scale factor.
         # When provided, it overrides :data:`GIZMO_SIZE_SCALE` so the gizmo
         # can track camera distance for constant on-screen size. Returning
@@ -248,6 +319,18 @@ class TransformManipulator(sc.Manipulator):
             AXIS_COLOR_X as _TX_COL_X,  # noqa: F401 — unused, kept for clarity
         )
         from ovui_widgets.viewport.translate_gizmo import (
+            FREE_COLOR,
+            HIGHLIGHT_COLOR_FREE,
+            HIGHLIGHT_COLOR_XY,
+            HIGHLIGHT_COLOR_XZ,
+            HIGHLIGHT_COLOR_YZ,
+            PLANE_COLOR_XY,
+            PLANE_COLOR_XZ,
+            PLANE_COLOR_YZ,
+            HighlightGesture,
+            PrimTranslateChangedGesture,
+        )
+        from ovui_widgets.viewport.translate_gizmo import (
             HIGHLIGHT_COLOR_X as _TX_HI_X,
         )
         from ovui_widgets.viewport.translate_gizmo import (
@@ -255,10 +338,6 @@ class TransformManipulator(sc.Manipulator):
         )
         from ovui_widgets.viewport.translate_gizmo import (
             HIGHLIGHT_COLOR_Z as _TX_HI_Z,
-        )
-        from ovui_widgets.viewport.translate_gizmo import (
-            HighlightGesture,
-            PrimTranslateChangedGesture,
         )
         _axes = (
             ((1.0, 0.0, 0.0), AXIS_COLOR_X, _TX_HI_X),
@@ -274,6 +353,35 @@ class TransformManipulator(sc.Manipulator):
                              generation=generation)
             for _, col, hi in _axes
         ]
+        _planes = (
+            ((1.0, 1.0, 0.0), PLANE_COLOR_XY, HIGHLIGHT_COLOR_XY),
+            ((1.0, 0.0, 1.0), PLANE_COLOR_XZ, HIGHLIGHT_COLOR_XZ),
+            ((0.0, 1.0, 1.0), PLANE_COLOR_YZ, HIGHLIGHT_COLOR_YZ),
+        )
+        self._translate_plane_drags = [
+            PrimTranslateChangedGesture(model=model, axis=mask, generation=generation)
+            for mask, _, _ in _planes
+        ]
+        self._translate_plane_hovers = [
+            HighlightGesture(
+                shapes=[],
+                base_color=col,
+                highlight_color=hi,
+                generation=generation,
+            )
+            for _, col, hi in _planes
+        ]
+        self._translate_free_drag = PrimTranslateChangedGesture(
+            model=model,
+            axis=(1.0, 1.0, 1.0),
+            generation=generation,
+        )
+        self._translate_free_hover = HighlightGesture(
+            shapes=[],
+            base_color=FREE_COLOR,
+            highlight_color=HIGHLIGHT_COLOR_FREE,
+            generation=generation,
+        )
         self._rotate_drags = [
             PrimRotateChangedGesture(model=model, axis=axis, generation=generation)
             for axis, _, _ in _axes
@@ -284,7 +392,12 @@ class TransformManipulator(sc.Manipulator):
             for _, col, hi in _axes
         ]
         self._scale_drags = [
-            PrimScaleChangedGesture(model=model, axis=axis, generation=generation)
+            PrimScaleChangedGesture(
+                model=model,
+                axis=axis,
+                world_scale_fn=self._resolve_scale,
+                generation=generation,
+            )
             for axis, _, _ in _axes
         ]
         self._scale_hovers = [
@@ -294,6 +407,7 @@ class TransformManipulator(sc.Manipulator):
         ]
         self._uniform_scale_drag = PrimScaleChangedGesture(
             model=model, axis=(1.0, 1.0, 1.0), uniform=True,
+            world_scale_fn=self._resolve_scale,
             generation=generation,
         )
         self._uniform_scale_hover = HighlightGesture(
@@ -302,19 +416,21 @@ class TransformManipulator(sc.Manipulator):
             highlight_color=HIGHLIGHT_COLOR_UNIFORM,
             generation=generation,
         )
-        # Shared :class:`PreventOthers` manager installed on every gizmo
-        # drag gesture (not the hovers — only drags carry the arbitration
-        # semantics). Kit keeps one instance per gesture; sharing is
-        # safe because :class:`PreventOthers` is stateless.
+        # Shared manager keeps selection/marquee gestures out and chooses one
+        # hovered gizmo handle when hit regions overlap.
         self._gesture_manager = PreventOthers()
-        for g in (
-            *self._translate_drags,
-            *self._rotate_drags,
-            *self._scale_drags,
-            self._uniform_scale_drag,
-        ):
+        pairs = (
+            *zip(self._translate_drags, self._translate_hovers),
+            *zip(self._translate_plane_drags, self._translate_plane_hovers),
+            (self._translate_free_drag, self._translate_free_hover),
+            *zip(self._rotate_drags, self._rotate_hovers),
+            *zip(self._scale_drags, self._scale_hovers),
+            (self._uniform_scale_drag, self._uniform_scale_hover),
+        )
+        for drag, hover in pairs:
+            self._gesture_manager.bind(drag, hover)
             try:
-                g.manager = self._gesture_manager
+                drag.manager = self._gesture_manager
             except Exception:
                 pass
         # Populated by ``_build_translate_placeholder`` each frame so QA
@@ -426,6 +542,17 @@ class TransformManipulator(sc.Manipulator):
         if not self._last_built_has_selection:
             return
         px, py, pz = self._pivot_fn()
+        self._last_front = self._pivot_in_front((px, py, pz))
+        if not self._last_front:
+            return
+        self._last_view_aligned = self._view_aligned_axes((px, py, pz))
+        # A handle built without gestures never gets its hover-ended event.
+        for aligned, translate, scale_drag in zip(
+            self._last_view_aligned, self._translate_drags, self._scale_drags
+        ):
+            if aligned:
+                self._gesture_manager.set_hovered(translate, False)
+                self._gesture_manager.set_hovered(scale_drag, False)
         scale = self._resolve_scale()
         self._pivot_transform = sc.Transform(
             transform=_translation_matrix(px, py, pz),
@@ -472,15 +599,30 @@ class TransformManipulator(sc.Manipulator):
             # can do that.
             self.invalidate()
             return
-        pivot_transform = getattr(self, "_pivot_transform", None)
-        scale_transform = getattr(self, "_scale_transform", None)
-        if pivot_transform is None or scale_transform is None:
-            return
         if not has_sel_now:
             return
         try:
             px, py, pz = self._pivot_fn()
         except Exception:
+            return
+        front = self._pivot_in_front((px, py, pz))
+        if front != self._last_front:
+            if self._last_front and not front:
+                self._cancel_drag_for_near_plane_transition()
+            self._last_front = front
+            self.invalidate()
+            return
+        if not front:
+            return
+        if (
+            self._view_aligned_axes((px, py, pz)) != self._last_view_aligned
+            and self._gesture_manager._active_drag is None
+        ):
+            self.invalidate()
+            return
+        pivot_transform = getattr(self, "_pivot_transform", None)
+        scale_transform = getattr(self, "_scale_transform", None)
+        if pivot_transform is None or scale_transform is None:
             return
         scale = self._resolve_scale()
         new_pivot = (float(px), float(py), float(pz))
@@ -499,6 +641,44 @@ class TransformManipulator(sc.Manipulator):
 
     def on_model_updated(self, item: Any) -> None:
         """Placeholder for future model-driven rebuilds — hooks Kit's signal."""
+
+    def _pivot_in_front(self, pivot: Any) -> bool:
+        """Return whether ``pivot`` is beyond the near plane.
+
+        The gate is optional and fails open so a transient camera-state error
+        cannot make the transform gizmo disappear permanently.
+        """
+        if self._front_fn is None:
+            return True
+        try:
+            return bool(self._front_fn(pivot))
+        except Exception:
+            return True
+
+    def _view_aligned_axes(self, pivot: Any) -> Tuple[bool, bool, bool]:
+        """Return which world axes point along the view ray through ``pivot``."""
+        if self._view_dir_fn is None:
+            return (False, False, False)
+        try:
+            dx, dy, dz = (float(v) for v in self._view_dir_fn(pivot))
+            length = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if not length > 0.0:
+                return (False, False, False)
+            return tuple(abs(c) / length > VIEW_ALIGNED_COS for c in (dx, dy, dz))
+        except Exception:
+            return (False, False, False)
+
+    def _cancel_drag_for_near_plane_transition(self) -> None:
+        """Cancel an active drag before hiding and rebuilding the gizmo."""
+        if self._cancel_drag_fn is None:
+            return
+        try:
+            self._cancel_drag_fn()
+        except Exception:
+            # Visibility still needs to change even if cancellation reports an
+            # error. The viewport cancellation path finalizes model state in a
+            # ``finally`` block and reports recovery failures itself.
+            pass
 
     # -- private helpers ---------------------------------------------------
 
@@ -524,6 +704,11 @@ class TransformManipulator(sc.Manipulator):
             self._prim_model,
             drag_gestures=self._translate_drags,
             hover_gestures=self._translate_hovers,
+            plane_drag_gestures=self._translate_plane_drags,
+            plane_hover_gestures=self._translate_plane_hovers,
+            free_drag_gesture=self._translate_free_drag,
+            free_hover_gesture=self._translate_free_hover,
+            view_aligned_axes=self._last_view_aligned,
         )
 
     def _build_rotate(self) -> None:
@@ -544,6 +729,5 @@ class TransformManipulator(sc.Manipulator):
             hover_gestures=self._scale_hovers,
             uniform_drag=self._uniform_scale_drag,
             uniform_hover=self._uniform_scale_hover,
+            view_aligned_axes=self._last_view_aligned,
         )
-
-

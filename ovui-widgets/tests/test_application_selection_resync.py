@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -104,6 +97,7 @@ def test_history_reconcile_restores_rename_after_tree_clears_selection() -> None
         },
         _stage_change_listeners=[],
         _viewport_window=None,
+        _secondary_viewport_window=None,
         _layer_window=None,
     )
 
@@ -148,6 +142,7 @@ def test_split_reparent_resync_defers_clear_until_added_path_arrives() -> None:
     app._deferred_selection_generation = 0
     app._stage_change_listeners = []
     app._viewport_window = None
+    app._secondary_viewport_window = None
     app._layer_window = None
     app.call_later = lambda _delay, callback: callbacks.append(callback)
 

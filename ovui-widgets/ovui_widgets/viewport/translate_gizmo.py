@@ -1,25 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
-"""Translate gizmo — axis arrows with drag + hover highlight.
+"""Translate gizmo — axis, plane, and free-move handles.
 
 Step C.2 of the viewport behavior. Replaces the C.1 placeholder lines
 with real draggable axis arrows. Three responsibilities:
 
-1. **Geometry** — :func:`build_translate_gizmo` draws three axis shafts
-   (``sc.Line``) and three pointed cone arrowheads
-   (``sc.PolygonMesh``). Each shaft owns a
-   :class:`PrimTranslateChangedGesture` (drag) and a :class:`HighlightGesture`
-   (hover).
-2. **Drag math** — :class:`PrimTranslateChangedGesture` projects the frame's
-   world-space mouse delta onto the shaft's axis, accumulates, and hands the
+1. **Geometry** — :func:`build_translate_gizmo` draws three axis arrows,
+   three coloured plane handles (XY, XZ, YZ), and one camera-facing free
+   handle for unconstrained movement. Every visible control owns a
+   :class:`PrimTranslateChangedGesture` and :class:`HighlightGesture`.
+2. **Drag math** — :class:`PrimTranslateChangedGesture` constrains the frame's
+   world-space mouse delta to its one-, two-, or three-axis mask and hands the
    resulting translation to
    :meth:`~ovui_widgets.viewport.prim_transform_model.PrimTransformModel.on_drag_moved`.
    The model handles the USD write-through and undo bracketing.
@@ -37,7 +29,7 @@ from __future__ import annotations
 
 import math
 from types import SimpleNamespace
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from omni.ui_scene import scene as sc
 
@@ -72,6 +64,34 @@ SHAFT_LENGTH: float = 1.0
 SHAFT_THICKNESS: float = 2.0
 SHAFT_INTERSECTION_THICKNESS: float = 10.0
 
+# Two-axis plane handles sit near the origin without covering the shaft pick
+# targets.  Rectangles are aligned to the corresponding world plane by their
+# normal-axis index (X=0, Y=1, Z=2).
+PLANE_HANDLE_SIZE: float = 0.22
+PLANE_HANDLE_OFFSET: float = 0.30
+PLANE_HANDLE_THICKNESS: float = 1.5
+PLANE_HANDLE_INTERSECTION_THICKNESS: float = 8.0
+
+# A small camera-facing square in the clear negative quadrant provides free
+# movement in the current view plane. With an oblique camera that plane has
+# non-zero X/Y/Z components, making this a useful all-three-axes control from
+# a 2-D pointer without overlapping the existing axis hit regions.
+FREE_HANDLE_SIZE: float = 0.14
+FREE_HANDLE_OFFSET: float = -0.24
+FREE_HANDLE_THICKNESS: float = 2.0
+FREE_HANDLE_INTERSECTION_THICKNESS: float = 12.0
+
+# Plane colours blend their two participating axis colours. Values use
+# omni.ui's packed ABGR convention; the lower alpha keeps the object readable.
+PLANE_COLOR_XY: int = 0x8858C0D0
+PLANE_COLOR_XZ: int = 0x88C070C0
+PLANE_COLOR_YZ: int = 0x88C0C060
+HIGHLIGHT_COLOR_XY: int = 0xCC80E8F0
+HIGHLIGHT_COLOR_XZ: int = 0xCCE898E8
+HIGHLIGHT_COLOR_YZ: int = 0xCCE8E888
+FREE_COLOR: int = 0xFFD0D0D0
+HIGHLIGHT_COLOR_FREE: int = 0xFFFFFFFF
+
 # Cone base radius (gizmo-local). The pointed cone extends beyond the shaft
 # endpoint, so the visible terminal shape is an arrow tip rather than a round
 # endpoint dot.
@@ -90,6 +110,22 @@ _AXES: Tuple[Tuple[str, Tuple[float, float, float], int, int], ...] = (
     ("x", (1.0, 0.0, 0.0), AXIS_COLOR_X, HIGHLIGHT_COLOR_X),
     ("y", (0.0, 1.0, 0.0), AXIS_COLOR_Y, HIGHLIGHT_COLOR_Y),
     ("z", (0.0, 0.0, 1.0), AXIS_COLOR_Z, HIGHLIGHT_COLOR_Z),
+)
+
+_PLANES: Tuple[
+    Tuple[
+        str,
+        Tuple[float, float, float],
+        int,
+        Tuple[float, float, float],
+        int,
+        int,
+    ],
+    ...,
+] = (
+    ("xy", (1.0, 1.0, 0.0), 2, (PLANE_HANDLE_OFFSET, PLANE_HANDLE_OFFSET, 0.0), PLANE_COLOR_XY, HIGHLIGHT_COLOR_XY),
+    ("xz", (1.0, 0.0, 1.0), 1, (PLANE_HANDLE_OFFSET, 0.0, PLANE_HANDLE_OFFSET), PLANE_COLOR_XZ, HIGHLIGHT_COLOR_XZ),
+    ("yz", (0.0, 1.0, 1.0), 0, (0.0, PLANE_HANDLE_OFFSET, PLANE_HANDLE_OFFSET), PLANE_COLOR_YZ, HIGHLIGHT_COLOR_YZ),
 )
 
 
@@ -112,6 +148,30 @@ def _project_onto_axis(
     ax, ay, az = axis
     dot = dx * ax + dy * ay + dz * az
     return (dot * ax, dot * ay, dot * az)
+
+
+def _constrain_delta(
+    dx: float,
+    dy: float,
+    dz: float,
+    axis_mask: Tuple[float, float, float],
+) -> Tuple[float, float, float]:
+    """Constrain a world delta to a one-, two-, or three-axis mask.
+
+    A single active component keeps the existing vector-projection behavior,
+    including support for non-cardinal axes. Multi-component translate handles
+    are cardinal masks: inactive components are removed while active components
+    retain the scene gesture's world-space motion.
+    """
+    active = tuple(i for i, value in enumerate(axis_mask) if abs(value) > 1.0e-12)
+    if not active:
+        raise ValueError("axis mask must contain at least one active component")
+    if len(active) == 1:
+        length = math.sqrt(sum(value * value for value in axis_mask))
+        axis = tuple(value / length for value in axis_mask)
+        return _project_onto_axis(dx, dy, dz, axis)
+    values = (dx, dy, dz)
+    return tuple(values[i] if i in active else 0.0 for i in range(3))
 
 
 def _axis_delta_matrix(dx: float, dy: float, dz: float) -> List[List[float]]:
@@ -191,7 +251,7 @@ def _make_cone_mesh(axis: Tuple[float, float, float], color: int) -> Any:
 
 
 class PrimTranslateChangedGesture(TransformGestureBase):
-    """Axis-constrained drag gesture.
+    """One-, two-, or three-axis translate drag gesture.
 
     Pipes incremental world-space deltas from ``sc.Line.gesture_payload.moved``
     into :class:`~ovui_widgets.viewport.prim_transform_model.PrimTransformModel`.
@@ -238,16 +298,19 @@ class PrimTranslateChangedGesture(TransformGestureBase):
         # the "drag only begins, never moves the prim" symptom.
         super().__init__(mouse_button=mouse_button, modifiers=modifiers)
         self._generation = generation
-        length = math.sqrt(axis[0] ** 2 + axis[1] ** 2 + axis[2] ** 2)
-        if length == 0.0:
+        active = tuple(abs(value) > 1.0e-12 for value in axis)
+        if not any(active):
             raise ValueError("axis vector must be non-zero")
-        # Normalise up-front so we never have to again. Callers pass unit
-        # axes already, but being defensive costs nothing.
-        self._axis: Tuple[float, float, float] = (
-            axis[0] / length,
-            axis[1] / length,
-            axis[2] / length,
+        self._axis_mask: Tuple[float, float, float] = tuple(
+            1.0 if enabled else 0.0 for enabled in active
         )
+        if sum(active) == 1:
+            length = math.sqrt(axis[0] ** 2 + axis[1] ** 2 + axis[2] ** 2)
+            self._axis = tuple(value / length for value in axis)
+        else:
+            # Combined handles advertise their cardinal constraint mask rather
+            # than a diagonal direction: XY means X and Y, not an XY bisector.
+            self._axis = self._axis_mask
         self._model = model
         self._active: bool = False
         # Latch set by ``_on_ended`` so the pick gesture's guard in
@@ -287,6 +350,10 @@ class PrimTranslateChangedGesture(TransformGestureBase):
     @property
     def axis(self) -> Tuple[float, float, float]:
         return self._axis
+
+    @property
+    def axis_mask(self) -> Tuple[float, float, float]:
+        return self._axis_mask
 
     @property
     def is_active(self) -> bool:
@@ -354,6 +421,9 @@ class PrimTranslateChangedGesture(TransformGestureBase):
         if not paths:
             self._active = False
             return
+        if not self._acquire_drag():
+            self._active = False
+            return
         self._accumulated = [0.0, 0.0, 0.0]
         # Reset the drag-start baseline; the first ``_on_changed`` will
         # capture the current closest-point, so total displacement starts
@@ -365,6 +435,7 @@ class PrimTranslateChangedGesture(TransformGestureBase):
             # Adapter not yet wired (pre-C.5 scaffolding, unit tests with a
             # bare model, etc.). Stay inert — nothing to commit at end.
             self._active = False
+            self._release_drag()
             return
         self._active = True
 
@@ -420,7 +491,7 @@ class PrimTranslateChangedGesture(TransformGestureBase):
             dx = cx - self._drag_start_point[0]
             dy = cy - self._drag_start_point[1]
             dz = cz - self._drag_start_point[2]
-            px, py, pz = _project_onto_axis(dx, dy, dz, self._axis)
+            px, py, pz = _constrain_delta(dx, dy, dz, self._axis_mask)
             # Overwrite (not add) — ``dx/dy/dz`` is already cumulative
             # from drag start, so each frame's accumulator is the full
             # displacement, not an increment.
@@ -435,7 +506,7 @@ class PrimTranslateChangedGesture(TransformGestureBase):
                 mx, my, mz = float(moved.x), float(moved.y), float(moved.z)
             else:
                 mx, my, mz = float(moved[0]), float(moved[1]), float(moved[2])
-            px, py, pz = _project_onto_axis(mx, my, mz, self._axis)
+            px, py, pz = _constrain_delta(mx, my, mz, self._axis_mask)
             self._accumulated[0] += px
             self._accumulated[1] += py
             self._accumulated[2] += pz
@@ -462,6 +533,8 @@ class PrimTranslateChangedGesture(TransformGestureBase):
             self._model.on_drag_ended()
         except Exception:
             pass
+        finally:
+            self._release_drag()
 
 
 class HighlightGesture(sc.HoverGesture):
@@ -574,22 +647,55 @@ class TranslateGizmoHandles:
         caps: List[Any],
         drag_gestures: List[PrimTranslateChangedGesture],
         hover_gestures: List[HighlightGesture],
+        plane_handles: Optional[List[Any]] = None,
+        plane_drag_gestures: Optional[List[PrimTranslateChangedGesture]] = None,
+        plane_hover_gestures: Optional[List[HighlightGesture]] = None,
+        free_handle: Any = None,
+        free_drag_gesture: Optional[PrimTranslateChangedGesture] = None,
+        free_hover_gesture: Optional[HighlightGesture] = None,
     ) -> None:
         self.shafts = shafts
         self.caps = caps
         self.drag_gestures = drag_gestures
         self.hover_gestures = hover_gestures
+        self.plane_handles = list(plane_handles or [])
+        self.plane_drag_gestures = list(plane_drag_gestures or [])
+        self.plane_hover_gestures = list(plane_hover_gestures or [])
+        self.free_handle = free_handle
+        self.free_drag_gesture = free_drag_gesture
+        self.free_hover_gesture = free_hover_gesture
 
     def gesture_for_axis(self, name: str) -> PrimTranslateChangedGesture:
         """Look up a drag gesture by axis name (``"x"``, ``"y"``, ``"z"``)."""
         idx = {"x": 0, "y": 1, "z": 2}[name.lower()]
         return self.drag_gestures[idx]
 
+    def gesture_for_plane(self, name: str) -> PrimTranslateChangedGesture:
+        """Look up a two-axis gesture by plane name (XY, XZ, or YZ)."""
+        idx = {"xy": 0, "xz": 1, "yz": 2}[name.lower()]
+        return self.plane_drag_gestures[idx]
+
+    def gesture_for_constraint(self, name: str) -> PrimTranslateChangedGesture:
+        """Look up any translate constraint by its visible handle name."""
+        key = name.lower()
+        if key in {"x", "y", "z"}:
+            return self.gesture_for_axis(key)
+        if key in {"xy", "xz", "yz"}:
+            return self.gesture_for_plane(key)
+        if key in {"free", "xyz"} and self.free_drag_gesture is not None:
+            return self.free_drag_gesture
+        raise KeyError(name)
+
 
 def build_translate_gizmo(
     model: Any,
     drag_gestures: Optional[List[PrimTranslateChangedGesture]] = None,
     hover_gestures: Optional[List[HighlightGesture]] = None,
+    plane_drag_gestures: Optional[List[PrimTranslateChangedGesture]] = None,
+    plane_hover_gestures: Optional[List[HighlightGesture]] = None,
+    free_drag_gesture: Optional[PrimTranslateChangedGesture] = None,
+    free_hover_gesture: Optional[HighlightGesture] = None,
+    view_aligned_axes: Sequence[bool] = (),
 ) -> TranslateGizmoHandles:
     """Emit the translate gizmo into the current ``sc.Transform`` scope.
 
@@ -598,13 +704,13 @@ def build_translate_gizmo(
     bundle so tests can verify the resulting shapes and drive their gestures
     without a real mouse.
 
-    ``drag_gestures`` / ``hover_gestures`` are optional lists of pre-built
-    gestures (one per axis, ordered X/Y/Z). When provided the builder
-    reuses them instead of constructing new instances — essential when the
-    manipulator invalidates every frame (for camera-distance scaling) so a
-    live drag isn't dropped when the scene graph rebuilds. The official
-    omni.ui.scene example keeps gesture identity stable across rebuilds
-    for the same reason.
+    ``view_aligned_axes`` flags (X, Y, Z) axes that point along the view
+    ray; their shafts are drawn without gestures.
+
+    Gesture arguments are optional pre-built instances. When provided the
+    builder reuses them instead of constructing replacements — essential when
+    the manipulator invalidates for camera-distance scaling so a live drag is
+    not dropped during a scene-graph rebuild.
 
     Each axis produces:
 
@@ -619,6 +725,9 @@ def build_translate_gizmo(
     caps: List[Any] = []
     drags: List[PrimTranslateChangedGesture] = []
     hovers: List[HighlightGesture] = []
+    plane_handles: List[Any] = []
+    plane_drags: List[PrimTranslateChangedGesture] = []
+    plane_hovers: List[HighlightGesture] = []
 
     for i, (_name, axis, base_color, highlight_color) in enumerate(_AXES):
         if drag_gestures is not None and i < len(drag_gestures):
@@ -645,7 +754,11 @@ def build_translate_gizmo(
             color=base_color,
             thickness=SHAFT_THICKNESS,
             intersection_thickness=SHAFT_INTERSECTION_THICKNESS,
-            gestures=[drag, hover],
+            # A shaft pointing along the view ray has no screen length to
+            # drag, and ui.scene's line hit test cannot resolve a ray parallel
+            # to the segment: it keeps the previous hit, so the handle would
+            # claim clicks anywhere in the viewport. Draw it without gestures.
+            gestures=[] if i < len(view_aligned_axes) and view_aligned_axes[i] else [drag, hover],
         )
         hover.add_shape(shaft)
         shafts.append(shaft)
@@ -653,7 +766,88 @@ def build_translate_gizmo(
         drags.append(drag)
         hovers.append(hover)
 
+    # Plane handles: one translucent rectangle per cardinal plane. The axis
+    # index is the rectangle normal, while the gesture mask names the two
+    # translation components retained from the world-space pointer delta.
+    for i, (_name, mask, normal_axis, center, base_color, highlight_color) in enumerate(_PLANES):
+        if plane_drag_gestures is not None and i < len(plane_drag_gestures):
+            drag = plane_drag_gestures[i]
+        else:
+            drag = PrimTranslateChangedGesture(model=model, axis=mask)
+        if plane_hover_gestures is not None and i < len(plane_hover_gestures):
+            hover = plane_hover_gestures[i]
+            hover._shapes = []
+        else:
+            hover = HighlightGesture(
+                shapes=[],
+                base_color=base_color,
+                highlight_color=highlight_color,
+            )
+        with sc.Transform(transform=[
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            center[0], center[1], center[2], 1.0,
+        ]):
+            handle = sc.Rectangle(
+                width=PLANE_HANDLE_SIZE,
+                height=PLANE_HANDLE_SIZE,
+                axis=normal_axis,
+                color=base_color,
+                thickness=PLANE_HANDLE_THICKNESS,
+                intersection_thickness=PLANE_HANDLE_INTERSECTION_THICKNESS,
+                wireframe=False,
+                gestures=[drag, hover],
+            )
+        hover.add_shape(handle)
+        plane_handles.append(handle)
+        plane_drags.append(drag)
+        plane_hovers.append(hover)
+
+    # Free handle: the camera-facing transform makes the small square
+    # draggable in the current view plane. Keep it in the clear negative
+    # screen quadrant instead of directly on the pivot, where the three axis
+    # shafts' forgiving hit regions would otherwise win the same mouse-down.
+    # At a three-quarter view, this plane naturally carries X, Y, and Z
+    # components together.
+    if free_drag_gesture is None:
+        free_drag_gesture = PrimTranslateChangedGesture(
+            model=model,
+            axis=(1.0, 1.0, 1.0),
+        )
+    if free_hover_gesture is None:
+        free_hover_gesture = HighlightGesture(
+            shapes=[],
+            base_color=FREE_COLOR,
+            highlight_color=HIGHLIGHT_COLOR_FREE,
+        )
+    else:
+        free_hover_gesture._shapes = []
+    with sc.Transform(look_at=sc.Transform.LookAt.CAMERA):
+        with sc.Transform(transform=[
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            FREE_HANDLE_OFFSET, FREE_HANDLE_OFFSET, 0.0, 1.0,
+        ]):
+            free_handle = sc.Rectangle(
+                width=FREE_HANDLE_SIZE,
+                height=FREE_HANDLE_SIZE,
+                color=FREE_COLOR,
+                thickness=FREE_HANDLE_THICKNESS,
+                intersection_thickness=FREE_HANDLE_INTERSECTION_THICKNESS,
+                wireframe=True,
+                gestures=[free_drag_gesture, free_hover_gesture],
+            )
+    free_hover_gesture.add_shape(free_handle)
+
     return TranslateGizmoHandles(
         shafts=shafts, caps=caps,
         drag_gestures=drags, hover_gestures=hovers,
+        plane_handles=plane_handles,
+        plane_drag_gestures=plane_drags,
+        plane_hover_gestures=plane_hovers,
+        free_handle=free_handle,
+        free_drag_gesture=free_drag_gesture,
+        free_hover_gesture=free_hover_gesture,
     )

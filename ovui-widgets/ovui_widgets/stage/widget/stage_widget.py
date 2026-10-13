@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Stage browser widget — pure embeddable StageWidget.
 
@@ -268,7 +261,8 @@ class StageWidget:
                             horizontal_scrollbar_policy=ui.ScrollBarPolicy.SCROLLBAR_ALWAYS_OFF,
                             vertical_scrollbar_policy=ui.ScrollBarPolicy.SCROLLBAR_AS_NEEDED,
                         )
-                        self._scrolling_frame.raster_policy = ui.RasterPolicy.AUTO
+                        # Keep dynamic stage growth live. AUTO can retain the
+                        # previous scene's content height and zero scroll range.
                         with self._scrolling_frame:
                             self._tree_view = ui.TreeView(
                                 self._model,
@@ -960,12 +954,16 @@ class StageWidget:
         path = self._pending_focus_path
         if not path:
             return
-        item = self._model.resolve_path(path)
+        item = self._model.profile_call(
+            "StageBrowser.focus.resolve_path", self._model.resolve_path, path
+        )
         if item is None:
             self._pending_focus_path = None
             getattr(self, "_focus_preserve_expanded_paths", set()).clear()
             return
-        self._expand_ancestors(path)
+        self._model.profile_call(
+            "StageBrowser.focus.expand_ancestors", self._expand_ancestors, path
+        )
         if self._tree_view is not None:
             self._model._selection_guard = True
             try:
@@ -995,7 +993,9 @@ class StageWidget:
         frame = getattr(self, "_scrolling_frame", None)
         if frame is None:
             return False
-        row_info = self._visible_row_position(path)
+        row_info = self._model.profile_call(
+            "StageBrowser.focus.visible_row_position", self._visible_row_position, path
+        )
         if row_info is None:
             return False
         row_index, visible_count = row_info

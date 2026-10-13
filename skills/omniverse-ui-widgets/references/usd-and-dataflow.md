@@ -2,6 +2,16 @@
 
 ## USD Open And Wiring Recipe
 
+OpenUSD stages with session sublayers (for example, ovlive participant overlays)
+are loaded into the existing `OvRtxRendererAdapter` through a composed snapshot.
+This preserves inserted or removed Live geometry on structural reloads without
+saving the stored root file. Hosts may suppress duplicate USD notices while a
+Live binding applies records, then use `notify_transform_changed` for pose-only
+updates and `renderer.load_stage(stage, use_live_root_snapshot=True)` when
+geometry is inserted or removed. Both operations run on the USD-owning thread.
+Transport acknowledgment is separate from renderer presentation; validate the
+receiving viewport with Inspector screenshots.
+
 Every exercise should route CLI positional file opening and File > Open dialog
 acceptance through the same `open_usd(path)` or `_wire_open_stage(...)` path.
 
@@ -195,6 +205,23 @@ if __name__ == "__main__":
 ## Selection And Dataflow Wiring
 
 Use one `SelectionBus` for all surfaces.
+
+For the native OVStage provider, `OvstageRendererAdapter` retains one activation
+reset after the first successfully applied non-empty selection, including on
+native OVRTX 0.5 or newer. `load_stage()` arms activation without directly
+resetting the renderer. Once the outline pass is active, the dedicated
+selection membership APIs consume completed writes on the next render step
+without another membership reset when the loaded native `Renderer.version`
+is 0.5 or newer. The first selection can still incur renderer-reset latency.
+Resolution-change resets remain unchanged; resizing with no applied outline
+re-arms activation for the next non-empty selection. Do not add per-selection
+renderer resets in the application. The adapter retains compatibility handling
+for older/unknown native runtimes and legacy transports, including
+reserved-attribute writes. Validate first selection in a fresh cube/sphere
+scene before any camera movement, then replacement, clear/reselect, and
+clear → resize → select. Also exercise select A → pan → zoom → select B, with
+only B outlined afterward. Check real rendered outlines as well as callback
+timings; callback completion alone does not prove that the outline is visible.
 
 Stage row -> viewport -> Property:
 

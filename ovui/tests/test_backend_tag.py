@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Pure-Python coverage for ``_backend_tag()`` in ``tests/test_base.py``.
 
@@ -91,9 +84,16 @@ def test_backend_tag_egl_takes_priority_over_vulkan_backend_env():
         assert _backend_tag() == "egl"
 
 
-def test_backend_tag_opengl_default():
+def test_backend_tag_vulkan_is_the_ordinary_windowed_default():
+    """An unset OMNIUI_BACKEND is a windowed Vulkan launch, not OpenGL.
+
+    ``GlfwPlatform::createWindow`` selects Vulkan when nothing is
+    requested, so classifying this as OpenGL would compare windowed
+    captures against the wrong golden directory and would hide a revert
+    of that default.
+    """
     with _env({"OMNIUI_HEADLESS": None, "OMNIUI_HEADLESS_GL": None, "OMNIUI_BACKEND": None}):
-        assert _backend_tag() == "opengl"
+        assert _backend_tag() == "vulkan"
 
 
 def test_backend_tag_opengl_explicit_backend():
@@ -101,12 +101,18 @@ def test_backend_tag_opengl_explicit_backend():
         assert _backend_tag() == "opengl"
 
 
+def test_backend_tag_opengl_explicit_gl_alias():
+    """OMNIUI_BACKEND=gl is accepted by GlfwPlatform and must tag as opengl."""
+    with _env({"OMNIUI_HEADLESS": None, "OMNIUI_HEADLESS_GL": None, "OMNIUI_BACKEND": "gl"}):
+        assert _backend_tag() == "opengl"
+
+
 def test_backend_tag_headless_gl_without_headless_falls_through():
     """OMNIUI_HEADLESS_GL=1 without OMNIUI_HEADLESS=1 is not 'egl' — it
     falls through the headless gate and ends up classified by
-    OMNIUI_BACKEND (here: opengl, since BACKEND is unset)."""
+    OMNIUI_BACKEND (here: vulkan, since BACKEND is unset)."""
     with _env({"OMNIUI_HEADLESS": None, "OMNIUI_HEADLESS_GL": "1", "OMNIUI_BACKEND": None}):
-        assert _backend_tag() == "opengl"
+        assert _backend_tag() == "vulkan"
 
 
 def test_backend_tag_current_test_env_is_vulkan():

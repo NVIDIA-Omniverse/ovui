@@ -267,3 +267,45 @@ ones above:
 5. If upstream now provides equivalent shadow APIs, remove downstream aliases and
    call-site compatibility code in one coordinated change. Do not leave two
    shadow flag layouts active at the same time.
+
+## Common Kit and ovui geometry and input compatibility
+
+Kit is the reference for these compatibility behaviors. Both repositories ship
+this complete ImGui tree byte for byte. The previous OMNIUI_KIT_IMGUI_COMPAT
+switch is removed: its active Kit branches are now unconditional. imconfig.h
+selects NVIDIA extensions, FreeType and 32-bit drawing indices for all consumers.
+Native builds use a shared ImGui library so the UI and host use one context.
+
+- Reapply ImGuiCond_Appearing after a popup's hidden sizing frame, preserving
+  explicit modal positions. Preserve the one-pixel popup avoidance rectangle and
+  the established two-axis placement fit test.
+- Keep fractional draw sizes for locked Canvas font bakes; ordinary unlocked
+  font sizes retain their current rounding.
+- Preserve whole-value double-click selection for non-Mac text fields, numeric
+  power editing, cursor appearance and first-focus highlight behavior.
+- Keep immediate content-extent updates in cursor-position setters, including
+  cursor-only Window, child and Group layouts.
+- Use the twelve-sample rounded-rectangle arcs and established inner clipping,
+  convex-fill and line-join normal clamps.
+- Preserve window shadows and their atlas defaults, resize-grip dimensions,
+  title-bar spacing and docked background/separator colors.
+- Preserve dock-tab alpha/placement, dock focus and popup ownership when windows
+  gain focus. Keep fractional scrollbar extents and per-axis insets.
+- Preserve RGB text prefixes and the established saturation/value cursor shape.
+
+The existing Carbonite adapter serializes each command's index span because its
+public drawing interface has no index/vertex offset fields. Host style defaults
+and resource ownership remain in the existing service adapters; shared widget
+implementations are not duplicated. Existing tests and their acceptance criteria
+remain unchanged.
+
+## Scalar InputText cancellation status (OVUI)
+
+`imgui_internal.h` reserves status bit 11 (`InputTextCancelled`), without changing
+any struct layout. `imgui_widgets.cpp` sets it only in the terminal cancellation
+branch of temporary scalar InputText (Escape/gamepad cancel). Enter keeps its
+existing precedence; `EscapeClearsAll` does not set this terminal marker.
+`ItemAdd` clears status on every scalar submission. FloatSlider/FloatDrag consume
+the bit before model callbacks, so neither value equality nor a raw key poll is
+used to infer cancellation. Preserve both sites when updating the vendor source.
+The shared ImGui producer and OVUI consumer must be rebuilt together.

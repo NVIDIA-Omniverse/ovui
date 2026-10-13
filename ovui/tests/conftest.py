@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Session-level pytest fixtures.
 
@@ -47,26 +40,38 @@ def _is_opengl_backend() -> bool:
     - Headless EGL surfaceless (``OMNIUI_HEADLESS=1`` +
       ``OMNIUI_HEADLESS_GL=1``) → real GL context via EGL;
       ``requires_gl`` runs.
-    - ``OMNIUI_BACKEND=vulkan|vk`` (windowed Vulkan, currently unused) →
-      no GL.
-    - Otherwise developer-flow GLFW + OpenGL → GL available.
+    - ``OMNIUI_BACKEND=opengl|gl`` (explicitly requested windowed GL) →
+      GL available.
+    - Otherwise windowed Vulkan, which is what an ordinary launch selects
+      when ``OMNIUI_BACKEND`` is unset → no GL.
     """
     if os.environ.get("OMNIUI_HEADLESS", "").lower() in ("1", "true"):
         if os.environ.get("OMNIUI_HEADLESS_GL", "").lower() in ("1", "true"):
             return True
         return False
-    if os.environ.get("OMNIUI_BACKEND", "").lower() in ("vulkan", "vk"):
-        return False
-    return True
+    return os.environ.get("OMNIUI_BACKEND", "").lower() in ("opengl", "gl")
+
+
+def load_cudart():
+    """Return a loaded CUDA runtime, or ``None`` when there is none.
+
+    The versioned SONAME is tried first: a supported deployment has the NVIDIA
+    driver and the runtime the wheel ships, but not the CUDA Toolkit, so the
+    unversioned ``libcudart.so`` development symlink need not exist. Probing
+    only that name would silently skip every CUDA test on exactly the machines
+    the export is meant to run on.
+    """
+    for candidate in ("libcudart.so.12", "libcudart.so", "cudart64_12.dll"):
+        try:
+            return ctypes.CDLL(candidate)
+        except OSError:
+            continue
+    return None
 
 
 def _have_libcudart() -> bool:
-    """True when ``libcudart.so`` is loadable in-process."""
-    try:
-        ctypes.CDLL("libcudart.so")
-        return True
-    except OSError:
-        return False
+    """True when a CUDA runtime is loadable in-process."""
+    return load_cudart() is not None
 
 
 def _is_headless_mode() -> bool:

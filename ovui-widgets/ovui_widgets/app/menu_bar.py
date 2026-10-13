@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Application menu bar for USD Viewer."""
 
@@ -178,6 +171,7 @@ def build_menu_bar(app: Any) -> None:
         on_build_fn=lambda: _build_tools_menu(app),
     )
     _remember_top_level_menu(app, "Tools", tools_menu)
+    _wire_tools_menu_invalidation(app, tools_menu)
     with tools_menu:
         pass
 
@@ -228,7 +222,10 @@ def build_menu_bar(app: Any) -> None:
     )
     _remember_top_level_menu(app, "Help", help_menu)
     with help_menu:
-        ui.MenuItem("About USD Viewer", triggered_fn=lambda: print("[OvGear] v0.1.0"))
+        ui.MenuItem(
+            "About USD Viewer",
+            triggered_fn=lambda: _show_about_dialog(app),
+        )
         _build_hook_items(app, ("Help",))
 
 
@@ -238,6 +235,12 @@ def _remember_top_level_menu(app: Any, label: str, menu: Any) -> None:
     except TypeError:
         return
     menus[str(label)] = menu
+
+
+def _show_about_dialog(app: Any) -> None:
+    show = getattr(app, "show_about_dialog", None)
+    if callable(show):
+        show()
 
 
 def _build_product_identity() -> None:
@@ -440,6 +443,28 @@ def _wire_layer_menu_invalidation(app: Any, layer_menu: Any) -> None:
 def _invalidate_layer_menu(app: Any) -> None:
     layer_menu = getattr(app, "_layer_menu", None)
     invalidate = getattr(layer_menu, "invalidate", None)
+    if callable(invalidate):
+        invalidate()
+
+
+def _wire_tools_menu_invalidation(app: Any, tools_menu: Any) -> None:
+    """Keep the Tools menu dirty so the active-tool checkmark rebuilds on open.
+
+    Without this the menu is built once and frozen: ``Menu`` only calls
+    ``on_build_fn`` while its children are dirty, and only ``invalidate()``
+    marks them dirty. The checkmarks would then come solely from each
+    ``checkable`` item toggling itself on click — so they accumulate instead
+    of staying exclusive, and a W/E/R hotkey change is never reflected.
+    """
+    app._tools_menu = tools_menu
+    set_shown_changed_fn = getattr(tools_menu, "set_shown_changed_fn", None)
+    if callable(set_shown_changed_fn):
+        set_shown_changed_fn(lambda shown: _invalidate_tools_menu(app))
+
+
+def _invalidate_tools_menu(app: Any) -> None:
+    tools_menu = getattr(app, "_tools_menu", None)
+    invalidate = getattr(tools_menu, "invalidate", None)
     if callable(invalidate):
         invalidate()
 
@@ -1434,7 +1459,9 @@ def _to_stage_open_path(url: str) -> str:
 
 
 def _join_picker_path(dirname: str, filename: str) -> str:
-    """Join file-picker parts without changing the picker's slash style."""
+    """Join local picker parts while preserving HTTP(S) scene identifiers."""
+    if filename.lower().startswith(("http://", "https://")):
+        return filename
     if not dirname:
         return filename
 

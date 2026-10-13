@@ -1,25 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION is strictly
-# prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Owned snapshots and exact public OVStage structural mutation helpers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
 from ovui_data_adapters.common import Command
 from ovui_data_adapters.ovstage._native import read_token_attribute
-from ovui_data_adapters.ovstage._stage_write import wait_operation
+from ovui_data_adapters.ovstage._stage_write import (
+    wait_operation,
+    write_fixed_attribute,
+    write_relationship_attribute,
+    write_token_attribute,
+)
 from ovui_data_adapters.ovstage.runtime_import import import_ovstage_runtime_module
 
 
@@ -140,8 +138,50 @@ class _NativeStructuralCommand(Command):
 class NativeCreatePrimsCommand(_NativeStructuralCommand):
     """Create exact native prim rows and delete them as one undo edge."""
 
-    def __init__(self, scene: Any, prims: Sequence[tuple[str, str]]) -> None:
+    def __init__(
+        self,
+        scene: Any,
+        prims: Sequence[tuple[str, str]],
+        *,
+        token_attributes: Mapping[str, Mapping[str, str]] | None = None,
+        fixed_attributes: Mapping[
+            str,
+            Mapping[str, tuple[Any, int, Any]],
+        ] | None = None,
+        relationship_attributes: Mapping[
+            str,
+            Mapping[str, Sequence[str]],
+        ] | None = None,
+        promoted_paths: Iterable[str] = (),
+    ) -> None:
         self._prims = tuple((str(path), str(type_name)) for path, type_name in prims)
+        self._token_attributes = {
+            str(path): {str(name): str(value) for name, value in values.items()}
+            for path, values in (token_attributes or {}).items()
+        }
+        self._fixed_attributes = {
+            str(path): {
+                str(name): (values, int(lanes), semantic)
+                for name, (values, lanes, semantic) in attributes.items()
+            }
+            for path, attributes in (fixed_attributes or {}).items()
+        }
+        self._relationship_attributes = {
+            str(path): {
+                str(name): tuple(str(target) for target in targets)
+                for name, targets in attributes.items()
+            }
+            for path, attributes in (relationship_attributes or {}).items()
+        }
+        self._promoted_paths = tuple(
+            dict.fromkeys(str(path) for path in promoted_paths)
+        )
+        stage = getattr(scene, "_stage", None)
+        births = getattr(stage, "_ovui_path_birth_ordinals", None)
+        self._previous_promoted_births = {
+            path: births.get(path) if isinstance(births, dict) else None
+            for path in self._promoted_paths
+        }
         self._delete_roots = _outermost(path for path, _type_name in self._prims)
         super().__init__(
             scene,
@@ -151,26 +191,188 @@ class NativeCreatePrimsCommand(_NativeStructuralCommand):
 
     def do(self) -> None:
         def create_and_verify() -> None:
-            self._scene.prepare_native_topology((), self._prims)
-            stage = getattr(self._scene, "_stage", None)
-            mismatches = []
-            for path, expected in self._prims:
-                actual = read_token_attribute(stage, path, _TYPE_ATTRIBUTE)
-                if actual != expected:
-                    mismatches.append((path, expected, actual))
-            if not mismatches:
-                return
-            self._scene.delete_native_subtrees(self._delete_roots)
-            details = ", ".join(
-                f"{path}: expected {expected!r}, got {actual!r}"
-                for path, expected, actual in mismatches
-            )
-            raise RuntimeError(f"native type verification failed: {details}")
+            try:
+                ordinal = self._scene.prepare_native_topology((), self._prims)
+                stage = getattr(self._scene, "_stage", None)
+                if self._promoted_paths:
+                    births = getattr(stage, "_ovui_path_birth_ordinals", None)
+                    if not isinstance(births, dict):
+                        births = {}
+                        stage._ovui_path_birth_ordinals = births
+                    for path in self._promoted_paths:
+                        births[path] = int(ordinal)
+                for path, attributes in self._token_attributes.items():
+                    for name, value in attributes.items():
+                        write_token_attribute(stage, [path], name, [value])
+                for path, attributes in self._fixed_attributes.items():
+                    for name, (values, lanes, semantic) in attributes.items():
+                        write_fixed_attribute(
+                            stage,
+                            [path],
+                            name,
+                            values,
+                            lanes=lanes,
+                            semantic=semantic,
+                        )
+                for path, attributes in self._relationship_attributes.items():
+                    for name, targets in attributes.items():
+                        write_relationship_attribute(stage, path, name, targets)
+                mismatches = []
+                for path, expected in self._prims:
+                    actual = read_token_attribute(stage, path, _TYPE_ATTRIBUTE)
+                    if actual != expected:
+                        mismatches.append((path, _TYPE_ATTRIBUTE, expected, actual))
+                for path, attributes in self._token_attributes.items():
+                    for name, expected in attributes.items():
+                        actual = read_token_attribute(stage, path, name)
+                        if actual != expected:
+                            mismatches.append((path, name, expected, actual))
+                if not mismatches:
+                    return
+                details = ", ".join(
+                    f"{path}.{name}: expected {expected!r}, got {actual!r}"
+                    for path, name, expected, actual in mismatches
+                )
+                raise RuntimeError(f"native create verification failed: {details}")
+            except BaseException:
+                self._scene.delete_native_subtrees(self._delete_roots)
+                self._restore_promoted_births()
+                raise
 
         self._apply(create_and_verify)
 
     def undo(self) -> None:
-        self._apply(lambda: self._scene.delete_native_subtrees(self._delete_roots))
+        def delete_and_restore_promotions() -> None:
+            self._scene.delete_native_subtrees(self._delete_roots)
+            self._restore_promoted_births()
+
+        self._apply(delete_and_restore_promotions)
+
+    def _restore_promoted_births(self) -> None:
+        if not self._promoted_paths:
+            return
+        births = getattr(self._stage, "_ovui_path_birth_ordinals", None)
+        if not isinstance(births, dict):
+            births = {}
+            self._stage._ovui_path_birth_ordinals = births
+        for path, previous in self._previous_promoted_births.items():
+            if previous is None:
+                births.pop(path, None)
+            else:
+                births[path] = int(previous)
+
+
+class NativeClonePrimsCommand(_NativeStructuralCommand):
+    """Clone populated native templates and override their authored values."""
+
+    def __init__(
+        self,
+        scene: Any,
+        clones: Sequence[tuple[str, str, str]],
+        *,
+        token_attributes: Mapping[str, Mapping[str, str]] | None = None,
+        fixed_attributes: Mapping[
+            str,
+            Mapping[str, tuple[Any, int, Any]],
+        ] | None = None,
+        relationship_attributes: Mapping[
+            str,
+            Mapping[str, Sequence[str]],
+        ] | None = None,
+    ) -> None:
+        self._clones = tuple(
+            (str(source), str(target), str(type_name))
+            for source, target, type_name in clones
+        )
+        self._token_attributes = {
+            str(path): {str(name): str(value) for name, value in values.items()}
+            for path, values in (token_attributes or {}).items()
+        }
+        self._fixed_attributes = {
+            str(path): {
+                str(name): (values, int(lanes), semantic)
+                for name, (values, lanes, semantic) in attributes.items()
+            }
+            for path, attributes in (fixed_attributes or {}).items()
+        }
+        self._relationship_attributes = {
+            str(path): {
+                str(name): tuple(str(target) for target in targets)
+                for name, targets in attributes.items()
+            }
+            for path, attributes in (relationship_attributes or {}).items()
+        }
+        self._targets = tuple(target for _source, target, _type in self._clones)
+        super().__init__(
+            scene,
+            event_paths=self._targets,
+            source="structural:clone",
+        )
+
+    def do(self) -> None:
+        def clone_and_override() -> None:
+            stage = self._stage
+            ordinal = self._scene._begin_native_topology_frame(
+                stage,
+                require_clone=True,
+            )
+            try:
+                for source, target, _type_name in self._clones:
+                    stage.clone(source, (target,), ordinal)
+            except BaseException as exc:
+                self._scene._finish_failed_native_topology_frame(stage, ordinal, exc)
+                raise
+            self._scene._finish_native_topology_frame(stage, ordinal)
+            _record_cloned_paths(
+                stage,
+                ((target, type_name) for _source, target, type_name in self._clones),
+                ordinal,
+            )
+            self._scene._topology_revision += 1
+            try:
+                for path, attributes in self._token_attributes.items():
+                    for name, value in attributes.items():
+                        write_token_attribute(stage, [path], name, [value])
+                for path, attributes in self._fixed_attributes.items():
+                    for name, (values, lanes, semantic) in attributes.items():
+                        write_fixed_attribute(
+                            stage,
+                            [path],
+                            name,
+                            values,
+                            lanes=lanes,
+                            semantic=semantic,
+                        )
+                for path, attributes in self._relationship_attributes.items():
+                    for name, targets in attributes.items():
+                        write_relationship_attribute(stage, path, name, targets)
+            except BaseException:
+                self._scene.delete_native_subtrees(self._targets)
+                raise
+
+        self._apply(clone_and_override)
+
+    def undo(self) -> None:
+        self._apply(lambda: self._scene.delete_native_subtrees(self._targets))
+
+
+def _record_cloned_paths(
+    stage: Any,
+    rows: Iterable[tuple[str, str]],
+    ordinal: int,
+) -> None:
+    authored_types = getattr(stage, "_ovui_authored_prim_types", None)
+    if not isinstance(authored_types, dict):
+        authored_types = {}
+        stage._ovui_authored_prim_types = authored_types
+    births = getattr(stage, "_ovui_path_birth_ordinals", None)
+    if not isinstance(births, dict):
+        births = {}
+        stage._ovui_path_birth_ordinals = births
+    for raw_path, raw_type_name in rows:
+        path = str(raw_path)
+        authored_types[path] = str(raw_type_name)
+        births[path] = int(ordinal)
 
 
 class NativeDeletePrimsCommand(_NativeStructuralCommand):

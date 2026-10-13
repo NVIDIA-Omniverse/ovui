@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Pure-math orbit camera controller. No pxr/USD dependency."""
 
@@ -38,6 +31,11 @@ def _look_at(eye: Any, center: Any, up: Any) -> Any:
     f = center - eye
     f = f / np.linalg.norm(f)
     r = np.cross(f, up)
+    if np.linalg.norm(r) < 1.0e-6:
+        # Exact authored top/bottom cameras are valid; orbit gestures still
+        # clamp away from the poles. Choose a stable plan-view up vector.
+        up = np.asarray([0, 1, 0] if abs(f[2]) > 0.5 else [0, 0, -1], dtype=np.float32)
+        r = np.cross(f, up)
     r = r / np.linalg.norm(r)
     u = np.cross(r, f)
 
@@ -63,6 +61,21 @@ def _perspective(fovy: Any, aspect: Any, near: Any, far: Any) -> Any:
     return m
 
 
+def _orthographic(
+    half_width: float,
+    half_height: float,
+    near: float,
+    far: float,
+) -> Any:
+    """Compute a centered OpenGL orthographic projection matrix."""
+    m = np.eye(4, dtype=np.float32)
+    m[0, 0] = 1.0 / max(float(half_width), 1.0e-6)
+    m[1, 1] = 1.0 / max(float(half_height), 1.0e-6)
+    m[2, 2] = -2.0 / (far - near)
+    m[2, 3] = -(far + near) / (far - near)
+    return m
+
+
 class CameraController:
     """Orbit camera: azimuth/elevation spherical coords around a target point.
 
@@ -81,6 +94,15 @@ class CameraController:
         self.state = CameraState()
         self.up_axis: list = [0.0, 1.0, 0.0]
         self.fov_degrees: float = 45.0
+        self.projection_mode: str = "perspective"
+
+    def set_projection_mode(self, mode: str) -> bool:
+        """Select ``perspective`` or ``orthographic`` projection."""
+        normalized = str(mode or "").strip().lower()
+        if normalized not in {"perspective", "orthographic"}:
+            return False
+        self.projection_mode = normalized
+        return True
 
     def set_up_axis(self, up_axis_str: str) -> None:
         """Accepts USD-style ``"Y"`` or ``"Z"``; anything else is treated as Y."""
@@ -123,8 +145,15 @@ class CameraController:
             el = math.asin(max(-1.0, min(1.0, vertical / d)))
             # az=0 → eye is along +Z of target (camera looks toward -Z)
             az = math.atan2(float(offset[0]), float(offset[2]))
+        horizontal_axes = (0, 1) if self.up_axis[2] > 0.5 else (0, 2)
+        horizontal = math.hypot(*(float(offset[i]) for i in horizontal_axes))
+        if horizontal <= 1.0e-6 * d:
+            # At an exact pole the azimuth is undefined (atan2 of zero/noise),
+            # while _look_at renders a fixed plan-view up vector. Use the
+            # azimuth whose pan/orbit basis matches that rendered image.
+            az = 0.0 if vertical > 0 else math.pi
         self.state.azimuth = float(az)
-        self.state.elevation = float(np.clip(el, -_ELEV_CLAMP, _ELEV_CLAMP))
+        self.state.elevation = float(el)
 
     def orbit(self, delta_x: float, delta_y: float) -> None:
         self.state.azimuth += delta_x
@@ -201,7 +230,17 @@ class CameraController:
         dist = max(float(self.state.distance), _MIN_DIST)
         near = max(dist / 1000.0, 0.01)
         far = max(dist * 100.0, 10000.0)
-        proj = _perspective(math.radians(self.fov_degrees), aspect, near, far)
+        fovy = math.radians(self.fov_degrees)
+        if self.projection_mode == "orthographic":
+            half_height = dist * math.tan(fovy * 0.5)
+            proj = _orthographic(
+                half_height * aspect,
+                half_height,
+                near,
+                far,
+            )
+        else:
+            proj = _perspective(fovy, aspect, near, far)
         return view, proj
 
     def focus(self, target: Any, distance: float) -> None:

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Generic provider hooks for adapter-backed property surfaces."""
 
@@ -116,17 +109,35 @@ class PropertyProviderRow:
 
 
 class PropertyProviderHandle:
-    """Removable handle returned from ``PropertyProviderRegistry.add``."""
+    """Removable handle returned from ``PropertyProviderRegistry.add``.
 
-    def __init__(self, registry: "PropertyProviderRegistry", provider_id: str) -> None:
+    Handles bind to their exact registration generation (``token``): a
+    stale handle whose entry was removed no-ops instead of removing a
+    later same-ID registration — including one that re-adds the very
+    same contribution object, which starts a new generation an old
+    handle cannot match. Token-less handles keep legacy key-based
+    removal (administrative use only).
+    """
+
+    def __init__(
+        self,
+        registry: "PropertyProviderRegistry",
+        provider_id: str,
+        token: Any = None,
+    ) -> None:
         self._registry = registry
         self._provider_id = provider_id
+        self._token = token
 
     @property
     def id(self) -> str:
         return self._provider_id
 
     def remove(self) -> bool:
+        if self._token is not None:
+            return self._registry._remove_if_token(
+                self._provider_id, self._token
+            )
         return self._registry.remove(self._provider_id)
 
 
@@ -144,6 +155,10 @@ class PropertyProviderRegistry:
         self._capabilities: set[str] = set(capabilities)
         self._dev_mode = bool(dev_mode)
         self._entries: dict[str, PropertyProviderContribution] = {}
+        # Unique registration-generation token per live ID: handles bind
+        # to it, so removing and re-adding even the same contribution
+        # starts a new generation a stale handle can never remove.
+        self._tokens: dict[str, object] = {}
         self._failures: dict[str, BaseException] = {}
 
     @property
@@ -169,17 +184,66 @@ class PropertyProviderRegistry:
             self._capabilities.discard(capability)
 
     def add(self, contribution: PropertyProviderContribution) -> PropertyProviderHandle:
+        """Register ``contribution`` once; return its owner-bound handle.
+
+        Re-adding the exact same contribution object returns another
+        handle bound to it (legacy idempotent add). A *different*
+        contribution under an existing ID raises — ownership of a
+        foreign registration is never silently granted.
+        """
         provider_id = contribution.descriptor.provider_id
-        if provider_id in self._entries:
-            return PropertyProviderHandle(self, provider_id)
+        existing = self._entries.get(provider_id)
+        if existing is not None:
+            if existing is contribution:
+                return PropertyProviderHandle(
+                    self, provider_id, token=self._tokens.get(provider_id)
+                )
+            raise ValueError(
+                f"PropertyProviderRegistry: id {provider_id!r} is already "
+                "registered by another contribution"
+            )
         self._entries[provider_id] = contribution
+        self._tokens[provider_id] = object()
         self._invoke_lifecycle(contribution, "add")
-        return PropertyProviderHandle(self, provider_id)
+        return PropertyProviderHandle(
+            self, provider_id, token=self._tokens[provider_id]
+        )
+
+    def _remove_if_token(self, provider_id: str, token: object) -> bool:
+        """Atomically remove ``provider_id`` iff ``token`` is its live
+        generation. Handle-facing: a stale handle whose entry was
+        removed (and possibly re-added, even with the same object)
+        no-ops here."""
+        if self._tokens.get(provider_id) is not token:
+            return False
+        return self.remove(provider_id)
+
+    def remove_if_matches(
+        self,
+        provider_id: str,
+        expected: PropertyProviderContribution,
+    ) -> bool:
+        """Atomically remove ``provider_id`` only if ``expected`` owns it.
+
+        Recovery path for an ``add()`` that mutated the registry and
+        raised before returning its handle: comparison and removal are
+        one registry operation with no callback/reentrant gap, so a
+        stale owner can never remove an independent replacement.
+        PRECONDITION: handle-less recovery only, with a unique
+        contribution object per registration generation — object
+        identity cannot distinguish generations when the same object is
+        removed and re-added. Handles bind to generation tokens instead.
+        """
+        current = self._entries.get(provider_id)
+        if current is None or current is not expected:
+            return False
+        return self.remove(provider_id)
 
     def remove(self, provider_id: str) -> bool:
         contribution = self._entries.pop(provider_id, None)
         if contribution is None:
             return False
+        self._tokens.pop(provider_id, None)
         self._invoke_lifecycle(contribution, "remove")
         return True
 

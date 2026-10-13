@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -35,7 +28,35 @@ class OMNIUI_SCENE_CLASS_API SceneView : public Widget, public ManipulatorModelH
 protected:
     using TextureOptions = ImageProviderTextureOptions;
 
+    /** Backends opt in during construction, without allocating a draw system. */
+    OMNIUI_SCENE_API
+    void _setSupportsDepthGroups(bool supported);
+    OMNIUI_SCENE_API
+    void _setSupportsMeshLighting(bool supported);
+    OMNIUI_SCENE_API
+    void _setSupportsDistanceFade(bool supported);
+    OMNIUI_SCENE_API
+    void _setSupportsWorldSpaceWidths(bool supported);
+    OMNIUI_SCENE_API
+    void _setSupportsPixelDiameterWidths(bool supported);
+
 public:
+    /** Whether this draw system implements scoped depth groups. */
+    OMNIUI_SCENE_API
+    bool supportsDepthGroups() const;
+    /** Whether this draw system supports PolygonMesh headlight lighting. */
+    OMNIUI_SCENE_API
+    bool supportsMeshLighting() const;
+    /** Whether child shapes can inherit a DistanceFadeGroup opacity fade. */
+    OMNIUI_SCENE_API
+    bool supportsDistanceFade() const;
+    /** Whether Curve/Line/Points can use camera-facing world-space widths. */
+    OMNIUI_SCENE_API
+    bool supportsWorldSpaceWidths() const;
+    /** Whether strokes can use physical pixel diameters with Hermite coverage. */
+    OMNIUI_SCENE_API
+    bool supportsPixelDiameterWidths() const;
+
     enum class AspectRatioPolicy : uint8_t
     {
         eStretch = 0,
@@ -179,6 +200,26 @@ protected:
      */
     OMNIUI_SCENE_API
     void _drawContent(float elapsedTime) override;
+
+    /** Collect an attached view using its normal layout, input and camera.
+     * A backend publishing explicit frame identities may collect an empty scene
+     * to clear its previous image and complete a transparent frame. False keeps
+     * the ordinary behavior of releasing the draw system when no geometry exists.
+     * Returns true only when this call collected a frame for the draw system.
+     * Nonvirtual: existing SceneView layout and virtual dispatch are unchanged.
+     */
+    OMNIUI_SCENE_API
+    bool _collectAttachedFrame(float elapsedTime, bool collectEmptyScene);
+
+    /** Collect an unattached view with explicit camera/pixel dimensions and no
+     * input. For offscreen-capable backends on the UI thread with their graphics
+     * context active. Returns false during renderer initialization. The caller
+     * schedules rendering separately; this method never pumps UI/app events.
+     * Nonvirtual: existing published SceneView layout and widget drawing are unchanged.
+     */
+    OMNIUI_SCENE_API
+    bool _collectOffscreenFrame(uint32_t width, uint32_t height, const Matrix44& projection,
+                               const Matrix44& view, float dpiScale = 1.0f);
 
     void _dirtyHierarchy();
 

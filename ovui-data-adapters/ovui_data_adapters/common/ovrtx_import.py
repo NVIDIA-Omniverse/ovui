@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Shared optional ovrtx import resolver for adapter runtimes."""
 
@@ -17,6 +10,7 @@ import importlib
 import os
 from pathlib import Path
 import platform
+import re
 import sys
 from typing import Any
 
@@ -91,6 +85,34 @@ def _ovrtx_runtime_dirs(raw_root: str) -> tuple[Path, ...]:
                 if plugin_dir.is_dir() and plugin_dir not in dirs:
                     dirs.append(plugin_dir)
     return tuple(dirs)
+
+
+def ovrtx_root_mdl_base_dirs() -> tuple[Path, ...]:
+    """Return the MDL ``Base`` library directories of the ``OVRTX_ROOT`` install."""
+    raw_root = os.environ.get(OVRTX_ROOT_ENV, "").strip()
+    if not raw_root:
+        return ()
+    root = Path(raw_root).expanduser()
+    return tuple(
+        bin_dir / "library" / "mdl" / "Base"
+        for bin_dir in (root / "bin", root / "python" / "ovrtx" / "bin")
+    )
+
+
+_VERSION_ASSIGNMENT = re.compile(r"""^__version__\s*=\s*["']([^"']+)["']""", re.MULTILINE)
+
+
+def ovrtx_root_version() -> str:
+    """Return ``ovrtx.__version__`` of the ``OVRTX_ROOT`` install without importing it."""
+    for candidate in _ovrtx_python_path_candidates(os.environ.get(OVRTX_ROOT_ENV, "")):
+        try:
+            text = (candidate / "ovrtx" / "__init__.py").read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        match = _VERSION_ASSIGNMENT.search(text)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def _platform_build_dir_name() -> str:
@@ -194,11 +216,44 @@ def _compose_ovrtx_import_error(
     return ImportError(message)
 
 
+_OVUI_IMGUI_HANDLE: Any = None
+
+
+def _load_ovui_imgui() -> None:
+    """Load ovui's ImGui library before ovrtx loads its own.
+
+    A process has one library named imgui. ovui's copy also provides the old
+    entry points ovrtx imports, but ovrtx's older copy lacks what ovui needs,
+    so ovui's must be the one loaded. Only the library is loaded: omni.ui
+    itself is not imported. Without an installed omni.ui this does nothing.
+    """
+    global _OVUI_IMGUI_HANDLE
+    if _OVUI_IMGUI_HANDLE is not None:
+        return
+    try:
+        import ctypes
+        import importlib.util
+
+        spec = importlib.util.find_spec("omni.ui")
+    except (ImportError, ValueError):
+        return
+    if spec is None or not spec.submodule_search_locations:
+        return
+    name = {"win32": "imgui.dll", "darwin": "libimgui.dylib"}.get(sys.platform, "libimgui.so")
+    for location in spec.submodule_search_locations:
+        library = Path(location) / name
+        if library.is_file():
+            _OVUI_IMGUI_HANDLE = ctypes.CDLL(str(library))
+            return
+
+
 def import_ovrtx() -> OvRtxImportResult:
     """Resolve ovrtx from the active env first, then ``OVRTX_ROOT``."""
     global _OVRTX_IMPORT_RESULT
     if _OVRTX_IMPORT_RESULT is not None:
         return _OVRTX_IMPORT_RESULT
+
+    _load_ovui_imgui()
 
     try:
         module = importlib.import_module("ovrtx")

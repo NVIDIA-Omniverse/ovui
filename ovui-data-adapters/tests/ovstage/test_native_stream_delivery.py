@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Native OVStage provider-stream delivery contracts (runtime-free).
 
@@ -33,12 +26,377 @@ from types import SimpleNamespace
 
 import pytest
 
+from ovui_data_adapters.common import ChangeEvent, ChangeEventType
 from ovui_data_adapters.common._command import command_edge, in_command_edge
 from ovui_data_adapters.ovstage.change_stream import OvstageChangeStream
 
 
+class _AsyncDirtyStage:
+    def __init__(self) -> None:
+        self.current_ordinal = 0
+
+    def read_attributes(self, *_args, **_kwargs):
+        raise AssertionError("native collector must own the read")
+
+    def fetch_read_next(self, *_args, **_kwargs):
+        raise AssertionError("native collector must own the fetch")
+
+    def get_attribute_write_floor(self):
+        return None
+
+
+class _AsyncDirtyCollector:
+    def __init__(self, responses) -> None:
+        self.responses = list(responses)
+        self.begin_calls: list[tuple[int, int]] = []
+        self.update_calls: list[int] = []
+        self.poll_calls: list[bool] = []
+
+    def begin(self, since: int, current: int) -> bool:
+        self.begin_calls.append((since, current))
+        return True
+
+    def poll(self, *, blocking: bool):
+        self.poll_calls.append(blocking)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    def update_current_ordinal(self, current: int) -> None:
+        self.update_calls.append(current)
+
+    def close(self) -> None:
+        return None
+
+
+class _AsyncDirtyPaths:
+    def token_to_string(self, token: int) -> str:
+        assert token == 101
+        return "test:ratio"
+
+    def path_to_string(self, path: int) -> str:
+        assert path == 201
+        return "/World/Camera"
+
+    def destroy(self) -> None:
+        return None
+
+
 def _stream() -> OvstageChangeStream:
     return OvstageChangeStream(SimpleNamespace(_stage=None, is_open=True))
+
+
+def _async_dirty_stream(monkeypatch, responses):
+    stage = _AsyncDirtyStage()
+    scene = SimpleNamespace(
+        _stage=stage,
+        current_ordinal=0,
+        initial_ordinal=0,
+        is_open=True,
+        _topology_revision=0,
+    )
+    monkeypatch.setattr(
+        "ovui_data_adapters.ovstage.change_stream._native_topology_paths",
+        lambda *_args, **_kwargs: {"/World", "/World/Camera"},
+    )
+    stream = OvstageChangeStream(scene)
+    collector = _AsyncDirtyCollector(responses)
+    stream._native_dirty_collector = collector
+    stream._native_dirty_paths = _AsyncDirtyPaths()
+    monkeypatch.setattr(
+        stream,
+        "_physics_transform_paths_for_range",
+        lambda **_kwargs: (),
+    )
+    return scene, stream, collector
+
+
+def test_scheduled_native_dirty_poll_does_not_wait_or_advance(monkeypatch) -> None:
+    scene, stream, collector = _async_dirty_stream(
+        monkeypatch,
+        [None, (0, 1, ((101, (201,)),))],
+    )
+    scene.current_ordinal = 1
+
+    assert stream._poll_impl(
+        source=None,
+        deliver_suppressed=False,
+        allow_native_async=True,
+    ) == ()
+    assert stream.last_ordinal == 0
+    assert collector.begin_calls == [(0, 1)]
+    assert collector.poll_calls == [False]
+
+    emitted = stream._poll_impl(
+        source=None,
+        deliver_suppressed=False,
+        allow_native_async=True,
+    )
+
+    assert emitted == (
+        ChangeEvent(
+            changed_paths=("/World/Camera",),
+            resynced_paths=(),
+            event_type=ChangeEventType.INFO_CHANGE,
+            source="ovstage:attribute",
+        ),
+    )
+    assert stream.last_ordinal == 1
+    assert collector.poll_calls == [False, False]
+    assert collector.update_calls == [1]
+
+
+def test_scheduled_native_dirty_failure_rearms_without_python_fallback(
+    monkeypatch,
+) -> None:
+    scene, stream, collector = _async_dirty_stream(
+        monkeypatch,
+        [RuntimeError("transient native read race"), None],
+    )
+    scene.current_ordinal = 1
+
+    def fail_python_fallback(*_args, **_kwargs):
+        raise AssertionError("scheduled collection must not fall back onto the UI thread")
+
+    monkeypatch.setattr(
+        "ovui_data_adapters.ovstage.change_stream._native_dirty_paths_by_attribute",
+        fail_python_fallback,
+    )
+
+    assert stream._poll_impl(
+        source=None,
+        deliver_suppressed=False,
+        allow_native_async=True,
+    ) == ()
+    assert stream._native_dirty_collector is collector
+    assert stream._native_dirty_pending is False
+
+    assert stream._poll_impl(
+        source=None,
+        deliver_suppressed=False,
+        allow_native_async=True,
+    ) == ()
+    assert collector.begin_calls == [(0, 1), (0, 1)]
+    assert collector.poll_calls == [False, False]
+    assert stream._native_dirty_pending is True
+
+
+def test_direct_native_dirty_poll_preserves_synchronous_contract(monkeypatch) -> None:
+    scene, stream, collector = _async_dirty_stream(
+        monkeypatch,
+        [(0, 1, ((101, (201,)),))],
+    )
+    scene.current_ordinal = 1
+
+    emitted = stream.poll()
+
+    assert len(emitted) == 1
+    assert stream.last_ordinal == 1
+    assert collector.begin_calls == [(0, 1)]
+    assert collector.poll_calls == [True]
+
+
+@pytest.mark.parametrize(
+    "prim_count, current_paths, raw_groups, expected_added, expected_removed",
+    [
+        (3, {"/World", "/World/Camera", "/World/New"}, (), ("/World/New",), ()),
+        (1, {"/World"}, (), (), ("/World/Camera",)),
+        # Equal counts do not rule out replacing one prim with another.
+        (2, {"/World", "/World/New"}, ((101, (202,)),), ("/World/New",), ("/World/Camera",)),
+    ],
+)
+def test_native_membership_changes_without_dirty_usd_path(
+    monkeypatch, prim_count, current_paths, raw_groups, expected_added, expected_removed,
+):
+    scene, stream, collector = _async_dirty_stream(
+        monkeypatch, [(0, 1, raw_groups, prim_count)],
+    )
+    stream._topology_prim_count = 2
+    scene._stage._ovui_kit_child_paths_cache = object()
+    monkeypatch.setattr(
+        stream._native_dirty_paths, "path_to_string",
+        lambda path: {201: "/World/Camera", 202: "/World/New"}[path],
+    )
+    monkeypatch.setattr(
+        "ovui_data_adapters.ovstage.change_stream._native_topology_paths",
+        lambda *_args, **_kwargs: current_paths,
+    )
+    scene.current_ordinal = 1
+
+    emitted = stream.poll()
+
+    assert tuple(path for event in emitted if event.source == "ovstage:added" for path in event.resynced_paths) == expected_added
+    assert tuple(path for event in emitted if event.source == "ovstage:removed" for path in event.resynced_paths) == expected_removed
+    assert stream._topology_paths == current_paths
+    assert stream.last_ordinal == 1
+    assert stream._topology_prim_count == prim_count
+    assert scene._topology_revision == 1
+    assert scene._stage._ovui_kit_child_paths_cache is None
+    assert collector.poll_calls == [True]
+
+
+@pytest.mark.parametrize("raw_groups", [(), ((101, (201,)),)])
+def test_native_value_only_count_does_not_rescan_topology(monkeypatch, raw_groups):
+    from ovui_data_adapters.ovstage._scene import _KitTopologySnapshot
+
+    scene, stream, _collector = _async_dirty_stream(monkeypatch, [(0, 1, raw_groups, 2)])
+    stream._topology_prim_count = 2
+    snapshot = _KitTopologySnapshot(0, ("/World", "/World/Camera"))
+    scene._stage._ovui_kit_topology_snapshot = snapshot
+
+    def unexpected_scan(*_args, **_kwargs):
+        raise AssertionError("camera/value-only updates must not enumerate topology")
+
+    monkeypatch.setattr(
+        "ovui_data_adapters.ovstage.change_stream._native_topology_paths", unexpected_scan,
+    )
+    scene.current_ordinal = 1
+    stream.poll()
+    assert stream.last_ordinal == 1
+    assert snapshot.ordinal == 1
+    assert scene._topology_revision == 0
+
+
+def test_native_equal_count_replacement_with_no_dirty_values(monkeypatch):
+    scene, stream, _collector = _async_dirty_stream(monkeypatch, [(0, 1, (), 2, 2)])
+    stream._topology_prim_count = 2
+    stream._topology_query_revision = 1
+    monkeypatch.setattr(
+        "ovui_data_adapters.ovstage.change_stream._native_topology_paths",
+        lambda *_args, **_kwargs: {"/World", "/World/New"},
+    )
+    scene.current_ordinal = 1
+
+    emitted = stream.poll()
+
+    assert {event.source for event in emitted} == {"ovstage:added", "ovstage:removed"}
+    assert stream._topology_paths == {"/World", "/World/New"}
+    assert stream._topology_query_revision == 2
+
+
+@pytest.mark.parametrize("mode", ["nativePacing", "fast"])
+@pytest.mark.parametrize("attribute", ["usd-prim-type", "usd-schemas"])
+def test_native_metadata_resync_invalidates_hierarchy_before_delivery(monkeypatch, mode, attribute):
+    monkeypatch.setenv("OMNIUI_RENDER_FLOW_MODE", mode)
+    scene, stream, _collector = _async_dirty_stream(
+        monkeypatch, [(0, 1, ((101, (201,)),), 2)],
+    )
+    stream._topology_prim_count = 2
+    monkeypatch.setattr(stream._native_dirty_paths, "token_to_string", lambda _token: attribute)
+    revisions = []
+    subscription = stream.subscribe_stage(lambda _event: revisions.append(scene._topology_revision))
+    scene.current_ordinal = 1
+
+    emitted = stream.poll()
+
+    assert emitted[0].event_type == ChangeEventType.RESYNC
+    assert emitted[0].resynced_paths == ("/World/Camera",)
+    assert revisions == [1]
+    subscription.cancel()
+
+
+def test_fast_native_membership_resync_invalidates_hierarchy(monkeypatch):
+    monkeypatch.setenv("OMNIUI_RENDER_FLOW_MODE", "fast")
+    scene, stream, _collector = _async_dirty_stream(monkeypatch, [(0, 1, (), 2)])
+    monkeypatch.setattr(
+        "ovui_data_adapters.ovstage.change_stream._native_topology_paths",
+        lambda *_args, **_kwargs: {"/World", "/World/New"},
+    )
+    scene.current_ordinal = 1
+
+    assert {event.source for event in stream.poll()} == {"ovstage:added", "ovstage:removed"}
+    assert scene._topology_revision == 1
+
+
+def test_failed_topology_refresh_does_not_consume_membership_revision(monkeypatch):
+    scene, stream, _collector = _async_dirty_stream(
+        monkeypatch, [(0, 1, (), 2, 2), (0, 1, (), 2, 2)],
+    )
+    stream._topology_prim_count = 2
+    stream._topology_query_revision = 1
+    scene.current_ordinal = 1
+
+    def failed_scan(*_args, **_kwargs):
+        raise RuntimeError("topology temporarily unavailable")
+
+    monkeypatch.setattr(
+        "ovui_data_adapters.ovstage.change_stream._native_topology_paths", failed_scan,
+    )
+    with pytest.raises(RuntimeError, match="topology temporarily unavailable"):
+        stream.poll()
+    assert stream.last_ordinal == 0
+    assert stream._topology_query_revision == 1
+
+    monkeypatch.setattr(
+        "ovui_data_adapters.ovstage.change_stream._native_topology_paths",
+        lambda *_args, **_kwargs: {"/World", "/World/New"},
+    )
+    assert stream.poll()
+    assert stream.last_ordinal == 1
+    assert stream._topology_query_revision == 2
+
+
+def test_scheduled_poll_rearms_after_recoverable_collection_failure(
+    monkeypatch,
+) -> None:
+    stage = SimpleNamespace(current_ordinal=0)
+    scene = SimpleNamespace(
+        _stage=stage,
+        current_ordinal=0,
+        initial_ordinal=0,
+        is_open=True,
+    )
+    stream = OvstageChangeStream(scene)
+    expected = ChangeEvent(
+        changed_paths=(),
+        resynced_paths=("/World/AddedMesh",),
+        event_type=ChangeEventType.RESYNC,
+        source="ovstage:added",
+    )
+    attempts = 0
+
+    def collect(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("snapshot failed")
+        return [expected]
+
+    monkeypatch.setattr(stream, "_collect_events", collect)
+    monkeypatch.setattr(
+        stream,
+        "_physics_transform_paths_for_range",
+        lambda **_kwargs: (),
+    )
+    scheduled: list = []
+
+    def call_later(_delay, callback):
+        scheduled.append(callback)
+
+    received: list = []
+    direct_subscription = stream.subscribe_stage(received.append)
+    poll_subscription = stream.subscribe_stage(
+        lambda _event: None,
+        call_later=call_later,
+    )
+    scene.current_ordinal = 1
+
+    first_poll = scheduled.pop(0)
+    try:
+        first_poll()
+    except RuntimeError as exc:
+        assert str(exc) == "snapshot failed"
+
+    assert attempts == 1
+    assert scheduled
+
+    scheduled.pop(0)()
+
+    assert len(received) == 1
+    assert received[0].resynced_paths == ("/World/AddedMesh",)
+    poll_subscription.cancel()
+    direct_subscription.cancel()
 
 
 class TestProviderStreamIsolation:

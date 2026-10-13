@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Depth-one LdrColor overlap behavior for the OVStage BORROW adapter.
 
@@ -19,6 +12,7 @@ release) executes end to end.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -103,6 +97,12 @@ class _FakeRenderer:
 
 def _adapter() -> OvstageRendererAdapter:
     adapter = OvstageRendererAdapter.__new__(OvstageRendererAdapter)
+    adapter._render_worker_thread = None
+    adapter._render_state_lock = threading.RLock()
+    adapter._queued_viewport_renders = {}
+    adapter._completed_viewport_frames = {}
+    adapter._presentation_pending_viewports = set()
+    adapter._completed_pick_callbacks = []
     adapter._scene = SimpleNamespace(_stage=object(), is_open=True,
                                      current_ordinal=1)
     adapter._ovrtx = _FakeOvrtx
@@ -120,9 +120,11 @@ def _adapter() -> OvstageRendererAdapter:
     adapter._active_render_product_common_path = None
     adapter._camera_path = mod._RENDER_CAMERA_LOCAL_PATH
     adapter._active_camera_common_path = None
+    adapter._render_flow_mode = "nativePacing"
+    adapter._secondary_viewport_active = False
     adapter._last_resolution = (W, H)
     adapter._last_render_product_resolution = (W, H)
-    adapter._dt_clock = time.monotonic()
+    adapter._dt_clock = time.perf_counter()
     adapter._last_load_from_scene_context = False
     adapter._borrow_step_count = 0
     adapter._successful_frame_count = 0
@@ -318,7 +320,17 @@ def test_remove_scene_and_shutdown_release_retained() -> None:
     adapter = _overlapped()
     adapter._runtime_population = None
     adapter._runtime_reference_handle = None
+    destroyed = []
+
+    def destroy() -> None:
+        assert adapter._ldr_overlap.retained_products is None
+        assert adapter._ldr_overlap.presented_snapshot is None
+        assert adapter._attached_stage is None
+        destroyed.append(True)
+
+    adapter._renderer.destroy = destroy
     adapter.shutdown()
+    assert destroyed == [True]
     assert adapter._ldr_overlap.retained_products is None
     assert adapter._ldr_overlap.presented_snapshot is None
     assert adapter._renderer is None

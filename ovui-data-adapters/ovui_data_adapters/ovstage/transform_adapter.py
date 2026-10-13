@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ovstage transform adapter backed by ovhierarchy runtime matrices."""
 
@@ -67,6 +60,12 @@ class OvstageTransformAdapter(TransformAdapter):
         return self._read_matrix(path, "localMatrix")
 
     def get_world_transform(self, path: str) -> List[List[float]]:
+        profile_fn = getattr(self._scene, "profile_ovui_call", None)
+        if callable(profile_fn):
+            return profile_fn(
+                "OvstageTransformAdapter.get_world_transform",
+                self._read_matrix, path, "worldMatrix",
+            )
         return self._read_matrix(path, "worldMatrix")
 
     def set_local_transform(self, path: str, matrix: List[List[float]]) -> None:
@@ -177,8 +176,8 @@ class OvstageTransformAdapter(TransformAdapter):
         flat_matrix: list[float],
     ) -> None:
         stage = self._require_stage()
-        # Legacy standalone ovstage runtime: write through ovhierarchy exactly
-        # as before so existing source-layout roots keep their behavior.
+        # Legacy standalone ovstage runtime: write through ovhierarchy exactly as
+        # before so existing source-layout roots keep their behavior.
         hierarchy = self._optional_hierarchy()
         if hierarchy is not None:
             ordinal = stage.begin_frame()

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Notice-derived visibility events and exact transactional undo/redo.
 
@@ -548,6 +541,10 @@ class TestRendererCoarseRootFanOut:
         )
 
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._renderer = _RecordingRenderer()
         renderer._selected_paths = []
@@ -971,6 +968,10 @@ class TestStructuralResyncSemantics:
 
         stage, event = self._reentrant_define_event()
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         decision = renderer._stage_change_sync_decision(
@@ -1011,6 +1012,10 @@ class TestStructuralResyncSemantics:
         assert "/World" in event.resynced_paths
         assert "/World" in event.visibility_delta["authored"]
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         decision = renderer._stage_change_sync_decision(
@@ -1062,6 +1067,10 @@ class TestInSubtreeStructuralResync:
 
         stage, event = self._reentrant_in_subtree_event()
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         decision = renderer._stage_change_sync_decision(
@@ -1245,6 +1254,10 @@ class TestAmbiguousResyncMutations:
         annotated = set(event.visibility_delta.get("operation_resyncs") or ())
         assert "/World/Cube" not in annotated
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         decision = renderer._stage_change_sync_decision(
@@ -1299,6 +1312,10 @@ class TestCoarseReplayConsequences:
         )
 
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         calls: dict = {"writes": [], "structural": [], "transforms": []}
@@ -1680,6 +1697,10 @@ class TestNonDefaultVisibilityConsequences:
             (event.visibility_delta or {}).get("operation_resyncs") or ())
         assert "/World" not in annotated
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         decision = renderer._stage_change_sync_decision(
@@ -2017,6 +2038,10 @@ class TestMixedChangedPathRendererRouting:
 
         stage, event = self._mixed_event(mutation)
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         renderer._latest_point_cloud_frames = {}
@@ -2054,6 +2079,10 @@ class TestMixedChangedPathRendererRouting:
         adapter.set_visibility(stage.GetPrimAtPath("/World/Cube"), False)
         event = events[-1]
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         decision = renderer._stage_change_sync_decision(
@@ -2081,6 +2110,10 @@ class TestMixedChangedPathRendererRouting:
             stage.GetPrimAtPath("/World/Group/Cube"), False)
         event = events[-1]
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         decision = renderer._stage_change_sync_decision(
@@ -2132,6 +2165,10 @@ class TestVisibilityNameShapeSemantics:
         )
 
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         renderer._latest_point_cloud_frames = {}
@@ -2203,6 +2240,10 @@ class TestVisibilityNameShapeSemantics:
         assert "/World/Cube" in set(
             (event.visibility_delta or {}).get("authored") or ())
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         assert renderer._stage_change_sync_decision(
@@ -2258,6 +2299,10 @@ class TestSchemaShapedVisibilityAuthority:
         )
 
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         renderer._latest_point_cloud_frames = {}
@@ -2403,6 +2448,10 @@ class TestConsumerBoundaryStructuralFloor:
         )
 
         renderer = OvRtxRendererAdapter.__new__(OvRtxRendererAdapter)
+        # The renderer change
+        # gate reads the active product path before visibility
+        # routing; a bare __new__ adapter carries none.
+        renderer._render_product_path = None
         renderer._stage = stage
         renderer._selected_paths = []
         renderer._latest_point_cloud_frames = {}

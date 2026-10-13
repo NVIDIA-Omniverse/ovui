@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -22,7 +15,7 @@ constexpr uint32_t kMouseButtonCount = 5;
 
 struct Widget::WidgetData
 {
-    virtual ~WidgetData();
+    OMNIUI_API virtual ~WidgetData();
 
     // True when the mouse pointer is inside the widget area.
     // TODO: Have not decided if we need this as a property. Probably when we have signals, it would be useful to have
@@ -106,6 +99,10 @@ struct Widget::WidgetData
 
     float m_dpiAtPreviousFrame = 0.0f;
     bool m_wasVisiblePreviousFrame = false;
+
+    // Whether the pending size invalidation has been evaluated before drawing.
+    bool m_widthEvaluated = false;
+    bool m_heightEvaluated = false;
 };
 
 OMNIUI_NAMESPACE_CLOSE_SCOPE

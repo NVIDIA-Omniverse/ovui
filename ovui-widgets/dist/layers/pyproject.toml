@@ -1,17 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-widgets-layers"
-dynamic = ["version"]
+license = {text = "Apache-2.0"}
+# Dependencies are in setup.py: first-party packages are pinned to VERSION.md.
+dynamic = ["version", "dependencies"]
 description = "ovui-widgets Layers Panel"
-readme = "README.md"
+readme = {content-type = "text/markdown", text = """
+# ovui-widgets-layers
+
+Layers and composition stack package for ovui-widgets. It shows layer order,
+authoring target state, dirty/save state, mute and lock controls, missing-file
+signals, optional prim-spec rows, and command-backed save, reload, insert,
+remove, move, merge, flatten, mute, lock, and authoring-target operations.
+
+The widget reads layer and composition data through adapter objects so it can
+stay independent from the concrete scene backend.
+"""}
 requires-python = ">=3.10"
-dependencies = [
-    "ovui-widgets-common>=0.1.0",
-    "ovui-data-adapters-common>=0.1.0",
-]
 
 [tool.setuptools.packages.find]
 namespaces = true

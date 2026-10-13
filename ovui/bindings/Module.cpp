@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/bind/BindUtils.h>
@@ -103,6 +96,7 @@
 #include "BindStyleStore.h"
 #include "BindToolBar.h"
 #include "BindToolButton.h"
+#include "BindTimelinePlot.h"
 #include "BindTreeView.h"
 #include "BindTriangle.h"
 #include "BindValueModelHelper.h"
@@ -222,6 +216,7 @@ OMNIUI_PYBIND_MODULE(_ui, m)
     OMNIUI_BIND(Workspace);
     OMNIUI_BIND(Placer);
     OMNIUI_BIND(Plot);
+    OMNIUI_BIND(TimelinePlot);
     OMNIUI_BIND(ToolBar);
     OMNIUI_BIND(Font);
     OMNIUI_BIND(Glyph);
@@ -316,7 +311,7 @@ OMNIUI_PYBIND_MODULE(_ui, m)
         pybind11::arg("dock_tab_draw_inactive_separators"),
         pybind11::arg("tab_use_rectangular_shape"),
         pybind11::arg("dock_tab_text_color"),
-        pybind11::arg("splitter_handle_color"),
+        pybind11::arg("splitter_handle_color"), 
         pybind11::arg("splitter_handle_hovered_color"),
         pybind11::arg("dock_tab_hovered_color"),
         pybind11::arg("dock_tab_color"),

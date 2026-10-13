@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for ovui_data_adapters.openusd._camera_writer.
 
@@ -271,6 +264,28 @@ class TestIntrinsics:
         fovx_expected = 2.0 * math.atan(math.tan(fovy / 2.0) * aspect)
         fovx_read = 2.0 * math.atan(0.5 * h_ap / focal)
         assert fovx_read == pytest.approx(fovx_expected, abs=1e-4)
+
+    def test_orthographic_projection_and_extent_round_trip(self, stage):
+        controller = CameraController()
+        controller.state.distance = 12.0
+        controller.set_projection_mode("orthographic")
+        view, proj = controller.get_matrices(1600, 900)
+
+        write_camera_from_matrices(stage, CAMERA_PATH, view, proj, 1600, 900)
+
+        camera = UsdGeom.Camera(stage.GetPrimAtPath(CAMERA_PATH))
+        assert camera.GetProjectionAttr().Get() == UsdGeom.Tokens.orthographic
+        assert camera.GetHorizontalApertureAttr().Get() == pytest.approx(
+            20.0 / float(proj[0, 0]), rel=1e-5
+        )
+        assert camera.GetVerticalApertureAttr().Get() == pytest.approx(
+            20.0 / float(proj[1, 1]), rel=1e-5
+        )
+
+        controller.set_projection_mode("perspective")
+        view, proj = controller.get_matrices(1600, 900)
+        write_camera_from_matrices(stage, CAMERA_PATH, view, proj, 1600, 900)
+        assert camera.GetProjectionAttr().Get() == UsdGeom.Tokens.perspective
 
 
 # ── compute_camera_intrinsics (Issue #22) ─────────────────────────────────

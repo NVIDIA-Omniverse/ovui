@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OpenUSD provider factories registered through common."""
 
@@ -29,6 +22,11 @@ from ovui_data_adapters.openusd.property_adapter import UsdPropertyAdapter
 from ovui_data_adapters.openusd.stage_adapter import HAS_USD, UsdStageAdapter
 from ovui_data_adapters.openusd.transform_adapter import UsdTransformAdapter
 
+
+_URL_OPEN_ERROR = (
+    "The OpenUSD provider cannot open URLs. "
+    "Use the ovstage provider: OVUI_DATA_ADAPTER_PROVIDER=ovstage."
+)
 
 _OPENUSD_STAGE_CAPABILITIES = StageCapabilities(
     create_stage=AdapterCapability.supported(),
@@ -156,6 +154,13 @@ class OpenUSDProviderSession:
     def prepare_runtime_imports(self) -> None:
         from pxr import Gf, Sdf, Tf, Usd, UsdGeom  # noqa: F401
 
+    def runtime_component_versions(self) -> tuple[tuple[str, str], ...]:
+        """Return concrete runtime versions without exposing OpenUSD to widgets."""
+        from pxr import Usd
+
+        version = ".".join(str(part) for part in Usd.GetVersion())
+        return (("OpenUSD", version),)
+
     def inspector_usd_local_matrix(self, prim: Any) -> Any | None:
         """Return exact local USD transform evidence for the Inspector."""
 
@@ -187,7 +192,12 @@ class OpenUSDProviderSession:
     def open_stage(self, path: str) -> Any:
         from pxr import Usd
 
-        return Usd.Stage.Open(path)
+        try:
+            return Usd.Stage.Open(path)
+        except Exception as exc:
+            if str(path).lower().startswith(("http://", "https://")):
+                raise RuntimeError(_URL_OPEN_ERROR) from exc
+            raise
 
     def create_stage(self, path: str) -> Any:
         from pxr import Usd

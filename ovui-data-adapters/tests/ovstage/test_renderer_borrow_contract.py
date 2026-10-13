@@ -1,18 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Runtime-free contract tests for native OVStage BORROW rendering."""
 
 from __future__ import annotations
 
 import ast
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +14,8 @@ from typing import Any
 
 import numpy as np
 import pytest
+
+from ovui_data_adapters.common.instrumentation import Instrumentation, set_instrumentation
 from ovui_data_adapters.ovstage import renderer_adapter as renderer_module
 from ovui_data_adapters.ovstage._scene import OvstageScene
 from ovui_data_adapters.ovstage.provider import OvstageProviderSession
@@ -30,7 +26,9 @@ _ALLOWED_RENDERER_CALLS = frozenset(
         # Native OVStage attachment and presentation.
         "attach_ovstage",
         "detach_ovstage",
+        "destroy",
         "step",
+        "step_async",
         # Presentation-only interaction and renderer controls.
         "enqueue_pick_query",
         "reset",
@@ -164,6 +162,81 @@ def test_ovrtx_renderer_calls_remain_presentation_only() -> None:
     )
 
 
+class _RecordingInstrumentation(Instrumentation):
+    def __init__(self, events: list) -> None:
+        self.events = events
+
+    def begin_scope(self, owner, name):
+        self.events.append(("begin", owner, name))
+        return 42
+
+    def end_scope(self, owner, token):
+        self.events.append(("end", owner, token))
+
+    def release_renderer(self, owner):
+        self.events.append(("release", owner))
+
+
+@pytest.fixture
+def recorded_instrumentation():
+    events: list = []
+    set_instrumentation(_RecordingInstrumentation(events))
+    try:
+        yield events
+    finally:
+        set_instrumentation(None)
+
+
+def test_profiled_calls_use_installed_instrumentation(recorded_instrumentation) -> None:
+    adapter = OvstageRendererAdapter.__new__(OvstageRendererAdapter)
+    name = "OvstagePropertyAdapter.query_prims"
+    assert adapter._profile_ovui_call(name, lambda: "completed") == "completed"
+
+    def fail():
+        raise RuntimeError("operation failed")
+
+    with pytest.raises(RuntimeError, match="operation failed"):
+        adapter._profile_ovui_call(name, fail)
+
+    assert recorded_instrumentation == [
+        ("begin", adapter, name), ("end", adapter, 42),
+    ] * 2
+
+
+def test_profiled_calls_without_instrumentation_only_call_the_function() -> None:
+    adapter = OvstageRendererAdapter.__new__(OvstageRendererAdapter)
+    assert adapter.start_ovui_performance_scope("StageBrowser.build_branch") is None
+    assert adapter._profile_ovui_call("StageBrowser.build_branch", lambda: 7) == 7
+
+
+@pytest.mark.parametrize("fail_lock", [False, True])
+def test_pacing_lock_wait_scope_is_balanced(fail_lock) -> None:
+    events = []
+
+    class Lock:
+        def __enter__(self):
+            if fail_lock:
+                raise RuntimeError("lock failed")
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    adapter = OvstageRendererAdapter.__new__(OvstageRendererAdapter)
+    adapter._attached_stage = SimpleNamespace(_ovui_frame_lock=Lock())
+    adapter._frame_pacing_transition_lock = Lock()
+    adapter.start_ovui_performance_scope = lambda name: events.append("start") or 42
+    adapter.end_ovui_performance_scope = lambda uid: events.append("end") if uid else None
+    adapter._stop_native_frame_pacing_locked = lambda *args, **kwargs: events.append("stop")
+    if fail_lock:
+        with pytest.raises(RuntimeError, match="lock failed"):
+            adapter._stop_native_frame_pacing("selection")
+        assert events == ["start", "end"]
+    else:
+        adapter._stop_native_frame_pacing("selection")
+        assert events == ["start", "end", "stop"]
+
+
 def test_borrow_ast_guard_tracks_getattr_renderer_aliases() -> None:
     """A future data write cannot evade the guard through ``getattr``."""
 
@@ -203,11 +276,13 @@ def _borrow_adapter(renderer: _BorrowRenderer) -> OvstageRendererAdapter:
     adapter._attached_stage = object()
     adapter._render_product_path = "/_OvuiRuntime/Render/Viewport"
     adapter._camera_path = None
+    adapter._render_flow_mode = "nativePacing"
+    adapter._secondary_viewport_active = False
     adapter._last_resolution = (64, 32)
     adapter._last_render_product_resolution = (64, 32)
     adapter._last_view_matrix = None
     adapter._last_proj_matrix = None
-    adapter._dt_clock = time.monotonic()
+    adapter._dt_clock = time.perf_counter()
     adapter._logged_first_step = True
     adapter._borrow_step_count = 0
     adapter._successful_frame_count = 0
@@ -283,6 +358,9 @@ class _LifecycleRenderer:
         if self._fail_detach:
             raise RuntimeError("mock detach failure")
 
+    def destroy(self) -> None:
+        self._events.append("renderer.destroy")
+
 
 class _LifecyclePathDictionary:
     def __init__(self, events: list[str]) -> None:
@@ -308,6 +386,12 @@ def _attached_lifecycle_pair(
     adapter._scene = scene
     adapter._renderer = _LifecycleRenderer(events, fail_detach=fail_detach)
     adapter._attached_stage = stage
+    adapter._render_worker_thread = None
+    adapter._render_state_lock = threading.RLock()
+    adapter._queued_viewport_renders = {}
+    adapter._completed_viewport_frames = {}
+    adapter._presentation_pending_viewports = set()
+    adapter._completed_pick_callbacks = []
     adapter._runtime_population = None
     adapter._runtime_reference_handle = None
     adapter._path_dictionary = _LifecyclePathDictionary(events)
@@ -324,6 +408,7 @@ def test_scene_shutdown_detaches_borrow_renderer_before_destroying_stage() -> No
     assert events == [
         "renderer.detach_ovstage",
         "path_dictionary.destroy",
+        "renderer.destroy",
         "stage.destroy",
     ]
     assert scene.is_open is False
@@ -331,10 +416,85 @@ def test_scene_shutdown_detaches_borrow_renderer_before_destroying_stage() -> No
     assert adapter._renderer is None
 
 
-def test_detach_failure_blocks_stage_destruction_and_preserves_provider_owner() -> None:
+def test_shutdown_drains_worker_and_closes_outputs_before_destroying_renderer() -> None:
+    _scene, adapter, _stage, events = _attached_lifecycle_pair()
+    adapter._render_worker_stop = threading.Event()
+    adapter._render_worker_wake = threading.Event()
+
+    def worker_main() -> None:
+        adapter._render_worker_stop.wait(timeout=5.0)
+        events.append("worker.stopped")
+
+    worker = threading.Thread(target=worker_main)
+    adapter._render_worker_thread = worker
+    adapter._completed_viewport_frames["primary"] = SimpleNamespace(
+        image=SimpleNamespace(close=lambda: events.append("output.closed"))
+    )
+    adapter._livestream = SimpleNamespace(
+        close=lambda: events.append("livestream.closed")
+    )
+    worker.start()
+    try:
+        adapter.shutdown()
+    finally:
+        adapter._render_worker_stop.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert events == [
+        "worker.stopped",
+        "output.closed",
+        "renderer.detach_ovstage",
+        "path_dictionary.destroy",
+        "livestream.closed",
+        "renderer.destroy",
+    ]
+    assert adapter._renderer is None
+
+
+def test_shutdown_destroys_renderer_then_releases_instrumentation(recorded_instrumentation) -> None:
+    scene, adapter, _stage, events = _attached_lifecycle_pair()
+
+    adapter.shutdown()
+    adapter.shutdown()
+
+    # Native destruction happens immediately, independently of Python
+    # references that instrumentation may still hold until it is released.
+    assert events == [
+        "renderer.detach_ovstage",
+        "path_dictionary.destroy",
+        "renderer.destroy",
+    ]
+    assert ("release", adapter) in recorded_instrumentation
+    assert scene.is_open is True
+    assert adapter._attached_stage is None
+    assert adapter._renderer is None
+
+
+def test_shutdown_propagates_renderer_destroy_failure() -> None:
+    _scene, adapter, _stage, events = _attached_lifecycle_pair()
+    renderer = adapter._renderer
+
+    def fail_destroy() -> None:
+        raise RuntimeError("mock destroy failure")
+
+    renderer.destroy = fail_destroy
+    with pytest.raises(RuntimeError, match="mock destroy failure"):
+        adapter.shutdown()
+
+    assert events == ["renderer.detach_ovstage", "path_dictionary.destroy"]
+    assert adapter._attached_stage is None
+    assert adapter._renderer is renderer
+
+
+def test_detach_failure_blocks_stage_destruction_and_preserves_provider_owner(
+    recorded_instrumentation,
+) -> None:
     scene, adapter, stage, events = _attached_lifecycle_pair(fail_detach=True)
+    renderer = adapter._renderer
     session = OvstageProviderSession.__new__(OvstageProviderSession)
     session._current_scene = scene
+    session._pending_scene_cleanup = []
     session.physics_controls = SimpleNamespace(
         disable=lambda: events.append("physics.disable")
     )
@@ -347,4 +507,16 @@ def test_detach_failure_blocks_stage_destruction_and_preserves_provider_owner() 
     assert scene.is_open is True
     assert scene._stage is stage
     assert adapter._attached_stage is stage
-    assert adapter._renderer is not None
+    assert adapter._renderer is renderer
+    assert ("release", adapter) not in recorded_instrumentation
+
+    renderer._fail_detach = False
+    session.shutdown_scene()
+    assert events[-4:] == [
+        "renderer.detach_ovstage",
+        "path_dictionary.destroy",
+        "renderer.destroy",
+        "stage.destroy",
+    ]
+    assert adapter._renderer is None
+    assert ("release", adapter) in recorded_instrumentation

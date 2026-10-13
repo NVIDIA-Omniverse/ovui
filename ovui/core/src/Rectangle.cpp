@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #define _USE_MATH_DEFINES
@@ -45,6 +38,9 @@ void Rectangle::_drawShadow(
     // ImDrawCornerFlags
     uint32_t round_corner = ImDrawFlags_RoundCornersAll;
     this->_resolveStyleProperty(StyleEnumProperty::eCornerFlag, &round_corner);
+    // Public CornerFlag values retain their original four-bit ABI.
+    if (round_corner <= 0x0F)
+        round_corner = round_corner ? (round_corner << 4) : ImDrawFlags_RoundCornersNone;
 
     ImVec2 objMin{ x, y };
     ImVec2 objMax{ x + width, y + height };
@@ -68,7 +64,8 @@ void Rectangle::_drawShadow(
     // which would otherwise push the combined value out of range and silently lose the corner mask.
     if (round_corner >= 0x01 && round_corner <= 0x0F)
         round_corner <<= 4;
-    ImGui::GetWindowDrawList()->AddShadowRect(objMin, objMax, shadowColor, shadowThickness, shadowOffset, shadowFlag | round_corner, borderRadius);
+    ImGui::GetWindowDrawList()->AddShadowRect(objMin, objMax, shadowColor, shadowThickness, shadowOffset,
+                                            shadowFlag, borderRadius, round_corner);
 }
 
 void Rectangle::_drawShape(float elapsedTime, float x, float y, float width, float height)
@@ -101,6 +98,9 @@ void Rectangle::_drawShape(float elapsedTime, float x, float y, float width, flo
     // ImDrawCornerFlags
     uint32_t round_corner = ImDrawFlags_RoundCornersAll;
     this->_resolveStyleProperty(StyleEnumProperty::eCornerFlag, &round_corner);
+    // Public CornerFlag values retain their original four-bit ABI.
+    if (round_corner <= 0x0F)
+        round_corner = round_corner ? (round_corner << 4) : ImDrawFlags_RoundCornersNone;
 
     ImVec2 start{ x, y };
 

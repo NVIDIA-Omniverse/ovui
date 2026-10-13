@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 // Internal header: text-run layout + emoji/UTF-8 helpers.  Not part of the
@@ -46,11 +39,20 @@ int _scanEmojiSequence(const char* p, const char* end, TwemojiAtlas* atlas,
 
 // ---- Font-glyph probes ----------------------------------------------
 
-// Returns true if `font` has a dedicated glyph for `cp` (no fallback).
-// Astral-plane codepoints (cp > 0xFFFF) only succeed on ImWchar32 builds;
-// on ImWchar16 builds we return false so callers fall through to their
-// fallback-font path instead of short-circuiting at this probe.
+// Returns true if the `font` face itself provides a glyph for `cp`.  This is
+// a property of the font file, independent of what the atlas has rasterized
+// so far.  Astral-plane codepoints (cp > 0xFFFF) only succeed on ImWchar32
+// builds; on ImWchar16 builds we return false so callers fall through to
+// their fallback-font path instead of short-circuiting at this probe.
 bool _fontHasGlyph(ImFont* font, float fontSize, uint32_t cp);
+
+// Returns true if `font` already has `cp` rasterized into its atlas, i.e. the
+// glyph can be drawn from the atlas texture the GPU currently holds.  Faces
+// served by FontAtlasTexture upload their pixels once at construction and are
+// never re-uploaded, so a glyph baked after that point exists CPU-side only
+// and would draw blank.  Callers that opt into a face on the fly must use
+// this stricter probe rather than _fontHasGlyph().
+bool _fontHasBakedGlyph(ImFont* font, float fontSize, uint32_t cp);
 
 // ---- Text emission --------------------------------------------------
 

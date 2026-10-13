@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Assert.h"
@@ -408,6 +401,9 @@ void ImageWithProvider::_drawContent(float elapsedTime)
 
     uint32_t round_corner = ImDrawFlags_RoundCornersAll;
     this->_resolveStyleProperty(StyleEnumProperty::eCornerFlag, &round_corner);
+    // Public CornerFlag values retain their original four-bit ABI.
+    if (round_corner <= 0x0F)
+        round_corner = round_corner ? (round_corner << 4) : ImDrawFlags_RoundCornersNone;
 
     float imageSize[2] = { static_cast<float>(textureSize.x), static_cast<float>(textureSize.y) };
     float canvasSize[2] = { this->getComputedContentWidth(), this->getComputedContentHeight() };

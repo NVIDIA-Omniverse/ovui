@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -31,8 +24,6 @@ _RUN_ENV = "OVUI_RUN_INSPECTOR_QA"
 _TARGET_PATH = "/World/Hierarchy/GroupA/BoxA"
 _FILE_MENU = (122, 10)
 _FILE_NEW_ITEM = (135, 35)
-_CREATE_MENU = (232, 10)
-_CREATE_XFORM_ITEM = (240, 145)
 
 _PICK_DELETE_HISTORY_SCENARIO = ScenarioEvidenceContract.declare(
     "test_ovstage_stage_workflows.py::"
@@ -76,19 +67,6 @@ _PICK_DELETE_HISTORY_SCENARIO = ScenarioEvidenceContract.declare(
 
 def _enabled() -> bool:
     return os.environ.get(_RUN_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-_CREATE_XFORM_SCENARIO = ScenarioEvidenceContract.declare(
-    "test_ovstage_stage_workflows.py::"
-    "test_create_xform_through_visible_menu_populates_native_ovstage",
-    {
-        "create.xform": (
-            "menu_click",
-            "xform_schema",
-            "ovstage_path",
-        ),
-    },
-)
 
 
 def _record_feature_evidence(
@@ -249,83 +227,3 @@ def test_viewport_pick_delete_undo_redo_preserve_native_scene_state(tmp_path: Pa
         )
         manifest = evidence.finalize()
         assert manifest["summary"]["complete"] is True
-
-
-@pytest.mark.skipif(not _enabled(), reason=f"set {_RUN_ENV}=1 to run real Inspector QA")
-def test_create_xform_through_visible_menu_populates_native_ovstage(
-    tmp_path: Path,
-) -> None:
-    """A visible Create > Xform menu click populates exact native OVStage.
-
-    Native-only migration of the create.xform portion of the removed hybrid
-    File-New scenario (File New itself is now accepted-unsupported): the Xform
-    is created through the real Create menu and verified against native
-    OVStage type/topology and the Stage tree rows, with undo/redo.
-    """
-    repo_root = Path(__file__).resolve().parents[3]
-    config = InspectorRuntimeConfig.from_environment(repo_root)
-    workspace = tmp_path / "viewer"
-    workspace.mkdir(parents=True)
-    source_scene = (
-        repo_root
-        / "ovui-data-adapters"
-        / "tests"
-        / "data"
-        / "ovstage_static_scene.usda"
-    )
-    scene = workspace / "ovstage_static_scene.usda"
-    shutil.copy2(source_scene, scene)
-    evidence_root = tmp_path / "evidence" / "create-xform-native"
-
-    with InspectorAppProcess(config, workspace, scene=scene) as application:
-        initial = application.wait_for_scene()
-        assert initial["adapter"]["paths"]
-        evidence = EvidenceRecorder(
-            application.client,
-            evidence_root,
-            scenario=_CREATE_XFORM_SCENARIO,
-        )
-
-        menu = evidence.action(
-            "open-create-menu",
-            lambda: application.client.click(*_CREATE_MENU),
-        )
-        assert menu["record"]["screenshot_changed"] is True
-        created = evidence.action(
-            "choose-create-xform",
-            lambda: application.client.click(*_CREATE_XFORM_ITEM),
-        )
-        state = created["after"]["state"]
-        assert state["ovstage"]["prims"]["/World/Xform"]["type_name"] == "Xform"
-        assert "/World/Xform" in state["ovstage"]["paths"]
-        assert "/World/Xform" in state["adapter"]["paths"]
-        assert "/World/Xform" in {
-            row["path"] for row in state["stage_ui"]["rows"]
-        }
-        assert_native_scene_state(state)
-
-        undone = evidence.action(
-            "undo-create-xform",
-            lambda: application.client.press("z", modifiers=["ctrl"]),
-        )
-        assert "/World/Xform" not in undone["after"]["state"]["ovstage"]["paths"]
-        assert_native_scene_state(undone["after"]["state"])
-
-        redone = evidence.action(
-            "redo-create-xform",
-            lambda: application.client.press("z", modifiers=["ctrl", "shift"]),
-        )
-        assert "/World/Xform" in redone["after"]["state"]["ovstage"]["paths"]
-        assert_native_scene_state(redone["after"]["state"])
-
-        _record_feature_evidence(
-            evidence,
-            "create.xform",
-            {
-                "menu_click": "A real mouse click opened Create and chose Xform.",
-                "xform_schema": "The created prim's native OVStage type is exactly Xform.",
-                "ovstage_path": "/World/Xform is present in native OVStage, the adapter, and the Stage rows.",
-            },
-        )
-        manifest = evidence.finalize()
-        assert manifest["summary"]["passed"] is True

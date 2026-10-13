@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Headless entrypoint for OvGear — `python -m ovui_widgets.app.headless`.
 
@@ -63,6 +56,13 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> None:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
+    from ovui_widgets.app.cli_settings import apply_early_setting_overrides
+
+    try:
+        apply_early_setting_overrides(args.settings_overrides)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     os.environ["OMNIUI_HEADLESS"] = "1"
     os.environ["OMNIUI_BACKEND"] = "vulkan"
 
@@ -78,7 +78,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         preconstruct_selected_native_renderer,
     )
 
-    bootstrap = preconstruct_selected_native_renderer()
+    bootstrap = preconstruct_selected_native_renderer(args.settings_overrides)
     from ovui_widgets.app.application import Application
     app = Application(settings_overrides=args.settings_overrides)
     install_preconstructed_renderer(app, bootstrap)

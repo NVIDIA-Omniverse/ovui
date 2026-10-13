@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION is strictly
-# prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Scene-bound exact-public OVStage value authoring."""
 
@@ -14,6 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import ntpath
+import os
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -378,7 +373,23 @@ def _make_array_tensor(
     value: Any,
     dtype: Any,
 ) -> Any:
-    if descriptor.semantic in {
+    if (
+        descriptor.semantic == _SEMANTIC_ASSET_STRING
+        and not descriptor.logical_is_array
+    ):
+        authored = str(value)
+        resolved = (
+            authored
+            if (
+                os.path.isabs(authored)
+                or ntpath.isabs(authored)
+                or "://" in authored
+            )
+            else ""
+        )
+        encoded = f"{authored}\0{resolved}".encode("utf-8")
+        array = np.frombuffer(encoded, dtype=np.uint8).copy()
+    elif descriptor.semantic in {
         _SEMANTIC_STRING,
         _SEMANTIC_ASSET_STRING,
         _SEMANTIC_PATH_EXPRESSION_STRING,

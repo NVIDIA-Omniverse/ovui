@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0
+
+- Publish the framework, widgets, adapters, and packaged agent skills as the
+  synchronized 0.3.0 release, with first-party wheel dependencies pinned to
+  the same version.
+- Distribute NVIDIA-authored source under Apache 2.0 and include the license
+  and third-party notices in published packages.
+- Add clean-wheel installation and application regression coverage, including
+  renderer loading, viewport resize/selection, and numeric-field keyboard input.
+
+- Restore embedded scene-widget frames in Kit through the existing virtual-window,
+  renderer, GPU resource and input services; preserve standalone backend behavior.
+- Return Kit's registered Python GPU resource, image format and application-window
+  types, so the viewport presents native frames after a library/binding replacement.
+- Supply the existing host binding entry points for upload status, docking flags
+  and the native legacy slider. Keep all mapped shared sources unchanged.
+- Include pinned, unmodified host interface headers in source packages.
+- Synchronize the complete ImGui dependency and drawing configuration with Kit;
+  deliver it as one shared native library.
+- Pin native and browser binding builds to Kit's pybind11 2.11.1.
+- Ship the native UI/scene SDK, dependency headers, Windows link libraries,
+  notices and source/file manifests in the wheel.
+- Synchronize Workspace callback ownership with Kit and release standalone
+  callback owners before shutdown.
+- Update 38 ovui image references only after pixel-identical comparison with
+  unchanged Kit-mainline ImGui; retain all existing tests and acceptance settings.
+
 ## 0.2.0 - 16-06-2026
 
 ### Added
@@ -36,10 +63,8 @@ python3 ovui/tools/sbom/enrich_sbom_licenses.py --sbom sbom.cdx.json
   - durable new-document creation, save/export, layer-stack and composition
     operations, and clearing authored property values are unavailable with the
     native provider; the standalone `openusd` provider covers those workflows;
-  - selected objects receive a renderer-owned selection outline on the
-    supported attach-capable ovrtx 0.4 path; a runtime that does not expose the
-    outline-membership API degrades honestly (selection still synchronizes, no
-    outline appears);
+  - selected borrowed objects may have correct logical selection without a
+    visible selection outline;
   - point-cloud request and error handling is partial, and real payload parity
     plus radar support are not claimed;
   - physics requires a matching `ovphysx` runtime (loaded lazily when physics

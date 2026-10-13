@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # ==============================================================================
 # standalone/CMakeLists.txt - libomniui_standalone.so
 # ==============================================================================
@@ -9,6 +12,12 @@ if(NOT OMNIUI_HEADLESS_ONLY)
     find_package(OpenGL REQUIRED)
 endif()
 find_package(Vulkan QUIET)
+if(Vulkan_FOUND)
+    find_package(ovrtx CONFIG QUIET
+        HINTS
+            "$ENV{OVRTX_ROOT}/public/tools/dev"
+    )
+endif()
 
 # GLFW is optional when building headless-only
 if(NOT OMNIUI_HEADLESS_ONLY)
@@ -26,18 +35,20 @@ if(NOT OMNIUI_HEADLESS_ONLY)
 endif()
 
 # ImGui backend sources (GLFW + OpenGL3)
-set(IMGUI_BACKEND_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui/backends)
+set(IMGUI_BACKEND_DIR ${OVUI_IMGUI_ROOT}/imgui/backends)
 
 set(STANDALONE_SOURCES
     src/StandaloneSettings.cpp
     src/StandaloneFileIO.cpp
     src/OpenGLRenderer.cpp
     src/OpenGLByteImageGpu.cpp
+    src/StandaloneImageBackend.cpp
     src/StandaloneRasterImageLoader.cpp
     src/GlfwPlatform.cpp
     src/StandaloneGlyphManager.cpp
     src/StandaloneInit.cpp
     src/StandaloneWindowCallbackManager.cpp
+    src/Win32WindowTitle.cpp
     ${IMGUI_BACKEND_DIR}/imgui_impl_glfw.cpp
     ${IMGUI_BACKEND_DIR}/imgui_impl_opengl3.cpp
 )
@@ -47,13 +58,46 @@ if(Vulkan_FOUND)
     list(APPEND STANDALONE_SOURCES
         src/VulkanBackend.cpp
         src/VulkanByteImageGpu.cpp
+        src/NativeFramePacing.cpp
         src/StreamingVulkan.cpp
         src/HeadlessVulkanPlatform.cpp
         ${IMGUI_BACKEND_DIR}/imgui_impl_vulkan.cpp
     )
     message(STATUS "Vulkan found - enabling Vulkan backend + streaming + headless")
 else()
+    list(APPEND STANDALONE_SOURCES src/NativeFramePacingStub.cpp)
     message(STATUS "Vulkan not found - Vulkan backend disabled")
+endif()
+
+if(WIN32)
+    add_executable(win32_window_title_test
+        tests/test_win32_window_title.cpp
+        src/Win32WindowTitle.cpp
+    )
+    target_include_directories(win32_window_title_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(win32_window_title_test PRIVATE user32)
+    add_test(NAME win32_window_title COMMAND win32_window_title_test)
+    set_tests_properties(win32_window_title PROPERTIES TIMEOUT 30)
+endif()
+
+# Native ovrtx frame pacing is optional at build time. The renderer library is
+# resolved dynamically at runtime; the headers must expose the consumed ABI.
+# An explicit cache path wins so wheel/runtime builds never capture a host path.
+# The hints name header-only packages on the build machine (e.g. the ovrtx
+# wheel), so a cross build must not re-root them into the target sysroot.
+set(OMNIUI_OVRTX_INCLUDE_DIR "" CACHE PATH "Directory containing a usable ovrtx/ovrtx.h public C ABI")
+if(NOT OMNIUI_OVRTX_INCLUDE_DIR)
+    find_path(OMNIUI_OVRTX_DISCOVERED_INCLUDE_DIR ovrtx/ovrtx.h
+        HINTS
+            "$ENV{OVRTX_ROOT}/include"
+            "$ENV{OVRTX_INCLUDE_DIR}"
+        NO_CMAKE_FIND_ROOT_PATH
+    )
+    if(OMNIUI_OVRTX_DISCOVERED_INCLUDE_DIR)
+        set(OMNIUI_OVRTX_INCLUDE_DIR "${OMNIUI_OVRTX_DISCOVERED_INCLUDE_DIR}")
+    endif()
 endif()
 
 # CUDA-Vulkan interop (conditional -- requires both Vulkan and CUDA)
@@ -101,23 +145,21 @@ if(Vulkan_FOUND)
     endif()
 endif()
 
-list(APPEND STANDALONE_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/scene/StandaloneWidget.cpp
-)
-
 add_library(omniui_standalone SHARED ${STANDALONE_SOURCES})
 
-# StandaloneWidget.cpp must be compiled with OMNIUI_SCENE_EXPORTS so that the
-# scene::Widget class typeinfo (RTTI) and vtable are exported with default
-# visibility. Pybind11 requires them to be in the dynamic symbol table when
-# _scene.so is loaded. The class is declared OMNIUI_SCENE_CLASS_API which
-# expands to __attribute__((visibility("default"))) iff OMNIUI_SCENE_EXPORTS
-# is defined, overriding the CXX_VISIBILITY_PRESET hidden on this library.
-set_source_files_properties(
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/scene/StandaloneWidget.cpp
-    PROPERTIES
-    COMPILE_DEFINITIONS "OMNIUI_SCENE_EXPORTS"
-)
+# Optional native timing. The hook table is empty until a package installs one
+# through `omni.ui._ui._set_native_timing_hooks(capsule)`; a scope then costs
+# one pointer test. The table itself belongs to the core library, because core
+# widgets and the standalone backend both open scopes and the standalone
+# library links the core library. Kit builds only `core/`, so they do not get
+# this file and keep every core scope compiled out.
+option(OMNIUI_ENABLE_NATIVE_TIMING_SCOPES
+    "Compile the optional native timing scopes into the standalone build" ON)
+target_sources(ovui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/NativeTiming.cpp")
+target_include_directories(ovui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+if(OMNIUI_ENABLE_NATIVE_TIMING_SCOPES)
+    target_compile_definitions(ovui PRIVATE OMNIUI_HAS_NATIVE_TIMING_SCOPES=1)
+endif()
 
 # glad is provided by FetchContent (Dav1dde/glad@v0.1.36) as a STATIC library
 target_compile_definitions(omniui_standalone PRIVATE OMNIUI_HAS_GLAD=1)
@@ -126,19 +168,17 @@ target_include_directories(omniui_standalone
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     PRIVATE
-        ${CMAKE_SOURCE_DIR}/third_party/imgui/backends
-        ${CMAKE_SOURCE_DIR}/third_party/imgui
+        ${OVUI_IMGUI_ROOT}/imgui/backends
+        ${OVUI_IMGUI_ROOT}/imgui
         # Access to internal core headers (IRasterImageLoader etc.) which live
         # in core/src and are otherwise private to libovui.
         ${CMAKE_SOURCE_DIR}/core/src
 )
 
 # Inherit ovui's public includes (platform interfaces)
-# Link ovuiscene so Widget stub symbols resolve and scene types are visible
 target_link_libraries(omniui_standalone
     PUBLIC
         ovui
-        ovuiscene
     PRIVATE
         glad
         OpenGL::GL
@@ -166,7 +206,51 @@ if(Vulkan_FOUND)
     target_compile_definitions(omniui_standalone PRIVATE OMNIUI_HAS_VULKAN=1)
     target_include_directories(omniui_standalone PRIVATE ${Vulkan_INCLUDE_DIRS})
     target_link_libraries(omniui_standalone PRIVATE Vulkan::Vulkan)
+
+    if(OMNIUI_OVRTX_INCLUDE_DIR AND
+       EXISTS "${OMNIUI_OVRTX_INCLUDE_DIR}/ovrtx/ovrtx_types.h")
+        include(CheckCXXSourceCompiles)
+        set(CMAKE_REQUIRED_INCLUDES "${OMNIUI_OVRTX_INCLUDE_DIR}")
+        unset(OMNIUI_OVRTX_FRAME_PACING_CAPABLE CACHE)
+        check_cxx_source_compiles([=[
+            #include <ovrtx/ovrtx.h>
+            template <typename T>
+            auto render_var_name(const T& output, int) -> decltype(output.source_name) {
+                return output.source_name;
+            }
+            template <typename T>
+            auto render_var_name(const T& output, long) -> decltype(output.render_var_name) {
+                return output.render_var_name;
+            }
+            int main() {
+                ovrtx_binding_desc_t binding{};
+                ovrtx_input_buffer_t input{};
+                ovrtx_render_product_set_outputs_t outputs{};
+                ovrtx_render_product_render_var_output_t render_var{};
+                ovrtx_render_var_output_t mapped{};
+                (void)binding.prim_list;
+                (void)binding.attribute_name;
+                (void)input.tensors;
+                (void)outputs.outputs;
+                (void)render_var_name(render_var, 0);
+                (void)render_var.output_handle;
+                (void)mapped.map_handle;
+                return 0;
+            }
+        ]=] OMNIUI_OVRTX_FRAME_PACING_CAPABLE)
+        unset(CMAKE_REQUIRED_INCLUDES)
+        if(OMNIUI_OVRTX_FRAME_PACING_CAPABLE)
+            target_compile_definitions(omniui_standalone PRIVATE OMNIUI_HAS_OVRTX_FRAME_PACING=1)
+            target_include_directories(omniui_standalone PRIVATE "${OMNIUI_OVRTX_INCLUDE_DIR}")
+            message(STATUS "required ovrtx public interfaces found - enabling native frame pacing coordinator")
+        else()
+            message(STATUS "ovrtx headers lack required interfaces - native frame pacing coordinator will fail closed")
+        endif()
+    else()
+        message(STATUS "ovrtx public headers not found - native frame pacing coordinator will fail closed")
+    endif()
 endif()
+
 
 # NVENC support (optional)
 if(OMNIUI_HAS_NVENC)
@@ -252,6 +336,46 @@ if(CUDAToolkit_FOUND)
     endif()
     target_compile_definitions(omniui_standalone PRIVATE OMNIUI_HAS_CUDA=1)
     message(STATUS "CUDA found (${CUDAToolkit_VERSION}) -- streaming CUDA-GL interop enabled")
+
+    # omniui_standalone imports the CUDA runtime directly and _ui links
+    # omniui_standalone, so `import omni.ui` needs cudart present. A supported
+    # machine has the NVIDIA driver but not the CUDA Toolkit, so record the
+    # runtime this build linked against and let the packaging step ship it
+    # beside the extension. The CUDA *driver* library is never packaged.
+    #
+    # Record the file the *loader* needs, which is not the file the linker
+    # consumed: on Windows CUDA::cudart resolves to cudart.lib, while the
+    # backend's import is cudart64_<major>.dll. Shipping the import library
+    # would leave the wheel unloadable in exactly the deployment this is for.
+    set(OMNIUI_CUDA_RUNTIME_FILE "")
+    if(WIN32)
+        if(DEFINED CUDAToolkit_VERSION_MAJOR)
+            set(_ovui_cudart_names "cudart64_${CUDAToolkit_VERSION_MAJOR}.dll")
+        else()
+            set(_ovui_cudart_names "cudart64_12.dll" "cudart64_11.dll")
+        endif()
+        find_file(OMNIUI_CUDA_RUNTIME_DLL
+            NAMES ${_ovui_cudart_names}
+            HINTS "${CUDAToolkit_BIN_DIR}"
+                  "$ENV{CUDA_PATH}/bin" "$ENV{CUDAToolkit_ROOT}/bin" "$ENV{CUDA_HOME}/bin"
+            DOC "CUDA runtime DLL shipped inside the omni.ui package")
+        if(OMNIUI_CUDA_RUNTIME_DLL)
+            set(OMNIUI_CUDA_RUNTIME_FILE "${OMNIUI_CUDA_RUNTIME_DLL}")
+        endif()
+    elseif(TARGET CUDA::cudart)
+        set(OMNIUI_CUDA_RUNTIME_FILE "$<TARGET_FILE:CUDA::cudart>")
+    elseif(CUDA_CUDART)
+        set(OMNIUI_CUDA_RUNTIME_FILE "${CUDA_CUDART}")
+    endif()
+    if(OMNIUI_CUDA_RUNTIME_FILE)
+        file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/cuda_runtime_path.txt"
+             CONTENT "${OMNIUI_CUDA_RUNTIME_FILE}")
+    elseif(OMNIUI_REQUIRE_CUDA)
+        message(FATAL_ERROR
+            "OMNIUI_REQUIRE_CUDA=ON but the CUDA runtime library could not be "
+            "located next to the toolkit. The wheel would build without it and "
+            "then fail to import on any machine without a CUDA Toolkit.")
+    endif()
 else()
     message(STATUS "CUDA not found -- streaming will work without CUDA (GL texture only, no zero-copy)")
 endif()
@@ -278,18 +402,19 @@ if(APPLE)
     set_target_properties(omniui_standalone PROPERTIES
         # See ovui/core/CMakeLists.txt for rationale on this multi-entry
         # RPATH and BUILD_WITH_INSTALL_RPATH.
-        INSTALL_RPATH "@loader_path;@loader_path/../core;@loader_path/../standalone;@loader_path/../ui;@loader_path/../ui_scene"
+        INSTALL_RPATH "@loader_path;@loader_path/../third_party;@loader_path/../core;@loader_path/../standalone;@loader_path/../ui;@loader_path/../ui_scene"
         BUILD_WITH_INSTALL_RPATH ON
     )
 elseif(NOT WIN32)
     set_target_properties(omniui_standalone PROPERTIES
         # See ovui/core/CMakeLists.txt for rationale on this multi-entry
         # RPATH and BUILD_WITH_INSTALL_RPATH.
-        INSTALL_RPATH "$ORIGIN:$ORIGIN/../core:$ORIGIN/../standalone:$ORIGIN/../ui:$ORIGIN/../ui_scene"
+        INSTALL_RPATH "$ORIGIN:$ORIGIN/../third_party:$ORIGIN/../core:$ORIGIN/../standalone:$ORIGIN/../ui:$ORIGIN/../ui_scene"
         BUILD_WITH_INSTALL_RPATH ON
     )
 endif()
 if(WIN32)
+    target_link_libraries(omniui_standalone PRIVATE user32)
     set_target_properties(omniui_standalone PROPERTIES
         WINDOWS_EXPORT_ALL_SYMBOLS OFF
         RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}"
@@ -312,8 +437,8 @@ if(Vulkan_FOUND AND CUDAToolkit_FOUND)
     )
     target_include_directories(cuda_interop_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/third_party/imgui/backends
-        ${CMAKE_SOURCE_DIR}/third_party/imgui
+        ${OVUI_IMGUI_ROOT}/imgui/backends
+        ${OVUI_IMGUI_ROOT}/imgui
     )
     target_link_libraries(cuda_interop_test PRIVATE
         omniui_standalone
@@ -326,7 +451,7 @@ if(Vulkan_FOUND AND CUDAToolkit_FOUND)
     message(STATUS "CUDA interop test: cuda_interop_test target added")
 
     # ByteImageProvider fromGpu round-trip test — verifies the wiring added
-    # for ovui#17 (CUDA dev pointer → VkImage via importVkImageMemoryToCuda).
+    # for CUDA byte images (CUDA dev pointer → VkImage via importVkImageMemoryToCuda).
     add_executable(byte_image_gpu_test
         tests/byte_image_gpu_test.cpp
     )
@@ -345,7 +470,7 @@ if(Vulkan_FOUND AND CUDAToolkit_FOUND)
     if(NOT WIN32 AND NOT APPLE)
         set_target_properties(byte_image_gpu_test PROPERTIES INSTALL_RPATH "$ORIGIN")
     endif()
-    message(STATUS "byte_image_gpu_test target added (ovui#17 helper-layer test)")
+    message(STATUS "byte_image_gpu_test target added (CUDA byte-image helper-layer test)")
 
     # Dispatch-layer pixel-verifying test that goes through the public
     # ByteImageProvider::setBytesDataFromGPU API — ensures the actual
@@ -360,7 +485,7 @@ if(Vulkan_FOUND AND CUDAToolkit_FOUND)
     )
     target_include_directories(byte_image_gpu_dispatch_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/third_party/imgui
+        ${OVUI_IMGUI_ROOT}/imgui
     )
     target_link_libraries(byte_image_gpu_dispatch_test PRIVATE
         omniui_standalone
@@ -372,7 +497,7 @@ if(Vulkan_FOUND AND CUDAToolkit_FOUND)
     if(NOT WIN32 AND NOT APPLE)
         set_target_properties(byte_image_gpu_dispatch_test PROPERTIES INSTALL_RPATH "$ORIGIN")
     endif()
-    message(STATUS "byte_image_gpu_dispatch_test target added (ovui#17 dispatch-layer test)")
+    message(STATUS "byte_image_gpu_dispatch_test target added (CUDA byte-image dispatch-layer test)")
 
     # All-format pixel round-trip test — loops a 128x128 CUDA buffer
     # through every supported PixelFormat (8-bit + R/RG/RGB/RGBA float)
@@ -387,7 +512,7 @@ if(Vulkan_FOUND AND CUDAToolkit_FOUND)
     )
     target_include_directories(byte_image_gpu_format_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/third_party/imgui
+        ${OVUI_IMGUI_ROOT}/imgui
     )
     target_link_libraries(byte_image_gpu_format_test PRIVATE
         omniui_standalone
@@ -467,8 +592,8 @@ if(Vulkan_FOUND)
     target_link_libraries(headless_test PRIVATE omniui_standalone Vulkan::Vulkan stb)
     target_include_directories(headless_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/third_party/imgui
-        ${CMAKE_SOURCE_DIR}/third_party/imgui/backends
+        ${OVUI_IMGUI_ROOT}/imgui
+        ${OVUI_IMGUI_ROOT}/imgui/backends
     )
     target_compile_definitions(headless_test PRIVATE OMNIUI_HAS_VULKAN=1)
     set_target_properties(headless_test PROPERTIES
@@ -558,7 +683,7 @@ if(OMNIUI_HEADLESS_GL)
     add_executable(headless_egl_test src/headless_egl_test.cpp)
     target_link_libraries(headless_egl_test PRIVATE omniui_standalone stb)
     target_include_directories(headless_egl_test PRIVATE
-        ${CMAKE_SOURCE_DIR}/third_party/imgui)
+        ${OVUI_IMGUI_ROOT}/imgui)
     if(NOT WIN32 AND NOT APPLE)
         set_target_properties(headless_egl_test PROPERTIES INSTALL_RPATH "$ORIGIN")
     endif()

@@ -48,10 +48,11 @@ Select the provider explicitly with `OVUI_DATA_ADAPTER_PROVIDER=ovstage` when ru
 ## 4. System requirements
 
 - **Python 3.10+**
-- Declared dependency: `ovui-data-adapters-common>=0.1.0` — deliberately no `ovui-data-adapters-openusd`, `usd-core`, or `pxr` dependency
+- Declared dependency: `ovui-data-adapters-common`, pinned to the version of this wheel — deliberately no `ovui-data-adapters-openusd`, `usd-core`, or `pxr` dependency
 - External native runtimes, supplied outside of pip: **ovstage** (required; exposes a callable `ovstage.Stage`), **ovrtx** (required for rendering and picking), **ovphysx** (optional; loaded lazily for physics)
 - Required ovrtx renderer APIs, verified by the startup preflight: a callable `ovrtx.RendererConfig` and a callable `ovrtx.Renderer` exposing `ovrtx.Renderer.attach_ovstage`, `ovrtx.Renderer.step`, and `ovrtx.Renderer.detach_ovstage`
 - BORROW attachment is the supported mode: the current default-BORROW ovrtx API needs no `AttachMode` type; when an ovrtx build exposes `ovrtx.AttachMode.BORROW`, the provider passes that explicit mode to `ovrtx.RendererConfig` instead
+- OVRTX 0.5 is Vulkan-only on Windows and removed `RendererConfig.use_vulkan`; the provider passes `use_vulkan=True` only to older runtimes that still expose that keyword
 - The renderer requirement is fail-closed: the provider has no read-only compatibility mode and never substitutes a fallback renderer — setting `OVUI_WIDGETS_REQUIRE_OVRTX=0` relaxes nothing when the `ovstage` provider is selected
 - **NVIDIA RTX-capable GPU + compatible driver** for ovrtx rendering
 - Installing the wheel does not prove native-runtime compatibility; the provider's startup preflight verifies the required modules and APIs and fails with a structured error naming what is missing
@@ -60,8 +61,8 @@ Select the provider explicitly with `OVUI_DATA_ADAPTER_PROVIDER=ovstage` when ru
 
 ## 5. Licensing
 
-- Governed by the **[NVIDIA Software License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/)** and the **[Product Specific Terms for NVIDIA Omniverse](https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-omniverse/)**.
-- Source-available for inspection; pre-release versions are provided **AS-IS** and are **not currently open to external contributions**.
+- Licensed under the **[Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0)**. See the `LICENSE` file for the full license text.
+- Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 > **Note:** ovui is pre-release Early Access software and is not enterprise-supported. APIs may change before the 1.0 release. OVStage, ovrtx, and ovphysx are external runtime components with their own availability and licensing.
 

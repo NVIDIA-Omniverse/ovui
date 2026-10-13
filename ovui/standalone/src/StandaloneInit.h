@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -43,9 +36,20 @@ OMNIUI_STANDALONE_API void shutdown();
 /// the platform does not support resizing (e.g. headless Vulkan).
 OMNIUI_STANDALONE_API bool setWindowSize(int width, int height);
 
+/// Move the main OS window. Returns false for headless/uninitialized backends.
+OMNIUI_STANDALONE_API bool setWindowPosition(int x, int y);
+
 /// Query the main OS window framebuffer size.  Returns false if the backend
 /// is not initialised or the size could not be determined.
 OMNIUI_STANDALONE_API bool getWindowSize(int* width, int* height);
+
+/// Update the title of the main OS window. Returns false when the backend is
+/// not initialized or the main window is unavailable.
+OMNIUI_STANDALONE_API bool setWindowTitle(const char* title);
+
+/// Query the title of the main OS window. Returns an empty string when the
+/// backend is not initialized or the main window is unavailable.
+OMNIUI_STANDALONE_API std::string getWindowTitle();
 
 // ---------------------------------------------------------------------------
 // Input injection (bypasses GLFW -- writes directly to ImGui IO)
@@ -72,6 +76,16 @@ OMNIUI_STANDALONE_API void applyInjectedInput();
 // ---------------------------------------------------------------------------
 OMNIUI_STANDALONE_API void setSoftwareCursor(bool enabled);
 OMNIUI_STANDALONE_API bool isSoftwareCursorEnabled();
+
+// ---------------------------------------------------------------------------
+// Text input state
+//
+// Returns ImGui's `io.WantTextInput`: true while a text input (a StringField,
+// or a FloatDrag/IntDrag in keyboard-edit mode) owns the keyboard. App-level
+// shortcuts read it so that a key the field edits (Backspace, Delete) does not
+// also run a global action.
+// ---------------------------------------------------------------------------
+OMNIUI_STANDALONE_API bool isTextInputActive();
 
 // ---------------------------------------------------------------------------
 // Screenshot capture

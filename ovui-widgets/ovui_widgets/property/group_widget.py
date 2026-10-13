@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Collapsible attribute group header for the Property Inspector (property inspector implementation, §22.2).
 
@@ -105,11 +98,20 @@ class AttributeGroupWidget:
         on_collapse_change: Optional[Callable[[bool], None]] = None,
         on_context_menu: Optional[Callable[[float, float], None]] = None,
         level: int = 0,
+        build_header_fn: Optional[Callable[[bool, str], None]] = None,
     ) -> None:
+        """``build_header_fn`` optionally replaces the standard compact
+        header builder — same ``(collapsed, title)`` contract
+        :class:`ui.CollapsableFrame` defines. Callers that need extra
+        header content (a header enable control, a status glyph) wrap
+        :func:`build_property_group_header` rather than duplicating the
+        frame; omitted, the standard Property header renders unchanged.
+        """
         self._name = name
         self._on_collapse_change = on_collapse_change
         self._on_context_menu = on_context_menu
         self._level = level
+        self._build_header_fn = build_header_fn or build_property_group_header
         self._frame: Optional[ui.CollapsableFrame] = None
         self._content: Optional[ui.VStack] = None
         self._build_ui(initially_collapsed)
@@ -120,7 +122,7 @@ class AttributeGroupWidget:
             collapsed=initially_collapsed,
             height=FIT_CONTENT_HEIGHT,
             style_type_name_override="Property.GroupFrame",
-            build_header_fn=build_property_group_header,
+            build_header_fn=self._build_header_fn,
         )
         # Step 8.2 — nested frames (level >= 1) activate the
         # ``Property.GroupFrame::inner`` selector family by stamping

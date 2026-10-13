@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Static ownership audit for the depth-one LdrColor overlap (ENFORCING).
 
@@ -31,7 +24,8 @@ tainted expression against a closed list of allowed contexts:
 4. assignment of the handle to a plain local name (tracked alias) and
    assignment TO the ``_renderer`` field itself (field management);
 
-EVERY other use — bare attribute/property loads (including bound-method
+Apart from explicitly reviewed, owner-and-method-scoped instrumentation
+borrows, EVERY other use — bare attribute/property loads (including bound-method
 aliases like ``op = r.reset``), attribute writes and deletes, returns,
 yields, container literals, subscript stores, lambda bodies and default
 arguments, comprehensions, conditional/boolean expressions, star-args,
@@ -105,6 +99,7 @@ OVSTAGE_ADAPTER = ADAPTERS_ROOT / "ovstage" / "renderer_adapter.py"
 # docs/ovrtx-viewport-fps-overlap.md).
 EXEMPT_CALLS = {
     "step",                  # the produce call; retention exists to span it
+    "step_async",            # same producer; completion is drained before mutation
     "write_attribute",       # per-frame Fabric writes (camera, selection groups)
     # Renderer-owned, stream-ordered selection-outline membership writes
     # (the ovrtx 0.4 replacement for the omni:selectionOutlineGroup
@@ -124,6 +119,7 @@ EXEMPT_CALLS = {
 
 # Ownership-invalidating native operations.
 MUTATING_CALLS = {
+    "destroy",
     "remove_usd",
     "add_usd",
     "add_usd_layer",
@@ -162,6 +158,9 @@ BOUNDARY_FUNCTIONS = {
     # retained output first, then remove old/debt handles.
     "_reconcile_old_native",
     "_drain_native_debt",
+    # One-shot selection-outline activation: releases the retained output,
+    # then resets the renderer once outline membership exists.
+    "_ensure_selection_outline_pass_active",
 }
 
 # Calls to these (on self) count as mutations for path ordering: they either
@@ -299,12 +298,13 @@ class OwnershipAudit:
                  boundary_functions: frozenset | set | None = None,
                  delegating_funnels: frozenset | set | None = None,
                  safe_helper_callees: frozenset | set = frozenset(),
-                 readonly_capability_names: frozenset | set = frozenset()) -> None:
+                 readonly_capability_names: frozenset | set = frozenset(),
+                 reviewed_handle_uses: frozenset | set = frozenset()) -> None:
         """``boundary_owner`` pins boundary identity to ONE owner scope: the
         named module-level class (the production adapter). When set, only
         that class's direct methods may register boundary facts or satisfy
-        the boundary name-approval; a same-named def anywhere else is a
-        ``boundary-identity-conflict``. When ``None`` (synthetic snippets),
+        the boundary name-approval; a same-named def elsewhere cannot claim
+        a release or mutation boundary. When ``None`` (synthetic snippets),
         any single top-level definition qualifies, but DUPLICATE definitions
         of a boundary name are conflicts — a second definition can never
         establish, replace, mask, or satisfy the real ordering facts."""
@@ -322,6 +322,9 @@ class OwnershipAudit:
         # output hazard) and may be read outside call position.
         self.safe_helper_callees = set(safe_helper_callees)
         self.readonly_capability_names = set(readonly_capability_names)
+        # Exact (method, expression/statement) pairs reviewed as borrowed
+        # handles. They apply only to the named owner's direct method.
+        self.reviewed_handle_uses = set(reviewed_handle_uses)
         self.tree = ast.parse(source)
         self.findings: list[Finding] = []
         self.calls: list[tuple[str, int, str]] = []
@@ -370,7 +373,8 @@ class OwnershipAudit:
         # shadows a boundary must NOT merge into (or replace) the real
         # boundary's facts — its calls are rejected as deferred. Boundary
         # identity is further pinned: with ``boundary_owner`` set, only that
-        # class's direct methods qualify; without it, a boundary name may
+        # class's direct methods qualify (other classes are still scanned
+        # for native uses); without it, a boundary name may
         # have exactly ONE eligible definition (duplicates conflict).
         for node in ast.walk(self.tree):
             if not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -382,9 +386,9 @@ class OwnershipAudit:
             if node.name in self.boundary_functions:
                 if (self.boundary_owner is not None
                         and owner != self.boundary_owner):
-                    self._flag("boundary-identity-conflict", node,
-                               f"'{node.name}' defined on '{owner}', not the "
-                               f"boundary owner '{self.boundary_owner}'")
+                    # A facade can share a method name without touching the
+                    # renderer. Native calls/releases are still identity-gated
+                    # below and cannot supply the owner's ordering facts.
                     continue
                 existing = self.function_facts.get(node.name)
                 if existing is not None and existing.node is not node:
@@ -645,6 +649,14 @@ class OwnershipAudit:
 
     def _classify_tainted_use(self, node: ast.AST) -> None:
         parent = self._parents.get(id(node))
+
+        facts = self.function_facts.get(self._fn(node))
+        if (self.boundary_owner is not None and facts is not None
+                and facts.owner == self.boundary_owner
+                and facts.node is self._func_node_of.get(id(node))
+                and parent is not None
+                and (facts.name, ast.unparse(parent)) in self.reviewed_handle_uses):
+            return
 
         # a NAME in Store/Del context is the binding side of an alias (the
         # alias itself is tracked; its LOADS are classified), not a use
@@ -1375,10 +1387,19 @@ def ordering_findings(source: str) -> list[Finding]:
 
 PRODUCTION_BOUNDARY_OWNER = "OvRtxRendererAdapter"
 
+# Optional instrumentation borrows the renderer through this one accessor; it
+# does not mutate it or retain step-result outputs, and the adapter calls
+# ``release_renderer`` before it drops the renderer. All other stores, calls,
+# and comparisons remain subject to default-deny.
+INSTRUMENTATION_TARGET_USES = {
+    ("instrumentation_target", "return self._renderer"),
+}
+
 
 def test_openusd_adapter_ownership_audit_passes() -> None:
     audit = OwnershipAudit(OPENUSD_ADAPTER.read_text(),
-                           boundary_owner=PRODUCTION_BOUNDARY_OWNER)
+                           boundary_owner=PRODUCTION_BOUNDARY_OWNER,
+                           reviewed_handle_uses=INSTRUMENTATION_TARGET_USES)
     findings = classify(audit) + check_release_ordering(audit)
     assert not findings, "ownership audit violations:\n" + "\n".join(
         str(f) for f in findings)
@@ -1398,7 +1419,16 @@ OVSTAGE_BOUNDARY_FUNCTIONS = {
     "shutdown",                              # detach + renderer teardown
     "_remove_scene",                         # detach_ovstage
     "_apply_resolution",                     # renderer reset
+    "_apply_secondary_resolution",           # secondary product renderer reset
     "_configure_selection_outline_styles",   # set_selection_group_styles
+    # declaration mirror : the shared render-setting WARMUP lifecycle.
+    # Per-edge pending-ledger drain executed at the top of render_frame on
+    # the presentation thread; the #110 retained-output ownership boundary
+    # is released BEFORE the per-edge resets, an edge is released only
+    # after its reset succeeds, and a fault marks the ledger
+    # blocked-with-reason (no per-frame retry) until a defined recovery
+    # trigger re-arms exactly one drain attempt.
+    "_consume_render_settings_renderer_update",  # renderer reset
     # Renderer reset that activates the selection-outline pass: fires at
     # most once per armed epoch (fresh attach / empty-membership resolution
     # reset), only from set_selection_highlight after a successful nonempty
@@ -1412,6 +1442,7 @@ OVSTAGE_BOUNDARY_FUNCTIONS = {
 # (per-frame resolution no-ops and the latched style configurator stay free).
 OVSTAGE_STRICT_GUARD_FUNCTIONS = {
     "_apply_resolution",
+    "_apply_secondary_resolution",
     "_configure_selection_outline_styles",
     "_remove_scene",
     # Disarmed/armed-but-unavailable guard paths run per selection sync and
@@ -1436,6 +1467,7 @@ def _ovstage_audit() -> OwnershipAudit:
         boundary_functions=OVSTAGE_BOUNDARY_FUNCTIONS,
         safe_helper_callees=OVSTAGE_SAFE_HELPER_CALLEES,
         readonly_capability_names=OVSTAGE_READONLY_CAPABILITIES,
+        reviewed_handle_uses=INSTRUMENTATION_TARGET_USES,
     )
 
 
@@ -1471,14 +1503,65 @@ def test_ovstage_mutation_sites_are_pinned() -> None:
     })
     assert mutating == [
         ("_apply_resolution", "reset"),
+        ("_apply_secondary_resolution", "reset"),
         ("_configure_selection_outline_styles", "set_selection_group_styles"),
+        # declaration mirror : declared-WARMUP render-setting lifecycle reset,
+        # release-before-reset proven by check_release_ordering above.
+        ("_consume_render_settings_renderer_update", "reset"),
         ("_ensure_selection_outline_pass_active", "reset"),
         ("_remove_scene", "detach_ovstage"),
         ("load_stage", "attach_ovstage"),
+        ("shutdown", "destroy"),
     ], f"unreviewed OVStage mutation sites: {mutating}"
 
 
 # ── negative self-tests: every rejection class fires ─────────────────────
+
+
+def test_reviewed_instrumentation_target_is_scoped_to_owner_and_method() -> None:
+    source = (
+        "class Adapter:\n"
+        "    def instrumentation_target(self):\n"
+        "        return self._renderer\n")
+    audit = OwnershipAudit(source, boundary_owner="Adapter",
+                           reviewed_handle_uses=INSTRUMENTATION_TARGET_USES)
+    assert not classify(audit)
+    assert classify(OwnershipAudit(source, boundary_owner="Adapter"))
+    for changed in (
+        source.replace("class Adapter:", "class Other:"),
+        source.replace("def instrumentation_target", "def unrelated"),
+        source + "    def leak(self):\n        return self._renderer\n",
+    ):
+        audit = OwnershipAudit(changed, boundary_owner="Adapter",
+                               reviewed_handle_uses=INSTRUMENTATION_TARGET_USES)
+        assert classify(audit), changed
+
+
+def test_facade_method_names_do_not_claim_renderer_boundary() -> None:
+    source = (
+        "class Facade:\n"
+        "    def shutdown(self):\n"
+        "        self._owner._secondary_viewport_active = False\n"
+        "class Adapter:\n"
+        "    def shutdown(self):\n"
+        "        self._release_retained_output()\n"
+        "        self._renderer.destroy()\n")
+    audit = OwnershipAudit(source, boundary_owner="Adapter",
+                           boundary_functions={"shutdown"})
+    assert not classify(audit) + check_release_ordering(audit)
+    assert audit.function_facts["shutdown"].owner == "Adapter"
+
+
+def test_destroy_requires_release_and_async_step_cannot_escape() -> None:
+    assert ordering_findings(
+        "def shutdown(self):\n    self._renderer.destroy()\n")
+    assert not ordering_findings(
+        "def shutdown(self):\n"
+        "    self._release_retained_output()\n"
+        "    self._renderer.destroy()\n")
+    assert not _kinds("def f(self):\n    self._renderer.step_async()\n")
+    assert "deferred-native-call" in _kinds(
+        "def f(self):\n    return lambda: self._renderer.step_async()\n")
 
 
 def _kinds(source: str) -> set[str]:
@@ -2285,7 +2368,7 @@ def test_rejects_mutation_in_suspending_binding_targets() -> None:
 
 def test_rejects_release_in_chained_comparison_tail_statement_level() -> None:
     # `1 < q < (release() or 2)`: the release only runs when `1 < q` held —
-    # it must not satisfy the next statement's mutation (Codex bypass)
+    # it must not satisfy the next statement's mutation (bypass)
     kinds = _order_kinds(
         "def _reinject_session_layer(self, q):\n"
         "    ok = 1 < q < (self._release_retained_output() or 2)\n"

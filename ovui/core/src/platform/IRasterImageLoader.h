@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -15,6 +8,7 @@
 #include <omni/ui/platform/Types.h>
 #include <omni/ui/ImageProvider/ImageProvider.h>
 
+#include <ctime>
 #include <string>
 
 namespace omni {
@@ -65,8 +59,30 @@ public:
     /// Release all resources associated with a load instance.
     virtual void releaseLoad(void* instanceKey) = 0;
 
-    /// Release a GPU cache entry by key.
+    /// Give one consumer's reference to a GPU cache entry back by key. The
+    /// entry is freed once nothing references it any more; consumers that
+    /// still hold the same key keep their image.
     virtual void releaseGpuResource(const std::string& cacheKey) = 0;
+
+    /// Drop the cached entry for a key from the shared lookup, so the next
+    /// load of that URL reads the file again instead of sharing the entry
+    /// decoded earlier. Consumers still drawing that entry keep it, unchanged,
+    /// until they release it. This is how a provider reloads a replaced file;
+    /// it is deliberately not part of releasing a reference, because losing a
+    /// consumer says nothing about the file having changed.
+    virtual void invalidateCacheEntry(const std::string& /*cacheKey*/)
+    {
+    }
+    virtual time_t getModTime(const std::string&) { return 0; }
+    virtual std::string getCacheKey(const std::string& path) { return path; }
+
+    /// Allocation requirements must be available before consulting a GPU cache.
+    /// Keep the original entrypoint for existing backend implementations.
+    virtual LoadResult beginLoadWithOptions(void* instanceKey, const std::string& url,
+                                           const ImageProviderTextureOptions& textureOptions)
+    {
+        return beginLoad(instanceKey, url);
+    }
 };
 
 } // namespace ui

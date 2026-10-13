@@ -1,20 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Generic lazy window contributions for optional app components."""
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from types import MappingProxyType
-import sys
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ovui_widgets.app.menu_hooks import (
@@ -23,7 +16,6 @@ from ovui_widgets.app.menu_hooks import (
     AppMenuRegistry,
     normalize_menu_path,
 )
-
 
 WindowFactory = Callable[[Any], Any]
 WindowPredicate = Callable[[Any], bool]
@@ -64,18 +56,32 @@ class AppWindowContribution:
 
 
 class AppWindowHandle:
-    """Removable handle returned from ``AppWindowRegistry.add``."""
+    """Removable handle returned from ``AppWindowRegistry.add``.
 
-    def __init__(self, registry: "AppWindowRegistry", contribution_id: str) -> None:
+    Handles bind to their exact registration generation (``token``): a
+    stale handle whose record was already removed and replaced under the
+    same ID no-ops instead of removing the replacement. Token-less
+    handles keep the legacy key-based removal (administrative use only).
+    """
+
+    def __init__(
+        self,
+        registry: "AppWindowRegistry",
+        contribution_id: str,
+        token: Any = None,
+    ) -> None:
         self._registry = registry
         self._contribution_id = contribution_id
+        self._token = token
 
     @property
     def id(self) -> str:
         return self._contribution_id
 
     def remove(self) -> bool:
-        return self._registry.remove(self._contribution_id)
+        return self._registry._remove_record(
+            self._contribution_id, token=self._token
+        )
 
 
 @dataclass
@@ -83,6 +89,10 @@ class _WindowRecord:
     contribution: AppWindowContribution
     window: Any = None
     menu_handle: AppMenuHandle | None = None
+    # Unique registration-generation identity: handles and conditional
+    # removal bind to this token, so a stale owner can never affect a
+    # later same-ID registration.
+    token: Any = field(default_factory=object)
 
 
 class AppWindowRegistry:
@@ -119,26 +129,70 @@ class AppWindowRegistry:
         self._capabilities = set(capabilities)
 
     def add(self, contribution: AppWindowContribution) -> AppWindowHandle:
-        """Register one lazy window contribution and return its handle."""
+        """Register one lazy window contribution; return its owner handle.
+
+        Re-adding the exact same contribution object returns another
+        handle bound to the existing registration (legacy idempotent
+        add). A *different* contribution under an existing ID raises —
+        ownership of a foreign record is never silently granted.
+        """
 
         existing = self._records.get(contribution.id)
         if existing is not None:
-            return AppWindowHandle(self, contribution.id)
+            if existing.contribution is contribution:
+                return AppWindowHandle(self, contribution.id, token=existing.token)
+            raise ValueError(
+                f"AppWindowRegistry: id {contribution.id!r} is already "
+                "registered by another contribution"
+            )
         record = _WindowRecord(contribution=contribution)
         self._records[contribution.id] = record
         record.menu_handle = self._register_menu(contribution)
         self._invoke_lifecycle(contribution, "add")
-        return AppWindowHandle(self, contribution.id)
+        return AppWindowHandle(self, contribution.id, token=record.token)
 
     def remove(self, contribution_id: str) -> bool:
-        record = self._records.pop(contribution_id, None)
+        return self._remove_record(contribution_id)
+
+    def remove_if_matches(
+        self,
+        contribution_id: str,
+        expected: AppWindowContribution,
+    ) -> bool:
+        """Atomically remove ``contribution_id`` only if ``expected`` owns it.
+
+        Recovery path for an ``add()`` that mutated the registry and
+        raised before returning its handle: comparison and removal are
+        one registry operation with no callback/reentrant gap, so a
+        stale owner can never remove an independent replacement.
+        """
+        return self._remove_record(contribution_id, expected=expected)
+
+    def _remove_record(
+        self,
+        contribution_id: str,
+        token: Any = None,
+        expected: AppWindowContribution | None = None,
+    ) -> bool:
+        record = self._records.get(contribution_id)
         if record is None:
             return False
+        if token is not None and record.token is not token:
+            return False
+        if expected is not None and record.contribution is not expected:
+            return False
+        # Nested menu releases FIRST: if it raises, the record stays
+        # installed and fully retryable — the registration is never
+        # claimed absent while its owned menu remains published.
         if record.menu_handle is not None:
             record.menu_handle.remove()
             record.menu_handle = None
-        self._destroy_window(contribution_id, record.window)
-        record.window = None
+        self._records.pop(contribution_id, None)
+        # Window destruction happens only after the record is gone, so a
+        # live record can never point at a destroyed window; destruction
+        # and lifecycle callbacks are error-isolated below.
+        window, record.window = record.window, None
+        self._destroy_window(contribution_id, window)
         self._invoke_lifecycle(record.contribution, "remove")
         return True
 

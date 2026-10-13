@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Assert.h"
@@ -18,6 +11,7 @@
 #include <omni/ui/SimpleNumericModel.h>
 
 #include "WidgetData.h"
+#include "ValueModelEditCancellation.h"
 
 #include <algorithm>
 
@@ -128,6 +122,12 @@ void FloatSlider::_drawUnderlyingItem()
     double value = _getData<FloatSliderData>().m_valueCache;
     bool result = this->_drawUnderlyingItem(&value, this->getMin(), this->getMax());
 
+    // Capture the exact item's terminal reason before callbacks submit another
+    // item or replace the model. Keep the recipient alive through its end event.
+    auto dispatchModel = this->getModel();
+    const bool cancelled = ctx->LastItemData.ID == id &&
+        (ctx->LastItemData.StatusFlags & ImGuiItemStatusFlags_InputTextCancelled) != 0;
+    detail::ScopedValueModelEditCancellation cancelScope(cancelled ? dispatchModel.get() : nullptr);
     this->_beginModelChange();
 
     if (result)
@@ -138,7 +138,7 @@ void FloatSlider::_drawUnderlyingItem()
             value = round(value / this->getStep()) * this->getStep();
         }
 
-        auto model = this->getModel();
+        auto model = cancelled ? dispatchModel : this->getModel();
         if (OMNIUI_LIKELY(static_cast<bool>(model)))
         {
             // Trying to set the value. If the model accepts it, it will call onModelUpdated and update m_textBuffer.
@@ -150,7 +150,19 @@ void FloatSlider::_drawUnderlyingItem()
         }
     }
 
-    this->_endModelChange();
+    if (cancelled && m_editActive)
+    {
+        // A value callback may replace the widget's model. Finish the same
+        // cancelled recipient, never a replacement model's edit.
+        m_editActive = false;
+        if (dispatchModel)
+            dispatchModel->processEndEditCallbacks();
+        this->forceRasterDirty(BakeDirtyReason::eEditEnded);
+    }
+    else
+    {
+        this->_endModelChange();
+    }
 }
 
 bool FloatSlider::_drawUnderlyingItem(double* value, double min, double max)

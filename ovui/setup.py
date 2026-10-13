@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """
 setup.py for ovui
@@ -20,6 +13,9 @@ Usage:
     python -m build           # build wheel
 """
 
+import fnmatch
+import hashlib
+import json
 import os
 import platform
 import shlex
@@ -39,22 +35,6 @@ IS_MACOS = platform.system() == "Darwin"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "VERSION.md"
 BUILD_INFO_PATH = Path(__file__).resolve().parent / "python" / "omni" / "ui" / "_build_info.py"
-
-
-def _read_long_description() -> str:
-    """Return the PyPI long description: the repository root README.md.
-
-    The nested ovui/README.md is the in-repo native framework guide and must
-    not become the published package description. Failing loudly here keeps a
-    missing root README from silently shipping an empty description.
-    """
-    readme = REPO_ROOT / "README.md"
-    if not readme.is_file():
-        raise RuntimeError(f"{readme} not found — cannot build the PyPI long description")
-    text = readme.read_text(encoding="utf-8")
-    if not text.strip():
-        raise RuntimeError(f"{readme} is empty — refusing to ship an empty PyPI description")
-    return text
 
 
 def _read_project_version() -> str:
@@ -209,6 +189,34 @@ def _find_artifact(build_dir: Path, subdir: str, filename: str) -> "Path | None"
     return None
 
 
+def _use_prebuilt_shared(prebuilt: Path, pkg_dir: Path, scene_pkg_dir: Path,
+                         core_libs: list, scene_lib: str, ext_suffix: str) -> None:
+    """Replace the four shared binaries with those of a prebuilt ovui folder.
+
+    The folder has the wheel layout (``omni/ui``, ``omni/ui_scene``). Debug
+    sections are stripped on Linux; everything else is copied unchanged.
+    """
+    # On Windows another build's omni.ui.dll may be a plugin, not the
+    # forwarder-only DLL of the wheel: only ovui.dll is taken.
+    shared_core = [name for name in core_libs if name != "omni.ui.dll"]
+    files = [("omni/ui", pkg_dir, name) for name in shared_core + [f"_ui{ext_suffix}"]]
+    files += [("omni/ui_scene", scene_pkg_dir, name) for name in (scene_lib, f"_scene{ext_suffix}")]
+    strip = None if IS_WINDOWS or IS_MACOS else shutil.which("strip")
+    if not IS_WINDOWS and not IS_MACOS and not strip:
+        raise RuntimeError("OVUI_PREBUILT_DIR on Linux needs 'strip' to remove debug sections")
+    for subdir, dest_dir, name in files:
+        src = prebuilt / subdir / name
+        if not src.is_file():
+            raise RuntimeError(f"OVUI_PREBUILT_DIR has no {subdir}/{name}")
+        dest = dest_dir / name
+        if dest.exists() or dest.is_symlink():
+            dest.unlink()
+        shutil.copyfile(str(src), str(dest))
+        if strip:
+            subprocess.check_call([strip, "--strip-debug", str(dest)])
+        print(f"  prebuilt {subdir}/{name}")
+
+
 class CMakeBuild(build_ext):
     """Custom build_ext that runs cmake to produce the shared libraries."""
 
@@ -353,28 +361,42 @@ class CMakeBuild(build_ext):
         if not ext_suffix:
             ext_suffix = ".pyd" if IS_WINDOWS else ".so"
 
-        # Platform-specific library names
+        # Library names. The shared binaries carry these names: the core is
+        # libovui.so with the internal name libomni.ui.so (and a libomni.ui.so
+        # file next to it), the scene library is libomni.ui.scene.so.
         if IS_WINDOWS:
-            core_lib = "ovui.dll"
+            core_libs = ["ovui.dll", "omni.ui.dll"]
             standalone_lib = "omniui_standalone.dll"
         elif IS_MACOS:
-            core_lib = "libovui.dylib"
+            core_libs = ["libovui.dylib"]
             standalone_lib = "libomniui_standalone.dylib"
         else:
-            core_lib = "libovui.so"
+            core_libs = ["libovui.so", "libomni.ui.so"]
             standalone_lib = "libomniui_standalone.so"
 
-        # Locate and copy the pybind11 module
-        pybind_src = _find_artifact(build_dir, "bindings", f"_ui{ext_suffix}")
-        if pybind_src:
-            shutil.copy2(str(pybind_src), str(pkg_dir / f"_ui{ext_suffix}"))
-            print(f"  copied {pybind_src.name} -> {pkg_dir / f'_ui{ext_suffix}'}")
+        # Locate and copy the pybind11 modules: the shared _ui and the
+        # standalone bridge _standalone.
+        for module in ("_ui", "_standalone"):
+            pybind_src = _find_artifact(build_dir, "bindings", f"{module}{ext_suffix}")
+            if not pybind_src:
+                raise RuntimeError(f"the build did not produce {module}{ext_suffix}")
+            shutil.copy2(str(pybind_src), str(pkg_dir / f"{module}{ext_suffix}"))
+            print(f"  copied {pybind_src.name} -> {pkg_dir / f'{module}{ext_suffix}'}")
 
-        # Locate and copy the core shared library
-        core_src = _find_artifact(build_dir, "core", core_lib)
-        if core_src:
+        # Locate and copy the core shared library (a link is copied as a file)
+        for core_lib in core_libs:
+            core_src = _find_artifact(build_dir, "core", core_lib)
+            if not core_src:
+                raise RuntimeError(f"the build did not produce {core_lib}")
             shutil.copy2(str(core_src), str(pkg_dir / core_lib))
             print(f"  copied {core_src.name} -> {pkg_dir / core_lib}")
+
+        # OVUI and its native consumers share one ImGui library.
+        imgui_lib = "ovui_imgui.dll" if IS_WINDOWS else ("libimgui.dylib" if IS_MACOS else "libimgui.so")
+        imgui_src = _find_artifact(build_dir, "third_party", imgui_lib)
+        if not imgui_src:
+            raise RuntimeError("the build did not produce the shared ImGui library")
+        shutil.copy2(str(imgui_src), str(pkg_dir / imgui_lib))
 
         # Locate and copy the standalone shared library
         standalone_src = _find_artifact(build_dir, "standalone", standalone_lib)
@@ -382,10 +404,47 @@ class CMakeBuild(build_ext):
             shutil.copy2(str(standalone_src), str(pkg_dir / standalone_lib))
             print(f"  copied {standalone_src.name} -> {pkg_dir / standalone_lib}")
 
+        # Ship the CUDA runtime the backend linked against. omniui_standalone
+        # imports cudart directly and _ui links omniui_standalone, so without
+        # it `import omni.ui` fails on any machine that has the NVIDIA driver
+        # but not the CUDA Toolkit — which is the supported deployment. The
+        # CUDA driver library is deliberately not packaged: it belongs to the
+        # installed driver.
+        runtime_record = build_dir / "cuda_runtime_path.txt"
+        if runtime_record.exists():
+            runtime_src = Path(runtime_record.read_text().strip())
+            if not runtime_src.is_file():
+                raise RuntimeError(
+                    f"the build recorded a CUDA runtime at {runtime_src} but it "
+                    "does not exist; the wheel would import only where a CUDA "
+                    "Toolkit is installed"
+                )
+            runtime_src = runtime_src.resolve()
+            # The loader's file, not the linker's. On Windows those are
+            # different files — the link consumes cudart.lib while the backend
+            # imports cudart64_<major>.dll — and shipping the wrong one yields
+            # a wheel that installs cleanly and then fails to load.
+            expected = "cudart64_*.dll" if IS_WINDOWS else "libcudart.so.*"
+            if not fnmatch.fnmatch(runtime_src.name, expected):
+                raise RuntimeError(
+                    f"recorded CUDA runtime {runtime_src} is not a loadable "
+                    f"runtime ({expected} expected); it cannot satisfy the "
+                    "backend's import"
+                )
+            if IS_WINDOWS:
+                runtime_name = runtime_src.name
+            else:
+                # Ship under the SONAME, not the resolved real name: the
+                # backend's dependency is on libcudart.so.<major>.
+                major = runtime_src.name.split(".so.")[1].split(".")[0]
+                runtime_name = f"libcudart.so.{major}"
+            shutil.copy2(str(runtime_src), str(pkg_dir / runtime_name))
+            print(f"  copied CUDA runtime {runtime_src.name} -> {runtime_name}")
+
         # Also copy versioned shared lib files (Linux: .so.X.Y.Z, macOS: .X.Y.Z.dylib)
         if not IS_WINDOWS:
-            for lib_name in ["libovui", "libomniui_standalone"]:
-                lib_dir = build_dir / ("core" if "ovui" in lib_name else "standalone")
+            for lib_name in ["libomniui_standalone"]:
+                lib_dir = build_dir / "standalone"
                 if IS_MACOS:
                     patterns = [f"{lib_name}.*.dylib"]
                 else:
@@ -466,42 +525,62 @@ class CMakeBuild(build_ext):
             shutil.copy2(str(notices_src), str(pkg_dir / notices_src.name))
             print(f"  copied {notices_src.name}")
 
+        # Install the native SDK from the configured build, not a separately
+        # resolved dependency set. Clear only our generated SDK staging tree so
+        # removed headers cannot survive a subsequent wheel build.
+        sdk_dir = pkg_dir / "sdk"
+        if sdk_dir.exists():
+            shutil.rmtree(sdk_dir)
+        subprocess.check_call([
+            cmake, "--install", str(build_dir), "--config", "Release",
+            "--component", "ovui-sdk", "--prefix", str(sdk_dir),
+        ])
+        sdk_manifest = {
+            "source_commit": _PROJECT_COMMIT,
+            "version": _QUALIFIED_VERSION,
+            "files": {
+                path.relative_to(sdk_dir).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in sorted(sdk_dir.rglob("*")) if path.is_file()
+            },
+        }
+        (sdk_dir / "manifest.json").write_text(
+            json.dumps(sdk_manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
         # ---- Generate and bundle SBOM ----
         self._generate_sbom(build_dir, pkg_dir)
 
         # ---- Copy omni.ui_scene artifacts ----
-        # _scene.so and libovuiscene.so* go into a sibling omni/ui_scene/ dir.
+        # _scene and the scene library go into a sibling omni/ui_scene/ dir.
         scene_pkg_dir = pkg_dir.parent / "ui_scene"
         scene_pkg_dir.mkdir(parents=True, exist_ok=True)
 
         if IS_WINDOWS:
-            scene_lib = "ovuiscene.dll"
+            scene_lib = "omni.ui.scene.dll"
         elif IS_MACOS:
-            scene_lib = "libovuiscene.dylib"
+            scene_lib = "libomni.ui.scene.dylib"
         else:
-            scene_lib = "libovuiscene.so"
+            scene_lib = "libomni.ui.scene.so"
 
         # pybind11 scene module
         scene_pybind_src = _find_artifact(build_dir, "bindings", f"_scene{ext_suffix}")
-        if scene_pybind_src:
-            shutil.copy2(str(scene_pybind_src), str(scene_pkg_dir / f"_scene{ext_suffix}"))
-            print(f"  copied {scene_pybind_src.name} -> {scene_pkg_dir / f'_scene{ext_suffix}'}")
+        if not scene_pybind_src:
+            raise RuntimeError(f"the build did not produce _scene{ext_suffix}")
+        shutil.copy2(str(scene_pybind_src), str(scene_pkg_dir / f"_scene{ext_suffix}"))
+        print(f"  copied {scene_pybind_src.name} -> {scene_pkg_dir / f'_scene{ext_suffix}'}")
 
         # scene shared library
         scene_lib_src = _find_artifact(build_dir, "core", scene_lib)
-        if scene_lib_src:
-            shutil.copy2(str(scene_lib_src), str(scene_pkg_dir / scene_lib))
-            print(f"  copied {scene_lib_src.name} -> {scene_pkg_dir / scene_lib}")
+        if not scene_lib_src:
+            raise RuntimeError(f"the build did not produce {scene_lib}")
+        shutil.copy2(str(scene_lib_src), str(scene_pkg_dir / scene_lib))
+        print(f"  copied {scene_lib_src.name} -> {scene_pkg_dir / scene_lib}")
 
-        # versioned scene lib files
-        if not IS_WINDOWS:
-            scene_lib_dir = build_dir / "core"
-            lib_base = "libovuiscene"
-            patterns = [f"{lib_base}.*.dylib"] if IS_MACOS else [f"{lib_base}.so.*"]
-            for pattern in patterns:
-                for f in sorted(scene_lib_dir.glob(pattern)):
-                    shutil.copy2(str(f), str(scene_pkg_dir / f.name))
-                    print(f"  copied {f.name} -> {scene_pkg_dir / f.name}")
+        # Prebuilt mode: the shared binaries come from another build of the
+        # same sources instead of this CMake build.
+        prebuilt = os.environ.get("OVUI_PREBUILT_DIR", "").strip()
+        if prebuilt:
+            _use_prebuilt_shared(Path(prebuilt), pkg_dir, scene_pkg_dir, core_libs, scene_lib, ext_suffix)
 
         # Python source files for the scene package
         scene_py_src = source_dir / "python" / "omni" / "ui_scene"
@@ -517,6 +596,10 @@ class BuildPyWithAgentSkills(build_py):
 
     def run(self) -> None:
         super().run()
+        # The .pth and its module sit at the wheel root, so site imports
+        # them at startup (see python/_ovui_imgui_preload.py).
+        for name in ("ovui_imgui_preload.pth", "_ovui_imgui_preload.py"):
+            shutil.copy2(Path(__file__).resolve().parent / "python" / name, Path(self.build_lib) / name)
         source_root = REPO_ROOT / "skills"
         target_root = Path(self.build_lib) / "ovui_agent_skills" / "skills"
         if target_root.exists():
@@ -557,8 +640,6 @@ setup(
     name="ovui",
     version=_QUALIFIED_VERSION,
     description="ovui — GPU-accelerated Python UI toolkit",
-    long_description=_read_long_description(),
-    long_description_content_type="text/markdown",
     ext_modules=[CMakeExtension("omni.ui._ui")],
     cmdclass={"build_ext": CMakeBuild, "build_py": BuildPyWithAgentSkills},
     packages=[
@@ -587,6 +668,7 @@ setup(
             "*.pyd",
             "THIRD_PARTY_NOTICES.md",
             "sbom.cdx.json",
+            "sdk/**/*",
             "resources/fonts/*.ttf",
             "resources/fonts/*.txt",
             "resources/fonts/*.md",

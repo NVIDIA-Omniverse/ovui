@@ -1,8 +1,6 @@
 # ovui
 
-[![B1 Vulkan-lavapipe](https://github.com/NVIDIA-Omniverse/ovui/actions/workflows/test-b1-vulkan.yml/badge.svg?branch=main)](https://github.com/NVIDIA-Omniverse/ovui/actions/workflows/test-b1-vulkan.yml)
-[![B2 Vulkan-lavapipe + ASan](https://github.com/NVIDIA-Omniverse/ovui/actions/workflows/test-b2-vulkan-asan.yml/badge.svg?branch=main)](https://github.com/NVIDIA-Omniverse/ovui/actions/workflows/test-b2-vulkan-asan.yml)
-[![B3 EGL-surfaceless](https://github.com/NVIDIA-Omniverse/ovui/actions/workflows/test-b3-egl.yml/badge.svg?branch=main)](https://github.com/NVIDIA-Omniverse/ovui/actions/workflows/test-b3-egl.yml)
+<!-- CI status badges for ${OVUI_PROJECT_URL} are added by the release staging filter. -->
 
 `ovui` -- a GPU-accelerated Python UI toolkit built on GLFW and OpenGL. (Distribution name: `ovui`; Python import namespace: `omni.ui`.)
 
@@ -173,7 +171,7 @@ are disabled.
 ### Python Dependencies
 
 - **Python** >= 3.12
-- **pybind11** >= 2.11 (installed automatically by pip, or `pip install pybind11`)
+- **pybind11** == 2.11.1 (installed automatically by pip, or `pip install pybind11==2.11.1`)
 - **setuptools** >= 68.0
 
 ### Third-Party Dependencies
@@ -240,10 +238,13 @@ CUDA/CUDAToolkit paths as well as Vulkan paths. The
 `examples/byte_image_gpu_demo.py` demo requires this capability; installing
 CUDA after the fact is not enough unless you rebuild/reinstall ovui so CMake
 can detect it.
-
 ## Building from Scratch
 
 For C++ contributors who want to invoke CMake directly -- useful for debugging the native layer or working on the bindings.
+
+The Kit-compatible native build uses Python 3.12 and exactly pybind11 2.11.1,
+matching the wheel workflows. Direct CMake invocation does not install the
+build dependencies declared in `pyproject.toml`.
 
 ```bash
 mkdir build && cd build
@@ -251,6 +252,79 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
   -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())")
 cmake --build . --parallel $(nproc)
 ```
+
+### Native frame pacing build options
+
+The standalone backend can build an optional native frame-pacing coordinator
+that borrows an ovrtx renderer and drives render and presentation independently
+of the UI tick. It has one gate:
+
+| Option | Default | Effect |
+|---|---|---|
+| `OMNIUI_OVRTX_INCLUDE_DIR` | auto-discovered | Build the coordinator when the public ovrtx headers expose the consumed ABI. Used by the standalone and OpenUSD render paths. |
+
+The coordinator uses the public ovrtx C ABI and nothing else. `ovui` depends on
+no scene library: a scene provider lives in its own `ovui-data-adapters`
+package, which drives ovui through the generic renderer-borrow entry points
+(`omni.ui._ui._native_frame_pacing_*`) rather than putting provider code into
+ovui. A provider whose scene library ovui cannot borrow through those entry
+points renders on the ordinary synchronous path.
+
+### Visual Studio 2022 OVRTX application project
+
+Enable `OMNIUI_BUILD_OVRTX_UI_APP` to generate the `ovrtx_ui_app` startup project
+inside `ovui.sln`. This is an opt-in development build; library and wheel builds
+keep their existing behavior when the flag is off. It requires the local Kit
+development SDK/runtime, Python 3.12 with development headers and libraries,
+Visual Studio 2022 C++, CMake, Git, and network access for dependency downloads.
+The app build finds pinned pybind11 2.11.1 or fetches its sources automatically.
+
+```powershell
+$Repo = (Get-Location).Path
+$KitRoot = "<kit-checkout>"
+$Python312 = "$KitRoot/rendering/_build/target-deps/python/python.exe"
+cmake -S "$Repo\ovui" -B "$Repo\ovui\build\vs2022-dev" -G "Visual Studio 17 2022" -A x64 `
+  -DOMNIUI_BUILD_OVRTX_UI_APP=ON "-DPYTHON_EXECUTABLE=$Python312" `
+  "-DCMAKE_PREFIX_PATH=$KitRoot/rendering/ovrtx/public/tools/dev" `
+  "-DOMNIUI_OVRTX_INCLUDE_DIR=$KitRoot/rendering/ovrtx/public/include" `
+  -DOMNIUI_REQUIRE_VULKAN=ON -DOMNIUI_REQUIRE_CUDA=ON
+if ($LASTEXITCODE -eq 0) { cmake --build "$Repo\ovui\build\vs2022-dev" --target ovrtx_ui_app --config RelWithDebInfo --parallel }
+```
+
+Open `ovui/build/vs2022-dev/ovui.sln`, select `ovrtx_ui_app` as the startup
+project if Visual Studio retains an older selection, and use RelWithDebInfo/x64.
+Building this project builds `_ui`, `_standalone`, `_scene`, and their native dependencies.
+Its first build also creates `app/venv` inside the CMake build directory and
+installs the local widget, service and data-adapter distributions
+in editable mode using their existing package definitions. Pip resolves their
+Python dependencies, and the build verifies dependency consistency and the
+selected provider's early-renderer registration. CMake's in-place native `ovui` package gets
+its metadata from the existing setuptools configuration, without rebuilding it
+through pip or replacing it with a published wheel.
+
+CMake generates the project's debugger command, arguments, working directory,
+and environment. F5 launches `app/venv/Scripts/python.exe -m ovui_widgets.app`
+with the selected Kit sources/runtime and the freshly built native libraries.
+No manual `.vcxproj` edits, package installations, or pre-existing virtual
+environment are needed. Deleting the build directory removes the app environment;
+building the project again recreates it. Package-definition changes rerun setup,
+while ordinary Python edits are picked up by the editable installs.
+
+`OMNIUI_OVRTX_UI_APP_RUNTIME_DIR` overrides the Kit runtime directory (default:
+the selected Kit checkout's `rendering/_build/windows-x86_64/release`).
+`OMNIUI_OVRTX_UI_APP_ARGUMENTS` adds scene or settings arguments to the debugger
+command. Existing `OMNIUI_OVRTX_*` include flags select the SDK sources.
+Missing required SDK paths fail configuration.
+
+ovui names no scene provider. `OMNIUI_OVRTX_UI_APP_PROVIDER` selects which
+`ovui-data-adapters` provider the generated environment installs and runs
+(default `openusd`, which needs nothing beyond the renderer SDK), and
+`OMNIUI_OVRTX_UI_APP_EXTRA_PROJECTS`, `OMNIUI_OVRTX_UI_APP_EXTRA_PYTHONPATH`
+and `OMNIUI_OVRTX_UI_APP_EXTRA_ENVIRONMENT` carry whatever else that provider
+needs. A provider's own configure recipe is documented with its adapter
+package. Kit itself remains
+an external, separately built dependency. Internal development options that are
+not part of a release are described in the source repository's `docs/` folder.
 
 The build produces three shared libraries:
 
@@ -779,7 +853,7 @@ ovui/
 
 ## License
 
-NVIDIA Proprietary. See the copyright headers in source files for the full license terms. This software may not be used, reproduced, or distributed without an express license agreement from NVIDIA Corporation.
+Licensed under the Apache License, Version 2.0. See the `LICENSE` file for the full license text and the SPDX headers in individual source files. Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 ## Kit / Standalone File Sync Status
 

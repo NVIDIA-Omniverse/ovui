@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Read the "current" USD camera from stage metadata.
 
@@ -148,6 +141,9 @@ def _pose_from_camera_prim(
         up_axis=up_axis,
         fov_degrees=float(fov_deg),
         prim_path=prim_path,
+        projection=str(cam.GetProjectionAttr().Get()),
+        orthographic_height=float(aperture) * Gf.Camera.APERTURE_UNIT
+        if cam.GetProjectionAttr().Get() == UsdGeom.Tokens.orthographic and aperture else None,
     )
 
 

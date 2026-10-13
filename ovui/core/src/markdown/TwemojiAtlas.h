@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -44,7 +37,7 @@ public:
 
     bool lookup(uint64_t key, ImVec2& uv0, ImVec2& uv1) const;
 
-    ImTextureID textureId() const { return m_texId; }
+    ImTextureID textureId() const;
     bool isLoaded() const { return m_loaded; }
 
     static uint64_t hashSequence(const uint32_t* codepoints, int count);

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Optional contribution registry for USD Viewer menus."""
 
@@ -123,17 +116,35 @@ class _BuiltMenuWidget:
 
 
 class AppMenuHandle:
-    """Removable handle returned from ``AppMenuRegistry.add``."""
+    """Removable handle returned from ``AppMenuRegistry.add``.
 
-    def __init__(self, registry: "AppMenuRegistry", contribution_id: str) -> None:
+    Handles bind to their exact registration generation (``token``): a
+    stale handle whose registration was already removed no-ops instead
+    of removing a later same-ID registration — including one that
+    re-adds the very same contribution/provider object, which starts a
+    new generation an old handle cannot match. Token-less handles keep
+    the legacy key-based removal (administrative use only).
+    """
+
+    def __init__(
+        self,
+        registry: "AppMenuRegistry",
+        contribution_id: str,
+        token: Any = None,
+    ) -> None:
         self._registry = registry
         self._contribution_id = contribution_id
+        self._token = token
 
     @property
     def id(self) -> str:
         return self._contribution_id
 
     def remove(self) -> bool:
+        if self._token is not None:
+            return self._registry._remove_if_token(
+                self._contribution_id, self._token
+            )
         return self._registry.remove(self._contribution_id)
 
 
@@ -144,6 +155,10 @@ class AppMenuRegistry:
         self._app = app
         self._entries: dict[str, AppMenuContribution] = {}
         self._providers: dict[str, AppMenuContributionProvider] = {}
+        # Unique registration-generation token per live ID: handles bind
+        # to it, so removing and re-adding even the same object starts a
+        # new generation a stale handle can never remove.
+        self._tokens: dict[str, object] = {}
         self._capabilities: set[str] = set(capabilities)
         self._failures: dict[str, BaseException] = {}
         self._built_widgets: dict[str, _BuiltMenuWidget] = {}
@@ -202,30 +217,88 @@ class AppMenuRegistry:
         self._capabilities = set(capabilities)
 
     def add(self, contribution: AppMenuContribution) -> AppMenuHandle:
-        """Register a contribution once and return its removal handle."""
-        if contribution.id in self._entries or contribution.id in self._providers:
-            return AppMenuHandle(self, contribution.id)
+        """Register a contribution once and return its owner-bound handle.
+
+        Re-adding the exact same contribution object returns another
+        handle bound to it (legacy idempotent add). A *different*
+        contribution under an existing ID raises — ownership of a
+        foreign registration is never silently granted.
+        """
+        existing = self._entries.get(contribution.id)
+        if existing is not None or contribution.id in self._providers:
+            if existing is contribution:
+                return AppMenuHandle(
+                    self, contribution.id, token=self._tokens.get(contribution.id)
+                )
+            raise ValueError(
+                f"AppMenuRegistry: id {contribution.id!r} is already "
+                "registered by another contribution"
+            )
         self._entries[contribution.id] = contribution
+        self._tokens[contribution.id] = object()
         self._invoke_lifecycle(contribution, "add")
-        return AppMenuHandle(self, contribution.id)
+        return AppMenuHandle(self, contribution.id, token=self._tokens[contribution.id])
 
     def add_provider(self, provider: AppMenuContributionProvider) -> AppMenuHandle:
-        """Register a dynamic contribution provider once."""
-        if provider.id in self._providers or provider.id in self._entries:
-            return AppMenuHandle(self, provider.id)
+        """Register a dynamic contribution provider once (owner-bound)."""
+        existing = self._providers.get(provider.id)
+        if existing is not None or provider.id in self._entries:
+            if existing is provider:
+                return AppMenuHandle(
+                    self, provider.id, token=self._tokens.get(provider.id)
+                )
+            raise ValueError(
+                f"AppMenuRegistry: id {provider.id!r} is already "
+                "registered by another contribution"
+            )
         self._providers[provider.id] = provider
+        self._tokens[provider.id] = object()
         self._invoke_provider_lifecycle(provider, "add")
-        return AppMenuHandle(self, provider.id)
+        return AppMenuHandle(self, provider.id, token=self._tokens[provider.id])
+
+    def _remove_if_token(self, contribution_id: str, token: object) -> bool:
+        """Atomically remove ``contribution_id`` iff ``token`` is its live
+        generation. Handle-facing: a stale handle whose registration was
+        removed (and possibly re-added, even with the same object)
+        no-ops here."""
+        if self._tokens.get(contribution_id) is not token:
+            return False
+        return self.remove(contribution_id)
+
+    def remove_if_matches(self, contribution_id: str, expected: Any) -> bool:
+        """Atomically remove ``contribution_id`` only if ``expected`` owns it.
+
+        Ownership comparison and removal happen inside one registry call
+        with no callback between the check and the unpublish, so a stale
+        owner can never remove an independently installed replacement.
+        PRECONDITION: handle-less recovery only, with a unique
+        contribution object per registration generation — object
+        identity cannot distinguish generations when the same object is
+        removed and re-added. Handles bind to generation tokens instead.
+        """
+        current = self._entries.get(contribution_id)
+        if current is not None:
+            if current is not expected:
+                return False
+            return self.remove(contribution_id)
+        provider = self._providers.get(contribution_id)
+        if provider is not None:
+            if provider is not expected:
+                return False
+            return self.remove(contribution_id)
+        return False
 
     def remove(self, contribution_id: str) -> bool:
         contribution = self._entries.pop(contribution_id, None)
         if contribution is not None:
+            self._tokens.pop(contribution_id, None)
             self._built_widgets.pop(contribution_id, None)
             self._invoke_lifecycle(contribution, "remove")
             return True
 
         provider = self._providers.pop(contribution_id, None)
         if provider is not None:
+            self._tokens.pop(contribution_id, None)
             # Dynamic provider entry IDs need not share the provider prefix.
             # Clear the read-only cache; the next menu build repopulates it.
             self._built_widgets.clear()

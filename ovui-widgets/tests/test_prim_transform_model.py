@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for PrimTransformModel and _apply_delta."""
 
@@ -601,10 +594,16 @@ class TestOnDragEnded:
         )
 
     def test_skips_final_notify_when_drag_does_not_change_transform(self, model):
+        model._transform.set_local_transform = MagicMock(
+            wraps=model._transform.set_local_transform
+        )
         model.set_selection(["/World/A"])
         model.on_drag_start()
         model.on_drag_ended()
         model._stage.notify_transform_changed.assert_not_called()
+        model._transform.set_local_transform.assert_not_called()
+        assert model._undo.open_group_depth == 0
+        assert model._undo.can_undo() is False
 
 
 class TestReleaseCommitsFinalTransformOnce:
@@ -677,7 +676,7 @@ class TestReleaseCommitsFinalTransformOnce:
 
         model.on_drag_ended()
 
-        assert transform.set_local_transform.call_count == 2
+        assert transform.set_local_transform.call_count == 1
         assert transform.get_local_transform("/World/A")[3][0] == pytest.approx(15.0)
         assert transform.get_local_transform("/World/B") == initial_b
         model._stage.notify_transform_changed.assert_called_once_with(
@@ -1266,10 +1265,22 @@ class TestOnDragStartLabel:
     def test_label_is_persisted_for_ended(self, model):
         model.set_selection(["/World/A"])
         model.on_drag_start(label="Rotate Prims")
+        model.on_drag_rotated((0.0, 0.0, 1.0), math.pi / 2)
         model.on_drag_ended()
         # The UndoGroup label should match what was begun.
         undo_group = model._undo._undo_stack[-1]
         assert undo_group.label == "Rotate Prims"
+
+    def test_second_start_is_rejected_before_opening_another_group(self, model):
+        model.set_selection(["/World/A"])
+        model.on_drag_start(label="Rotate Prims")
+
+        with pytest.raises(RuntimeError, match="already active"):
+            model.on_drag_start(label="Rotate Prims")
+
+        model._stage.begin_undo_group.assert_called_once_with("Rotate Prims")
+        model.on_drag_cancelled()
+        model._stage.end_undo_group.assert_called_once()
 
 
 class TestOnDragRotated:

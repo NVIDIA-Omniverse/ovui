@@ -841,9 +841,9 @@ void ImDrawList::PrimQuadUV(const ImVec2& a, const ImVec2& b, const ImVec2& c, c
 // On AddPolyline() and AddConvexPolyFilled() we intentionally avoid using ImVec2 and superfluous function calls to optimize debug/non-inlined builds.
 // - Those macros expects l-values and need to be used as their own statement.
 // - Those macros are intentionally not surrounded by the 'do {} while (0)' idiom because even that translates to runtime with debug compilers.
-#define IM_NORMALIZE2F_OVER_ZERO(VX,VY)     { float d2 = VX*VX + VY*VY; if (d2 > 0.0f) { float inv_len = ImRsqrt(d2); VX *= inv_len; VY *= inv_len; } } (void)0
-#define IM_FIXNORMAL2F_MAX_INVLEN2          100.0f // 500.0f (see #4053, #3366)
-#define IM_FIXNORMAL2F(VX,VY)               { float d2 = VX*VX + VY*VY; if (d2 > 0.000001f) { float inv_len2 = 1.0f / d2; if (inv_len2 > IM_FIXNORMAL2F_MAX_INVLEN2) inv_len2 = IM_FIXNORMAL2F_MAX_INVLEN2; VX *= inv_len2; VY *= inv_len2; } } (void)0
+// Preserve Kit convex-fill and line-join coverage at sharp corners.
+#define IM_NORMALIZE2F_OVER_ZERO(VX,VY)     do { float d2 = VX*VX + VY*VY; if (d2 > 0.0f) { float inv_len = 1.0f / ImSqrt(d2); VX *= inv_len; VY *= inv_len; } } while (0)
+#define IM_FIXNORMAL2F(VX,VY)               do { float d2 = VX*VX + VY*VY; if (d2 < 0.5f) d2 = 0.5f; float inv_lensq = 1.0f / d2; VX *= inv_lensq; VY *= inv_lensq; } while (0)
 
 // TODO: Thickness anti-aliased lines cap are missing their AA fringe.
 // We avoid using the ImVec2 math operators here to reduce cost to a minimum for debug/non-inlined builds.
@@ -1305,7 +1305,8 @@ void ImDrawList::PathArcToFast(const ImVec2& center, float radius, int a_min_of_
         _Path.push_back(center);
         return;
     }
-    _PathArcToFastEx(center, radius, a_min_of_12 * IM_DRAWLIST_ARCFAST_SAMPLE_MAX / 12, a_max_of_12 * IM_DRAWLIST_ARCFAST_SAMPLE_MAX / 12, 0);
+    // Kit's public UI keeps the original twelve-sample rounded rectangle geometry.
+    _PathArcToFastEx(center, radius, a_min_of_12 * IM_DRAWLIST_ARCFAST_SAMPLE_MAX / 12, a_max_of_12 * IM_DRAWLIST_ARCFAST_SAMPLE_MAX / 12, IM_DRAWLIST_ARCFAST_SAMPLE_MAX / 12);
 }
 
 void ImDrawList::PathArcTo(const ImVec2& center, float radius, float a_min, float a_max, int num_segments)
@@ -3236,6 +3237,8 @@ ImFontAtlas::ImFontAtlas()
     FontNextUniqueID = 1;
     Builder = NULL;
     ShadowRectIds[0] = ShadowRectIds[1] = -1;
+    // The atlas-wide memset above erased this non-trivial member's defaults.
+    ShadowTexConfig = ImFontAtlasShadowTexConfig();
 }
 
 ImFontAtlas::~ImFontAtlas()
@@ -4965,8 +4968,8 @@ void ImFontAtlasTextureGrow(ImFontAtlas* atlas, int old_tex_w, int old_tex_h)
 
     // Handle minimum size first (for pathologically large packed rects)
     const int pack_padding = atlas->TexGlyphPadding;
-    new_tex_w = ImMax(new_tex_w, ImUpperPowerOfTwo(builder->MaxRectSize.x + pack_padding));
-    new_tex_h = ImMax(new_tex_h, ImUpperPowerOfTwo(builder->MaxRectSize.y + pack_padding));
+    new_tex_w = ImMax(new_tex_w, ImUpperPowerOfTwo(builder->MaxRectSize.x + 2 * pack_padding));
+    new_tex_h = ImMax(new_tex_h, ImUpperPowerOfTwo(builder->MaxRectSize.y + 2 * pack_padding));
     new_tex_w = ImClamp(new_tex_w, atlas->TexMinWidth, atlas->TexMaxWidth);
     new_tex_h = ImClamp(new_tex_h, atlas->TexMinHeight, atlas->TexMaxHeight);
     if (new_tex_w == old_tex_w && new_tex_h == old_tex_h)
@@ -5125,7 +5128,9 @@ void ImFontAtlasPackInit(ImFontAtlas * atlas)
     const int pack_node_count = tex->Width / 2;
     builder->PackNodes.resize(pack_node_count);
     IM_STATIC_ASSERT(sizeof(stbrp_context) <= sizeof(stbrp_context_opaque));
-    stbrp_init_target((stbrp_context*)(void*)&builder->PackContext, tex->Width, tex->Height, builder->PackNodes.Data, builder->PackNodes.Size);
+    // Keep transparent padding at the texture edges as well as between glyphs.
+    // Otherwise clamp-to-edge sampling makes a glyph at x/y == 0 artificially opaque.
+    stbrp_init_target((stbrp_context*)(void*)&builder->PackContext, tex->Width - atlas->TexGlyphPadding, tex->Height - atlas->TexGlyphPadding, builder->PackNodes.Data, builder->PackNodes.Size);
     builder->RectsPackedSurface = builder->RectsPackedCount = 0;
     builder->MaxRectSize = ImVec2i(0, 0);
     builder->MaxRectBounds = ImVec2i(0, 0);
@@ -5212,8 +5217,8 @@ ImFontAtlasRectId ImFontAtlasPackAddRect(ImFontAtlas* atlas, int w, int h, ImFon
         pack_r.w = w + pack_padding;
         pack_r.h = h + pack_padding;
         stbrp_pack_rects((stbrp_context*)(void*)&builder->PackContext, &pack_r, 1);
-        r.x = (unsigned short)pack_r.x;
-        r.y = (unsigned short)pack_r.y;
+        r.x = (unsigned short)(pack_r.x + pack_padding);
+        r.y = (unsigned short)(pack_r.y + pack_padding);
         if (pack_r.was_packed)
             break;
 
@@ -6311,6 +6316,14 @@ const char* ImFontCalcWordWrapPositionEx(ImFont* font, float size, const char* t
     int prev_type = ImWcharClass_Other;
     const bool keep_blanks = (flags & ImDrawTextFlags_WrapKeepBlanks) != 0;
 
+    // Kit's existing labels use the legacy word boundaries, including punctuation
+    // before digits and the previous word when the next word overflows. Keep the
+    // newer explicit WrapKeepBlanks behavior for callers that request it.
+    float word_width = 0.0f;
+    const char* word_end = text;
+    const char* prev_word_end = NULL;
+    bool inside_word = true;
+
     // Find next wrapping point
     //const char* span_begin = s;
     const char* span_end = s;
@@ -6340,6 +6353,47 @@ const char* ImFontCalcWordWrapPositionEx(ImFont* font, float size, const char* t
         float char_width = (c < (unsigned int)baked->IndexAdvanceX.Size) ? baked->IndexAdvanceX.Data[c] : -1.0f;
         if (char_width < 0.0f)
             char_width = BuildLoadGlyphGetAdvanceOrFallback(baked, c);
+
+        if (!keep_blanks)
+        {
+            if (ImCharIsBlankW(c))
+            {
+                if (inside_word)
+                {
+                    line_width += blank_width;
+                    blank_width = 0.0f;
+                    word_end = s;
+                }
+                blank_width += char_width;
+                inside_word = false;
+            }
+            else
+            {
+                word_width += char_width;
+                if (inside_word)
+                    word_end = next_s;
+                else
+                {
+                    prev_word_end = word_end;
+                    line_width += word_width + blank_width;
+                    word_width = blank_width = 0.0f;
+                }
+                // Retain the ideographic punctuation boundaries of the current font API.
+                inside_word = !(c == '.' || c == ',' || c == ';' || c == '!' || c == '?' || c == '"' ||
+                                c == 0x3001 || c == 0x3002);
+            }
+
+            // Trailing blanks are skipped by the next-line helper. A word that
+            // cannot fit on an entire line must still be split to make progress.
+            if (line_width + word_width > wrap_width)
+            {
+                if (word_width < wrap_width)
+                    s = prev_word_end ? prev_word_end : word_end;
+                break;
+            }
+            s = next_s;
+            continue;
+        }
 
         // Classify current character
         int curr_type;

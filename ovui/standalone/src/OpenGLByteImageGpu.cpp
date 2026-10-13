@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "OpenGLByteImageGpu.h"
@@ -20,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #if OMNIUI_HAS_CUDA
 #  include <cuda_runtime.h>
@@ -52,6 +46,9 @@ struct GpuState
     cudaGraphicsResource_t cudaRes = nullptr;
     bool cudaResIsTexture = false;
     size_t pboBytes = 0;
+    // Set when CUDA-GL interop fails for this provider, for example on a GL
+    // context of another device. fromGpu images then use a host copy.
+    bool cudaInteropFailed = false;
 #endif
 };
 
@@ -227,7 +224,10 @@ static bool ensureCudaPbo(GpuState* state, size_t byteSize)
 static bool copyDeviceToPbo(GpuState* state, const void* srcDptr,
                             size_t srcPitch, size_t rowBytes, size_t height)
 {
-    cudaError_t err = cudaGraphicsMapResources(1, &state->cudaRes, 0);
+    cudaError_t err;
+    {
+        err = cudaGraphicsMapResources(1, &state->cudaRes, 0);
+    }
     if (err != cudaSuccess)
     {
         fprintf(stderr, "OpenGLByteImageGpu: cudaGraphicsMapResources failed: %s\n",
@@ -241,11 +241,14 @@ static bool copyDeviceToPbo(GpuState* state, const void* srcDptr,
     if (err == cudaSuccess && needed <= mappedSize && dst != nullptr)
     {
         err = cudaMemcpy2DAsync(dst, /*dpitch=*/rowBytes,
-                                srcDptr, /*spitch=*/srcPitch,
-                                /*width=*/rowBytes, /*height=*/height,
-                                cudaMemcpyDeviceToDevice, /*stream=*/0);
+                               srcDptr, /*spitch=*/srcPitch,
+                               /*width=*/rowBytes, /*height=*/height,
+                               cudaMemcpyDeviceToDevice, /*stream=*/0);
     }
-    cudaError_t unmapErr = cudaGraphicsUnmapResources(1, &state->cudaRes, 0);
+    cudaError_t unmapErr;
+    {
+        unmapErr = cudaGraphicsUnmapResources(1, &state->cudaRes, 0);
+    }
     if (err != cudaSuccess)
     {
         fprintf(stderr, "OpenGLByteImageGpu: cudaMemcpy2DAsync(D2D) failed: %s\n",
@@ -310,7 +313,10 @@ static bool copyDeviceToTextureViaInterop(
     GpuState* state, const void* srcDptr,
     size_t srcPitch, size_t rowBytes, int height)
 {
-    cudaError_t err = cudaGraphicsMapResources(1, &state->cudaRes, 0);
+    cudaError_t err;
+    {
+        err = cudaGraphicsMapResources(1, &state->cudaRes, 0);
+    }
     if (err != cudaSuccess)
     {
         fprintf(stderr, "OpenGLByteImageGpu: cudaGraphicsMapResources (tex) failed: %s\n",
@@ -332,7 +338,10 @@ static bool copyDeviceToTextureViaInterop(
             cudaMemcpyDeviceToDevice,
             /*stream=*/0);
     }
-    cudaError_t unmapErr = cudaGraphicsUnmapResources(1, &state->cudaRes, 0);
+    cudaError_t unmapErr;
+    {
+        unmapErr = cudaGraphicsUnmapResources(1, &state->cudaRes, 0);
+    }
     if (err != cudaSuccess)
     {
         fprintf(stderr, "OpenGLByteImageGpu: cudaMemcpy2DToArrayAsync failed: %s\n",
@@ -345,6 +354,32 @@ static bool copyDeviceToTextureViaInterop(
                 cudaGetErrorString(unmapErr));
         return false;
     }
+    return true;
+}
+
+// Copy the caller's device pointer to host memory and upload it into the
+// texture. Used when CUDA-GL interop is not available for this GL context.
+static bool copyDeviceToTextureViaHost(GpuState* state, const void* srcDptr,
+                                       size_t srcPitch, size_t rowBytes, UInt2 size,
+                                       GLenum glFormat, GLenum glType)
+{
+    std::vector<uint8_t> host(rowBytes * (size_t)size.y);
+    cudaError_t err = cudaMemcpy2D(host.data(), rowBytes, srcDptr, srcPitch,
+                                   rowBytes, (size_t)size.y, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "OpenGLByteImageGpu: cudaMemcpy2D(D2H) failed: %s\n",
+                cudaGetErrorString(err));
+        return false;
+    }
+    glBindTexture(GL_TEXTURE_2D, state->texture);
+    GLint prevAlign = 4;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &prevAlign);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)size.x, (GLsizei)size.y,
+                    glFormat, glType, host.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT, prevAlign);
+    glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
 
@@ -453,8 +488,19 @@ IByteImageGpu::UpdateResult OpenGLByteImageGpu::updateImage(
         // ``cudaGraphicsGLRegisterImage`` (CUDA's supported-formats
         // table excludes GL_RGB*); transparently fall through to the
         // PBO path. Other formats follow the configured interop mode.
-        const bool useDirectThisCall = m_useDirectInterop &&
+        const bool useInteropThisCall = !state->cudaInteropFailed;
+        const bool useDirectThisCall = useInteropThisCall && m_useDirectInterop &&
                                        isDirectInteropCompatibleFormat(format);
+        // On an interop failure, latch the host-copy path for this provider
+        // and upload the same frame through it.
+        auto fallBackToHostCopy = [&]() -> UpdateResult {
+            state->cudaInteropFailed = true;
+            releaseCudaInterop(state);
+            fprintf(stderr, "OpenGLByteImageGpu: CUDA-GL interop unavailable; "
+                            "using a host copy for fromGpu images\n");
+            return updateImage(h, mipMapBuffers, mipMapStrides, mipMapCount,
+                               size, format, fromGpu, 0, 0, 0);
+        };
         // The BGRA direct path stores raw BGRA bytes in a GL_RGBA8 texture
         // and asks GL to swizzle on sample (CUDA does no channel reorder).
         // The PBO path lets ``glTexSubImage2D(... GL_BGRA, ...)`` do the
@@ -546,19 +592,25 @@ IByteImageGpu::UpdateResult OpenGLByteImageGpu::updateImage(
             state->textureForDirectInterop = useDirectThisCall;
         }
 
-        if (useDirectThisCall)
+        if (!useInteropThisCall)
+        {
+            if (!copyDeviceToTextureViaHost(state, mipMapBuffers[0], srcPitch,
+                                            rowBytes, size, glFormat, glType))
+                return {};
+        }
+        else if (useDirectThisCall)
         {
             // 2a. Register the texture with CUDA (idempotent across
             //     frames; recreate above already dropped any prior
             //     registration).
             if (!ensureCudaTextureInterop(state))
-                return {};
+                return fallBackToHostCopy();
             // 3a. CUDA device ptr → texture cudaArray. Single copy;
             //     ``glTexSubImage2D`` is not needed. ``srcPitch`` honors
             //     pitched CUDA allocations (cudaMallocPitch / NVENC).
             if (!copyDeviceToTextureViaInterop(
                     state, mipMapBuffers[0], srcPitch, rowBytes, (int)size.y))
-                return {};
+                return fallBackToHostCopy();
             // Leave GL_TEXTURE_2D unbound (matches CPU path's contract).
             glBindTexture(GL_TEXTURE_2D, 0);
         }
@@ -567,13 +619,13 @@ IByteImageGpu::UpdateResult OpenGLByteImageGpu::updateImage(
             // 2b. Ensure the PBO is allocated + registered with CUDA at
             //     the correct size. Resize releases and re-registers.
             if (!ensureCudaPbo(state, byteSize))
-                return {};
+                return fallBackToHostCopy();
             // 3b. CUDA → PBO (GPU→GPU memcpy via mapped pointer). The
             //     PBO is tightly packed; ``copyDeviceToPbo`` translates
             //     the source's ``srcPitch`` to the tight dst pitch.
             if (!copyDeviceToPbo(state, mipMapBuffers[0],
                                  srcPitch, rowBytes, (size_t)size.y))
-                return {};
+                return fallBackToHostCopy();
             // 4b. PBO → texture (driver-internal upload, stays on GPU).
             //     R8 packed at 1 byte/pixel breaks GL's default
             //     ``GL_UNPACK_ALIGNMENT=4`` for odd widths — set 1 to be
@@ -583,9 +635,11 @@ IByteImageGpu::UpdateResult OpenGLByteImageGpu::updateImage(
             GLint prevAlign = 4;
             glGetIntegerv(GL_UNPACK_ALIGNMENT, &prevAlign);
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                            (GLsizei)size.x, (GLsizei)size.y,
-                            glFormat, glType, nullptr);
+            {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                                (GLsizei)size.x, (GLsizei)size.y,
+                                glFormat, glType, nullptr);
+            }
             glPixelStorei(GL_UNPACK_ALIGNMENT, prevAlign);
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
             glBindTexture(GL_TEXTURE_2D, 0);

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Scale gizmo — axis cubes + uniform center cube with drag + hover highlight.
 
@@ -50,7 +43,7 @@ gesture only computes the ``(axis_mask, factor)`` pair each frame.
 from __future__ import annotations
 
 import math
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from omni.ui_scene import scene as sc
 
@@ -88,7 +81,7 @@ SHAFT_THICKNESS: float = 2.0
 SHAFT_INTERSECTION_THICKNESS: float = 10.0
 
 # Cube handle half-edge in gizmo-local space. Small and elegant — per
-# the design directive, "cube handles must be small, NOT chunky". At the
+# The design requirement, "cube handles must be small, NOT chunky". At the
 # 0.05 GIZMO_SIZE_SCALE this is ~0.4% of viewport, in line with the
 # translate cone cap (``CONE_TIP_RADIUS = 0.06``).
 CUBE_HALF: float = 0.07
@@ -227,6 +220,9 @@ class PrimScaleChangedGesture(TransformGestureBase):
         ``True`` for the centre handle. Affects the gesture's advertised
         :attr:`is_uniform` flag and the default projection axis; the
         same math runs either way.
+    world_scale_fn:
+        Returns the gizmo's current world scale. It is captured at drag start
+        so movement is measured as a fraction of the displayed shaft size.
 
     Lifecycle
     ---------
@@ -235,7 +231,7 @@ class PrimScaleChangedGesture(TransformGestureBase):
       Prims"`` to open an undo group. Resets the accumulated length.
     * ``on_changed``: read ``moved``, project onto the projection axis,
       add to the accumulated length, compute
-      ``factor = 1 + accumulated / SHAFT_LENGTH`` (clamped at
+      ``factor = 1 + accumulated / scaled_shaft_length`` (clamped at
       :data:`MIN_SCALE_FACTOR`), and call
       :meth:`PrimTransformModel.on_drag_scaled(axis, factor)`.
     * ``on_ended``: call :meth:`PrimTransformModel.on_drag_ended` which
@@ -252,6 +248,7 @@ class PrimScaleChangedGesture(TransformGestureBase):
         axis: Tuple[float, float, float],
         projection_axis: Optional[Tuple[float, float, float]] = None,
         uniform: bool = False,
+        world_scale_fn: Optional[Any] = None,
         mouse_button: int = _MOUSE_LEFT,
         modifiers: int = _NO_MODIFIERS,
         generation: Any = None,
@@ -285,6 +282,8 @@ class PrimScaleChangedGesture(TransformGestureBase):
             )
         self._projection_axis: Tuple[float, float, float] = proj
         self._uniform: bool = bool(uniform)
+        self._world_scale_fn = world_scale_fn
+        self._world_scale: float = 1.0
         self._model = model
         self._active: bool = False
         # See the twin ``_drag_ended_this_cycle`` latch in
@@ -337,8 +336,25 @@ class PrimScaleChangedGesture(TransformGestureBase):
         """
         return max(
             MIN_SCALE_FACTOR,
-            1.0 + self._accumulated / SHAFT_LENGTH,
+            1.0 + self._accumulated / (SHAFT_LENGTH * self._world_scale),
         )
+
+    @staticmethod
+    def _payload_closest_point(sender: Any, self_: "PrimScaleChangedGesture") -> Any:
+        shape = sender if sender is not None else getattr(self_, "sender", None)
+        payload = getattr(shape, "gesture_payload", None) if shape is not None else None
+        if payload is None:
+            payload = getattr(self_, "gesture_payload", None)
+        if payload is None:
+            return None
+        closest = getattr(payload, "line_closest_point", None)
+        return closest if closest is not None else getattr(payload, "ray_closest_point", None)
+
+    @staticmethod
+    def _point_tuple(point: Any) -> Tuple[float, float, float]:
+        if hasattr(point, "x"):
+            return float(point.x), float(point.y), float(point.z)
+        return float(point[0]), float(point[1]), float(point[2])
 
     def _on_began(self, sender: Any = None) -> None:
         if self._generation is not None and not self._generation.effective:
@@ -348,14 +364,30 @@ class PrimScaleChangedGesture(TransformGestureBase):
         if not paths:
             self._active = False
             return
+        if not self._acquire_drag():
+            self._active = False
+            return
         self._accumulated = 0.0
-        self._drag_start_point = None
+        closest = self._payload_closest_point(sender, self)
+        self._drag_start_point = (
+            self._point_tuple(closest) if closest is not None else None
+        )
+        try:
+            world_scale = (
+                float(self._world_scale_fn())
+                if self._world_scale_fn is not None
+                else 1.0
+            )
+        except Exception:
+            world_scale = 1.0
+        self._world_scale = world_scale if world_scale > 0.0 else 1.0
         try:
             self._model.on_drag_start(label=self._UNDO_LABEL)
         except Exception:
             # Pre-adapter-wired model (unit tests, pre-C.5 scaffolding).
             # Stay inert — nothing to close at drag end.
             self._active = False
+            self._release_drag()
             return
         self._active = True
 
@@ -377,14 +409,9 @@ class PrimScaleChangedGesture(TransformGestureBase):
         # line closest-point; fall back to the ``moved`` delta in that
         # case (accumulation is tolerant of occasional zero frames for
         # the rectangle handle's drag).
-        closest = getattr(payload, "line_closest_point", None)
-        if closest is None:
-            closest = getattr(payload, "ray_closest_point", None)
+        closest = self._payload_closest_point(sender, self)
         if closest is not None:
-            if hasattr(closest, "x"):
-                cx, cy, cz = float(closest.x), float(closest.y), float(closest.z)
-            else:
-                cx, cy, cz = float(closest[0]), float(closest[1]), float(closest[2])
+            cx, cy, cz = self._point_tuple(closest)
             if self._drag_start_point is None:
                 self._drag_start_point = (cx, cy, cz)
                 return
@@ -411,7 +438,7 @@ class PrimScaleChangedGesture(TransformGestureBase):
             self._accumulated += mx * px + my * py + mz * pz
         factor = max(
             MIN_SCALE_FACTOR,
-            1.0 + self._accumulated / SHAFT_LENGTH,
+            1.0 + self._accumulated / (SHAFT_LENGTH * self._world_scale),
         )
         try:
             self._model.on_drag_scaled(self._axis, factor)
@@ -432,6 +459,8 @@ class PrimScaleChangedGesture(TransformGestureBase):
             self._model.on_drag_ended()
         except Exception:
             pass
+        finally:
+            self._release_drag()
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +509,7 @@ def build_scale_gizmo(
     hover_gestures: Optional[List[HighlightGesture]] = None,
     uniform_drag: Optional[PrimScaleChangedGesture] = None,
     uniform_hover: Optional[HighlightGesture] = None,
+    view_aligned_axes: Sequence[bool] = (),
 ) -> ScaleGizmoHandles:
     """Emit the scale gizmo into the current ``sc.Transform`` scope.
 
@@ -491,6 +521,9 @@ def build_scale_gizmo(
     ``uniform_hover`` let the parent manipulator pass in pre-built gesture
     instances so drag state survives a per-frame rebuild — same rationale
     as :func:`~ovui_widgets.viewport.translate_gizmo.build_translate_gizmo`.
+
+    ``view_aligned_axes`` flags (X, Y, Z) axes that point along the view
+    ray; their shafts are drawn without gestures.
 
     Geometry layout
     ---------------
@@ -535,7 +568,11 @@ def build_scale_gizmo(
             color=base_color,
             thickness=SHAFT_THICKNESS,
             intersection_thickness=SHAFT_INTERSECTION_THICKNESS,
-            gestures=[drag, hover],
+            # A shaft pointing along the view ray has no screen length to
+            # drag, and ui.scene's line hit test cannot resolve a ray parallel
+            # to the segment: it keeps the previous hit, so the handle would
+            # claim clicks anywhere in the viewport. Draw it without gestures.
+            gestures=[] if i < len(view_aligned_axes) and view_aligned_axes[i] else [drag, hover],
         )
         hover.add_shape(shaft)
         shafts.append(shaft)

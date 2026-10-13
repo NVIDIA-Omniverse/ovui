@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/bind/BindUtils.h>
@@ -57,6 +50,10 @@ void wrapCurve(module& m)
                       [](Curve& self, const pybind11::handle& obj) { self.setColors(pythonListToVector4(obj)); },
                       OMNIUI_PYBIND_DOC_Curve_colors)
         .def_property("thicknesses", &Curve::getThicknesses, &Curve::setThicknesses, OMNIUI_PYBIND_DOC_Curve_thicknesses)
+        .def_property("vertex_counts", &Curve::getVertexCounts, &Curve::setVertexCounts,
+                      "Optional independent linear-polyline counts. Empty preserves a single curve; invalid partitions draw nothing.")
+        .def_property("antialiasing_width", &Curve::getAntialiasingWidth, &Curve::setAntialiasingWidth,
+                      "Optional coverage transition width in pixels. Zero preserves renderer defaults; standard OpenGL supports positive widths, while OIT retains its existing coverage.")
         .def_property("intersection_thicknesses", &Curve::getIntersectionThickness, &Curve::setIntersectionThickness, OMNIUI_PYBIND_DOC_Curve_intersectionThickness)
         .def_property("curve_type", &Curve::getCurveType, &Curve::setCurveType, OMNIUI_PYBIND_DOC_Curve_curveType)
         .def_property_readonly("gesture_payload", [](const Curve& self) { return self.getGesturePayload(); },

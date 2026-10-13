@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """PrimTransformModel — manages multi-prim transform drag state.
 
@@ -17,7 +10,7 @@ and brackets the operation in an undo group.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ovui_data_adapters.common import (
     RendererAdapter,
@@ -190,6 +183,28 @@ class PrimTransformModel:
         # Row-major: translation in row 3, columns 0..2.
         return (float(mat[3][0]), float(mat[3][1]), float(mat[3][2]))
 
+    def get_first_world_transform(self) -> Optional[List[float]]:
+        """Return the selected prim's live world matrix in scene-flat form."""
+        if self._transform is None or not self._selected_paths:
+            return None
+        path = self._selected_paths[0]
+        matrix = None
+        if self._drag_active:
+            live_local = self._live_transforms.get(path)
+            if live_local is None:
+                live_local = self._initial_transforms.get(path)
+            if live_local is not None:
+                matrix = self._live_world_transform(path, live_local)
+        if matrix is None:
+            try:
+                matrix = self._transform.get_world_transform(path)
+            except Exception:
+                return None
+        try:
+            return [float(matrix[row][column]) for row in range(4) for column in range(4)]
+        except (IndexError, TypeError, ValueError):
+            return None
+
     def set_selection(self, paths: List[str]) -> None:
         # Selection clicks are the cheapest frequent repair point.
         if self._failed_preview_restores:
@@ -240,6 +255,8 @@ class PrimTransformModel:
         return dict(self._selection_policies)
 
     def on_drag_start(self, label: str = "Move Prims") -> None:
+        if self._drag_active:
+            raise RuntimeError("transform drag already active")
         # Retry owed restores before capturing new drag-start state.
         if self._failed_preview_restores:
             self.retry_failed_preview_restores()
@@ -351,8 +368,9 @@ class PrimTransformModel:
                         final = self._live_transforms.get(path)
                         if final is None:
                             final = self._transform.get_local_transform(path)
-                        if not _matrices_close(initial, final):
-                            changed_paths.append(path)
+                        if _matrices_close(initial, final):
+                            continue
+                        changed_paths.append(path)
                         cmd = BatchTransformCommand(
                             self._transform,
                             path,

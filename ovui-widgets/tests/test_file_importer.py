@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the content browser implementation step 53 — :class:`FileImporterHelper`.
 
@@ -544,6 +537,35 @@ class TestImportHandler:
 
 
 class TestValidation:
+    def test_file_open_workflow_passes_https_identifier_unchanged(
+        self, helper: FileImporterHelper, ephemeral_window, monkeypatch,
+    ):
+        """Remote scene identifiers reach the application without local validation."""
+        from ovui_widgets.app.menu_bar import _on_open_clicked
+
+        opened: List[str] = []
+        remote_url = "https://example.com/scenes/remote.usda"
+
+        class _App:
+            @staticmethod
+            def open_file(path: str) -> None:
+                opened.append(path)
+
+        monkeypatch.setattr(
+            FileImporterHelper,
+            "instance",
+            classmethod(lambda cls: helper),
+        )
+        try:
+            with in_window_frame(ephemeral_window):
+                _on_open_clicked(_App())
+            helper.dialog.navigate_to("mock://Home/Documents/Projects")
+            helper.dialog.set_filename(remote_url)
+            helper.dialog._fire_apply_for_test()
+            assert opened == [remote_url]
+        finally:
+            helper.destroy()
+
     def test_validation_rejects_missing_file(
         self, helper: FileImporterHelper, ephemeral_window,
     ):

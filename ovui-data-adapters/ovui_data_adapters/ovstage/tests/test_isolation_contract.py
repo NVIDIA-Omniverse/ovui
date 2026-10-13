@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Structural and runtime isolation contract for the OVStage adapter."""
 
@@ -563,6 +556,14 @@ def test_distribution_metadata_declares_no_openusd_or_pxr_dependency() -> None:
 
     project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
     requirements = list(project.get("dependencies", ()))
+    # Dynamic dependencies are the install_requires list in setup.py.
+    setup_tree = ast.parse((pyproject.parent / "setup.py").read_text(encoding="utf-8"))
+    for keyword in ast.walk(setup_tree):
+        if isinstance(keyword, ast.keyword) and keyword.arg == "install_requires":
+            requirements.extend(
+                ast.unparse(item) for item in keyword.value.elts
+            )
+    assert requirements, "the ovstage distribution declares no requirements"
     for extra_requirements in project.get("optional-dependencies", {}).values():
         requirements.extend(extra_requirements)
 

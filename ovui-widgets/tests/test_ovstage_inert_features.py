@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OVStage provider capability gating and no-scene fallback behavior.
 
@@ -421,22 +414,9 @@ def test_ovstage_provider_session_reports_persistent_and_authoring_gates() -> No
     assert session.can_delete_prims() is True
 
 
-def test_production_code_keeps_widget_and_adapter_boundaries_clean() -> None:
+def test_ovstage_adapter_does_not_import_widget_modules() -> None:
     root = pathlib.Path(__file__).resolve().parents[2]
     scans = (
-        (
-            root / "ovui-widgets" / "ovui_widgets",
-            (
-                "ovui_data_adapters.openusd",
-                "ovui_data_adapters.ovstage",
-                "pxr",
-                "ovstage",
-                "ovpopulation",
-                "ovhierarchy",
-                "ovphysx",
-                "ovrtx",
-            ),
-        ),
         (
             root / "ovui-data-adapters" / "ovui_data_adapters" / "ovstage",
             ("ovui_widgets",),

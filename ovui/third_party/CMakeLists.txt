@@ -1,26 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # ==============================================================================
 # third_party/CMakeLists.txt - Third-party dependency targets
 # ==============================================================================
 
 include(FetchContent)
 
-# --- ImGui (OBJECT library) ---
-add_library(imgui OBJECT
-    imgui/imgui.cpp
-    imgui/imgui_draw.cpp
-    imgui/imgui_tables.cpp
-    imgui/imgui_widgets.cpp
-    imgui/imgui_demo.cpp
-    imgui/misc/freetype/imgui_freetype.cpp
+# --- One ImGui library shared by UI, standalone and native consumers ---
+set(OVUI_IMGUI_LIBRARY_TYPE SHARED)
+if(EMSCRIPTEN)
+    set(OVUI_IMGUI_LIBRARY_TYPE STATIC)
+endif()
+add_library(imgui ${OVUI_IMGUI_LIBRARY_TYPE}
+    ${OVUI_IMGUI_ROOT}/imgui/imgui.cpp
+    ${OVUI_IMGUI_ROOT}/imgui/imgui_draw.cpp
+    ${OVUI_IMGUI_ROOT}/imgui/imgui_tables.cpp
+    ${OVUI_IMGUI_ROOT}/imgui/imgui_widgets.cpp
+    ${OVUI_IMGUI_ROOT}/imgui/imgui_demo.cpp
+    ${OVUI_IMGUI_ROOT}/imgui/imgui_kit_compat.cpp
+    ${OVUI_IMGUI_ROOT}/imgui/imgui_ovrtx_compat.cpp
+    ${OVUI_IMGUI_ROOT}/imgui/misc/freetype/imgui_freetype.cpp
 )
 target_include_directories(imgui PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}          # so #include <imgui/imgui.h> works
+    ${OVUI_IMGUI_ROOT}                   # so #include <imgui/imgui.h> works
 )
 target_include_directories(imgui PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui    # for imgui internal includes
+    ${OVUI_IMGUI_ROOT}/imgui             # for imgui internal includes
 )
 target_compile_definitions(imgui PUBLIC IMGUI_NVIDIA)
 target_link_libraries(imgui PUBLIC Freetype::Freetype)
+if(WIN32)
+    # The backends are compiled into each host, not exported by ovui_imgui.dll.
+    # Do not let their declarations inherit the core library's import mode.
+    target_compile_definitions(imgui PUBLIC "IMGUI_IMPL_API=")
+    target_compile_definitions(imgui PRIVATE "IMGUI_API=__declspec(dllexport)"
+        INTERFACE "IMGUI_API=__declspec(dllimport)")
+    # Avoid colliding with the older ImGui DLL loaded by OVRTX.
+    set_target_properties(imgui PROPERTIES
+        RUNTIME_OUTPUT_NAME ovui_imgui
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}"
+        ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}")
+elseif(NOT EMSCRIPTEN)
+    target_compile_definitions(imgui PUBLIC "IMGUI_API=__attribute__((visibility(\"default\")))")
+endif()
 
 # --- glad (generated OpenGL loader) ---
 # Verified refs/tags/v0.1.36 with:
@@ -110,20 +133,9 @@ target_include_directories(stb INTERFACE
 )
 
 # --- md4c (CommonMark/GFM parser) ---
-# Verified refs/tags/release-0.5.2 with:
-# git ls-remote https://github.com/mity/md4c.git refs/tags/release-0.5.2
-#
-# Upstream CMake always adds md4c-html; populate the source tree and build only
-# the parser plus entity table used by ovui's markdown renderer.
-FetchContent_Declare(
-    md4c
-    GIT_REPOSITORY https://github.com/mity/md4c.git
-    GIT_TAG        729e6b8b320caa96328968ab27d7db2235e4fb47
-    GIT_SHALLOW    FALSE
-    SOURCE_SUBDIR  cmake/skip-upstream-add-subdirectory
-)
-FetchContent_MakeAvailable(md4c)
-
+# Vendored in md4c/: release-0.5.2, commit 729e6b8b320caa96328968ab27d7db2235e4fb47
+# (the parser, its entity table and the license). Other builds use the same files.
+set(md4c_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/md4c")
 add_library(md4c STATIC
     ${md4c_SOURCE_DIR}/src/md4c.c
     ${md4c_SOURCE_DIR}/src/entity.c
@@ -137,4 +149,6 @@ target_compile_definitions(md4c PRIVATE
     MD_VERSION_RELEASE=2
     MD4C_USE_UTF8
 )
+# md4c is private to libovui: none of its symbols are exported.
+set_target_properties(md4c PROPERTIES C_VISIBILITY_PRESET hidden)
 set_target_properties(md4c PROPERTIES POSITION_INDEPENDENT_CODE ON)

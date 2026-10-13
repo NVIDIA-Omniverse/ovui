@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION is strictly
-# prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OVStage-native committed value-authoring contracts."""
 
@@ -96,6 +89,28 @@ def Xform "World"
         rel orderedVars = [</World/Beauty>, </World/Depth>]
         int2 resolution = (640, 360)
     }
+    def DomeLight "Dome"
+    {
+        asset inputs:texture:file = @@
+    }
+    def RectLight "Rect"
+    {
+        float inputs:height = 1
+        float inputs:width = 3
+    }
+    def DiskLight "Disk"
+    {
+        float inputs:radius = 0.5
+    }
+    def SphereLight "LightSphere"
+    {
+        float inputs:radius = 1.5
+    }
+    def CylinderLight "Cylinder"
+    {
+        float inputs:length = 4
+        float inputs:radius = 0.25
+    }
 }
 '''
 
@@ -174,6 +189,29 @@ def _event_tuple(event: Any) -> tuple[Any, ...]:
     )
 
 
+def test_light_shape_attributes_track_native_authored_values(
+    opened: tuple[Any, Any, Any, UndoManager],
+) -> None:
+    _session, scene, stage, undo = opened
+
+    expected = {
+        "/World/Rect": {"height": 1.0, "width": 3.0},
+        "/World/Disk": {"radius": 0.5},
+        "/World/LightSphere": {"radius": 1.5},
+        "/World/Cylinder": {"length": 4.0, "radius": 0.25},
+    }
+    for path, dimensions in expected.items():
+        item = stage.get_item_at_path(path)
+        assert item is not None
+        assert stage.get_light_shape_attributes(item) == dimensions
+
+    disk = _property(scene, stage, undo, "/World/Disk")
+    _edit(disk, "inputs:radius", 2.0)
+    disk_item = stage.get_item_at_path("/World/Disk")
+    assert disk_item is not None
+    assert stage.get_light_shape_attributes(disk_item) == {"radius": 2.0}
+
+
 def test_metadata_matches_exact_native_write_support(
     opened: tuple[Any, Any, Any, UndoManager],
 ) -> None:
@@ -223,6 +261,26 @@ def test_edit_session_is_one_frame_one_event_and_exact_undo_redo(
         assert len(events) == 3
     finally:
         subscription.cancel()
+
+
+def test_asset_edit_preserves_authored_and_resolved_native_paths(
+    opened: tuple[Any, Any, Any, UndoManager],
+    tmp_path: Path,
+) -> None:
+    _session, scene, stage, undo = opened
+    dome = _property(scene, stage, undo, "/World/Dome")
+    texture = tmp_path / "studio.exr"
+    texture.write_bytes(b"texture")
+
+    _edit(dome, "inputs:texture:file", str(texture))
+
+    assert dome.get_value("inputs:texture:file") == str(texture)
+    assert dome.get_resolved_asset_path("inputs:texture:file") == str(texture)
+
+    assert undo.undo() is True
+    assert dome.get_value("inputs:texture:file") == ""
+    assert undo.redo() is True
+    assert dome.get_resolved_asset_path("inputs:texture:file") == str(texture)
 
 
 def test_bool_token_string_and_arrays_round_trip_defensively(

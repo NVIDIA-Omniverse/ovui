@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """ovstage StageAdapter topology and path-cache behavior."""
 
@@ -17,6 +10,9 @@ from typing import Any, Iterator
 
 import pytest
 
+from ovui_data_adapters.common import ChangeEventType, CreateRequest
+from ovui_data_adapters.ovstage._stage_write import wait_operation
+from ovui_data_adapters.ovstage._structural import delete_native_paths
 from ovui_data_adapters.ovstage.provider import (
     PROVIDER_ENTRY_POINT_VALUE,
     PROVIDER_NAME,
@@ -162,6 +158,7 @@ def test_cache_invalidates_after_native_topology_mutation(
     ordinal = stage.begin_frame()
     stage.create_prims(ordinal, [probe_path], "Xform")
     stage.end_frame(ordinal)
+    stage_adapter._scene.change_stream.poll()
 
     group_after_create = stage_adapter.get_item_at_path(group_path)
     probe_item = stage_adapter.get_item_at_path(probe_path)
@@ -178,6 +175,7 @@ def test_cache_invalidates_after_native_topology_mutation(
     ordinal = stage.begin_frame()
     stage.delete_prims(ordinal, [probe_path])
     stage.end_frame(ordinal)
+    stage_adapter._scene.change_stream.poll()
 
     group_after_delete = stage_adapter.get_item_at_path(group_path)
 
@@ -186,6 +184,51 @@ def test_cache_invalidates_after_native_topology_mutation(
     assert group_after_delete is group_after_create
     assert stage_adapter.get_item_at_path(probe_path) is None
     assert probe_path not in _child_paths(stage_adapter, group_after_delete)
+
+
+def test_create_prim_appears_in_cached_stage_tree_children(
+    stage_adapter: OvstageStageAdapter,
+) -> None:
+    world = stage_adapter.get_item_at_path("/World")
+
+    assert world is not None
+    assert "/World/VisibleAfterCreate" not in _child_paths(stage_adapter, world)
+
+    result = stage_adapter.create_prim(
+        CreateRequest("create.xform", requested_name="VisibleAfterCreate")
+    )
+
+    assert result.accepted, result.message
+    assert result.primary_path == "/World/VisibleAfterCreate"
+    assert result.primary_path in _child_paths(stage_adapter, world)
+    assert stage_adapter.get_item_at_path(result.primary_path) is not None
+
+
+def test_adapter_authored_path_deleted_by_raw_native_topology_stays_deleted(
+    stage_adapter: OvstageStageAdapter,
+) -> None:
+    path = "/World/RawNativeTopologyDeleteProbe"
+    result = stage_adapter.create_prim(
+        CreateRequest(
+            "create.xform",
+            requested_parent_path="/World",
+            requested_name="RawNativeTopologyDeleteProbe",
+        )
+    )
+    assert result.accepted, result.message
+    assert stage_adapter.get_item_at_path(path) is not None
+
+    stage = stage_adapter.stage
+    ordinal = int(stage.current_ordinal) + 1
+    delete_native_paths(stage, (path,), ordinal=ordinal)
+    wait_operation(stage.advance_write_floor(ordinal))
+    emitted = stage_adapter._scene.change_stream.poll()
+
+    assert len(emitted) == 1
+    assert emitted[0].event_type is ChangeEventType.RESYNC
+    assert emitted[0].source == "ovstage:removed"
+    assert emitted[0].resynced_paths == (path,)
+    assert stage_adapter.get_item_at_path(path) is None
 
 
 def test_children_enumerate_in_native_order_not_authored_usd_order(

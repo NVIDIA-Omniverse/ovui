@@ -1,24 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ovui-widgets-all"
-dynamic = ["version"]
+license = {text = "Apache-2.0"}
+# Dependencies are in setup.py: first-party packages are pinned to VERSION.md.
+dynamic = ["version", "dependencies"]
 description = "ovui-widgets meta-package: installs all components"
-readme = "README.md"
+readme = {content-type = "text/markdown", text = """
+# ovui-widgets-all
+
+Meta-package for installing the complete ovui-widgets stack: the USD Viewer
+application, common services, Stage Browser, Layers panel, Content Browser,
+Property Inspector, Viewport, and the common plus OpenUSD
+data-adapter packages. It requests the OpenUSD adapter's `standalone` extra so
+a clean aggregate installation also receives the supported `usd-core` runtime.
+
+Install this package when a project wants the full scene-tooling surface rather
+than one widget distribution at a time. Kit and custom-USD environments that
+must retain their matching `pxr` runtime should install the component packages
+and plain `ovui-data-adapters-openusd` instead of this standalone aggregate.
+"""}
 requires-python = ">=3.10"
-dependencies = [
-    "ovui-widgets-common>=0.1.0",
-    "ovui-widgets-app>=0.1.0",
-    "ovui-widgets-stage>=0.1.0",
-    "ovui-widgets-layers>=0.1.0",
-    "ovui-widgets-content>=0.1.0",
-    "ovui-widgets-property>=0.1.0",
-    "ovui-widgets-viewport>=0.1.0",
-    "ovui-data-adapters-common>=0.1.0",
-    "ovui-data-adapters-openusd[standalone]>=0.2.0",
-]
 
 [tool.setuptools.packages.find]
 namespaces = true

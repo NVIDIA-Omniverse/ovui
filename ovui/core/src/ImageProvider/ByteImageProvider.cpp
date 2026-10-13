@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/ImageProvider/ByteImageProvider.h>
@@ -24,6 +17,38 @@ namespace omni
 {
 namespace ui
 {
+
+size_t getPixelFormatSize(PixelFormat format)
+{
+    switch (format)
+    {
+        case PixelFormat::eRGBA8_UNORM:
+        case PixelFormat::eRGBA8_SRGB:
+        case PixelFormat::eBGRA8_UNORM:
+            return 4;
+        case PixelFormat::eR8_UNORM:
+            return 1;
+        case PixelFormat::eR16_FLOAT:
+            return 2;
+        case PixelFormat::eR32_FLOAT:
+        case PixelFormat::eRG16_FLOAT:
+            return 4;
+        case PixelFormat::eRGB16_FLOAT:
+            return 6;
+        case PixelFormat::eRG32_FLOAT:
+        case PixelFormat::eRGBA16_FLOAT:
+            return 8;
+        case PixelFormat::eRGB32_FLOAT:
+            return 12;
+        case PixelFormat::eRGBA32_FLOAT:
+            return 16;
+        default:
+        {
+            auto* gpu = PlatformRegistry::instance().byteImageGpu();
+            return gpu ? gpu->getFormatSize(format) : 0;
+        }
+    }
+}
 
 ByteImageProvider::ByteImageProvider()
 {

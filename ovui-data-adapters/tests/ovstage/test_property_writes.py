@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """OVStage runtime-safe native property writes."""
 
@@ -28,6 +21,7 @@ from ovui_data_adapters.ovstage.provider import (
 )
 from ovui_data_adapters.ovstage.runtime_preflight import load_required_runtimes
 from ovui_data_adapters.ovstage.stage_adapter import OvstageStageAdapter
+from ovui_data_adapters.services.undo import UndoManager
 
 
 pytestmark = [
@@ -36,6 +30,7 @@ pytestmark = [
 
 _CAMERA_PATH = "/World/Cameras/MainCamera"
 _MESH_PATH = "/World/Hierarchy/GroupB/TriangleMesh"
+_SPHERE_PATH = "/World/Hierarchy/GroupA/BallA"
 
 
 class _RecordingUndoManager:
@@ -83,6 +78,10 @@ def _unpack_float(stage: Any, path: str, attr_name: str) -> float:
     return struct.unpack("<f", _raw(stage, path, attr_name))[0]
 
 
+def _unpack_double(stage: Any, path: str, attr_name: str) -> float:
+    return struct.unpack("<d", _raw(stage, path, attr_name))[0]
+
+
 def test_runtime_safe_numeric_write_updates_ovstage_and_adapter_readback(
     ovstage_scene: OvstageScene,
 ) -> None:
@@ -113,6 +112,41 @@ def test_runtime_safe_vector_write_updates_live_mirrored_bytes(
     assert struct.unpack("<2f", _raw(stage, _CAMERA_PATH, "clippingRange")) == pytest.approx(
         (4.0, 5000.0)
     )
+
+
+def test_numeric_drag_authors_native_intermediates_and_undoes_as_one_edit(
+    ovstage_scene: OvstageScene,
+) -> None:
+    undo_manager = UndoManager()
+    adapter = OvstagePropertyAdapter(
+        ovstage_scene,
+        [_SPHERE_PATH],
+        undo_manager=undo_manager,
+    )
+    stage = ovstage_scene._stage
+    original = _unpack_double(stage, _SPHERE_PATH, "radius")
+    starting_ordinal = int(stage.current_ordinal)
+
+    assert adapter.get_attribute_metadata("radius").change_on_edit_end is False
+
+    adapter.begin_edit("radius")
+    adapter.set_value("radius", 0.75)
+    first_ordinal = int(stage.current_ordinal)
+    assert first_ordinal > starting_ordinal
+    assert _unpack_double(stage, _SPHERE_PATH, "radius") == pytest.approx(0.75)
+    assert adapter.get_value("radius") == pytest.approx(0.75)
+
+    adapter.set_value("radius", 1.0)
+    second_ordinal = int(stage.current_ordinal)
+    assert second_ordinal > first_ordinal
+    assert _unpack_double(stage, _SPHERE_PATH, "radius") == pytest.approx(1.0)
+    assert adapter.get_value("radius") == pytest.approx(1.0)
+
+    adapter.end_edit("radius")
+    assert undo_manager.undo() is True
+    assert undo_manager.can_undo() is False
+    assert _unpack_double(stage, _SPHERE_PATH, "radius") == pytest.approx(original)
+    assert adapter.get_value("radius") == pytest.approx(original)
 
 
 def test_runtime_safe_write_notifies_property_subscribers_after_ovstage_poll(

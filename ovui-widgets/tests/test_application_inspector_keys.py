@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 from ovui_widgets.app.application import _normalize_printable_key
 
@@ -30,3 +23,21 @@ def test_inspector_printable_keys_normalize_to_ascii() -> None:
 def test_native_glfw_and_ascii_keys_are_unchanged() -> None:
     assert _normalize_printable_key(261) == 261
     assert _normalize_printable_key(ord("Z")) == ord("Z")
+
+
+def test_reference_viewer_contributes_the_shared_selection_command():
+    from types import SimpleNamespace
+    import pytest
+
+    pytest.importorskip("ovuiinspect")
+    from ovui_widgets.app.application import Application
+
+    app = Application.__new__(Application)
+    app._viewport_window = None
+    app._selection_bus = SimpleNamespace(
+        get_snapshot=lambda: SimpleNamespace(paths=lambda: ("/World/Cube",))
+    )
+    commands = {command.name: command for command in app.get_inspector_commands()}
+    assert commands["selection_get"].handler() == {"selection": ["/World/Cube"]}
+    assert commands["viewport_list"].handler() == {"views": []}
+    assert {"viewport_pick", "camera_list", "camera_set"} <= commands.keys()

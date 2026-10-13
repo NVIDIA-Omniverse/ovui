@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Assert.h"
@@ -141,6 +134,8 @@ Menu::~Menu()
 
 void Menu::destroy()
 {
+    this->_clearShownRecursive(true);
+
     _getData<MenuData>().m_deferredOsWindowReleaseSubs.reset();
 
     this->_removeMenuWindow(true);
@@ -148,6 +143,24 @@ void Menu::destroy()
     this->_menuHelperDestroy();
 
     Stack::destroy();
+}
+
+void Menu::_clearShownRecursive(bool includeVisibleTearOffs)
+{
+    for (const auto& child : _getChildren())
+    {
+        if (auto menu = std::dynamic_pointer_cast<Menu>(child))
+        {
+            const auto& data = menu->_getData<MenuData>();
+            const bool isTornAndVisible = menu->m_tearable && menu->m_teared && data.m_uiWindow;
+            if (includeVisibleTearOffs || !isTornAndVisible)
+            {
+                menu->_clearShownRecursive(includeVisibleTearOffs);
+            }
+        }
+    }
+
+    this->_setShown(false);
 }
 
 void Menu::addChild(std::shared_ptr<Widget> widget)
@@ -798,8 +811,17 @@ void Menu::_drawMenu(float elapsedTime, bool isInSeparateWindow, bool isPopupWin
         if (!isTornAndVisible)
         {
             this->_setTeared(false);
+            if (this->isShown())
+            {
+                this->_clearShownRecursive(false);
+            }
         }
-        this->_setShown(false);
+        else
+        {
+            // This draw belongs to the original menu-bar/popup copy. Its
+            // tear-off window still owns and draws the descendant menus.
+            this->_setShown(false);
+        }
 
         if (popupWindowWasOpen)
         {
@@ -835,6 +857,7 @@ void Menu::_drawMenu(float elapsedTime, bool isInSeparateWindow, bool isPopupWin
     if (wantClosePopup)
     {
         // The user closed popup. We need to remove the popup window.
+        this->_clearShownRecursive(false);
         this->_removeMenuWindowDeferred(true);
     }
 
@@ -882,7 +905,7 @@ void Menu::tearAt(float x, float y)
 void Menu::hide()
 {
     this->_setTeared(false);
-    this->_setShown(false);
+    this->_clearShownRecursive(false);
     this->_removeMenuWindowDeferred(true);
 }
 

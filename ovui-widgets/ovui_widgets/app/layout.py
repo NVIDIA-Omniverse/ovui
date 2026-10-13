@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Window layout management for OvGear.
 
@@ -299,6 +292,12 @@ def apply_default_layout() -> None:
                 ratio=0.30,
             )
 
+    # Optional components dock their own windows after the core panels.
+    components = getattr(app, "components", None)
+    apply_component_layout = getattr(components, "apply_default_layout", None)
+    if callable(apply_component_layout):
+        apply_component_layout()
+
     show_panel_dock_tab_bars()
 
 
@@ -399,6 +398,21 @@ def load_layout(path: str) -> None:
     _restore_layout(data.get("windows", {}))
 
 
+def window_layout_state(managed_win) -> dict | None:
+    """The saved state of one managed window, or ``None`` when it has none."""
+
+    if not managed_win or not getattr(managed_win, "window", None):
+        return None
+    w = managed_win.window
+    return {
+        "visible": managed_win.visible,
+        "position_x": float(w.position_x),
+        "position_y": float(w.position_y),
+        "width": float(w.width),
+        "height": float(w.height),
+    }
+
+
 def _collect_layout() -> dict:
     """Collect current window state from Application panel windows."""
     try:
@@ -416,15 +430,15 @@ def _collect_layout() -> dict:
         "Layers": app._layer_window,
     }
     for title, managed_win in panel_map.items():
-        if managed_win and managed_win.window:
-            w = managed_win.window
-            result[title] = {
-                "visible": managed_win.visible,
-                "position_x": float(w.position_x),
-                "position_y": float(w.position_y),
-                "width": float(w.width),
-                "height": float(w.height),
-            }
+        state = window_layout_state(managed_win)
+        if state is not None:
+            result[title] = state
+    # Optional components save their own windows. Shutdown unloads them
+    # before this point, so the manager keeps their last known state.
+    components = getattr(app, "components", None)
+    component_state = getattr(components, "layout_state", None)
+    if callable(component_state):
+        result.update(component_state())
     return result
 
 
@@ -457,6 +471,10 @@ def _restore_layout(windows: dict) -> None:
     for title, data in windows.items():
         managed_win = panel_map.get(title)
         if not managed_win or not managed_win.window:
+            components = getattr(app, "components", None)
+            restore = getattr(components, "restore_layout_window", None)
+            if callable(restore):
+                restore(title, data)
             continue
         if "visible" in data:
             managed_win.visible = data["visible"]

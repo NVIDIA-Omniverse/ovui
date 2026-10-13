@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -235,6 +228,24 @@ public:
                    float size,
                    size_t pointCount,
                    const Matrix44* transform = nullptr);
+
+    // Optional line coverage data is owned by a private derived buffer.
+    static constexpr DirtyBits kDirtyBitLineAntialiasing = (1 << 7);
+    OMNIUI_SCENE_API
+    const std::vector<float>& getLineAntialiasingWidths() const;
+    OMNIUI_SCENE_API
+    void addAntialiasedPolygonLines(const Vector3* points, const Color4* colors, const float* thicknesses,
+                                   const uint32_t* vertexIndices, const uint32_t* vertexCounts,
+                                   const uint32_t* flags, size_t vertexCountSize, float antialiasingWidth);
+
+    // Optional polygon data is owned by a private derived buffer. Existing
+    // DrawBuffer/Polys layouts and buffer-type values remain unchanged.
+    static constexpr DirtyBits kDirtyBitHeadlightNormals = (1 << 7);
+    OMNIUI_SCENE_API
+    const std::vector<Vector4>& getHeadlightNormals() const;
+    OMNIUI_SCENE_API
+    void addHeadlightPolygonMesh(const Vector3* points, const Color4* colors, const Vector3* normals,
+                                const uint32_t* indices, const uint32_t* counts, size_t countSize);
 
     OMNIUI_SCENE_API
     bool getPointBuffer(const Points** points) const;

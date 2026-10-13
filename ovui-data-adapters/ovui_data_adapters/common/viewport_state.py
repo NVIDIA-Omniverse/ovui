@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Backend-neutral viewport chrome state adapter.
 
@@ -317,7 +310,6 @@ class ViewportStateAdapter:
         *,
         stage_adapter: Any | None = None,
         renderer_adapter: Any | None = None,
-        render_settings_adapter: Any | None = None,
         selection_bus: Any | None = None,
         tool_registry_available: bool = False,
         active_tool: str = "move",
@@ -326,7 +318,6 @@ class ViewportStateAdapter:
     ) -> None:
         self.stage_adapter = stage_adapter
         self.renderer_adapter = renderer_adapter
-        self.render_settings_adapter = render_settings_adapter
         self.selection_bus = selection_bus
         self.viewport = viewport
         self._callbacks: list[Callable[[ViewportStateSnapshot], None]] = []
@@ -511,7 +502,6 @@ class ViewportStateAdapter:
         *,
         stage_adapter: Any | None = None,
         renderer_adapter: Any | None = None,
-        render_settings_adapter: Any | None = None,
         selection_bus: Any | None = None,
         viewport: Any | None = None,
         current_usd_path: str = "",
@@ -534,8 +524,6 @@ class ViewportStateAdapter:
             self.stage_adapter = stage_adapter
         if renderer_adapter is not None:
             self.renderer_adapter = renderer_adapter
-        if render_settings_adapter is not None:
-            self.render_settings_adapter = render_settings_adapter
         if selection_bus is not None:
             self.selection_bus = selection_bus
         if viewport is not None:

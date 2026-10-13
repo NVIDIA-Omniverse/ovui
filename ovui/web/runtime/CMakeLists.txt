@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 if(NOT EMSCRIPTEN)
     message(FATAL_ERROR "web/runtime must be configured with the Emscripten toolchain")
 endif()

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for ovui_widgets.app.style: URL constants, GLOBAL_STYLES dict, and style helpers.
 
@@ -510,7 +503,10 @@ class TestRegisterUrls:
     # tree's ``Sdf.SpecifierClass`` rows).
     PNG_ICON_NAMES = [
         "app_logo",
-        "prim_mesh", "prim_light", "prim_camera", "prim_scope",
+        "prim_mesh", "prim_light",
+        "prim_light_distant", "prim_light_dome", "prim_light_sphere",
+        "prim_light_rect", "prim_light_disk", "prim_light_cylinder",
+        "prim_camera", "prim_scope",
         "prim_xform",
         "prim_def", "prim_over", "prim_class",
         "prim_generic",
@@ -587,7 +583,15 @@ class TestRegisterUrls:
         assert "<svg" in content, f"{name}.svg missing <svg> tag"
         assert 'xmlns="http://www.w3.org/2000/svg"' in content, f"{name}.svg missing xmlns"
 
-    @pytest.mark.parametrize("name", ["prim_mesh", "prim_light", "prim_camera", "prim_scope", "prim_generic"])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "prim_mesh", "prim_light",
+            "prim_light_distant", "prim_light_dome", "prim_light_sphere",
+            "prim_light_rect", "prim_light_disk", "prim_light_cylinder",
+            "prim_camera", "prim_scope", "prim_generic",
+        ],
+    )
     def test_prim_icon_svg_source_is_16x16(self, name):
         from ovui_widgets.common.style.urls import _STYLE_ICON_PATHS
         svg_path = _STYLE_ICON_PATHS[name][:-4] + ".svg"
@@ -661,7 +665,10 @@ class TestRegisterUrls:
         from ovui_widgets.common.style.urls import _STYLE_ICON_PATHS
         expected = "#797A7F"
         for name in (
-            "prim_mesh", "prim_light", "prim_camera", "prim_scope",
+            "prim_mesh", "prim_light",
+            "prim_light_distant", "prim_light_dome", "prim_light_sphere",
+            "prim_light_rect", "prim_light_disk", "prim_light_cylinder",
+            "prim_camera", "prim_scope",
             "prim_xform", "prim_class", "prim_generic",
         ):
             svg_path = _STYLE_ICON_PATHS[name][:-4] + ".svg"
@@ -678,7 +685,10 @@ class TestRegisterUrls:
         from ovui_widgets.common.style.urls import _STYLE_ICON_PATHS
 
         for name in (
-            "prim_mesh", "prim_light", "prim_camera", "prim_scope",
+            "prim_mesh", "prim_light",
+            "prim_light_distant", "prim_light_dome", "prim_light_sphere",
+            "prim_light_rect", "prim_light_disk", "prim_light_cylinder",
+            "prim_camera", "prim_scope",
             "prim_xform", "prim_class", "prim_generic",
         ):
             img = Image.open(_STYLE_ICON_PATHS[name]).convert("RGBA")
@@ -1121,14 +1131,39 @@ class TestFontSizeTiers:
     def test_viewport_hud_label_value_color_hierarchy(self):
         merged, _ = self._merged_and_tiers()
         assert merged["Viewport.HUD.Label"]["color"] == (
-            ui.ColorStore.find("text_secondary")
+            ui.ColorStore.find("viewport_overlay_text_secondary")
         )
         assert merged["Viewport.HUD.Value"]["color"] == (
-            ui.ColorStore.find("text_value")
+            ui.ColorStore.find("viewport_overlay_text_value")
         )
         assert merged["Viewport.HUD.Separator"]["color"] == (
-            ui.ColorStore.find("text_disabled")
+            ui.ColorStore.find("viewport_overlay_text_disabled")
         )
+
+    def test_viewport_overlay_colors_do_not_follow_theme(self):
+        # The HUD and toolbar sit on the rendered image (and the letterbox
+        # backdrop), which stay dark in the light theme, so their colours
+        # must resolve identically.
+        import ovui_widgets.app.style
+
+        def overlay_colors():
+            return {
+                (selector, key): value
+                for selector, props in ui.style.default.items()
+                if selector.startswith(
+                    ("Viewport.HUD", "Viewport.Toolbar", "ViewportWidget.Background")
+                )
+                for key, value in props.items()
+                if key in ("color", "background_color")
+            }
+
+        ovui_widgets.app.style.set_theme("dark")
+        dark = overlay_colors()
+        ovui_widgets.app.style.set_theme("light")
+        light = overlay_colors()
+        ovui_widgets.app.style.set_theme("dark")
+
+        assert dark and dark == light
 
     def test_property_selection_header_tiers(self):
         # The header widget is introduced later in the design plan, but Step 2

@@ -1,17 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Runtime-free OVStage renderer coverage for the legacy viewport stream."""
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -34,6 +28,9 @@ class _FakeRenderer:
         return None
 
     def detach_ovstage(self) -> None:
+        return None
+
+    def destroy(self) -> None:
         return None
 
     def step(self, **_kwargs: Any) -> dict[str, object]:
@@ -75,7 +72,7 @@ def _patch_scene_load(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         renderer_module,
         "_build_runtime_layer",
-        lambda _stage, *, resolution, records, runtime_root_path: SimpleNamespace(
+        lambda _stage, *, resolution, records, runtime_root_path, viewport_quality: SimpleNamespace(
             usda="#usda 1.0",
             root_path=runtime_root_path,
             camera_path=f"{runtime_root_path}/Render/Cameras/Main",
@@ -290,6 +287,12 @@ def test_failed_old_scene_detach_preserves_active_livestream() -> None:
     tap = _LifecycleTap("active", [])
     adapter = OvstageRendererAdapter.__new__(OvstageRendererAdapter)
     adapter._livestream = tap
+    adapter._render_worker_thread = None
+    adapter._render_state_lock = threading.RLock()
+    adapter._queued_viewport_renders = {}
+    adapter._completed_viewport_frames = {}
+    adapter._presentation_pending_viewports = set()
+    adapter._completed_pick_callbacks = deque()
     adapter._in_flight_pick_queries = deque()
     adapter._attached_stage = object()
     adapter._renderer = _FailingDetachRenderer()
@@ -443,6 +446,66 @@ def test_zero_copy_ui_and_livestream_share_one_cuda_mapping() -> None:
     assert render_var.cuda_mapping.exited
 
 
+class _SingleTensorCudaMapping(_Tensor):
+    """An ovrtx 0.5 CUDA mapping: it *is* the DLPack tensor, no ``.tensor``.
+
+    ovrtx 0.4 wrapped the tensor in a ``MappedRenderVar``; 0.5 dropped the
+    attribute. Reading ``mapping.tensor`` therefore raises AttributeError, the
+    zero-copy probe retires tier-2 for the life of the process and the viewport
+    quietly renders from a CPU readback instead — correct pixels, no visible
+    failure.
+    """
+
+    def __init__(self, width: int, height: int, ptr: int = 0xBEEF) -> None:
+        super().__init__(width, height, ptr)
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self) -> "_SingleTensorCudaMapping":
+        self.entered = True
+        return self
+
+    def __exit__(self, *_args: Any) -> bool:
+        self.exited = True
+        return False
+
+
+def test_zero_copy_keeps_the_gpu_path_on_an_ovrtx_05_mapping() -> None:
+    tap = _Tap()
+    adapter, render_var, products = _adapter_and_products(tap=tap, zero_copy=True)
+    mapping = _SingleTensorCudaMapping(3, 2)
+    render_var.cuda_mapping = mapping
+    state = adapter._zero_copy_state
+
+    output = adapter._extract_ldr_color(products, 3, 2)
+
+    assert isinstance(output, GpuFrame), (
+        "the GPU ingest path bailed out on an ovrtx 0.5 mapping; zero-copy is "
+        f"now {state.mode} ({state.fallback_reason})"
+    )
+    assert output.ptr == mapping.data
+    assert state.mode is _Mode.ENABLED
+    assert state.fallback_reason is None
+    assert tap.tee_calls == [(mapping, 3, 2)]
+    assert mapping.entered and not mapping.exited
+    output.close()
+    assert mapping.exited
+
+
+def test_livestream_cuda_tee_reads_an_ovrtx_05_mapping() -> None:
+    streamed = np.arange(24, dtype=np.uint8).reshape(2, 3, 4)
+    tap = _Tap(streamed)
+    adapter, render_var, products = _adapter_and_products(tap=tap, zero_copy=False)
+    mapping = _SingleTensorCudaMapping(3, 2)
+    render_var.cuda_mapping = mapping
+
+    output = adapter._extract_ldr_color(products, 3, 2)
+
+    np.testing.assert_array_equal(output, streamed)
+    assert tap.d2h_calls == [(mapping, 3, 2, None)]
+    assert adapter._livestream_error_logged is False
+
+
 def test_livestream_only_tees_cuda_output_and_returns_host_frame() -> None:
     streamed = np.arange(24, dtype=np.uint8).reshape(2, 3, 4)
     tap = _Tap(streamed)
@@ -482,13 +545,21 @@ def test_shutdown_closes_livestream_once_and_releases_renderer() -> None:
     tap = _Tap()
     adapter = OvstageRendererAdapter.__new__(OvstageRendererAdapter)
     adapter._livestream = tap
+    adapter._render_worker_thread = None
+    adapter._render_state_lock = threading.RLock()
+    adapter._queued_viewport_renders = {}
+    adapter._completed_viewport_frames = {}
+    adapter._presentation_pending_viewports = set()
+    adapter._completed_pick_callbacks = deque()
     adapter._in_flight_pick_queries = deque()
     adapter._attached_stage = None
-    adapter._renderer = object()
+    destroyed = []
+    adapter._renderer = SimpleNamespace(destroy=lambda: destroyed.append(True))
 
     adapter.shutdown()
     adapter.shutdown()
 
     assert tap.close_count == 1
+    assert destroyed == [True]
     assert adapter.livestream is None
     assert adapter._renderer is None

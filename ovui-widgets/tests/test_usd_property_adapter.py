@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for UsdPropertyAdapter — attribute enumeration, get/set, and undo.
 
@@ -74,6 +67,27 @@ class TestSphereEnumeration:
         adapter = UsdPropertyAdapter(sphere_stage, ["/Sphere"])
         meta = adapter.get_attribute_metadata("radius")
         assert meta.value_type is float
+
+    def test_radius_edit_authors_before_end_and_remains_single_undo(self, sphere_stage):
+        from ovui_widgets.property.models import AttributeModelBase
+
+        undo = UndoManager()
+        adapter = UsdPropertyAdapter(sphere_stage, ["/Sphere"], undo_manager=undo)
+        meta = adapter.get_attribute_metadata("radius")
+        model = AttributeModelBase(adapter, "radius", meta)
+
+        model.begin_edit()
+        model.set_value(2.5)
+
+        # The backing USD value changes while the edit is still active, so
+        # renderer consumers can update before pointer release.
+        assert sphere_stage.GetPrimAtPath("/Sphere").GetAttribute("radius").Get() == pytest.approx(2.5)
+        assert not undo.can_undo()
+
+        model.end_edit()
+        assert undo.can_undo()
+        assert undo.undo() is True
+        assert sphere_stage.GetPrimAtPath("/Sphere").GetAttribute("radius").Get() == pytest.approx(1.0)
 
     def test_array_types_included_step_3_8(self, sphere_stage):
         """Step 3.8 stopped skipping array attributes — ``extent``

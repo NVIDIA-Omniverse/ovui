@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Step 19 import tests for ovstage without an ovui-widgets UI host."""
 
@@ -21,6 +14,11 @@ def test_ovstage_adapter_import_does_not_require_ovui_widgets(monkeypatch) -> No
     for module_name in list(sys.modules):
         if module_name.startswith("ovui_data_adapters.ovstage"):
             monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    # Importing the fresh package also replaces its parent's attribute. Restore
+    # that binding together with sys.modules so later imports see the same tree.
+    import ovui_data_adapters
+    monkeypatch.delattr(ovui_data_adapters, "ovstage", raising=False)
 
     real_import = builtins.__import__
 

@@ -1,18 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Property adapter scaffold for the registered ovstage provider."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import import_module
+import os
 import re
 import struct
 from typing import Any, Callable, Iterable, List, Optional, Sequence
@@ -35,6 +30,11 @@ from ovui_data_adapters.ovstage._authoring import (
 from ovui_data_adapters.ovstage._errors import raise_not_ready
 from ovui_data_adapters.ovstage._native import resolve_query_names
 from ovui_data_adapters.ovstage._native import resolve_token_id
+from ovui_data_adapters.ovstage._scene import (
+    _KitStageBridgeCache,
+    _build_kit_stage_cache,
+    _has_kit_stage_bridge,
+)
 _DLPACK_INT = 0
 _DLPACK_UINT = 1
 _DLPACK_FLOAT = 2
@@ -61,6 +61,20 @@ _MISSING = object()
 _BIG_ARRAY_COUNT = 64
 _VECTOR_VALUE_TYPES = frozenset(
     {
+        "float2",
+        "float3",
+        "float4",
+        "color3f",
+        "color4f",
+        "int2",
+        "int3",
+        "int4",
+    }
+)
+_DRAGGABLE_VALUE_TYPES = frozenset(
+    {
+        float,
+        int,
         "float2",
         "float3",
         "float4",
@@ -135,6 +149,7 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
         self._stage_adapter = stage_adapter
         self._cache_key: tuple[int, int] | None = None
         self._path_descriptors: dict[str, _PathDescriptor] = {}
+        self._selection_cache: _KitStageBridgeCache | None = None
         self._attribute_names: list[str] = []
         self._attribute_records: dict[str, _AttributeRecord] = {}
         self._edit_snapshots: dict[str, _EditSnapshot] = {}
@@ -168,6 +183,13 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
             value_type=record.value_type,
             group=record.group,
             is_big_array=record.is_big_array,
+            # Native numeric drag controls author every held-pointer value so
+            # the attached OVStage renderer can consume each committed frame.
+            # begin_edit/end_edit still group those commands into one undo.
+            change_on_edit_end=not (
+                record.value_type in _DRAGGABLE_VALUE_TYPES
+                or record.type_name.startswith("matrix")
+            ),
             is_locked=not (
                 _is_runtime_writable(record)
                 and _supports_exact_value_writes(self._stage_or_none())
@@ -249,10 +271,11 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
             values,
         )
         snapshot = self._edit_snapshots.get(attr_name)
-        if snapshot is not None:
-            snapshot.pending_values = values
-            return
-        old_values = tuple(self._values_for_attribute(attr_name))
+        old_values = (
+            snapshot.pending_values or snapshot.values
+            if snapshot is not None
+            else tuple(self._values_for_attribute(attr_name))
+        )
         if not old_values or any(old is _MISSING for old in old_values):
             raise_not_ready("property value write")
         if tuple(old_values) == values:
@@ -263,31 +286,19 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
             old_values,
             values,
         )
+        if snapshot is not None:
+            snapshot.pending_values = values
 
     def end_edit(self, attr_name: str) -> None:
         snapshot = self._edit_snapshots.pop(attr_name, None)
         undo_manager = self._undo_manager
         if snapshot is None:
             return
-        try:
-            record = self._runtime_write_record(attr_name)
-            paths = self._normalized_selected_paths()
-            new_values = snapshot.pending_values
-            if (
-                paths
-                and new_values is not None
-                and len(snapshot.values) == len(new_values)
-                and snapshot.values != tuple(new_values)
-            ):
-                self._push_value_command(
-                    paths,
-                    record,
-                    snapshot.values,
-                    new_values,
-                )
-        finally:
-            if undo_manager is not None:
-                undo_manager.end_group()
+        # set_value authors each intermediate value immediately. Closing the
+        # existing group records the whole pointer gesture as one ordinary
+        # undo edge; no release-only write is needed here.
+        if undo_manager is not None:
+            undo_manager.end_group()
 
     def _is_scene_visibility_write(
         self, record: _AttributeRecord, paths: Sequence[str]
@@ -374,16 +385,50 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
     def get_capabilities(self) -> PropertyCapabilities:
         return _OVSTAGE_PROPERTY_CAPABILITIES
 
+    def get_resolved_asset_path(self, attr_name: str) -> Optional[str]:
+        self._ensure_cache_current()
+        record = self._attribute_records.get(attr_name)
+        if record is None or record.type_name != "asset":
+            return None
+        stage = self._stage_or_none()
+        if stage is None:
+            return None
+        resolved_values: list[str] = []
+        for path in self._paths:
+            normalized_path = self._normalize_path(path)
+            if normalized_path is None:
+                return None
+            raw_value = _read_attribute_bytes(
+                stage, normalized_path, attr_name, self._selection_cache,
+            )
+            parts = _decode_byte_strings(raw_value or b"")
+            if len(parts) > 1 and parts[1]:
+                resolved_values.append(parts[1])
+            elif parts and parts[0] and os.path.isabs(parts[0]):
+                resolved_values.append(parts[0])
+            else:
+                return None
+        if not resolved_values or any(
+            value != resolved_values[0] for value in resolved_values[1:]
+        ):
+            return None
+        return resolved_values[0]
+
     def _ensure_cache_current(self) -> None:
         stage = self._stage_or_none()
         if stage is None:
             self._clear_cache()
             return
-        cache_key = self._make_cache_key(stage)
+        cache_key = self._profile_call(
+            "OvstagePropertyAdapter.cache_key", self._make_cache_key, stage
+        )
         if self._cache_key == cache_key:
             return
 
-        path_descriptors = self._copy_path_descriptors(stage)
+        path_descriptors = self._profile_call(
+            "OvstagePropertyAdapter.copy_path_descriptors",
+            self._copy_path_descriptors, stage,
+        )
         selected_paths = [self._normalize_path(path) for path in self._paths]
         attribute_names: list[str] = []
         attribute_records: dict[str, _AttributeRecord] = {}
@@ -400,7 +445,9 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
             for attr_name in first_descriptor.attributes:
                 if attr_name not in common_names:
                     continue
-                record = self._build_attribute_record(
+                record = self._profile_call(
+                    "OvstagePropertyAdapter.build_attribute_record",
+                    self._build_attribute_record,
                     stage,
                     normalized[0],
                     first_descriptor.prim_list_handle,
@@ -408,11 +455,14 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
                 )
                 if record is None:
                     continue
-                if not self._record_matches_all_paths(
+                if not self._profile_call(
+                    "OvstagePropertyAdapter.match_selected_paths",
+                    self._record_matches_all_paths,
                     stage,
                     normalized,
                     attr_name,
                     record,
+                    self._selection_cache,
                 ):
                     continue
                 attribute_names.append(attr_name)
@@ -423,9 +473,16 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
         self._attribute_names = attribute_names
         self._attribute_records = attribute_records
 
+    def _profile_call(self, name: str, function: Any, /, *args: Any) -> Any:
+        profile_fn = getattr(self._scene, "profile_ovui_call", None)
+        if callable(profile_fn):
+            return profile_fn(name, function, *args)
+        return function(*args)
+
     def _clear_cache(self) -> None:
         self._cache_key = None
         self._path_descriptors = {}
+        self._selection_cache = None
         self._attribute_names = []
         self._attribute_records = {}
 
@@ -469,16 +526,41 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
             topology_version = -1
         return (ordinal, topology_version)
 
-    @staticmethod
-    def _copy_path_descriptors(stage: Any) -> dict[str, _PathDescriptor]:
-        query_result = stage.query_prims(int(stage.current_ordinal))
+    def _copy_path_descriptors(self, stage: Any) -> dict[str, _PathDescriptor]:
+        self._selection_cache = None
+        if _has_kit_stage_bridge(stage):
+            paths = tuple(dict.fromkeys(self._normalized_selected_paths()))
+            if not paths:
+                return {}
+            # Keep this selection-local: publishing it as the stage bridge cache
+            # would make unrelated consumers see only the selected prims.
+            cache = self._profile_call(
+                "OvstagePropertyAdapter.selected_prims",
+                _build_kit_stage_cache, stage, int(stage.current_ordinal), paths,
+            )
+            self._selection_cache = cache
+            return {
+                path: _PathDescriptor(
+                    attributes=cache.attribute_names_for_path(path),
+                    prim_list_handle=cache.register_paths((path,)),
+                )
+                for path in cache.path_order
+            }
+        query_result = self._profile_call(
+            "OvstagePropertyAdapter.query_prims",
+            stage.query_prims, int(stage.current_ordinal),
+        )
         records: dict[str, _PathDescriptor] = {}
         for group in query_result.get("groups", ()):
             prim_list_handle = int(group.get("prim_list_handle") or 0)
             if not prim_list_handle:
                 continue
             attributes = resolve_query_names(stage, group.get("attributes", ()))
-            for path in _copy_strings(stage.get_prim_paths(prim_list_handle)):
+            paths = self._profile_call(
+                "OvstagePropertyAdapter.get_prim_paths",
+                stage.get_prim_paths, prim_list_handle,
+            )
+            for path in _copy_strings(paths):
                 records[path] = _PathDescriptor(
                     attributes=attributes,
                     prim_list_handle=prim_list_handle,
@@ -492,15 +574,20 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
         prim_list_handle: int,
         attr_name: str,
     ) -> _AttributeRecord | None:
-        info = _read_attribute_info(
+        info = self._profile_call(
+            "OvstagePropertyAdapter.read_attribute_info", _read_attribute_info,
             stage,
             path,
             prim_list_handle,
             attr_name,
+            self._selection_cache,
         )
         if info is None:
             return None
-        raw_value = _read_attribute_bytes(stage, path, attr_name)
+        raw_value = self._profile_call(
+            "OvstagePropertyAdapter.read_attribute_bytes",
+            _read_attribute_bytes, stage, path, attr_name, self._selection_cache,
+        )
         if raw_value is None:
             return None
 
@@ -543,6 +630,7 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
         paths: tuple[str, ...],
         attr_name: str,
         record: _AttributeRecord,
+        cache: _KitStageBridgeCache | None = None,
     ) -> bool:
         if not callable(getattr(stage, "read_attribute_info", None)):
             return True
@@ -553,8 +641,8 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
             record.native_is_array,
         )
         for path in paths[1:]:
-            info = _read_attribute_info(stage, path, 0, attr_name)
-            raw_value = _read_attribute_bytes(stage, path, attr_name)
+            info = _read_attribute_info(stage, path, 0, attr_name, cache)
+            raw_value = _read_attribute_bytes(stage, path, attr_name, cache)
             if info is None or raw_value is None:
                 return False
             dtype, semantic, native_is_array = info
@@ -583,14 +671,19 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
                 _SEMANTIC_RELATIONSHIP_PATH_ID,
                 _SEMANTIC_CONNECTION_PATH_ID,
             }:
-                targets = _read_path_targets(
+                targets = self._profile_call(
+                    "OvstagePropertyAdapter.read_path_targets", _read_path_targets,
                     stage,
                     normalized_path,
                     attr_name,
+                    self._selection_cache,
                 )
                 values.append(_MISSING if targets is None else targets)
                 continue
-            raw_value = _read_attribute_bytes(stage, normalized_path, attr_name)
+            raw_value = self._profile_call(
+                "OvstagePropertyAdapter.read_value_bytes",
+                _read_attribute_bytes, stage, normalized_path, attr_name, self._selection_cache,
+            )
             if raw_value is None or (
                 not raw_value
                 and not record.is_array
@@ -603,7 +696,10 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
             ):
                 values.append(_MISSING)
                 continue
-            values.append(_decode_value(stage, record, raw_value))
+            values.append(self._profile_call(
+                "OvstagePropertyAdapter.decode_value",
+                _decode_value, stage, record, raw_value,
+            ))
         return values
 
     @staticmethod
@@ -720,14 +816,15 @@ def _read_attribute_info(
     path: str,
     prim_list_handle: int,
     attr_name: str,
+    cache: _KitStageBridgeCache | None = None,
 ) -> tuple[tuple[int, int, int], int, bool] | None:
     reader = getattr(stage, "read_attribute_info", None)
-    if callable(reader):
+    if cache is not None or callable(reader):
         try:
-            info = reader(
-                int(stage.current_ordinal),
-                str(path),
-                str(attr_name),
+            info = (
+                cache.attribute_info(str(path), str(attr_name))
+                if cache is not None
+                else reader(int(stage.current_ordinal), str(path), str(attr_name))
             )
             if not isinstance(info, dict):
                 return None
@@ -748,12 +845,14 @@ def _read_attribute_info(
     return (dtype, _SEMANTIC_NONE, False)
 
 
-def _read_attribute_bytes(stage: Any, path: str, attr_name: str) -> bytes | None:
+def _read_attribute_bytes(
+    stage: Any, path: str, attr_name: str, cache: _KitStageBridgeCache | None = None,
+) -> bytes | None:
     try:
-        value = stage.read_attribute(
-            int(stage.current_ordinal),
-            [str(path)],
-            attr_name,
+        value = (
+            cache.read_attribute(str(path), attr_name)
+            if cache is not None
+            else stage.read_attribute(int(stage.current_ordinal), [str(path)], attr_name)
         )
     except Exception:
         return None
@@ -766,7 +865,14 @@ def _read_path_targets(
     stage: Any,
     path: str,
     attr_name: str,
+    cache: _KitStageBridgeCache | None = None,
 ) -> tuple[str, ...] | None:
+    if cache is not None:
+        try:
+            with import_module("ovstage").PathDictionary(stage) as paths:
+                return cache.read_path_targets(str(path), str(attr_name), paths)
+        except Exception:
+            return None
     reader = getattr(stage, "read_path_targets", None)
     if not callable(reader):
         return None
@@ -876,15 +982,12 @@ def _classify_attribute(
         return ("relationship", "relationship", True, item_count)
     if semantic == _SEMANTIC_STRING:
         return ("string", str, False, 1)
-    if semantic in {
-        _SEMANTIC_ASSET_STRING,
-        _SEMANTIC_PATH_EXPRESSION_STRING,
-    }:
+    if semantic == _SEMANTIC_ASSET_STRING:
+        return ("asset", "asset", False, 1)
+    if semantic == _SEMANTIC_PATH_EXPRESSION_STRING:
         decoded_parts = _decode_byte_strings(raw_value)
         if len(decoded_parts) > 1:
             return ("array", "array", True, len(decoded_parts))
-        if semantic == _SEMANTIC_ASSET_STRING:
-            return ("asset", "asset", False, 1)
         return ("string", str, False, 1)
     if semantic == _SEMANTIC_TOKEN_ID:
         if is_array:

@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
@@ -43,6 +36,7 @@ public:
         void* imGuiReference = nullptr;   ///< ImGui texture ID for rendering.
         void* managedResource = nullptr;  ///< Opaque GpuResource* for resource management.
     };
+
 
     /// Create GPU state for a new ByteImageProvider instance.
     virtual Handle createState() = 0;
@@ -84,37 +78,11 @@ public:
     /// Drives `omni.ui.has_gpu_byte_image()` so consumers don't need to
     /// scrape stderr to detect the silent-no-op path.
     virtual bool supportsFromGpu() const { return false; }
+    virtual size_t getFormatSize(PixelFormat) const { return 0; }
 };
 
 /// Get the byte size per pixel for a given PixelFormat.
-inline size_t getPixelFormatSize(PixelFormat format)
-{
-    switch (format)
-    {
-        case PixelFormat::eRGBA8_UNORM:
-        case PixelFormat::eRGBA8_SRGB:
-        case PixelFormat::eBGRA8_UNORM:
-            return 4;
-        case PixelFormat::eR8_UNORM:
-            return 1;
-        case PixelFormat::eR16_FLOAT:
-            return 2;
-        case PixelFormat::eR32_FLOAT:
-        case PixelFormat::eRG16_FLOAT:
-            return 4;
-        case PixelFormat::eRGB16_FLOAT:
-            return 6;
-        case PixelFormat::eRG32_FLOAT:
-        case PixelFormat::eRGBA16_FLOAT:
-            return 8;
-        case PixelFormat::eRGB32_FLOAT:
-            return 12;
-        case PixelFormat::eRGBA32_FLOAT:
-            return 16;
-        default:
-            return 0;
-    }
-}
+OMNIUI_API size_t getPixelFormatSize(PixelFormat format);
 
 /// Check if mipmap generation is supported for a given format.
 inline bool isMipGenFormatSupported(PixelFormat format)

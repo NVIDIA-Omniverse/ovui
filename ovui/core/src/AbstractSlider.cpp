@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Assert.h"
@@ -17,6 +10,8 @@
 #include <omni/ui/AbstractSlider.h>
 #include <omni/ui/AbstractValueModel.h>
 #include <omni/ui/StyleContainer.h>
+
+#include <cmath>
 
 OMNIUI_NAMESPACE_OPEN_SCOPE
 
@@ -106,7 +101,9 @@ void AbstractSlider::_drawContent(float elapsedTime)
             // draw Left side Fill
             float computedWidth = this->getComputedContentWidth();
             float computedHeight = this->getComputedContentHeight();
-            ImVec2 rectMax{ cursor.x + computedWidth * this->_getValueRatio(), cursor.y + computedHeight };
+            const float valueRatio = this->_getValueRatio();
+            const float fillRatio = std::isfinite(valueRatio) ? valueRatio : 0.0f;
+            ImVec2 rectMax{ cursor.x + computedWidth * fillRatio, cursor.y + computedHeight };
 
             ImVec2 cursorFull{ rectMax.x, cursor.y };
             ImVec2 rectFull{ cursor.x + computedWidth, cursor.y + computedHeight };
@@ -202,6 +199,24 @@ void AbstractSlider::_drawContent(float elapsedTime)
     if (this->_resolveStyleProperty(StyleColorProperty::eColor, &textColor))
     {
         ImGui::PushStyleColor(ImGuiCol_Text, textColor);
+        // Ctrl+click / double-click puts the widget into ImGui's temporary
+        // InputText, which draws the caret with ImGuiCol_InputTextCursor. It
+        // was never resolved from style here the way AbstractField does it, so
+        // it fell through to the process-global ImGui palette -- and that
+        // palette is dark-tuned, leaving the caret invisible against a light
+        // theme's field fill.
+        ImGui::PushStyleColor(ImGuiCol_InputTextCursor, textColor);
+
+        popStyleCount += 2;
+    }
+
+    // Selected-text highlight for that same temporary InputText. Same story as
+    // the caret above: unresolved here, so it fell through to the dark-tuned
+    // global ImGuiCol_TextSelectedBg and rendered invisibly on the light theme.
+    uint32_t backgroundSelectedColor;
+    if (this->_resolveStyleProperty(StyleColorProperty::eBackgroundSelectedColor, &backgroundSelectedColor))
+    {
+        ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, backgroundSelectedColor);
 
         popStyleCount += 1;
     }

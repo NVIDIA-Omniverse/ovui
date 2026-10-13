@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for the Step C.2 translate gizmo.
 
@@ -46,9 +39,11 @@ from ovui_widgets.viewport.translate_gizmo import (
     CONE_TIP_LENGTH,
     CONE_TIP_RADIUS,
     CONE_TIP_SEGMENTS,
+    FREE_HANDLE_SIZE,
     HIGHLIGHT_COLOR_X,
     HIGHLIGHT_COLOR_Y,
     HIGHLIGHT_COLOR_Z,
+    PLANE_HANDLE_SIZE,
     SHAFT_LENGTH,
     HighlightGesture,
     PrimTranslateChangedGesture,
@@ -226,6 +221,27 @@ class TestBuildTranslateGizmo:
             handles = build_translate_gizmo(wired_model)
         assert isinstance(handles, TranslateGizmoHandles)
 
+    def test_produces_three_visible_plane_handles_and_free_handle(self, scene_view, wired_model):
+        with scene_view.scene:
+            handles = build_translate_gizmo(wired_model)
+
+        assert len(handles.plane_handles) == 3
+        assert all(isinstance(handle, sc.Rectangle) for handle in handles.plane_handles)
+        assert all(handle.width == pytest.approx(PLANE_HANDLE_SIZE) for handle in handles.plane_handles)
+        assert isinstance(handles.free_handle, sc.Rectangle)
+        assert handles.free_handle.width == pytest.approx(FREE_HANDLE_SIZE)
+
+    def test_combined_handle_masks_match_xy_xz_yz_and_xyz(self, scene_view, wired_model):
+        with scene_view.scene:
+            handles = build_translate_gizmo(wired_model)
+
+        assert [gesture.axis_mask for gesture in handles.plane_drag_gestures] == [
+            (1.0, 1.0, 0.0),
+            (1.0, 0.0, 1.0),
+            (0.0, 1.0, 1.0),
+        ]
+        assert handles.free_drag_gesture.axis_mask == (1.0, 1.0, 1.0)
+
 
 # -- PrimTranslateChangedGesture ------------------------------------------
 
@@ -381,6 +397,28 @@ class TestPrimTranslateChangedGestureUndo:
         g._on_ended()
         # Many changed frames but only one top-level undo entry.
         assert len(wired_model._undo._undo_stack) == 1
+
+    def test_plane_drag_changes_two_axes_and_one_undo_reverts(self, wired_model):
+        g = PrimTranslateChangedGesture(model=wired_model, axis=(1.0, 1.0, 0.0))
+        g._on_began()
+        g._on_changed(_fake_drag_sender(2.0, 3.0, 7.0))
+        g._on_ended()
+
+        moved = wired_model._transform.get_local_transform("/World/Cube")
+        assert moved[3][:3] == pytest.approx((2.0, 3.0, 0.0))
+        assert wired_model._undo.undo() is True
+        assert wired_model._transform.get_local_transform("/World/Cube")[3][:3] == pytest.approx((0.0, 0.0, 0.0))
+
+    def test_free_drag_changes_three_axes_and_one_undo_reverts(self, wired_model):
+        g = PrimTranslateChangedGesture(model=wired_model, axis=(1.0, 1.0, 1.0))
+        g._on_began()
+        g._on_changed(_fake_drag_sender(2.0, 3.0, 4.0))
+        g._on_ended()
+
+        moved = wired_model._transform.get_local_transform("/World/Cube")
+        assert moved[3][:3] == pytest.approx((2.0, 3.0, 4.0))
+        assert wired_model._undo.undo() is True
+        assert wired_model._transform.get_local_transform("/World/Cube")[3][:3] == pytest.approx((0.0, 0.0, 0.0))
 
 
 class TestPrimTranslateChangedGesturePerAxis:

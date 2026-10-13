@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/platform/Assert.h>
@@ -24,6 +17,8 @@
 
 #include <numeric>
 #include <limits>
+#include <cmath>
+#include <stdexcept>
 
 OMNIUI_SCENE_NAMESPACE_OPEN_SCOPE
 
@@ -43,6 +38,8 @@ struct Curve::CurveData : public AbstractShape::AbstractShapeData
     // accumulated length from the start of the curve till the current vertex
     std::vector<float> m_cachedLengths;
     bool m_cacheIsDirty = true;
+    std::vector<uint32_t> m_vertexCounts;
+    float m_antialiasingWidth = 0.0f;
 
     CurveGesturePayload m_lastGesturePayload;
     std::array<std::unique_ptr<CurveGesturePayload>, static_cast<uint32_t>(GestureState::eCount)> m_itersections;
@@ -67,6 +64,38 @@ Curve::Curve(const std::vector<Vector3>& positions)
 
 Curve::~Curve() = default;
 
+const std::vector<uint32_t>& Curve::getVertexCounts() const
+{
+    return _getData<CurveData>().m_vertexCounts;
+}
+
+void Curve::setVertexCounts(const std::vector<uint32_t>& counts)
+{
+    auto& data = _getData<CurveData>();
+    if (data.m_vertexCounts != counts)
+    {
+        data.m_vertexCounts = counts;
+        _dirtyCache();
+    }
+}
+
+float Curve::getAntialiasingWidth() const
+{
+    return _getData<CurveData>().m_antialiasingWidth;
+}
+
+void Curve::setAntialiasingWidth(float width)
+{
+    if (!std::isfinite(width) || width < 0.0f)
+        throw std::invalid_argument("Curve antialiasing width must be finite and nonnegative");
+    auto& data = _getData<CurveData>();
+    if (data.m_antialiasingWidth != width)
+    {
+        data.m_antialiasingWidth = width;
+        _dirtyCache();
+    }
+}
+
 void Curve::_drawContent(const Matrix44& projection, const Matrix44& view)
 {
     OMNIUI_PROFILE_VERBOSE_FUNCTION;
@@ -84,9 +113,9 @@ void Curve::_drawContent(const Matrix44& projection, const Matrix44& view)
     auto drawList = this->_getDrawList();
     if (OMNIUI_LIKELY(drawList))
     {
-        drawList->addPolygonLines(data.m_cachedPositions.data(), data.m_cachedColors.data(), data.m_cachedThicknesses.data(),
+        drawList->addAntialiasedPolygonLines(data.m_cachedPositions.data(), data.m_cachedColors.data(), data.m_cachedThicknesses.data(),
                                   data.m_cachedVertexIndices.data(), data.m_cachedVertexCounts.data(), nullptr,
-                                  data.m_cachedVertexCounts.size());
+                                  data.m_cachedVertexCounts.size(), data.m_antialiasingWidth);
     }
 }
 
@@ -129,9 +158,17 @@ void Curve::intersect(const Vector3 origin,
     size_t minSegIndex = 0;
     // iterate all of the segments and find the closest one.
     Vector3 start = Vector3{ transform * Vector4{ positions[0], 1.0 } };
+    size_t curveIndex = 0;
+    size_t curveEnd = data.m_cachedVertexCounts[0];
     for (size_t i = 1; i < vertexCount; ++i)
     {
         Vector3 end = Vector3{ transform * Vector4{ positions[i], 1.0 } };
+        if (i == curveEnd)
+        {
+            curveEnd += data.m_cachedVertexCounts[++curveIndex];
+            start = end;
+            continue;
+        }
 
         Vector3 rayPoint;
         Vector3 segPoint;
@@ -160,7 +197,8 @@ void Curve::intersect(const Vector3 origin,
     data.m_lastGesturePayload.rayClosestPoint = minRayPoint;
     data.m_lastGesturePayload.itemClosestPoint = minSegPoint;
     data.m_lastGesturePayload.rayDistance = minRayDistance;
-    data.m_lastGesturePayload.curveDistance = minCurveDistance / data.m_cachedLengths[vertexCount-1];
+    const float totalLength = data.m_cachedLengths[vertexCount - 1];
+    data.m_lastGesturePayload.curveDistance = totalLength > 0.0f ? minCurveDistance / totalLength : 0.0f;
     data.m_lastGesturePayload.moved = data.m_lastGesturePayload.rayClosestPoint - lastClosestPoint;
     data.m_lastGesturePayload.movedDistance = data.m_lastGesturePayload.curveDistance - lastMovedDistance;
 
@@ -216,6 +254,31 @@ void Curve::_rebuildCache()
     const auto& positions = this->getPositions();
     size_t vertexCount = positions.size();
 
+    // Validate before indexing or publishing geometry. Mutating the topology and
+    // positions separately may temporarily leave an incomplete partition.
+    if (!data.m_vertexCounts.empty())
+    {
+        size_t remaining = vertexCount;
+        bool valid = this->getCurveType() == CurveType::linear;
+        for (uint32_t count : data.m_vertexCounts)
+        {
+            if (count < 2 || count > remaining)
+            {
+                valid = false;
+                break;
+            }
+            remaining -= count;
+        }
+        if (!valid || remaining != 0)
+        {
+            data.m_cachedPositions.clear();
+            data.m_cachedVertexCounts.clear();
+            data.m_cachedLengths.clear();
+            data.m_cacheIsDirty = false;
+            return;
+        }
+    }
+
     if (vertexCount < 2)
     {
         OMNIUI_LOG_ERROR("Input Error: input positions size should be larger than 1 to create a curve");
@@ -259,7 +322,10 @@ void Curve::_rebuildCache()
 
     // vertex counts and vertex indices
     data.m_cachedVertexCounts.clear();
-    data.m_cachedVertexCounts.push_back(uint32_t(vertexCount));
+    if (data.m_vertexCounts.empty())
+        data.m_cachedVertexCounts.push_back(uint32_t(vertexCount));
+    else
+        data.m_cachedVertexCounts = data.m_vertexCounts;
 
     data.m_cachedVertexIndices.resize(vertexCount);
     std::iota(std::begin(data.m_cachedVertexIndices), std::end(data.m_cachedVertexIndices), 0);
@@ -268,8 +334,16 @@ void Curve::_rebuildCache()
     data.m_cachedLengths.clear();
     data.m_cachedLengths.reserve(vertexCount);
     data.m_cachedLengths.push_back(0.0f);
+    size_t curveIndex = 0;
+    size_t curveEnd = data.m_cachedVertexCounts[0];
     for (size_t i = 1; i < vertexCount; ++i)
     {
+        if (i == curveEnd)
+        {
+            curveEnd += data.m_cachedVertexCounts[++curveIndex];
+            data.m_cachedLengths.push_back(data.m_cachedLengths.back());
+            continue;
+        }
         Vector3 dist = data.m_cachedPositions[i] - data.m_cachedPositions[i-1];
         float length = float(std::sqrt(dist.x * dist.x + dist.y * dist.y + dist.z * dist.z)) + data.m_cachedLengths[i-1];
         data.m_cachedLengths.push_back(length);

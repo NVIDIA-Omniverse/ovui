@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Dockable shell for the Layers panel (LAYERS-PLAN Step 8 → Step 16).
 
@@ -168,6 +161,10 @@ class LayerWindow(ManagedWindow):
         self._model: Optional[LayerModel] = None
         self._tree_view: Any = None
         self._tree_scrolling_frame: Any = None
+        self._hovered_tooltip_item: Optional[LayerItem] = None
+        self._hovered_tooltip_target: Any = None
+        self._path_tooltip_window: Any = None
+        self._path_tooltip_label: Any = None
         self._delegate: Optional[LayerDelegate] = None
 
         # Step 35 — toolbar widgets wired by :meth:`_build_toolbar`
@@ -247,6 +244,7 @@ class LayerWindow(ManagedWindow):
         self._selection_watch: Optional[LayerSelectionWatch] = None
         self._selection_anchor: Any = None
         super().__init__(self.TITLE, width=380, height=600)
+        self._build_path_tooltip_window()
 
     def _get_module_styles(self) -> dict:
         return LAYERS_STYLES
@@ -267,6 +265,10 @@ class LayerWindow(ManagedWindow):
         # rewritten, so holding on would stall GC of the old paint tree.
         self._tree_view = None
         self._tree_scrolling_frame = None
+        self._hovered_tooltip_item = None
+        self._hovered_tooltip_target = None
+        if self._path_tooltip_window is not None:
+            self._path_tooltip_window.visible = False
         # Toolbar widgets are owned by the same frame — drop the old
         # handles so a rebuild does not leak stale button / badge refs.
         # The Save-All subscription is released explicitly: ovui does
@@ -360,6 +362,8 @@ class LayerWindow(ManagedWindow):
         self._delegate.on_right_click = self._on_row_right_click
         self._delegate.on_left_click = self._on_row_left_click
         self._delegate.on_toggle_expand = self._set_row_expanded
+        self._delegate.on_name_hover = self._on_name_hover_changed
+        self._delegate.on_action_hover = self._on_action_hover_changed
         with ui.VStack(spacing=0):
             # Step 51 — filter bar above the Save-All toolbar. Mirrors
             # the Stage / Property filter-bar chrome (search icon,
@@ -1317,6 +1321,129 @@ class LayerWindow(ManagedWindow):
         ctx = self._build_menu_context(item)
         self._context_menu_builder.show_at(x, y, ctx)
 
+    def _on_name_hover_changed(
+        self,
+        item: LayerItem,
+        hovered: bool,
+        target: Any,
+    ) -> None:
+        """Show the full path only while the layer-name cell is hovered."""
+
+        if self._tree_view is None:
+            return
+        if hovered and isinstance(item, LayerItem):
+            self._show_tooltip(item, target, item.identifier, min_width=360.0)
+        elif not hovered:
+            self._hide_tooltip(item, target)
+
+    def _on_action_hover_changed(
+        self,
+        item: LayerItem,
+        text: str,
+        hovered: bool,
+        target: Any,
+    ) -> None:
+        """Keep row-action help visible for the full stationary hover."""
+
+        if hovered and isinstance(item, LayerItem):
+            self._show_tooltip(item, target, text, min_width=180.0)
+        elif not hovered:
+            self._hide_tooltip(item, target)
+
+    def _show_tooltip(
+        self,
+        item: LayerItem,
+        target: Any,
+        text: str,
+        *,
+        min_width: float,
+    ) -> None:
+        """Show the retained Layers tooltip beside its hovered cell."""
+
+        tooltip_window = self._path_tooltip_window
+        tooltip_label = self._path_tooltip_label
+        if tooltip_window is None or tooltip_label is None:
+            return
+
+        self._hovered_tooltip_item = item
+        self._hovered_tooltip_target = target
+        tooltip_label.text = text
+
+        main_width = max(360.0, float(ui.Workspace.get_main_window_width()))
+        main_height = max(120.0, float(ui.Workspace.get_main_window_height()))
+        tooltip_width = min(
+            max(min_width, len(text) * 7.0 + 16.0),
+            main_width - 16.0,
+        )
+        tooltip_height = 36.0
+        target_x = float(getattr(target, "screen_position_x", 0.0) or 0.0)
+        target_y = float(getattr(target, "screen_position_y", 0.0) or 0.0)
+        target_height = float(getattr(target, "computed_height", 0.0) or 0.0)
+
+        tooltip_window.width = tooltip_width
+        tooltip_window.height = tooltip_height
+        tooltip_window.position_x = max(
+            8.0,
+            min(target_x, main_width - tooltip_width - 8.0),
+        )
+
+        above_y = target_y - tooltip_height - 4.0
+        panel_top = max(28.0, float(self.window.position_y) + 4.0)
+        if above_y >= panel_top:
+            tooltip_y = above_y
+        else:
+            tooltip_y = target_y + target_height + 4.0
+        tooltip_window.position_y = max(
+            28.0,
+            min(tooltip_y, main_height - tooltip_height - 8.0),
+        )
+        tooltip_window.visible = True
+
+    def _hide_tooltip(self, item: LayerItem, target: Any) -> None:
+        """Hide only the tooltip owned by the target that was left."""
+
+        if (
+            self._hovered_tooltip_item is not item
+            or self._hovered_tooltip_target is not target
+        ):
+            return
+        self._hovered_tooltip_item = None
+        self._hovered_tooltip_target = None
+        if self._path_tooltip_window is not None:
+            self._path_tooltip_window.visible = False
+
+    def _build_path_tooltip_window(self) -> None:
+        """Create the retained no-input popup used by Layers hover targets."""
+
+        flags = (
+            ui.WINDOW_FLAGS_NO_TITLE_BAR
+            | ui.WINDOW_FLAGS_NO_MOVE
+            | ui.WINDOW_FLAGS_NO_RESIZE
+            | ui.WINDOW_FLAGS_NO_SCROLLBAR
+            | ui.WINDOW_FLAGS_NO_SAVED_SETTINGS
+            | ui.WINDOW_FLAGS_NO_MOUSE_INPUTS
+            | ui.WINDOW_FLAGS_NO_FOCUS_ON_APPEARING
+            | ui.WINDOW_FLAGS_NO_DOCKING
+        )
+        self._path_tooltip_window = ui.Window(
+            f"Layers path tooltip##{id(self)}",
+            width=360,
+            height=36,
+            padding_x=0,
+            padding_y=0,
+            flags=flags,
+            visible=False,
+        )
+        with self._path_tooltip_window.frame:
+            with ui.ZStack():
+                ui.Rectangle(style_type_name_override="Tooltip")
+                self._path_tooltip_label = ui.Label(
+                    "",
+                    word_wrap=True,
+                    style_type_name_override="Tooltip",
+                    alignment=ui.Alignment.LEFT_CENTER,
+                )
+
     def _visible_tree_items(self) -> List[Any]:
         """Return rows in the same visible order as the live TreeView."""
 
@@ -1585,8 +1712,14 @@ class LayerWindow(ManagedWindow):
         if self._model is not None:
             self._model.destroy()
             self._model = None
+        if self._path_tooltip_window is not None:
+            self._path_tooltip_window.destroy()
+            self._path_tooltip_window = None
+            self._path_tooltip_label = None
         self._tree_view = None
         self._tree_scrolling_frame = None
+        self._hovered_tooltip_item = None
+        self._hovered_tooltip_target = None
         self._delegate = None
         super().destroy()
 

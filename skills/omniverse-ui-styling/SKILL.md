@@ -6,11 +6,10 @@ description: >-
   selector grammar, widget name variants, style_type_name_override values,
   naming conventions, style hierarchy, the centralised style module, and
   styling reviews. This skill is the authoritative target style guide.
-author: "NVIDIA ovui Team <ovui-team@nvidia.com>"
-license: "LicenseRef-NVIDIA"
+license: "Apache-2.0"
 metadata:
   python-distribution: ovui-widgets-app
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # OVUI Styling

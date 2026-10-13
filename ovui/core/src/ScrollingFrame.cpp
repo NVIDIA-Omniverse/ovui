@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <imgui/imgui.h>
@@ -210,7 +203,8 @@ void ScrollingFrame::_drawContent(float elapsedTime)
 
     // If this ScrollingFrame is rasterized, Frame::_drawContent may draw the
     // cached draw list without iterating the child. ImGui still needs the
-    // child's full content size here so scroll bounds stay correct.
+    // child's full content size here so scroll bounds stay correct. Non-rasterized
+    // frames let ImGui measure submitted content, which can extend beyond the canvas.
     ImVec2 childContentSize{ 0.0f, 0.0f };
     if (data.m_canvas && data.m_canvas->isVisible())
     {
@@ -218,8 +212,9 @@ void ScrollingFrame::_drawContent(float elapsedTime)
         childContentSize.y = data.m_canvas->getComputedContentHeight();
     }
 
-    if (horizontalPolicy != ScrollBarPolicy::eScrollBarAlwaysOff ||
-        verticalPolicy != ScrollBarPolicy::eScrollBarAlwaysOff)
+    if (this->getRasterPolicy() != RasterPolicy::eNever &&
+        (horizontalPolicy != ScrollBarPolicy::eScrollBarAlwaysOff ||
+         verticalPolicy != ScrollBarPolicy::eScrollBarAlwaysOff))
     {
         ImGui::SetNextWindowContentSize(
             { horizontalPolicy == ScrollBarPolicy::eScrollBarAlwaysOff ? 0.0f : childContentSize.x,

@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Stage Browser domain-scoped styles (stage browser behavior, §21).
 
@@ -27,7 +20,7 @@ STAGE_STYLES = {
     # Token anchor (locked to ovuiDark rev-9 — OVUI_REFERENCE_IMPLEMENTATION_PLAN
     # Step 3.2 / UI-005):
     #   - header text colour   → ``cl.text_secondary`` (#A7A7A7 muted grey,
-    #     readable against the corrected reference #222222 header strip)
+    #     readable against the design reference #222222 header strip)
     #   - eye-icon colour      → ``cl.text_secondary`` for the same visible
     #     header-column treatment as NAME / TYPE
     #   - separator-rule tone  → ``cl.border_default`` (#4B4B4B — the rev-9

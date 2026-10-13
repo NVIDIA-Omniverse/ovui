@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Control state indicator for an attribute row.
 
@@ -431,6 +424,9 @@ class ControlStateIndicator:
         self._model = model
         self._adapter = adapter
         self._attr_name = attr_name
+        # Whether this indicator writes its own hover text. See
+        # :meth:`release_tooltip`.
+        self._owns_tooltip = True
         # The visual widget — ``ui.Image`` under Kit, ``ui.Rectangle``
         # standalone. Both expose the ``visible`` / ``name`` / ``tooltip``
         # attributes and ``set_mouse_pressed_fn`` method that the
@@ -469,6 +465,24 @@ class ControlStateIndicator:
         """The currently-matched :class:`ControlStateHandler`, or ``None``."""
         return self._active_state
 
+    def release_tooltip(self) -> None:
+        """Hand hover text for this glyph to the enclosing row.
+
+        Not called by default, so an ordinary row keeps the built-in
+        per-state tooltip. A host that puts a tooltip on the row container
+        calls this so there is a single hover-text owner, now and on every
+        later state change.
+        """
+
+        self._owns_tooltip = False
+        if self._widget is not None:
+            self._widget.tooltip = ""
+
+    def _state_tooltip(self, state: Optional[ControlStateHandler]) -> str:
+        if not self._owns_tooltip:
+            return ""
+        return state.tooltip if (state and state.tooltip) else ""
+
     def _resolve_state(self) -> Optional[ControlStateHandler]:
         manager = ControlStateManager.get_instance()
         return manager.get_active_state(self._model)
@@ -485,7 +499,7 @@ class ControlStateIndicator:
         transition doesn't need to rebuild the widget tree.
         """
         name = _style_state_name(state.name) if state is not None else ""
-        tooltip = state.tooltip if (state and state.tooltip) else ""
+        tooltip = self._state_tooltip(state)
         visible = state is not None
         if _SVG_RENDERING_AVAILABLE:
             source_url = state.icon_path if state is not None else ""
@@ -554,7 +568,7 @@ class ControlStateIndicator:
             self._widget.set_mouse_pressed_fn(lambda x, y, b, m: None)
             return
         self._widget.name = _style_state_name(state.name)
-        self._widget.tooltip = state.tooltip or ""
+        self._widget.tooltip = self._state_tooltip(state)
         self._widget.visible = True
         if _SVG_RENDERING_AVAILABLE and isinstance(self._widget, ui.Image):
             # ``source_url`` is mutable post-construction — swap the SVG

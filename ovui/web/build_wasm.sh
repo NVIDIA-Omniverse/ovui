@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -15,7 +17,7 @@ CPYTHON_SHA256="${OVUI_CPYTHON_SHA256:-a6b9459f45a6ebbbc1af44f5762623fa355a0c872
 CPYTHON_SOURCE_DIR="$CACHE_DIR/cpython-${CPYTHON_VERSION}"
 CPYTHON_BUILD_DIR="$CPYTHON_SOURCE_DIR/builddir/emscripten-browser-static"
 PYBIND11_VENV="${OVUI_PYBIND11_VENV:-$CACHE_DIR/pybind11-venv}"
-PYBIND11_VERSION="${OVUI_PYBIND11_VERSION:-2.13.6}"
+PYBIND11_VERSION="2.11.1"
 EMSDK_ENV="${OVUI_EMSDK_ENV:-/tmp/ovui-emsdk/emsdk_env.sh}"
 
 JOBS="${OVUI_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
@@ -41,8 +43,8 @@ mkdir -p "$CACHE_DIR"
 if [[ ! -x "$PYBIND11_VENV/bin/python" ]]; then
     python3 -m venv "$PYBIND11_VENV"
     "$PYBIND11_VENV/bin/python" -m pip install --upgrade pip >/dev/null
-    "$PYBIND11_VENV/bin/python" -m pip install "pybind11==$PYBIND11_VERSION" >/dev/null
 fi
+"$PYBIND11_VENV/bin/python" -m pip install "pybind11==$PYBIND11_VERSION" >/dev/null
 PYBIND11_INCLUDE_DIR="$("$PYBIND11_VENV/bin/python" -c 'import pybind11; print(pybind11.get_include())')"
 
 if [[ ! -d "$CPYTHON_SOURCE_DIR" ]]; then

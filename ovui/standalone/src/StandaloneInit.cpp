@@ -1,25 +1,21 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "StandaloneInit.h"
 
+#include "NativeTiming.h"
 #include "GlfwPlatform.h"
-#include "HeadlessVulkanPlatform.h"
 #ifdef OMNIUI_HAS_VULKAN
+#include "HeadlessVulkanPlatform.h"
 #include "VulkanBackend.h"
 #endif
 #include "OpenGLByteImageGpu.h"
+#include "NativeFramePacing.h"
 #include "OpenGLRenderer.h"
 #include "StandaloneFileIO.h"
+#include "StandaloneImageBackend.h"
 #include "StandaloneRasterImageLoader.h"
 #include "StandaloneSettings.h"
 #include "StandaloneLog.h"
@@ -40,6 +36,7 @@
 
 #include <omni/ui/platform/PlatformRegistry.h>
 #include <omni/ui/Workspace.h>
+#include "WorkspaceLifecycle.h"
 
 #include <imgui/imgui.h>
 #include <imgui/backends/imgui_impl_opengl3.h>
@@ -72,6 +69,7 @@ namespace standalone {
 
 // Keep shared_ptrs alive so we can access the concrete types for tick/shouldClose.
 static std::shared_ptr<IUiPlatform> s_platform;
+static WindowId s_mainWindowId = kInvalidWindowId;
 static std::shared_ptr<GlfwPlatform> s_glfwPlatform; // Non-null only in non-headless mode
 static std::shared_ptr<OpenGLRenderer> s_renderer;
 static bool s_headlessMode = false;
@@ -79,6 +77,7 @@ static std::shared_ptr<StandaloneFileIO> s_fileIO;
 static std::shared_ptr<StandaloneSettings> s_settings;
 static std::shared_ptr<IByteImageGpu> s_byteImageGpu;
 static std::shared_ptr<StandaloneRasterImageLoader> s_rasterImageLoader;
+static std::shared_ptr<StandaloneImageBackend> s_imageBackend;
 static std::shared_ptr<StandaloneLog> s_log;
 static std::unique_ptr<StandaloneWindowCallbackManager> s_windowCallbackManager;
 
@@ -92,19 +91,35 @@ static bool s_shutdownInProgress = false;
 
 static void shutdownPlatformResources()
 {
+    // Revoke/join the borrowed ovrtx renderer before Python-owned renderer or
+    // provider objects and before ImGui/Vulkan resources can be destroyed.
+    registerNativeFramePacingBackend(nullptr);
+    shutdownNativeFramePacing();
     shutdownVulkanStreaming();
     shutdownHeadlessFrameExport();
+
+    // Release callback owners while Python and platform services are still alive.
+    detail::endWorkspaceCallbackLifetime();
 
     // Release strong references to Windows before tearing down the WCM.
     // In standalone mode, Workspace::RegisterWindow keeps shared_ptrs to
     // prevent premature destruction when Python drops its reference.
     Workspace::clear();
 
+    // Providers that Python still holds share the loader and can call it after
+    // this point. Free its GPU textures while IByteImageGpu is registered.
+    if (s_rasterImageLoader)
+        s_rasterImageLoader->shutdown();
+
     PlatformRegistry::instance().reset();
-    s_platform.reset();
-    s_glfwPlatform.reset();
+    // GPU provider destructors retain a raw backend pointer by design. Retire
+    // them while the platform-owned Vulkan/OpenGL backend is still alive.
+    s_mainWindowId = kInvalidWindowId;
+    s_imageBackend.reset();
     s_rasterImageLoader.reset();
     s_byteImageGpu.reset();
+    s_platform.reset();
+    s_glfwPlatform.reset();
     s_renderer.reset();
     s_fileIO.reset();
     s_settings.reset();
@@ -137,9 +152,13 @@ bool init(const char* title, int width, int height)
 {
     if (PlatformRegistry::instance().isInitialized())
     {
+        // A backend is already active (for example from init_streaming() or an
+        // earlier C++ init()). It is usable, so this is not a failure.
         fprintf(stderr, "standalone::init: already initialized\n");
-        return false;
+        return true;
     }
+
+    detail::beginWorkspaceCallbackLifetime();
 
     // Register log backend first so messages during init are captured.
     s_log = std::make_shared<StandaloneLog>();
@@ -270,6 +289,7 @@ bool init(const char* title, int width, int height)
         s_settings.reset();
         return false;
     }
+    s_mainWindowId = wid;
 
     // Create the byte image GPU backend. Which one depends on the active
     // rendering backend — OpenGL texture for GL, Vulkan VkImage for Vulkan
@@ -319,6 +339,12 @@ bool init(const char* title, int width, int height)
         s_rasterImageLoader = std::make_shared<StandaloneRasterImageLoader>();
         reg.setRasterImageLoader(s_rasterImageLoader);
     }
+
+    // Register the ui.Image backend. It loads through the raster loader above.
+    // Register it also without a loader, so ui.Image logs an error instead of
+    // showing an empty area with no message.
+    s_imageBackend = std::make_shared<StandaloneImageBackend>(s_rasterImageLoader);
+    reg.setImageBackend(s_imageBackend);
 
     fprintf(stdout, "standalone::init: initialized successfully (%dx%d)\n", width, height);
 
@@ -382,6 +408,20 @@ bool setWindowSize(int width, int height)
 #endif
 }
 
+bool setWindowPosition(int x, int y)
+{
+#ifndef OMNIUI_HEADLESS_ONLY
+    if (!s_glfwPlatform || !s_glfwPlatform->getGlfwWindow())
+        return false;
+    s_glfwPlatform->setWindowPosition(1, x, y);
+    return true;
+#else
+    (void)x;
+    (void)y;
+    return false;
+#endif
+}
+
 bool getWindowSize(int* width, int* height)
 {
 #ifndef OMNIUI_HEADLESS_ONLY
@@ -400,6 +440,21 @@ bool getWindowSize(int* width, int* height)
     (void)height;
     return false;
 #endif
+}
+
+bool setWindowTitle(const char* title)
+{
+    if (!s_platform || s_mainWindowId == kInvalidWindowId || !title)
+        return false;
+    s_platform->setWindowTitle(s_mainWindowId, title);
+    return s_platform->getWindowTitle(s_mainWindowId) == title;
+}
+
+std::string getWindowTitle()
+{
+    if (!s_platform || s_mainWindowId == kInvalidWindowId)
+        return {};
+    return s_platform->getWindowTitle(s_mainWindowId);
 }
 
 bool shouldClose()
@@ -656,6 +711,13 @@ bool isSoftwareCursorEnabled()
     if (!ImGui::GetCurrentContext())
         return false;
     return ImGui::GetIO().MouseDrawCursor;
+}
+
+bool isTextInputActive()
+{
+    if (!ImGui::GetCurrentContext())
+        return false;
+    return ImGui::GetIO().WantTextInput;
 }
 
 // ---------------------------------------------------------------------------

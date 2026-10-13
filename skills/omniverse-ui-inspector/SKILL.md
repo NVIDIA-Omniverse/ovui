@@ -6,11 +6,10 @@ description: |
   ovui-inspect FastAPI inspector. The skill provides an importable
   `ovuiinspect` module, an `ovui-inspect` CLI, and a screenshot-first
   mouse/keyboard workflow for controlling ovui apps launched with PYTHONPATH.
-author: "NVIDIA ovui Team <ovui-team@nvidia.com>"
-license: "LicenseRef-NVIDIA"
+license: "Apache-2.0"
 metadata:
   python-distribution: ovui
-  version: "0.2.0"
+  version: "0.3.0"
 tools:
   - Bash
   - Read
@@ -121,8 +120,8 @@ Core commands:
 - `state [--out FILE]`: capture the attached application's read-only scene and
   interaction state on the ovui frame loop. It requires
   `OVUIINSPECT_ENABLE_STATE=1`. Use it after a strict Inspector input action to
-  check the active provider's scene state (native OVStage for the `ovstage`
-  provider; USD stage state only when the OpenUSD provider is selected) against
+  check the active provider's scene state (the payload is the application's;
+  the USD Viewer snapshot is documented with that application) against
   the provider-neutral adapter and UI views, or label geometry-guided use as
   state-guided QA; never use it to mutate UI.
 - `wait --timeout 60`: wait until `/health` responds.
@@ -176,3 +175,16 @@ printing the JSON error payload.
   keyboard focus. In the Stage filter, the headless remote text fallback appends
   printable text directly to the filter model, so do not use Ctrl+A plus `type`
   as proof that selected text replacement works there.
+
+## Discover application contributions
+
+Use `ovui-inspect commands` to discover the attached application's extra commands
+and JSON argument schemas, then `ovui-inspect call NAME --arguments JSON`.
+These calls use the existing Inspector frame-loop pipeline. Each application
+contributes its own catalog; discover it rather than assuming every app has every
+command.
+
+Typed commands are API actions. Keep screenshot-first mouse/keyboard QA distinct.
+For implementing contributions or a persistent Python namespace, read
+[application-commands.md](references/application-commands.md). It defines
+registration, owner-thread/async execution, cancellation and detach behavior.

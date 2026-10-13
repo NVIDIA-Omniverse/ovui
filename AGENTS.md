@@ -66,6 +66,7 @@ When a request maps to a known ovui workflow, go directly to the relevant skill 
   - `skills/omniverse-ui-widgets/references/runtime-environment.md` - portable shell environment (env vars, `PYTHONPATH`, USD fixture, `$PYTHON_BIN` check) and real-ovrtx fail-fast requirements.
   - `skills/omniverse-ui-widgets/references/app-skeleton.md` - the `TrialApp` class skeleton, the `run`/`run_async` initialization, ovuiinspect attach/drain, frame rendering.
   - `skills/omniverse-ui-widgets/references/usd-and-dataflow.md` - USD open and wiring recipe, standalone docking sequence, exercise configurations and CLI, plus selection and dataflow wiring across Stage, Viewport, and Property.
+  - `skills/omniverse-ui-widgets/references/inspector-commands.md` - viewport and media Inspector command providers and host wiring.
   - `skills/omniverse-ui-widgets/references/menu-and-qa.md` - menu bar with File > Open and the screenshot-first QA flow with `ovui-inspect`.
 - Styling ovui or ovui-widgets surfaces (palettes, colour/float/icon constants, shades, style selectors, `style_type_name_override`, widget `name` variants, `ui.style.default`, style hierarchy, the centralised style module, and styling reviews) -> `skills/omniverse-ui-styling/SKILL.md`
   - `skills/omniverse-ui-styling/references/target-architecture.md` - the target style schema every surface must follow.

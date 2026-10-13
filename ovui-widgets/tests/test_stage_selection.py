@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Tests for Stage Browser selection (Step 17).
 
@@ -15,6 +8,7 @@ and selection styles.
 """
 
 import pytest
+import omni.ui as ui
 from ovui_data_adapters.common import ChangeEvent, ChangeEventType
 
 from ovui_widgets.common.selection import SelectionBus
@@ -81,6 +75,11 @@ def _expected_centered_scroll(row_index: int, viewport_height: float) -> float:
 
 
 class TestSelectionTracking:
+    def test_stage_tree_keeps_dynamic_content_unrasterized(self):
+        w = StageWidget(MockStageAdapter())
+        assert w._scrolling_frame.raster_policy == ui.RasterPolicy.NEVER
+        w.destroy()
+
     def test_model_has_selected_items(self):
         model = HierarchyModel(MockStageAdapter())
         assert hasattr(model, "_selected_items")

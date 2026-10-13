@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 """Runtime-free tests for ovrtx-version-aware pick-query coordinate dispatch in
 the OpenUSD renderer adapter.
@@ -15,6 +8,7 @@ ovrtx >= 0.4.0 takes a normalized [0, 1] top-left NDC rectangle (and rejects
 pixel values); ovrtx 0.3.x takes RenderProduct pixel-int rectangles. The adapter
 must send the right one for the active runtime (matching the ovstage adapter).
 """
+
 from __future__ import annotations
 
 from collections import deque
@@ -57,6 +51,57 @@ def test_uses_ndc_predicate() -> None:
     assert _adapter((0, 3, 0), r)._pick_query_uses_ndc() is False
     assert _adapter((0, 2, 9), r)._pick_query_uses_ndc() is False
     assert _adapter("unknown", r)._pick_query_uses_ndc() is True
+
+
+def test_pending_picks_render_and_consume_their_own_products_after_view_switch():
+    adapter = _adapter((0, 4, 0), _RecordingRenderer())
+    hits = []
+    for product in ("/Front", "/Left"):
+        adapter._render_product_path = product
+        adapter.pick(0, 0, lambda path, pos: hits.append(path), product)
+    adapter._render_product_path = "/Perspective"
+    assert adapter._render_products_for_step() == {"/Front", "/Left", "/Perspective"}
+    adapter._read_pick_hits = lambda products, product_path=None: products[
+        product_path or adapter._render_product_path
+    ]
+    adapter._dispatch_pending_pick_results(
+        {"/Front": [("/Cube", (1, 2, 3))], "/Left": [("/Sphere", (4, 5, 6))]}
+    )
+    assert hits == ["/Cube", "/Sphere"]
+    assert not adapter._in_flight_pick_queries and not adapter._pick_query_products
+
+
+def test_same_name_replacement_never_inherits_hits_from_another_product():
+    adapter = _adapter((0, 4, 0), _RecordingRenderer())
+    hits = []
+    adapter._render_product_path = "/Front"
+    adapter.pick(0, 0, lambda path, pos: hits.append(path), "click")
+    adapter._render_product_path = "/Left"
+    adapter.pick(0, 0, lambda path, pos: hits.append(path), "click")
+    adapter._read_pick_hits = lambda products, product_path=None: products[
+        product_path or adapter._render_product_path
+    ]
+    adapter._dispatch_pending_pick_results({"/Front": [("/Wrong", (0, 0, 0))], "/Left": []})
+    assert hits == [None]
+    adapter.pick(0, 0, lambda *a: None, "cleanup")
+    adapter._dispatch_pending_pick_misses()
+    assert not adapter._pick_query_products
+
+
+def test_missing_step_product_waits_then_resolves_or_times_out():
+    adapter = _adapter((0, 4, 0), _RecordingRenderer())
+    hits = []
+    adapter.pick(0, 0, lambda path, pos: hits.append(path), "delayed")
+    adapter._read_pick_hits = lambda products, **kw: [("/Cube", (0, 0, 0))]
+    adapter._dispatch_pending_pick_results({})
+    assert hits == [] and len(adapter._in_flight_pick_queries) == 1
+    adapter._dispatch_pending_pick_results({_RP: object()})
+    assert hits == ["/Cube"] and not adapter._pick_query_waits
+    adapter.pick(0, 0, lambda path, pos: hits.append(path), "missing")
+    for _ in range(3):
+        adapter._dispatch_pending_pick_results({})
+    assert hits == ["/Cube", None]
+    assert not adapter._in_flight_pick_queries and not adapter._pick_query_products
 
 
 def test_old_ovrtx_030_pick_sends_pixel_ints() -> None:

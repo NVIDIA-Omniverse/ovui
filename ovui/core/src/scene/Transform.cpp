@@ -1,18 +1,19 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <omni/ui/platform/Assert.h>
 #include <omni/ui/platform/Log.h>
 
+#include <omni/ui/scene/DepthGroup.h>
+#include <omni/ui/scene/DistanceFadeGroup.h>
+#include <omni/ui/scene/WidthSpaceGroup.h>
+#include <omni/ui/scene/SelectionGroup.h>
+#include <cmath>
+#include <atomic>
+#include <stdexcept>
+#include <omni/ui/scene/Scene.h>
 #include <omni/ui/scene/DrawList.h>
 #include <omni/ui/scene/Transform.h>
 
@@ -210,6 +211,234 @@ void Transform::_dirtyTransform()
             pTransform->_dirtyTransform();
         }
     }
+}
+
+SelectionGroup::SelectionGroup(uint64_t id)
+{
+    this->setSelectionId(id);
+}
+
+uint64_t SelectionGroup::getSelectionId() const
+{
+    return m_selectionId;
+}
+
+void SelectionGroup::setSelectionId(uint64_t id)
+{
+    if (m_selectionId != id)
+    {
+        m_selectionId = id;
+        if (auto* scene = this->_getScene())
+            scene->_requestSelectionCollection();
+        this->forceDirty(DirtyReason::kDirtyReasonDescendantChanged);
+    }
+}
+
+std::shared_ptr<const SelectionData> SelectionGroup::getSelectionData() const
+{
+    return m_selectionData;
+}
+
+void SelectionGroup::setSelectionData(std::shared_ptr<const SelectionData> data)
+{
+    if (m_selectionData != data)
+    {
+        m_selectionData = std::move(data);
+        if (auto* scene = this->_getScene())
+            scene->_requestSelectionCollection();
+        this->forceDirty(DirtyReason::kDirtyReasonDescendantChanged);
+    }
+}
+
+void SelectionGroup::_preDrawContent(
+    const MouseInput& input, const Matrix44& projection, const Matrix44& view, float width, float height)
+{
+    if (auto* scene = this->_getScene())
+        scene->_requestSelectionCollection();
+    Transform::_preDrawContent(input, projection, view, width, height);
+}
+
+void SelectionGroup::_drawContent(const Matrix44& projection, const Matrix44& view)
+{
+    if (auto* scene = this->_getScene())
+        scene->_requestSelectionCollection();
+    Transform::_drawContent(projection, view);
+}
+
+namespace
+{
+// Only a fast negative check, never ownership of a Scene or a group. Unattached
+// and already-destroyed-but-retained groups can cause an extra hierarchy query.
+std::atomic<size_t> s_depthGroups{0};
+}
+
+DepthGroup::DepthGroup(DepthPolicy policy)
+{
+    this->setDepthPolicy(policy);
+    s_depthGroups.fetch_add(1, std::memory_order_relaxed);
+}
+
+DepthGroup::~DepthGroup()
+{
+    s_depthGroups.fetch_sub(1, std::memory_order_relaxed);
+}
+
+bool DepthGroup::_hasInstances()
+{
+    return s_depthGroups.load(std::memory_order_relaxed) != 0;
+}
+
+DepthPolicy DepthGroup::getDepthPolicy() const
+{
+    return m_depthPolicy;
+}
+
+void DepthGroup::setDepthPolicy(DepthPolicy policy)
+{
+    switch (policy)
+    {
+    case DepthPolicy::eInherit:
+    case DepthPolicy::eDefault:
+    case DepthPolicy::eTestOnly:
+    case DepthPolicy::eTestAndWrite:
+    case DepthPolicy::eOverlay:
+        break;
+    default:
+        return;
+    }
+    if (m_depthPolicy != policy)
+    {
+        m_depthPolicy = policy;
+        if (auto* scene = this->_getScene())
+        {
+            scene->_requestDepthCollection();
+        }
+        this->forceDirty(DirtyReason::kDirtyReasonDescendantChanged);
+    }
+}
+
+void DepthGroup::_preDrawContent(
+    const MouseInput& input, const Matrix44& projection, const Matrix44& view, float width, float height)
+{
+    if (m_depthPolicy != DepthPolicy::eInherit)
+    {
+        if (auto* scene = this->_getScene())
+        {
+            scene->_requestDepthCollection();
+        }
+    }
+    Transform::_preDrawContent(input, projection, view, width, height);
+}
+
+void DepthGroup::_drawContent(const Matrix44& projection, const Matrix44& view)
+{
+    // Also covers groups created by a manipulator after the pre-draw traversal.
+    if (m_depthPolicy != DepthPolicy::eInherit)
+    {
+        if (auto* scene = this->_getScene())
+        {
+            scene->_requestDepthCollection();
+        }
+    }
+    Transform::_drawContent(projection, view);
+}
+
+DistanceFadeGroup::DistanceFadeGroup(const DistanceFade& fade)
+{
+    this->setDistanceFade(fade);
+}
+
+const DistanceFade& DistanceFadeGroup::getDistanceFade() const
+{
+    return m_fade;
+}
+
+void DistanceFadeGroup::setDistanceFade(const DistanceFade& fade)
+{
+    const double normalLength2 = glm::dot(fade.planeNormal, fade.planeNormal);
+    if (!std::isfinite(fade.start) || !std::isfinite(fade.end) ||
+        !std::isfinite(normalLength2) || (normalLength2 != 0 && std::abs(normalLength2 - 1.0) > 1e-6))
+        throw std::invalid_argument("DistanceFade requires finite distances and a zero or unit normal");
+    if (!(m_fade == fade))
+    {
+        m_fade = fade;
+        if (auto* scene = this->_getScene())
+            scene->_requestDistanceFadeCollection();
+        this->forceDirty(DirtyReason::kDirtyReasonDescendantChanged);
+    }
+}
+
+void DistanceFadeGroup::_preDrawContent(
+    const MouseInput& input, const Matrix44& projection, const Matrix44& view, float width, float height)
+{
+    if (auto* scene = this->_getScene())
+        scene->_requestDistanceFadeCollection();
+    Transform::_preDrawContent(input, projection, view, width, height);
+}
+
+void DistanceFadeGroup::_drawContent(const Matrix44& projection, const Matrix44& view)
+{
+    if (auto* scene = this->_getScene())
+        scene->_requestDistanceFadeCollection();
+    Transform::_drawContent(projection, view);
+}
+
+WidthSpaceGroup::WidthSpaceGroup(StrokeWidthSpace space, Float pointAntialiasingWidth)
+{
+    this->setWidthSpace(space);
+    this->setPointAntialiasingWidth(pointAntialiasingWidth);
+}
+
+Float WidthSpaceGroup::getPointAntialiasingWidth() const
+{
+    return m_pointAntialiasingWidth;
+}
+
+void WidthSpaceGroup::setPointAntialiasingWidth(Float width)
+{
+    if (!std::isfinite(width) || width < 0.0)
+        throw std::invalid_argument("Point antialiasing width must be finite and nonnegative");
+    if (m_pointAntialiasingWidth != width)
+    {
+        m_pointAntialiasingWidth = width;
+        if (auto* scene = this->_getScene())
+            scene->_requestWidthSpaceCollection();
+        this->forceDirty(DirtyReason::kDirtyReasonDescendantChanged);
+    }
+}
+
+StrokeWidthSpace WidthSpaceGroup::getWidthSpace() const
+{
+    return m_space;
+}
+
+void WidthSpaceGroup::setWidthSpace(StrokeWidthSpace space)
+{
+    if (space != StrokeWidthSpace::ePixels && space != StrokeWidthSpace::eWorld &&
+        space != StrokeWidthSpace::ePixelDiameter)
+        throw std::invalid_argument("Unknown stroke width space");
+    if (m_space != space)
+    {
+        m_space = space;
+        if (auto* scene = this->_getScene())
+            scene->_requestWidthSpaceCollection();
+        this->forceDirty(DirtyReason::kDirtyReasonDescendantChanged);
+    }
+}
+
+void WidthSpaceGroup::_preDrawContent(
+    const MouseInput& input, const Matrix44& projection, const Matrix44& view, float width, float height)
+{
+    if (auto* scene = this->_getScene())
+        scene->_requestWidthSpaceCollection();
+    Transform::_preDrawContent(input, projection, view, width, height);
+}
+
+void WidthSpaceGroup::_drawContent(const Matrix44& projection, const Matrix44& view)
+{
+    if (auto* scene = this->_getScene())
+        scene->_requestWidthSpaceCollection();
+    Transform::_drawContent(projection, view);
 }
 
 OMNIUI_SCENE_NAMESPACE_CLOSE_SCOPE

@@ -1,13 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
- *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "platform/Assert.h"
@@ -36,9 +29,17 @@
 
 #include "WidgetData.h"
 
+#if OMNIUI_HAS_NATIVE_TIMING_SCOPES
+#include "NativeTiming.h"
+#endif
+
 #include <algorithm>
 
 OMNIUI_NAMESPACE_OPEN_SCOPE
+
+#if OMNIUI_HAS_NATIVE_TIMING_SCOPES
+using standalone::OvuiDevelopmentMetricTimeScope;
+#endif
 
 static constexpr char g_contentDropType[] = "AssetDragDropPayloadId";
 
@@ -81,6 +82,7 @@ struct TreeView::Node
     // to compute the size only of visible widgets.
     // This is the flag for _setNodeComputedWidth/_setNodeComputedHeight
     bool widthComputed = false;
+    uint64_t columnWidthsVersion = 0;
     bool heightComputed = false;
     // Cached size of widgets
     float nodeHeight = 0.0f;
@@ -116,6 +118,7 @@ struct TreeView::TreeViewData : public Widget::WidgetData
 
     // Absolute widths of each column.
     std::vector<float> m_columnComputedSizes;
+    uint64_t m_columnWidthsVersion = 0;
 
     // Absolute minimum widths of each column.
     std::vector<float> m_minColumnComputedSizes;
@@ -168,6 +171,9 @@ struct TreeView::TreeViewData : public Widget::WidgetData
 
     // Cached desired minimum width (pixels) for the last column measured during draw.
     float m_lastColumnMeasuredMinPx = 0.0f;
+
+    // Preserve Kit behavior: newly visible descendants invalidate the measured last-column width.
+    bool m_lastColumnRemeasureRequested = false;
 
     // If the column is resizing at this moment, it is the id of the right column. When 0, no resize happens.
     uint32_t m_resizeColumn = 0;
@@ -346,6 +352,9 @@ TreeView::~TreeView() = default;
 
 void TreeView::setComputedContentWidth(float width)
 {
+#if OMNIUI_HAS_NATIVE_TIMING_SCOPES
+    OVUI_DEVELOPMENT_TIME_SCOPE(widthScope, "TreeView.layout.width [ovui debug]");
+#endif
     auto& data = _getData<TreeViewData>();
 
     // Compute column widths first.
@@ -367,6 +376,9 @@ void TreeView::setComputedContentWidth(float width)
 
 void TreeView::setComputedContentHeight(float height)
 {
+#if OMNIUI_HAS_NATIVE_TIMING_SCOPES
+    OVUI_DEVELOPMENT_TIME_SCOPE(heightScope, "TreeView.layout.height [ovui debug]");
+#endif
     auto& data = _getData<TreeViewData>();
 
     this->_populateHeader();
@@ -674,6 +686,9 @@ void TreeView::dirtyWidgets()
 
 void TreeView::_drawContent(float elapsedTime)
 {
+#if OMNIUI_HAS_NATIVE_TIMING_SCOPES
+    OVUI_DEVELOPMENT_TIME_SCOPE(drawScope, "TreeView.draw_content [ovui debug]");
+#endif
     this->_populateHeader();
 
     uint32_t borderColor = 0x0;
@@ -723,9 +738,14 @@ void TreeView::_drawContent(float elapsedTime)
 
     // Draw all nodes
     std::vector<std::shared_ptr<const AbstractItemModel::AbstractItem>> saved_selection = data.m_selection;
-    this->_drawNodeInTable(data.m_root, {}, hoveringBackgroundColor, hoveringBorderColor, selectionBackgroundColor,
-                           dropBackgroundColor, dropBorderColor, dropIndicatorThickness, cursorAtBeginTable.x,
-                           cursorAtBeginTable.y, headerHeight, blockMouse, elapsedTime);
+    {
+#if OMNIUI_HAS_NATIVE_TIMING_SCOPES
+        OVUI_DEVELOPMENT_TIME_SCOPE(rowsScope, "TreeView.draw_rows [ovui debug]");
+#endif
+        this->_drawNodeInTable(data.m_root, {}, hoveringBackgroundColor, hoveringBorderColor, selectionBackgroundColor,
+                              dropBackgroundColor, dropBorderColor, dropIndicatorThickness, cursorAtBeginTable.x,
+                              cursorAtBeginTable.y, headerHeight, blockMouse, elapsedTime);
+    }
     if (data.m_selection != saved_selection)
     {
         // OMPE-61075: node drawing and model update may happen in different threads but at same time.
@@ -798,7 +818,8 @@ void TreeView::_drawContent(float elapsedTime)
     // Measure last column desired width using visible nodes (first-level) and cache for next frame
     // Only when model just synchronized or content width considered dirty (to avoid per-frame work), and when within
     // a ScrollingFrame with horizontal scroll enabled
-    if ((!data.m_modelSynchronized || data.m_contentWidthDirty) && data.m_columnsCount >= 1)
+    if ((!data.m_modelSynchronized || data.m_contentWidthDirty || data.m_lastColumnRemeasureRequested)
+        && data.m_columnsCount >= 1)
     {
         const size_t lastCol = data.m_columnsCount - 1;
         // Only when last column isn't fixed Pixel
@@ -824,24 +845,42 @@ void TreeView::_drawContent(float elapsedTime)
             if (underScrollingFrame && horizOn)
             {
                 float measuredMinWidthPx = 0.0f;
-                // Measure from visible root children area using computed widgets if available
-                for (const auto& child : data.m_root->children)
+                // Recursively measure the last-column cell across all currently expanded nodes. Deep children
+                // only contribute when expanded (and therefore populated/drawn this frame) so the column grows
+                // to fit them instead of clipping the text until the user resizes the window.
+                const bool keepAlive = this->isKeepAlive();
+                std::function<void(const std::unique_ptr<Node>&)> measureSubtree =
+                    [&](const std::unique_ptr<Node>& node)
                 {
-                    if (!child->widgets.empty() && lastCol < child->widgets.size())
+                    for (const auto& child : node->children)
                     {
-                        auto& cell = child->widgets[lastCol];
-                        if (cell)
+                        if (keepAlive && !child->active)
                         {
-                            measuredMinWidthPx = std::max(measuredMinWidthPx, cell->getComputedWidth());
+                            continue;
+                        }
+                        if (lastCol < child->widgets.size())
+                        {
+                            auto& cell = child->widgets[lastCol];
+                            if (cell)
+                            {
+                                measuredMinWidthPx = std::max(measuredMinWidthPx, cell->getComputedWidth());
+                            }
+                        }
+                        if (this->_isExpanded(child.get()))
+                        {
+                            measureSubtree(child);
                         }
                     }
-                }
+                };
+                measureSubtree(data.m_root);
+
                 if (measuredMinWidthPx > 0.0f)
                 {
                     data.m_lastColumnMeasuredMinPx = measuredMinWidthPx;
                 }
             }
         }
+        data.m_lastColumnRemeasureRequested = false;
     }
 
     float dpiScale = this->getDpiScale();
@@ -1345,9 +1384,12 @@ void TreeView::_populateNodeWidget(TreeView::Node* node)
     }
 
     node->nodeHeight = maxHeight;
+    node->columnWidthsVersion = data.m_columnWidthsVersion;
     node->heightComputed = true;
     data.m_sumHeights += maxHeight;
     data.m_numHeights++;
+    // Lazily populated row cells can expose wider content after the initial width pass.
+    data.m_lastColumnRemeasureRequested = true;
     data.m_contentHeightDirty = true;
     this->forceHeightDirty(SizeDirtyReason::eSizeChanged);
 }
@@ -1477,6 +1519,23 @@ float TreeView::_drawNodeInTable(const std::unique_ptr<TreeView::Node>& node,
     }
 
     auto& data = _getData<TreeViewData>();
+
+    if (currentOffset <= data.m_relativeRectMax && data.m_relativeRectMin <= currentOffset + node->nodeHeight &&
+        node->widgetsPopulated && (node->columnWidthsVersion != data.m_columnWidthsVersion ||
+            std::any_of(node->widgets.begin(), node->widgets.end(),
+            [](const auto& widget) { return widget->isHeightDirty() != SizeDirtyReason::eNone ||
+                                           widget->isWidthDirty() != SizeDirtyReason::eNone; })))
+    {
+        node->widthComputed = false;
+        this->_setNodeComputedWidth(node);
+        node->heightComputed = false;
+        for (const auto& widget : node->widgets)
+            widget->forceHeightDirty(SizeDirtyReason::eChildDirty);
+        float offset = currentOffset;
+        this->_setNodeComputedHeight(node, offset);
+        data.m_contentHeightDirty = true;
+        this->forceHeightDirty(SizeDirtyReason::eChildDirty);
+    }
 
     // Lazy-population. Populate node with children and widgets if not populated.
     if (currentOffset <= data.m_relativeRectMax && data.m_relativeRectMin <= currentOffset + node->nodeHeight)
@@ -1843,7 +1902,7 @@ void TreeView::_setNodeComputedWidth(const std::unique_ptr<Node>& node)
         return;
     }
 
-    if (!node->widthComputed || data.m_contentWidthDirty)
+    if (!node->widthComputed || data.m_contentWidthDirty || node->columnWidthsVersion != data.m_columnWidthsVersion)
     {
         for (size_t i = 0, n = std::min(data.m_columnsCount, node->widgets.size()); i < n; ++i)
         {
@@ -1853,6 +1912,7 @@ void TreeView::_setNodeComputedWidth(const std::unique_ptr<Node>& node)
         }
 
         node->widthComputed = true;
+        node->columnWidthsVersion = data.m_columnWidthsVersion;
     }
 
     if (this->_isExpanded(node.get()))
@@ -1992,6 +2052,7 @@ float TreeView::_computeColumnWidths(float width)
 
     // Compute Pixels and Percents. They don't depend on the length of others so they can be computed right away.
     bool columnWidthChanged = false;
+    bool computedWidthsChanged = false;
     for (size_t i = 0; i < data.m_columnsCount; ++i)
     {
         const auto columnWidth = i < columnWidths.size() ? columnWidths[i] : Fraction(1);
@@ -2024,6 +2085,7 @@ float TreeView::_computeColumnWidths(float width)
         }
 
         computedWidth = std::max(computedWidth, minColumnWidth);
+        computedWidthsChanged |= data.m_columnComputedSizes[i] != computedWidth;
         data.m_columnComputedSizes[i] = computedWidth;
 
         lengthForFractions -= computedWidth;
@@ -2057,6 +2119,7 @@ float TreeView::_computeColumnWidths(float width)
             }
 
             computedWidth = std::max(computedWidth, minColumnWidth);
+            computedWidthsChanged |= data.m_columnComputedSizes[i] != computedWidth;
             data.m_columnComputedSizes[i] = computedWidth;
 
             lengthForFractions -= computedWidth;
@@ -2064,6 +2127,12 @@ float TreeView::_computeColumnWidths(float width)
 
             totalWidthComputed += computedWidth;
         }
+    }
+
+    if (computedWidthsChanged)
+    {
+        // Rows outside the visible region retain their old measurements until they are drawn again.
+        ++data.m_columnWidthsVersion;
     }
 
     if (columnWidthChanged)
@@ -2290,6 +2359,7 @@ void TreeView::_setExpanded(TreeView::Node* node, bool expanded, bool recursive,
 
     auto& data = _getData<TreeViewData>();
     data.m_contentHeightDirty = true;
+    data.m_lastColumnRemeasureRequested = true;
     this->forceWidthDirty(SizeDirtyReason::eSizeChanged);
     this->forceHeightDirty(SizeDirtyReason::eSizeChanged);
     this->forceRasterDirty(BakeDirtyReason::eContentChanged);
@@ -2485,6 +2555,9 @@ void TreeView::_dragDropTarget(TreeView::Node* node, TreeView::Node* parent) con
 
 std::vector<std::shared_ptr<Widget>> TreeView::_getChildren()
 {
+#if OMNIUI_HAS_NATIVE_TIMING_SCOPES
+    OVUI_DEVELOPMENT_TIME_SCOPE(inspectScope, "TreeView.inspect_children [ovui debug]");
+#endif
     // Populate header
     this->_populateHeader();
 

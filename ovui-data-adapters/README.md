@@ -70,8 +70,8 @@ ovui-data-adapters/
 ```
 
 **Why dash-form folder, underscore-form package?** The visible
-repository folder is `ovui-data-adapters/` (a project naming
-requirement). Python identifiers cannot contain dashes, so the import package
+repository folder is `ovui-data-adapters/` (a project naming requirement).
+Python identifiers cannot contain dashes, so the import package
 inside is `ovui_data_adapters/`. The distributions
 (`ovui-data-adapters-common`, `ovui-data-adapters-services`,
 `ovui-data-adapters-openusd`, and `ovui-data-adapters-ovstage`) share
@@ -118,7 +118,7 @@ scene owner and no OpenUSD layer in between:
    and author through OVStage's own APIs; accepted edits, undo, and redo
    commit new OVStage ordinals. Adapter authoring integrates with the
    application's undo manager.
-3. OVRTX attaches to OVStage in native BORROW mode, renders committed
+3. OVRTX attaches to OVStage in `AttachMode.BORROW`, renders committed
    ordinals, and handles outputs and picks. It receives no OVRTX data writes
    or replicated scene, and the provider never falls back to a substitute
    renderer (`OVUI_WIDGETS_REQUIRE_OVRTX=0` is not honored for `ovstage`).
@@ -130,6 +130,37 @@ scene owner and no OpenUSD layer in between:
    property and transform authoring, rendering, picking, and undo are
    supported natively.
 
+Native Kit renderer startup is stage-scale safe: type discovery copies only
+path/type/schema metadata, catalog and render-setting values use exact owner
+queries, and initial camera framing batches only fixed primitive dimensions,
+authored extents, and Fabric transforms. It never materializes the general
+all-property compatibility cache or reads Mesh point arrays for startup
+framing; a Mesh without a usable extent is omitted from that framing pass.
+
+Native consumers that share the provider-owned scene use a deliberately small
+public boundary:
+
+- `open_scene_from_file(..., population_domains=...)` can restrict initial
+  population to explicit OVStage domains. Omitting the argument preserves the
+  provider's normal population entry-point selection.
+- `OvstageScene.native_stage` returns the live native Stage only while the
+  scene is open. It is the exact mutable borrowed `Stage`, not a copy,
+  read-only facade, or backing-USD proxy. Direct native topology commits
+  (including raw create and delete operations) are supported: advance the
+  native floor after committing, then let the scheduled change stream poll or
+  call `OvstageChangeStream.poll()` explicitly before expecting the adapter or
+  Stage Tree to reflect the topology change. A recoverable scheduled-poll
+  failure preserves the delivered watermark and re-arms polling, so the next
+  scheduled poll retries the missed committed change. Value-only native writes
+  do not produce a topology `RESYNC`. A consumer that borrows it must release
+  its native borrower before scene shutdown.
+- `ovui_data_adapters.ovstage.OvstageRendererAdapter` is the public renderer
+  integration export. Its ordinary `load_stage()` / `shutdown()` lifecycle
+  retains the scene owner until OVRTX has detached.
+
+These seams expose no `pxr` object and do not restore the retired hybrid
+backing-USD bridge.
+
 Use the full Kit rendering build for the native libraries. The matching Kit
 `python.sh` is the canonical native adapter-test host; the runnable USD Viewer
 uses this checkout's standalone ovui build in a clean Python 3.12 environment
@@ -137,6 +168,77 @@ because Kit's extension `omni.ui` does not expose `ui.init`. Select the
 provider with `OVUI_DATA_ADAPTER_PROVIDER=ovstage`. The complete portable
 environment, build, run, and test commands are in the
 [Kit-integrated runtime guide](docs/kit-runtime.md).
+
+### Progressive native viewport quality
+
+`OvstageRendererAdapter(..., viewport_quality=0)` now defaults to progressive
+presentation on its generated private viewport RenderProduct. It authors
+`custom int omni:rtx:quality = 0` before attachment, so resets (including initial
+selection-outline activation and resizing) do not request synchronous initial
+quality accumulation. Subsequent frames still refine toward the existing
+sampling target; total samples, samples per iteration, minimum samples, Eco
+mode, and selection/reset behavior are unchanged. This is a private viewport
+default, not a global OVRTX setting or a change to the OpenUSD provider.
+
+For a capture that needs the native full initial-quality budget before returning
+its first frame, use `OvstageRendererAdapter(..., viewport_quality=100)`. The same
+keyword is available on `create_renderer_adapter()` and the OVStage provider
+session's `create_renderer()`. Values must be plain Python `int` values from
+0 through 100 (not `bool` or integer subclasses). Intermediate values are passed
+through to OVRTX; their native behavior is not separately qualified here.
+Headless interactive applications keep the progressive default; headless alone
+does not imply a one-shot capture.
+
+Only the generated viewport product receives this initial opinion, including
+when its private root is relocated to avoid a scene collision. Authored render
+products retain their own quality. Switching products, changing render modes,
+and resizing do not reapply this default or overwrite later explicit setting
+edits. Other products requested in the same render step may still require a
+quality wait. This removes the viewport's initial-quality wait, not all possible
+GPU, shader, allocation, or readback stalls; `100` likewise does not promise
+identical pixels across runtimes.
+
+The generated product's quality descriptor advertises this adapter instance's
+configured `viewport_quality` as its default. Resetting that render setting
+restores the configured value through the existing undoable authoring path,
+rather than deleting the column and falling back to the renderer's native
+quality of `100`. Returning to the configured value is reported as unmodified;
+later edits remain visible as overrides. This applies only to the exact private
+product, including relocated roots. Quality on authored products and all other
+settings retain their existing reset semantics. This setting reset is distinct
+from a renderer reset or the application's simulation Reset.
+
+### Selection-outline activation reset
+
+The activation reset below still happens; progressive viewport quality removes
+only the synchronous quality warm-up that used to follow it.
+
+On native OVRTX 0.5 or newer, the OVStage adapter retains one activation reset
+after the first successfully applied non-empty selection. `load_stage()` arms
+this activation without directly resetting the renderer. Once the outline
+pass is active, completed dedicated membership writes update the outline on
+the next `step` / `step_with_stage` without another membership reset, including
+replacement, clear, and reselect. This preserves render history for subsequent
+selection changes; the first selection can still incur renderer-reset latency.
+Resolution-change resets remain unchanged, and resizing while no outline
+membership is applied re-arms activation for the next non-empty selection,
+which can incur that latency again. The membership-reset gate uses the loaded
+native library's `Renderer.version`, not the Python package version. Older or
+unknown native versions and legacy transports, including reserved-attribute
+writes, retain their existing compatibility reset behavior. Failed membership
+writes remain retryable. Native pixel validation must check first selection
+in a fresh cube/sphere scene before any camera movement, then replacement,
+clear/reselect, and clear → resize → select. Also cover select A → pan → wheel
+zoom → select B, with only B outlined afterward; callback timings alone do
+not establish outline visibility.
+
+The native-only widget regression
+`ovui-widgets/tests/test_native_selection_outline_integration.py` launches a
+fresh full-HD viewer, waits idle, and checks first selection, clear, and
+reselection pixels with no camera motion. Run it from the monorepo root with
+`python -m pytest -c ovui-widgets/pyproject.toml ovui-widgets/tests/test_native_selection_outline_integration.py -q`
+on a configured native Vulkan/OVStage/OVRTX host. Hosted adapter CI excludes
+these native runtime markers; it does not provide this pixel coverage.
 
 ## Services package boundary
 
@@ -167,8 +269,8 @@ Intentionally not moved in this migration:
 
 - viewport camera/render behavior: left in `ovui-widgets` because the condition
   gate for a neutral clock/renderer protocol was not satisfied
-- livestream/control-plane behavior: held by owner decision and the
-  hard no-livestream-edit rule; `MessageDispatcher` was not moved
+- livestream/control-plane behavior: held by the owner's decision
+  to preserve the livestream implementation; `MessageDispatcher` was not moved
 - snap/manipulator policy: remains in `ovui-widgets` as interaction/tool policy
 - widgets, delegates, view models, app event loop, status display, OS dialogs,
   native browser/clipboard integration, ovstream transport, renderer payloads,

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from conan import ConanFile
 
 
@@ -5,9 +8,9 @@ class OvuiConan(ConanFile):
     name = "ovui"
     version = "0.1.1"
     description = "GPU-accelerated Python UI toolkit"
-    license = "LicenseRef-NVIDIA-Proprietary"
-    url = "https://github.com/NVIDIA-Omniverse/ovui"
-    homepage = "https://github.com/NVIDIA-Omniverse/ovui"
+    license = "Apache-2.0"
+    url = "${OVUI_PROJECT_URL}"
+    homepage = "${OVUI_PROJECT_URL}"
     topics = ("ui", "gpu", "vulkan", "opengl", "imgui")
 
     # C++ dependencies sourced via CMake FetchContent.

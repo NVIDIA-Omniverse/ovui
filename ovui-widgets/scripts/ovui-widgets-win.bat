@@ -1,4 +1,6 @@
 @echo off
+REM SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+REM SPDX-License-Identifier: Apache-2.0
 REM Windows launcher for ovui-widgets. Activates _venv312, sets USD env vars,
 REM and invokes the Python bootstrap that registers USD DLL directories.
 REM Pass through all CLI args (e.g. a .usda path).
