@@ -4,7 +4,7 @@
 """Verifies the real ``icon_caches`` registry as populated by
 import-time side effects.
 
-Issue #35, Step 3 + Step 4b.
+Regression, Step 3 + Step 4b.
 
 Unlike :mod:`tests.test_icon_caches`, this file does NOT define an
 autouse fixture that monkeypatches ``_callbacks`` — the whole point is

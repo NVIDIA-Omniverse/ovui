@@ -9,7 +9,7 @@ Runs headlessly — no visible window needed.
 from __future__ import annotations
 
 import pytest
-from ovui_data_adapters.common import BadgeFlags, ItemFlags
+from ovui_data_adapters.common import BadgeFlags, ItemFlags, VisibilityState
 
 from ovui_widgets.common.testing.mock_stage import MockStageAdapter
 from ovui_widgets.stage.hierarchy_model import HierarchyItem, HierarchyModel
@@ -430,7 +430,7 @@ class TestColumnTypeValues:
 
 class TestColumnVisibilityValues:
     # Column 2 now returns VisibilityValueModel: the checkbox
-    # is True when the item is *invisible* (eye closed).
+    # is True when the item itself is *invisible* (eye closed).
     def test_visible_item_reads_false(self, model):
         root = model.get_item_children(None)[0]
         vm = model.get_item_value_model(root, 2)
@@ -444,15 +444,17 @@ class TestColumnVisibilityValues:
         vm = model.get_item_value_model(root, 2)
         assert vm.get_value_as_bool() is True
 
-    def test_inherited_invisible_reads_true(self):
+    def test_inherited_invisible_reads_false(self):
         adapter = MockStageAdapter()
         adapter._root.visible = False
         model = HierarchyModel(adapter)
         root = model.get_item_children(None)[0]
         children = model.get_item_children(root)
-        # Children inherit invisible state from root → checkbox checked (hidden).
+        # Regression: children hidden only through root are not hidden
+        # themselves → checkbox unchecked (open eye), state is inherited.
         vm = model.get_item_value_model(children[0], 2)
-        assert vm.get_value_as_bool() is True
+        assert vm.get_value_as_bool() is False
+        assert vm.get_visibility_state() is VisibilityState.INHERITED_INVISIBLE
 
     def test_visibility_model_is_cached(self, model):
         root = model.get_item_children(None)[0]
@@ -832,3 +834,48 @@ class TestMockStageAdapterSetDefault:
         adapter.set_badge_flags("/World/Camera", BadgeFlags.REFERENCE)
         camera = adapter.get_item_at_path("/World/Camera")
         assert adapter.get_badge_flags(camera) == BadgeFlags.REFERENCE
+
+
+class TestPropertyValueEdits:
+    """A value edit, such as each edit of a slider drag, repaints only its row.
+
+    It rebuilt the whole tree before. With a filter, the rebuild walked the
+    whole stage at each edit (about 150 ms on a scene of 41,000 prims).
+    """
+
+    def _filtered_dome(self, model):
+        model.set_filter("DomeLight")
+        root = model.get_item_children(None)[0]
+        (lights,) = model.get_item_children(root)
+        (dome,) = model.get_item_children(lights)
+        return root, dome
+
+    def test_a_value_edit_with_a_filter_repaints_its_row_and_walks_nothing(self, model, adapter):
+        root, dome = self._filtered_dome(model)
+        dome._refresh_flags(adapter)
+        walked = []
+        get_children = adapter.get_children
+        adapter.get_children = lambda item: walked.append(item) or get_children(item)  # type: ignore[assignment]
+        notified = []
+        sub = model.subscribe_item_changed_fn(lambda m, i: notified.append(i))  # noqa: F841
+        adapter.fire_change(["/World/Lights/DomeLight.inputs:intensity"])
+        assert notified == [dome]
+        assert dome._flags_dirty is True
+        assert root._children is not None
+        assert model.get_item_children(root)[0].adapter_item.name == "Lights"
+        assert walked == []
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/World/Lights/DomeLight",
+            "/World/Lights/DomeLight.visibility",
+            "/World/Lights/DomeLight.material:binding[/World/Looks/Mat]",
+        ],
+    )
+    def test_prim_visibility_and_target_changes_still_rebuild(self, model, adapter, path):
+        root, _dome = self._filtered_dome(model)
+        notified = []
+        sub = model.subscribe_item_changed_fn(lambda m, i: notified.append(i))  # noqa: F841
+        adapter.fire_change([path])
+        assert None in notified

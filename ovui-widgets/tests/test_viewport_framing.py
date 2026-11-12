@@ -28,8 +28,6 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("pxr")
-
 from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
 from pxr import Sdf, Usd, UsdGeom
 

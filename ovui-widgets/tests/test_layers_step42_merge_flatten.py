@@ -44,10 +44,18 @@ Coverage map:
   last-sibling rows).
 - :class:`TestCanonicalOrder` — destructive group lands at the tail
   (Remove → Merge Down → Flatten Sublayers).
+- :class:`TestUsdMergeFlattenSharedRootPrim` — with the USD adapter,
+  Merge Down and Flatten keep the composed stage when the layers share
+  the root prim ``/World``.
+- :class:`TestUsdMergeFlattenSharedRootCases` — more shared-root cases
+  (metadata, relationships, inactive prims, variants that are not
+  selected, value and specifier rules, root prim order, a property of
+  the other kind) and no new layer for a repeated merge.
 """
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -85,6 +93,41 @@ class _App:
     def __init__(self) -> None:
         self.undo_manager = UndoManager()
         self.selection_bus = SelectionBus()
+
+
+class _TwoArgumentAdapter(MockLayerStackAdapter):
+    """A layer adapter with the two-argument ``transfer_layer_content``."""
+
+    def transfer_layer_content(self, src_identifier, dst_identifier):
+        super().transfer_layer_content(src_identifier, dst_identifier)
+
+
+class _UnreadableSignatureTransfer:
+    """A two-argument transfer whose signature cannot be read.
+
+    Like a native pybind11 or Boost.Python function set on an adapter
+    class, it is not bound to the adapter, and ``inspect.signature``
+    raises ``error`` for it.
+    """
+
+    def __init__(self, adapter: MockLayerStackAdapter, error: Exception) -> None:
+        self._adapter = adapter
+        self._error = error
+
+    @property
+    def __signature__(self):
+        raise self._error
+
+    def __call__(self, src_identifier, dst_identifier):
+        MockLayerStackAdapter.transfer_layer_content(
+            self._adapter, src_identifier, dst_identifier
+        )
+
+
+def _adapter_with_unreadable_transfer(error: Exception) -> MockLayerStackAdapter:
+    ad = MockLayerStackAdapter(include_session=True)
+    ad.transfer_layer_content = _UnreadableSignatureTransfer(ad, error)
+    return ad
 
 
 @pytest.fixture
@@ -435,6 +478,96 @@ class TestFlattenSublayersCommand:
             adapter.get_sublayer_identifiers(adapter.get_root_layer())
             == []
         )
+
+    def test_parent_spec_wins_over_sublayer_specs(self, adapter, app) -> None:
+        # The parent is stronger than its sublayers, and the first
+        # sublayer is stronger than the next one.
+        adapter.set_prim_spec(ROOT_LAYER_IDENTIFIER, "/Shared", "from-root")
+        adapter.set_prim_spec("./top.usda", "/Shared", "from-top")
+        adapter.set_prim_spec("./top.usda", "/TopAndMiddle", "from-top")
+        adapter.set_prim_spec("./middle.usda", "/TopAndMiddle", "from-middle")
+        cmd = FlattenSublayersCommand(
+            adapter, app.selection_bus, ROOT_LAYER_IDENTIFIER
+        )
+        app.undo_manager.push(cmd)
+        root_specs = adapter._layers[ROOT_LAYER_IDENTIFIER].prim_specs
+        assert root_specs["/Shared"] == "from-root"
+        assert root_specs["/TopAndMiddle"] == "from-top"
+
+    @pytest.mark.parametrize(
+        "make_adapter, reason",
+        [
+            pytest.param(
+                lambda: _TwoArgumentAdapter(include_session=True),
+                "does not take dst_is_stronger",
+                id="python_method",
+            ),
+            pytest.param(
+                lambda: _adapter_with_unreadable_transfer(
+                    ValueError("no signature found for builtin")
+                ),
+                "has no readable signature "
+                "(ValueError: no signature found for builtin)",
+                id="no_signature",
+            ),
+            pytest.param(
+                lambda: _adapter_with_unreadable_transfer(
+                    TypeError("not supported by signature")
+                ),
+                "has no readable signature "
+                "(TypeError: not supported by signature)",
+                id="unsupported_signature",
+            ),
+        ],
+    )
+    def test_two_argument_adapter_keeps_the_flatten_of_main(
+        self, app, caplog, make_adapter, reason
+    ) -> None:
+        # An adapter whose transfer_layer_content takes only the two
+        # identifiers (the source always wins) must still flatten, also
+        # when its signature cannot be read, as for a native function.
+        # It keeps the merge of main: weakest sublayer first, so the
+        # first sublayer wins, and a warning names the adapter and why.
+        ad = make_adapter()
+        ad.add_sublayer(ROOT_LAYER_IDENTIFIER, "./top.usda")
+        ad.add_sublayer(ROOT_LAYER_IDENTIFIER, "./middle.usda")
+        ad.set_prim_spec("./top.usda", "/TopAndMiddle", "from-top")
+        ad.set_prim_spec("./middle.usda", "/TopAndMiddle", "from-middle")
+        ad.set_prim_spec("./middle.usda", "/PrimFromMiddle", "from-middle")
+        caplog.set_level(
+            logging.WARNING,
+            logger="ovui_data_adapters.services.layers.commands.merge_flatten_commands",
+        )
+        app.undo_manager.push(
+            FlattenSublayersCommand(
+                ad, app.selection_bus, ROOT_LAYER_IDENTIFIER
+            )
+        )
+        assert ad.get_sublayer_identifiers(ad.get_root_layer()) == []
+        assert (
+            ad.export_prim_spec(ROOT_LAYER_IDENTIFIER, "/TopAndMiddle")
+            == "from-top"
+        )
+        assert (
+            ad.export_prim_spec(ROOT_LAYER_IDENTIFIER, "/PrimFromMiddle")
+            == "from-middle"
+        )
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        ]
+        assert warnings == [
+            f"FlattenSublayersCommand: {type(ad).__name__}.transfer_layer_content "
+            f"{reason}; flattening {ROOT_LAYER_IDENTIFIER!r} with the "
+            "two-argument merge (weakest sublayer first, each sublayer "
+            "stronger than the parent)"
+        ]
+        app.undo_manager.undo()
+        assert ad.get_sublayer_identifiers(ad.get_root_layer()) == [
+            "./top.usda",
+            "./middle.usda",
+        ]
 
     def test_do_is_noop_on_empty_parent(self, adapter, app) -> None:
         # Create an empty sublayer and flatten it — nothing to merge.
@@ -792,14 +925,9 @@ class TestDialogHelpers:
 # wiring or the ``ExportToString`` / ``ImportFromString`` round-trip
 # gets caught before it breaks a real merge.
 
-try:
-    from pxr import Sdf, Usd
-    _HAS_USD = True
-except ImportError:
-    _HAS_USD = False
+from pxr import Sdf, Usd
 
 
-@pytest.mark.skipif(not _HAS_USD, reason="pxr (OpenUSD) not available")
 class TestUsdAdapterMergeFlatten:
     def _build(self, tmp_path):
         from ovui_data_adapters.openusd.layer_stack_adapter import UsdLayerStackAdapter
@@ -866,3 +994,289 @@ class TestUsdAdapterMergeFlatten:
         assert len(siblings) == 2
         assert siblings[0] == top_id
         assert siblings[1] == middle_id
+
+
+class TestUsdMergeFlattenSharedRootPrim:
+    """Merge Down and Flatten keep the composed stage when layers share ``/World``.
+
+    Every layer has its prims under the same root prim, as in a usual
+    scene. The commands must merge the ``/World`` specs, not replace
+    them, and keep the strength order of USD: the parent over its
+    sublayers, and the first sublayer over the next one.
+    """
+
+    def _build(self, tmp_path):
+        from ovui_data_adapters.openusd.layer_stack_adapter import UsdLayerStackAdapter
+
+        files = {
+            "root.usda": (
+                ["A.usda"],
+                'def Xform "World"\n{\n    def "FromRoot"\n    {\n    }\n}\n',
+            ),
+            "A.usda": (
+                ["sub/A1.usda", "sub/A2.usda"],
+                'over "World"\n{\n    def "FromA"\n    {\n    }\n'
+                '    over "Shared"\n    {\n        double v = 1\n    }\n}\n',
+            ),
+            "sub/A1.usda": (
+                [],
+                'over "World"\n{\n    def "FromA1"\n    {\n    }\n'
+                '    over "Shared"\n    {\n        double v = 2\n'
+                "        double w = 2\n    }\n}\n",
+            ),
+            "sub/A2.usda": (
+                [],
+                'over "World"\n{\n    def "FromA2"\n    {\n    }\n'
+                '    def "Shared"\n    {\n        double v = 3\n'
+                "        double w = 3\n        double x = 3\n    }\n}\n",
+            ),
+        }
+        for name, (sublayers, body) in files.items():
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            subs = ", ".join(f"@./{p}@" for p in sublayers)
+            path.write_text(f"#usda 1.0\n(\n    subLayers = [{subs}]\n)\n\n{body}")
+
+        stage = Usd.Stage.Open(str(tmp_path / "root.usda"))
+        adapter = UsdLayerStackAdapter(stage, UndoManager())
+        a_id = Sdf.Layer.Find(str(tmp_path / "A.usda")).identifier
+        # Prime the cache for every sublayer so find_layer resolves.
+        adapter.get_sublayer_identifiers(adapter.get_root_layer())
+        adapter.get_sublayer_identifiers(adapter.find_layer(a_id))
+        return stage, adapter, a_id
+
+    def test_flatten_keeps_the_composed_stage(self, tmp_path) -> None:
+        stage, adapter, a_id = self._build(tmp_path)
+        before = stage.Flatten().ExportToString()
+        app = _App()
+        app.undo_manager.push(
+            FlattenSublayersCommand(adapter, app.selection_bus, a_id)
+        )
+
+        assert adapter.get_sublayer_identifiers(adapter.find_layer(a_id)) == []
+        assert stage.Flatten().ExportToString() == before
+
+    def test_merge_down_keeps_the_composed_stage(self, tmp_path) -> None:
+        stage, adapter, a_id = self._build(tmp_path)
+        before = stage.Flatten().ExportToString()
+        app = _App()
+        app.undo_manager.push(
+            MergeDownCommand(adapter, app.selection_bus, a_id, 0)
+        )
+
+        siblings = adapter.get_sublayer_identifiers(adapter.find_layer(a_id))
+        assert [s.rsplit("/", 1)[-1] for s in siblings] == ["A2.usda"]
+        assert stage.Flatten().ExportToString() == before
+
+
+class TestUsdMergeFlattenSharedRootCases:
+    """More cases where the layers share ``/World``: the composed stage stays the same.
+
+    The stage is ``root.usda`` > ``parent.usda`` > [``strong.usda``,
+    ``weak.usda``]. Flatten Sublayers runs on ``parent.usda``; Merge Down
+    merges ``strong.usda`` into ``weak.usda``. The composed stage is
+    compared before and after the command, also with each variant
+    selected, so the variants that are not selected count too.
+    """
+
+    @staticmethod
+    def _composed(stage):
+        # The flattened text does not always show the child order, so the
+        # composed order of all prims is compared too.
+        result = {
+            "": stage.Flatten().ExportToString(),
+            "order": [str(prim.GetPath()) for prim in stage.TraverseAll()],
+        }
+        variant_sets = [
+            (prim.GetPath(), name, prim.GetVariantSet(name).GetVariantNames())
+            for prim in stage.Traverse()
+            for name in prim.GetVariantSets().GetNames()
+        ]
+        for path, name, variants in variant_sets:
+            for variant in variants:
+                variant_set = stage.GetPrimAtPath(path).GetVariantSet(name)
+                with Usd.EditContext(stage, stage.GetSessionLayer()):
+                    variant_set.SetVariantSelection(variant)
+                result[f"{path}{{{name}={variant}}}"] = stage.Flatten().ExportToString()
+                with Usd.EditContext(stage, stage.GetSessionLayer()):
+                    variant_set.ClearVariantSelection()
+        return result
+
+    def _open(self, tmp_path, strong, weak, parent='def Xform "World"\n{\n}\n'):
+        from ovui_data_adapters.openusd.layer_stack_adapter import UsdLayerStackAdapter
+
+        texts = {
+            "strong.usda": strong,
+            "weak.usda": weak,
+            "ref.usda": 'def "R"\n{\n    def "FromRef"\n    {\n    }\n}\n',
+            "parent.usda": "(\n    subLayers = [@./strong.usda@, @./weak.usda@]\n)\n\n" + parent,
+            "root.usda": "(\n    subLayers = [@./parent.usda@]\n)\n",
+        }
+        for name, text in texts.items():
+            (tmp_path / name).write_text("#usda 1.0\n" + text)
+        stage = Usd.Stage.Open(str(tmp_path / "root.usda"))
+        adapter = UsdLayerStackAdapter(stage, UndoManager())
+        parent_id = Sdf.Layer.Find(str(tmp_path / "parent.usda")).identifier
+        adapter.get_sublayer_identifiers(adapter.get_root_layer())
+        adapter.get_sublayer_identifiers(adapter.find_layer(parent_id))
+        return stage, adapter, parent_id
+
+    def _run(self, stage, adapter, parent_id, command):
+        app = _App()
+        if command == "flatten":
+            cmd = FlattenSublayersCommand(adapter, app.selection_bus, parent_id)
+        else:
+            cmd = MergeDownCommand(adapter, app.selection_bus, parent_id, 0)
+        app.undo_manager.push(cmd)
+        remaining = adapter.get_sublayer_identifiers(adapter.find_layer(parent_id))
+        assert len(remaining) == (0 if command == "flatten" else 1)
+
+    def _assert_keeps_composition(self, tmp_path, command, strong, weak, **kwargs):
+        stage, adapter, parent_id = self._open(tmp_path, strong, weak, **kwargs)
+        before = self._composed(stage)
+        self._run(stage, adapter, parent_id, command)
+        assert self._composed(stage) == before
+
+    @pytest.mark.parametrize("command", ["flatten", "merge_down"])
+    def test_metadata_relationships_and_inactive_prims(self, tmp_path, command) -> None:
+        strong = (
+            'over "World" (\n'
+            "    customData = {\n        float f = 1.5\n"
+            '        dictionary d = {\n            token t = "strong"\n        }\n    }\n'
+            '    kind = "assembly"\n    prepend apiSchemas = ["MaterialBindingAPI"]\n'
+            "    prepend references = @./ref.usda@</R>\n    prepend inherits = </ClassA>\n)\n{\n"
+            "    prepend rel material:binding = </World/LookS>\n    rel onlyStrong = </World/A>\n"
+            "    float out\n    prepend float out.connect = </World/Src.a>\n"
+            '    reorder nameChildren = ["Off", "Lamp"]\n'
+            '    over "Lamp" (\n        active = true\n    )\n    {\n    }\n}\n'
+        )
+        weak = (
+            'over "World" (\n'
+            "    customData = {\n        int64 i = 3\n"
+            '        dictionary d = {\n            token t = "weak"\n            string u = "weak"\n        }\n    }\n'
+            '    kind = "component"\n    append apiSchemas = ["CollectionAPI:c"]\n'
+            "    delete inherits = </ClassB>\n    prepend specializes = </SpecW>\n)\n{\n"
+            "    append rel material:binding = </World/LookW>\n    rel onlyWeak = [</World/B>, </World/C>]\n"
+            "    append float out.connect = </World/Src.b>\n"
+            '    reorder nameChildren = ["Hidden", "Lamp"]\n'
+            '    def "Lamp" (\n        active = false\n    )\n    {\n        def "Bulb"\n        {\n        }\n    }\n'
+            '    def "Off" (\n        active = false\n    )\n    {\n    }\n'
+            '    def "Hidden"\n    {\n    }\n}\n'
+        )
+        stage, adapter, parent_id = self._open(tmp_path, strong, weak)
+        before = self._composed(stage)
+        children = [prim.GetName() for prim in stage.GetPrimAtPath("/World").GetAllChildren()]
+        assert children == ["FromRef", "Hidden", "Off", "Lamp"]
+        self._run(stage, adapter, parent_id, command)
+        assert self._composed(stage) == before
+
+    @pytest.mark.parametrize("command", ["flatten", "merge_down"])
+    def test_variants_that_are_not_selected(self, tmp_path, command) -> None:
+        strong = (
+            'over "World" (\n    variants = {\n        string look = "red"\n    }\n'
+            '    prepend variantSets = "look"\n)\n{\n    variantSet "look" = {\n'
+            '        "red" {\n            double tone = 1\n'
+            '            def Cube "RedStrong"\n            {\n            }\n        }\n'
+            '        "blue" {\n            def Cube "BlueStrong"\n            {\n            }\n        }\n    }\n}\n'
+        )
+        weak = (
+            'over "World" (\n    variants = {\n        string look = "green"\n        string size = "big"\n    }\n'
+            '    prepend variantSets = ["look", "size"]\n)\n{\n    variantSet "look" = {\n'
+            '        "red" {\n            double tone = 2\n'
+            '            def Cube "RedWeak"\n            {\n            }\n        }\n'
+            '        "green" {\n            def Cube "GreenWeak"\n            {\n            }\n        }\n    }\n'
+            '    variantSet "size" = {\n        "big" {\n            double scale = 2\n        }\n'
+            '        "small" {\n            double scale = 0.5\n        }\n    }\n}\n'
+        )
+        self._assert_keeps_composition(tmp_path, command, strong, weak)
+
+    @pytest.mark.parametrize("command", ["flatten", "merge_down"])
+    def test_value_type_and_specifier_rules(self, tmp_path, command) -> None:
+        # Where both layers have an attribute, the strongest layer with a
+        # value (default, time samples or spline) gives the value; an
+        # ``over`` and an empty type name are no opinion.
+        block = "    double block = AnimationBlock\n" if hasattr(Sdf, "AnimationBlock") else ""
+        strong = (
+            'over "World"\n{\n    double defaultOverSamples = 1\n'
+            "    double samplesBoth.timeSamples = {\n        1: 10,\n    }\n"
+            '    double noValue (\n        doc = "no value here"\n    )\n' + block
+            + '    class "Klass"\n    {\n    }\n    over "Typed"\n    {\n    }\n}\n'
+        )
+        weak = (
+            'over "World"\n{\n    double defaultOverSamples.timeSamples = {\n        5: 50,\n    }\n'
+            "    double samplesBoth.timeSamples = {\n        3: 30,\n    }\n"
+            "    double noValue.timeSamples = {\n        7: 70,\n    }\n"
+            "    double block = 9\n    double block.timeSamples = {\n        1: 1,\n    }\n"
+            '    def Scope "Klass"\n    {\n    }\n    def Xform "Typed"\n    {\n    }\n}\n'
+        )
+        stage, adapter, parent_id = self._open(tmp_path, strong, weak)
+        # An empty type name, as the Sdf API can author it, is no opinion.
+        Sdf.Layer.Find(str(tmp_path / "strong.usda")).GetPrimAtPath("/World/Typed").typeName = ""
+        before = self._composed(stage)
+        assert stage.GetPrimAtPath("/World/Typed").GetTypeName() == "Xform"
+        self._run(stage, adapter, parent_id, command)
+        assert self._composed(stage) == before
+
+    def test_flatten_keeps_the_order_of_the_root_prims(self, tmp_path) -> None:
+        stage, adapter, parent_id = self._open(
+            tmp_path,
+            'over "World"\n{\n}\ndef "StrongRoot"\n{\n}\n',
+            'def "WeakFirst"\n{\n}\nover "World"\n{\n}\ndef "WeakRoot"\n{\n}\n',
+            parent='def Xform "World"\n{\n}\ndef "ParentRoot"\n{\n}\n',
+        )
+        before = [prim.GetName() for prim in stage.GetPseudoRoot().GetChildren()]
+        assert before == ["WeakFirst", "World", "WeakRoot", "StrongRoot", "ParentRoot"]
+        self._run(stage, adapter, parent_id, "flatten")
+        assert [prim.GetName() for prim in stage.GetPseudoRoot().GetChildren()] == before
+
+    @pytest.mark.parametrize("command", ["flatten", "merge_down"])
+    def test_property_of_the_other_kind(self, tmp_path, command) -> None:
+        # The same property name is an attribute in one layer and a
+        # relationship in the other: the stronger kind is kept, and the
+        # merged layer can be read again (as after Save All and a reopen).
+        stage, adapter, parent_id = self._open(
+            tmp_path,
+            'over "World"\n{\n    double foo = 1\n    rel bar = </World>\n}\n',
+            'over "World"\n{\n    rel foo = </World>\n    double bar = 2\n}\n',
+        )
+        self._run(stage, adapter, parent_id, command)
+        world = stage.GetPrimAtPath("/World")
+        assert world.GetAttribute("foo").Get() == 1
+        assert world.GetRelationship("bar").GetTargets() == [Sdf.Path("/World")]
+        merged = adapter.get_sublayer_identifiers(adapter.find_layer(parent_id))
+        merged_id = merged[0] if merged else parent_id
+        reread = Sdf.Layer.CreateAnonymous(".usda")
+        assert reread.ImportFromString(Sdf.Layer.Find(merged_id).ExportToString())
+        assert isinstance(reread.GetPropertyAtPath("/World.foo"), Sdf.AttributeSpec)
+        assert isinstance(reread.GetPropertyAtPath("/World.bar"), Sdf.RelationshipSpec)
+
+    def test_repeated_merge_makes_no_new_layer(self, tmp_path) -> None:
+        # OpenUSD keeps memory for each spec of a layer that it releases,
+        # so a merge must reuse its working layers: after the first merge,
+        # a merge has no layer alive that was not alive before it.
+        from pxr import Tf
+
+        stage, adapter, parent_id = self._open(
+            tmp_path,
+            'over "World"\n{\n    def "FromStrong"\n    {\n    }\n}\n',
+            'over "World"\n{\n    def "FromWeak"\n    {\n    }\n}\n',
+        )
+        strong_id, weak_id = adapter.get_sublayer_identifiers(adapter.find_layer(parent_id))
+        adapter.transfer_layer_content(strong_id, weak_id)
+        loaded = len(Sdf.Layer.GetLoadedLayers())
+        seen = []
+        key = Tf.Notice.RegisterGlobally(
+            Sdf.Notice.LayersDidChangeSentPerLayer,
+            lambda notice, sender: seen.append(len(Sdf.Layer.GetLoadedLayers())),
+        )
+        try:
+            for index in range(3):
+                # A new child each time, so that each merge changes the
+                # destination and a notice comes while the merge runs.
+                Sdf.CreatePrimInLayer(Sdf.Layer.Find(strong_id), f"/World/New{index}")
+                adapter.transfer_layer_content(strong_id, weak_id)
+        finally:
+            key.Revoke()
+        assert Sdf.Layer.Find(weak_id).GetPrimAtPath("/World/New2") is not None
+        assert seen
+        assert max(seen) == loaded

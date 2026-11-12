@@ -596,6 +596,90 @@ def _property_ui_snapshot(app: Any) -> dict[str, Any]:
     }
 
 
+def _window_snapshot(window: Any) -> dict[str, Any] | None:
+    """Return whether a ``ui.Window`` is docked, and its screen rectangle.
+
+    The rectangle includes the title bar (floating) or the tab bar (docked).
+    """
+    if window is None:
+        return None
+    try:
+        return {
+            "docked": bool(getattr(window, "docked", False)),
+            "rect": {
+                "x": float(getattr(window, "position_x", 0.0) or 0.0),
+                "y": float(getattr(window, "position_y", 0.0) or 0.0),
+                "width": float(getattr(window, "width", 0.0) or 0.0),
+                "height": float(getattr(window, "height", 0.0) or 0.0),
+            },
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _content_ui_snapshot(app: Any) -> dict[str, Any]:
+    """Return the Content Browser path bar state and real input geometry."""
+
+    window = getattr(app, "_content_window", None)
+    browser_bar = getattr(getattr(window, "_widget", None), "_browser_bar", None)
+    path_field = getattr(browser_bar, "_path_field", None)
+    if path_field is None:
+        return {"available": False}
+    from ovui_widgets.content.widget.path_field import MODE_EDIT
+
+    edit_field = getattr(path_field, "_edit_field", None)
+    edit_model = getattr(edit_field, "model", None)
+    editing = getattr(path_field, "_mode", None) == MODE_EDIT
+    suggestions_window = getattr(path_field, "_autocomplete_window", None)
+    suggestions_shown = bool(getattr(suggestions_window, "visible", False))
+    breadcrumbs = []
+    for label in list(getattr(path_field, "_breadcrumb_labels", ()) or ())[
+        :_MAX_SEQUENCE_ITEMS
+    ]:
+        rect = _widget_rect(label)
+        breadcrumbs.append(
+            {
+                "text": str(getattr(label, "text", "") or ""),
+                "rect": rect,
+                "point": _rect_point(rect),
+            }
+        )
+    return {
+        "available": True,
+        "window": _window_snapshot(getattr(window, "_window", None)),
+        "path": str(getattr(path_field, "path", "") or ""),
+        "path_bar_rect": _widget_rect(getattr(path_field, "_border_rect", None)),
+        "editing": editing,
+        "edit_text": (
+            str(edit_model.get_value_as_string())
+            if editing and edit_model is not None
+            else ""
+        ),
+        "breadcrumbs": breadcrumbs,
+        "suggestions": (
+            [str(name) for name in getattr(path_field, "_autocomplete_matches", ())]
+            if editing and suggestions_shown
+            else []
+        ),
+        "suggestion_selected": (
+            int(getattr(path_field, "_autocomplete_selected", -1))
+            if editing and suggestions_shown
+            else -1
+        ),
+        "suggestion_rows": [
+            {"rect": rect, "point": _rect_point(rect)}
+            for rect in (
+                _widget_rect(row)
+                for row in list(getattr(path_field, "_suggestion_rows", ()) or ())[
+                    :_MAX_SEQUENCE_ITEMS
+                ]
+            )
+        ]
+        if editing and suggestions_shown
+        else [],
+    }
+
+
 def _adapter_hierarchy_snapshot(adapter: Any) -> dict[str, Any]:
     if adapter is None:
         return {"available": False, "paths": [], "prims": {}}
@@ -2352,6 +2436,20 @@ def _renderer_snapshot(app: Any, scene: Any) -> dict[str, Any]:
     }
 
 
+def _camera_orbit_snapshot(camera: Any) -> dict[str, Any] | None:
+    """Return the viewport camera's orbit state (F, H and navigation change it)."""
+
+    state = getattr(camera, "state", None)
+    if state is None:
+        return None
+    return {
+        "target": [float(value) for value in state.target],
+        "distance": float(state.distance),
+        "azimuth": float(state.azimuth),
+        "elevation": float(state.elevation),
+    }
+
+
 def _viewport_snapshot(
     app: Any,
     usd_snapshot: dict[str, Any],
@@ -2459,6 +2557,7 @@ def _viewport_snapshot(
     return {
         "available": width > 0 and height > 0,
         "image_rect": image_rect,
+        "camera": _camera_orbit_snapshot(camera),
         "prim_screen_centers": screen_centers,
         "projection_path_limit": _MAX_VIEWPORT_PROJECTION_PATHS,
         "projection_paths_truncated": (
@@ -3282,6 +3381,7 @@ def capture_application_state(app: Any) -> dict[str, Any]:
         "selection": _selection_snapshot(app),
         "stage_ui": _stage_ui_snapshot(app),
         "property_ui": _property_ui_snapshot(app),
+        "content_ui": _content_ui_snapshot(app),
         "undo": _undo_snapshot(app),
         "status": _status_snapshot(app),
         "menus": _menu_snapshot(app),

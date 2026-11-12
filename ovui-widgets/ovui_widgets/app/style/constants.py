@@ -56,6 +56,7 @@ fl.treeview_indent = 16.0
 fl.treeview_row_height = 18.0
 fl.property_label_width = 160.0
 fl.property_row_height = 24.0
+fl.collapsable_frame_margin_height = 8.0
 fl.manipulator_handle_size = 80.0
 fl.menu_bar_height = float(MENU_BAR_HEIGHT)
 fl.menu_item_font_size = 14.0

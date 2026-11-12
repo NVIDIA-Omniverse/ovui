@@ -129,7 +129,10 @@ class TestKeyPressedDispatch:
     def test_f2_calls_begin_rename_selected(self):
         app = _make_app()
         app._stage_window = MagicMock()
-        app._on_key_pressed(_KEY_F2, 0, True)
+        # No field edits: F2 is the rename shortcut.
+        app._stage_window.is_filter_editing.return_value = False
+        with patch("ovui_widgets.app.application._is_text_input_active", return_value=False):
+            app._on_key_pressed(_KEY_F2, 0, True)
         app._stage_window.begin_rename_selected.assert_called_once()
 
     def test_f2_without_stage_window_does_not_raise(self):
@@ -204,7 +207,6 @@ class TestDeleteSelected:
         app._undo_manager.begin_group.assert_not_called()
 
     def test_with_selection_begins_group(self):
-        pytest.importorskip("pxr", reason="pxr not available")
         app = _make_app()
         snap = MagicMock()
         item = MagicMock()
@@ -258,7 +260,7 @@ class TestFrameSelected:
 
         viewport.frame_paths.assert_called_once_with(["/Sphere"])
 
-    def test_empty_snapshot_still_calls_frame_paths(self):
+    def test_empty_snapshot_frames_the_whole_stage(self):
         app = _make_app()
         snap = MagicMock()
         snap.items = []
@@ -268,7 +270,7 @@ class TestFrameSelected:
         app._viewport_window = viewport
         app._frame_selected()
 
-        viewport.frame_paths.assert_called_once_with([])
+        viewport.frame_paths.assert_called_once_with(["/"])
 
 
 class TestRegisterShortcuts:
@@ -553,12 +555,13 @@ class TestFilterOwnedDeleteKeys:
     """
 
     @staticmethod
-    def _app_with_targets(filter_editing):
+    def _app_with_targets(filter_editing, content_focused=False):
         app = _make_app()
         stage_window = MagicMock()
         stage_window.is_filter_editing.return_value = filter_editing
         app._stage_window = stage_window
         app._content_window = MagicMock()
+        app._content_window.is_focused = content_focused
         app._delete_selected = MagicMock()
         app._delete_selected_prim_specs_in_layers = MagicMock(return_value=False)
         return app
@@ -575,12 +578,33 @@ class TestFilterOwnedDeleteKeys:
         app._content_window.delete_selected.assert_not_called()
 
     @pytest.mark.parametrize("key", [_KEY_BACKSPACE, _KEY_DELETE])
-    def test_filter_not_editing_preserves_stage_and_content_delete(self, key):
+    def test_filter_not_editing_preserves_stage_delete(self, key):
         app = self._app_with_targets(filter_editing=False)
         app._on_key_pressed(key, 0, True)
         app._delete_selected_prim_specs_in_layers.assert_called_once()
         app._delete_selected.assert_called_once()
+        # The Content Browser does not have focus: no file delete starts.
+        app._content_window.delete_selected.assert_not_called()
+
+    @pytest.mark.parametrize("key", [_KEY_BACKSPACE, _KEY_DELETE])
+    def test_content_focus_deletes_only_content_selection(self, key):
+        app = self._app_with_targets(filter_editing=False, content_focused=True)
+        app._on_key_pressed(key, 0, True)
         app._content_window.delete_selected.assert_called_once()
+        # One key press must not also delete the selected prim.
+        app._delete_selected_prim_specs_in_layers.assert_not_called()
+        app._delete_selected.assert_not_called()
+
+    @pytest.mark.parametrize("key", [_KEY_BACKSPACE, _KEY_DELETE])
+    def test_text_input_active_suppresses_content_delete(self, key):
+        app = self._app_with_targets(filter_editing=False, content_focused=True)
+        with patch(
+            "ovui_widgets.app.application._is_text_input_active",
+            return_value=True,
+        ):
+            app._on_key_pressed(key, 0, True)
+        app._content_window.delete_selected.assert_not_called()
+        app._delete_selected.assert_not_called()
 
     @pytest.mark.parametrize("key", [_KEY_BACKSPACE, _KEY_DELETE])
     def test_filter_not_editing_preserves_layers_priority(self, key):
@@ -601,4 +625,148 @@ class TestFilterOwnedDeleteKeys:
         app._stage_window = None
         app._on_key_pressed(key, 0, True)
         app._delete_selected.assert_called_once()
-        app._content_window.delete_selected.assert_called_once()
+        app._content_window.delete_selected.assert_not_called()
+
+
+class TestPropertyInspectorDeleteKeys:
+    """Backspace/Delete in the focused Property Inspector delete nothing.
+
+    Reproduced bug (issue 498): with /World/Cube selected, a click in the
+    Display Color or Extent text field, in the Purpose dropdown or on the
+    Double Sided checkbox, then Backspace or Delete, deleted the cube. None of
+    these fields is an editing text input, so ``is_text_input_active`` is
+    False. ``ui.Window`` calls only the key handler of the focused window, so
+    the handler that ``_register_shortcuts`` gives the Property Inspector must
+    not delete, and the handlers of the other panels must still delete.
+    """
+
+    @staticmethod
+    def _app():
+        app = _make_app()
+        for name in ("_stage_window", "_property_window", "_viewport_window"):
+            panel = MagicMock()
+            panel.is_filter_editing.return_value = False
+            # Only the window that gets the key has focus; ``_press`` sets it.
+            panel.is_focused = False
+            setattr(app, name, panel)
+        app._content_window = MagicMock()
+        app._content_window.is_focused = False
+        app._delete_selected = MagicMock()
+        app._delete_selected_prim_specs_in_layers = MagicMock(return_value=False)
+        app._register_shortcuts()
+        return app
+
+    @staticmethod
+    def _press(panel, key, modifiers=0):
+        """Send a key press to the handler registered on ``panel.window``.
+
+        ``ui.Window`` calls the key handler only of the focused window, so the
+        panel that gets the key is the focused one.
+        """
+        panel.is_focused = True
+        handler = panel.window.set_key_pressed_fn.call_args.args[0]
+        with patch("ovui_widgets.app.application._is_text_input_active", return_value=False):
+            handler(key, modifiers, True)
+
+    @pytest.mark.parametrize("key", [_KEY_BACKSPACE, _KEY_DELETE])
+    def test_property_inspector_key_deletes_nothing(self, key):
+        app = self._app()
+        self._press(app._property_window, key)
+        app._delete_selected_prim_specs_in_layers.assert_not_called()
+        app._delete_selected.assert_not_called()
+        app._content_window.delete_selected.assert_not_called()
+
+    @pytest.mark.parametrize("panel", ["_stage_window", "_viewport_window"])
+    @pytest.mark.parametrize("key", [_KEY_BACKSPACE, _KEY_DELETE])
+    def test_stage_browser_and_viewport_keys_still_delete(self, key, panel):
+        app = self._app()
+        self._press(getattr(app, panel), key)
+        app._delete_selected_prim_specs_in_layers.assert_called_once()
+        app._delete_selected.assert_called_once()
+
+    def test_property_inspector_keeps_the_other_shortcuts(self):
+        app = self._app()
+        self._press(app._property_window, ord("Z"), _MOD_CTRL)
+        app._undo_manager.undo.assert_called_once()
+
+
+class TestHomeKeyInTextInput:
+    """H sends the camera home, but not while a text input owns the keyboard.
+
+    Reproduced bug: typing "Child" into the Stage Browser filter (or "ship"
+    into the Content Browser search) moved the viewport camera back to its
+    home view at the "h".
+    """
+
+    @staticmethod
+    def _app(filter_editing):
+        app = _make_app()
+        app._stage_window = MagicMock()
+        app._stage_window.is_filter_editing.return_value = filter_editing
+        app._viewport_window = MagicMock()
+        return app
+
+    @pytest.mark.parametrize("key", [ord("h"), ord("H")])
+    def test_stage_filter_editing_keeps_the_camera(self, key):
+        app = self._app(filter_editing=True)
+        app._on_key_pressed(key, 0, True)
+        app._viewport_window.go_camera_home.assert_not_called()
+
+    @pytest.mark.parametrize("key", [ord("h"), ord("H")])
+    def test_other_text_input_keeps_the_camera(self, key):
+        app = self._app(filter_editing=False)
+        with patch("ovui_widgets.app.application._is_text_input_active", return_value=True):
+            app._on_key_pressed(key, 0, True)
+        app._viewport_window.go_camera_home.assert_not_called()
+
+    @pytest.mark.parametrize("key", [ord("h"), ord("H")])
+    def test_no_text_input_sends_the_camera_home(self, key):
+        app = self._app(filter_editing=False)
+        with patch("ovui_widgets.app.application._is_text_input_active", return_value=False):
+            app._on_key_pressed(key, 0, True)
+        app._viewport_window.go_camera_home.assert_called_once()
+
+
+class TestViewportKeysInTextInput:
+    """F and the W/E/R tool keys do nothing while a text input owns the keyboard.
+
+    Reproduced bug (issue 509): with the Content Browser path bar editing,
+    typing "f" framed the selection and "e" changed the viewport tool.
+    """
+
+    @staticmethod
+    def _app(stage_filter=False, property_filter=False):
+        app = _make_app()
+        app._stage_window = MagicMock()
+        app._stage_window.is_filter_editing.return_value = stage_filter
+        app._property_window = MagicMock()
+        app._property_window.is_filter_editing.return_value = property_filter
+        app._frame_selected = MagicMock()
+        app._dispatch_tool_hotkey = MagicMock()
+        return app
+
+    @pytest.mark.parametrize(
+        "stage_filter, property_filter, text_input",
+        [(True, False, False), (False, True, False), (False, False, True)],
+        ids=["stage-filter", "property-filter", "text-input"],
+    )
+    @pytest.mark.parametrize("key", [ord("f"), ord("F")])
+    def test_text_input_keeps_the_camera(self, key, stage_filter, property_filter, text_input):
+        app = self._app(stage_filter, property_filter)
+        with patch("ovui_widgets.app.application._is_text_input_active", return_value=text_input):
+            app._on_key_pressed(key, 0, True)
+        app._frame_selected.assert_not_called()
+
+    @pytest.mark.parametrize("key", [ord(c) for c in "wWeErR"])
+    def test_text_input_keeps_the_tool(self, key):
+        app = self._app()
+        with patch("ovui_widgets.app.application._is_text_input_active", return_value=True):
+            app._on_key_pressed(key, 0, True)
+        app._dispatch_tool_hotkey.assert_not_called()
+
+    @pytest.mark.parametrize("key", [ord(c) for c in "wWeErR"])
+    def test_no_text_input_switches_the_tool(self, key):
+        app = self._app()
+        with patch("ovui_widgets.app.application._is_text_input_active", return_value=False):
+            app._on_key_pressed(key, 0, True)
+        app._dispatch_tool_hotkey.assert_called_once_with(key, 0)

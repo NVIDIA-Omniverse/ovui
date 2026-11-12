@@ -37,8 +37,14 @@ on:
 permissions:
   contents: read
 
+# The one tag of every native package: a wheel per platform holding the native
+# modules of all four interpreters.
+env:
+  COMBINED_TAG: cp312.cp313.cp314.cp315-cp312.cp313.cp314.cp315
+
+# Keep reusable-workflow callers separate from this workflow's own PR runs.
 concurrency:
-  group: build-app-wheelhouse-${{ github.ref }}
+  group: build-app-wheelhouse-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -56,8 +62,10 @@ jobs:
       - id: resolve
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-  build-app-wheelhouse-linux:
-    name: Build app wheelhouse (${{ matrix.label }}, Vulkan + CUDA)
+  # One native ovui wheel per interpreter.
+  # combine-app-wheelhouse-linux merges the four interpreter modules.
+  build-native-wheels-linux:
+    name: Build native wheels (${{ matrix.label }}, Python ${{ matrix.python }}, Vulkan + CUDA)
     needs: resolve-source
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -65,25 +73,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        target: [linux-x64, linux-arm64]
+        python: ["3.12", "3.13", "3.14", "3.15"]
         include:
-          - label: Linux x64
+          - target: linux-x64
+            label: Linux x64
             runner: ubuntu-22.04
-            artifact: ovui-app-wheelhouse-linux-x64
             linux_tag: linux_x86_64
             manylinux_tag: manylinux_2_35_x86_64
             cuda_repo_arch: x86_64
-            standalone_openusd: true
-          - label: Linux ARM64
+          - target: linux-arm64
+            label: Linux ARM64
             # Cross-compiled on x86_64 with the host CUDA toolkit plus its
             # sbsa cross runtime.
             runner: ubuntu-22.04
-            artifact: ovui-app-wheelhouse-linux-arm64
             linux_tag: linux_aarch64
             manylinux_tag: manylinux_2_35_aarch64
             cuda_repo_arch: x86_64
             cross_compile: true
-            # usd-core 25.11 does not publish a Linux ARM64 wheel.
-            standalone_openusd: false
 
     env:
       DEBIAN_FRONTEND: noninteractive
@@ -150,15 +157,16 @@ jobs:
           echo "LD_LIBRARY_PATH=$stub_dir:$(dirname "$cuda_runtime")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           "$CUDAToolkit_ROOT/bin/nvcc" --version
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
 
       - name: Upgrade pip toolchain
         run: |
-          python -m pip install --upgrade pip wheel setuptools build 'cmake>=3.22' pybind11==2.11.1
-          python -m pip install --no-deps ovrtx
+          python -m pip install --upgrade pip wheel setuptools build 'cmake>=3.22' "pybind11>=2.13.6,<3"
+          echo "PYTAG=cp$(python -c 'import sys; print(f"{sys.version_info[0]}{sys.version_info[1]}")')" >> "$GITHUB_ENV"
 
       - name: Set up Linux ARM64 cross-compilation
         if: matrix.cross_compile
@@ -167,24 +175,96 @@ jobs:
       - name: Build native ovui wheel
         run: |
           mkdir -p wheelhouse
-          ovrtx_include="$(python -c "from importlib.util import find_spec; from pathlib import Path; print(Path(find_spec('ovrtx').origin).parent / 'include')")"
           # The OVUI_CROSS_* variables are set only by the cross-compilation step.
-          # Only ovrtx headers are offered. ovui depends on no scene library;
-          # a scene provider lives in its own ovui-data-adapters package.
-          OVRTX_INCLUDE_DIR="$ovrtx_include" \
+          # No product headers are offered: ovui depends on no renderer and no
+          # scene library. Both live in their own packages.
           OMNIUI_CMAKE_ARGS="$OMNIUI_CMAKE_ARGS ${OVUI_CROSS_CMAKE_ARGS:-}" \
             "${OVUI_CROSS_PYTHON:-python}" -m pip wheel ./ovui --no-deps ${OVUI_CROSS_PYTHON:+--no-build-isolation} -w wheelhouse/ -v
 
-      - name: Retag ovui wheel for manylinux
+      - name: Assert the ovui wheel carries no ovrtx ABI
+        run: python .github/scripts/assert_no_ovrtx_abi.py wheelhouse/ovui-*.whl
+
+      - name: Check the wheels are for this interpreter only
         run: |
+          set -euo pipefail
           shopt -s nullglob
-          src_wheels=(wheelhouse/ovui-*-cp312-cp312-${{ matrix.linux_tag }}.whl)
-          if [ "${#src_wheels[@]}" -ne 1 ]; then
-            echo "Expected exactly one ${{ matrix.linux_tag }} ovui wheel in wheelhouse/, found ${#src_wheels[@]}"
-            printf '  %s\n' "${src_wheels[@]}"
-            exit 1
-          fi
-          python -m wheel tags --platform-tag ${{ matrix.manylinux_tag }} "${src_wheels[0]}"
+          for pattern in "ovui-*"; do
+            wheels=(wheelhouse/${pattern}-${PYTAG}-${PYTAG}-${{ matrix.linux_tag }}.whl)
+            if [ "${#wheels[@]}" -ne 1 ]; then
+              echo "Expected exactly one ${pattern} ${PYTAG} wheel, found ${#wheels[@]}"
+              printf '  %s\n' "${wheels[@]}"
+              exit 1
+            fi
+            python .github/scripts/combined_wheel.py modules "${wheels[0]}" --python-tag "$PYTAG"
+          done
+
+      - name: Upload the interpreter wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-wheelhouse-${{ matrix.target }}-py${{ matrix.python }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  # Merge the four interpreter wheels of each package into one combined-tag wheel
+  # per platform, build the pure-Python wheels once, and check the wheelhouse.
+  combine-app-wheelhouse-linux:
+    name: Combine app wheelhouse (${{ matrix.label }})
+    needs: [resolve-source, build-native-wheels-linux]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            label: Linux x64
+            artifact: ovui-app-wheelhouse-linux-x64
+            linux_tag: linux_x86_64
+            manylinux_tag: manylinux_2_35_x86_64
+          - target: linux-arm64
+            label: Linux ARM64
+            artifact: ovui-app-wheelhouse-linux-arm64
+            linux_tag: linux_aarch64
+            manylinux_tag: manylinux_2_35_aarch64
+            cross_compile: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Resolve checked-out commit
+        run: echo "EXPECTED_COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download the interpreter wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "native-wheelhouse-${{ matrix.target }}-py*"
+          path: parts
+
+      - name: Prove the combine and check scripts
+        run: python .github/scripts/combined_wheel.py selftest
+
+      - name: Combine the native wheels
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ls -R parts
+          mkdir -p wheelhouse
+          for prefix in ovui; do
+            native=(parts/native-wheelhouse-${{ matrix.target }}-py*/${prefix}-*-cp3*-cp3*-${{ matrix.linux_tag }}.whl)
+            python .github/scripts/combined_wheel.py combine "${native[@]}" \
+              --out-dir wheelhouse --also-platform ${{ matrix.manylinux_tag }}
+          done
+          python .github/scripts/combined_wheel.py check wheelhouse/*.whl
+          python .github/scripts/assert_no_ovrtx_abi.py wheelhouse/ovui-*.whl
 
       - name: Build ovui-widgets and data-adapter wheels
         run: |
@@ -241,8 +321,8 @@ jobs:
             echo "${label}: $(basename "${matches[0]}")"
           }
 
-          require_one "ovui-*-cp312-cp312-${{ matrix.linux_tag }}.whl" "ovui ${{ matrix.linux_tag }}"
-          require_one "ovui-*-cp312-cp312-${{ matrix.manylinux_tag }}.whl" "ovui ${{ matrix.manylinux_tag }}"
+          require_one "ovui-*-${COMBINED_TAG}-${{ matrix.linux_tag }}.whl" "ovui ${{ matrix.linux_tag }}"
+          require_one "ovui-*-${COMBINED_TAG}-${{ matrix.manylinux_tag }}.whl" "ovui ${{ matrix.manylinux_tag }}"
           require_one "ovui_data_adapters_common-*-py3-none-any.whl" "ovui-data-adapters-common"
           require_one "ovui_data_adapters_services-*-py3-none-any.whl" "ovui-data-adapters-services"
           require_one "ovui_data_adapters_openusd-*-py3-none-any.whl" "ovui-data-adapters-openusd"
@@ -256,6 +336,7 @@ jobs:
           require_one "ovui_widgets_app-*-py3-none-any.whl" "ovui-widgets-app"
           require_one "ovui_widgets_all-*-py3-none-any.whl" "ovui-widgets-all"
           wheel_count="$(find wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)"
+          # Two native platform names plus twelve pure-Python wheels.
           if [ "$wheel_count" -ne 14 ]; then
             echo "Expected 14 wheels in Linux wheelhouse, found $wheel_count"
             find wheelhouse -maxdepth 1 -type f -name '*.whl' -print | sort
@@ -273,12 +354,115 @@ jobs:
       - name: Note ARM64 runtime checks not run
         if: matrix.cross_compile
         run: |
-          msg="${{ matrix.label }} wheels are cross-compiled on x86_64. The install/import smoke test and the clean-install check run ARM64 code and are skipped; the wheels have not been executed in this job."
+          msg="${{ matrix.label }} wheels are cross-compiled on x86_64. The install/import smoke tests and the clean-install check run ARM64 code and are skipped; the wheels have not been executed in this job."
           echo "::notice title=ARM64 runtime checks skipped::$msg"
           echo "$msg" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload app wheelhouse as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: wheelhouse/*
+          if-no-files-found: error
+
+  # Install the combined wheels that were just made, the way a user does, and run
+  # the package tests on each supported interpreter.
+  test-app-wheelhouse-linux:
+    name: Test app wheelhouse (Linux x64, Python ${{ matrix.python }})
+    needs: [resolve-source, combine-app-wheelhouse-linux]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14", "3.15"]
+        include:
+          # usd-core 25.11, the tested version, has wheels for Python 3.12 and
+          # 3.13 only, so the steps that install it cannot run on 3.14 and 3.15.
+          # The install, import and no-OpenUSD test steps still do.
+          - python: "3.12"
+            standalone_openusd: true
+          - python: "3.13"
+            standalone_openusd: true
+          - python: "3.14"
+            standalone_openusd: false
+          - python: "3.15"
+            standalone_openusd: false
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CUDAToolkit_ROOT: /usr/local/cuda-12.8
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Resolve checked-out commit
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "EXPECTED_COMMIT_SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: Install Vulkan, CUDA, and static dependency build prerequisites
+        # Do not install libglfw3-dev, libfreetype-dev, or libfontconfig1-dev:
+        # wheel builds force the pinned static FetchContent targets instead.
+        run: |
+          set -euo pipefail
+          keyring="$RUNNER_TEMP/cuda-keyring_1.1-1_all.deb"
+          curl -fsSL \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb" \
+            -o "$keyring"
+          sudo dpkg -i "$keyring"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-8 \
+            libvulkan-dev \
+            mesa-vulkan-drivers \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libxkbcommon-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            xvfb \
+            xsel \
+            xauth \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3-dev
+
+          test -x "$CUDAToolkit_ROOT/bin/nvcc"
+          test -f "$CUDAToolkit_ROOT/include/cuda_runtime.h"
+          cuda_stub="$(find "$CUDAToolkit_ROOT" -path '*/stubs/libcuda.so' -print -quit)"
+          cuda_runtime="$(find "$CUDAToolkit_ROOT" -name 'libcudart.so.12' -print -quit)"
+          test -n "$cuda_stub"
+          test -n "$cuda_runtime"
+          stub_dir="$RUNNER_TEMP/cuda-driver-stub"
+          mkdir -p "$stub_dir"
+          ln -s "$cuda_stub" "$stub_dir/libcuda.so.1"
+          echo "LD_LIBRARY_PATH=$stub_dir:$(dirname "$cuda_runtime")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          "$CUDAToolkit_ROOT/bin/nvcc" --version
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+
+      - name: Download the app wheelhouse
+        uses: actions/download-artifact@v4
+        with:
+          name: ovui-app-wheelhouse-linux-x64
+          path: wheelhouse
+
       - name: Smoke test wheelhouse install without external deps
-        if: ${{ !matrix.cross_compile }}
         env:
           OMNIUI_HEADLESS: "1"
           OMNIUI_BACKEND: "vulkan"
@@ -287,7 +471,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          native=(wheelhouse/ovui-*-cp312-cp312-${{ matrix.linux_tag }}.whl)
+          native=(wheelhouse/ovui-*-${COMBINED_TAG}-linux_x86_64.whl)
           if [ "${#native[@]}" -ne 1 ]; then
             echo "Expected one native ovui wheel for smoke test, found ${#native[@]}"
             exit 1
@@ -339,15 +523,28 @@ jobs:
           components = {ep.name for ep in eps.select(group="ovui_widgets.components")}
           assert {"openusd", "ovstage"} <= adapters, adapters
           assert {"ovstage_physics_controls"} <= components, components
+          # No optional renderer pacing provider is installed. The viewport
+          # presents on the ordinary UI tick and reports hooks_unavailable.
           frame_pacing = omni.ui.get_frame_pacing_status()
-          assert frame_pacing["supported"], frame_pacing
+          assert frame_pacing["supported"] is False, frame_pacing
+          assert frame_pacing["status_reason"] == "hooks_unavailable", frame_pacing
           print("wheelhouse smoke OK")
           PY
           /tmp/ovui-app-wheelhouse-venv/bin/python \
             .github/scripts/validate_packaged_skills.py
+          # Each native module is the one of this interpreter.
+          /tmp/ovui-app-wheelhouse-venv/bin/python - <<'PY'
+          import os
+          import sys
+          from omni.ui import _standalone, _ui
+          from omni.ui_scene import _scene
+          want = "cpython-%d%d" % sys.version_info[:2]
+          for module in (_ui, _standalone, _scene):
+              assert want in os.path.basename(module.__file__), module.__file__
+              print("loaded", module.__file__)
+          PY
 
       - name: Download common clean-install dependencies
-        if: ${{ !matrix.cross_compile }}
         run: |
           python -m pip download \
             --only-binary=:all: \
@@ -355,7 +552,6 @@ jobs:
             "numpy>=1.20"
 
       - name: Clean-install common livestream package
-        if: ${{ !matrix.cross_compile }}
         env:
           PYTHONNOUSERSITE: "1"
           PYTHONPATH: ""
@@ -425,7 +621,7 @@ jobs:
           services=(wheelhouse/ovui_data_adapters_services-*-py3-none-any.whl)
           ovstage=(wheelhouse/ovui_data_adapters_ovstage-*-py3-none-any.whl)
           if [ "${#services[@]}" -ne 1 ] || [ "${#ovstage[@]}" -ne 1 ]; then
-            echo "Expected one services and ovstage wheel"
+            echo "Expected one services wheel and one ovstage wheel"
             exit 1
           fi
           "$python" -m pip install \
@@ -437,6 +633,10 @@ jobs:
             Pillow \
             "imageio-ffmpeg>=0.6" \
             "ovstream==0.4.5"
+          # ovrtx ships the attribute definition file of its render settings.
+          # The tests that apply a scene's stored settings read it, and need no
+          # GPU to do so. The step above already checks the install without it.
+          "$python" -m pip install --no-deps ovrtx
           "$python" -m pip check
 
           (
@@ -454,20 +654,121 @@ jobs:
             -c ovui-widgets/pyproject.toml ovui-widgets/tests \
             -m "not inspector_qa and not performance and not requires_cuda_vulkan_gl_interop and not (requires_ovstage or requires_ovphysx or requires_ovrtx)"
           xvfb-run -a "$python" -m pytest -q -rs \
-            --import-mode=importlib ovui/tests/test_backend_default_policy.py
+            --import-mode=importlib ovui/tests/test_backend_default_policy.py \
+            ovui/tests/test_opengl_markdown_exit.py \
+            ovui/tests/test_standalone_thread_progress.py \
+            ovui/tests/test_standalone_present_wait.py \
+            ovui/tests/test_standalone_resize_present.py \
+            ovui/tests/test_standalone_os_clipboard.py
 
-      - name: Upload app wheelhouse as workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: wheelhouse/*
-          if-no-files-found: error
+      # usd-core 25.11 has no wheel for this interpreter, so the tests that need
+      # pxr cannot run: the OpenUSD adapter tests, the two tests of
+      # tests/common that import the OpenUSD adapter, the image scale test that
+      # checks the OpenUSD and the ovstage adapters together, and the widget
+      # tests that open a USD stage. Everything else runs, in the environment of
+      # the smoke test above: the adapter, inspector and widget suites.
+      # The widget suite runs with
+      # collection errors allowed, and check_no_pxr_failures.py then requires
+      # that every failure ends with the import error of pxr itself. Seven tests
+      # patch the OpenUSD adapter module and fail with another message when pxr
+      # is missing (they pass with pxr); they are deselected by exact id.
+      - name: Run package tests without OpenUSD
+        if: ${{ !matrix.standalone_openusd }}
+        env:
+          PYTHONNOUSERSITE: "1"
+          PYTHONPATH: ""
+          OVUI_TEST_INSTALLED_RELEASE: "1"
+          OVUI_WIDGETS_REQUIRE_OVRTX: "0"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          python="/tmp/ovui-app-wheelhouse-venv/bin/python"
+          "$python" -m pip install numpy "pydantic>=2" "pytest>=7,<10" pytest-timeout Pillow \
+            "imageio-ffmpeg>=0.6" "ovstream==0.4.5" \
+            -r skills/omniverse-ui-inspector/requirements.txt
+          # The attribute definition file of the render settings (see the hosted tests).
+          "$python" -m pip install --no-deps ovrtx
+          "$python" .github/scripts/check_no_pxr_failures.py --selftest
+          (
+            cd ovui-data-adapters
+            "$python" -m pytest -q -rs tests \
+              -m "not (requires_ovstage or requires_ovphysx or requires_ovrtx)" \
+              --ignore=tests/openusd --ignore=tests/test_fixture_smoke.py \
+              --ignore=tests/test_viewport_image_scale.py \
+              --ignore=tests/common/test_livestream_async.py \
+              --ignore=tests/common/test_livestream_tap.py \
+              --deselect tests/common/test_runtime_versions.py::test_openusd_session_reports_the_loaded_ovrtx \
+              --deselect tests/common/test_render_product_stream.py::test_authored_product_switch_does_not_recompose_owned_session
+          )
+          (
+            cd skills/omniverse-ui-inspector
+            "$python" -m pytest -q -rs tests
+          )
+          unset OVUI_DATA_ADAPTER_PROVIDER
+          set +e
+          xvfb-run -a "$python" -m pytest -q -rs \
+            --import-mode=importlib --continue-on-collection-errors \
+            --junitxml=widgets-no-openusd.xml \
+            --deselect tests/test_application_headless_export.py::test_setup_treats_init_returning_false_as_failure \
+            --deselect tests/test_application_renderer.py::TestPreconstructOrdering::test_failed_early_attempt_is_not_retried_after_stage_open \
+            --deselect tests/test_content_browser_e2e.py::TestFullFlowOpenSave::test_open_failure_leaves_app_in_clean_state \
+            --deselect tests/test_keyboard_shortcuts.py::TestDeleteSelected::test_with_selection_begins_group \
+            --deselect tests/test_step70_wiring.py::TestOpenStageWiring::test_open_stage_sets_stage_adapter \
+            --deselect tests/test_step70_wiring.py::TestOpenStageWiring::test_open_stage_no_crash_without_windows \
+            --deselect tests/test_step70_wiring.py::TestOpenStageWiring::test_open_stage_twice_no_crash \
+            -c ovui-widgets/pyproject.toml ovui-widgets/tests \
+            -m "not inspector_qa and not performance and not requires_cuda_vulkan_gl_interop and not (requires_ovstage or requires_ovphysx or requires_ovrtx)"
+          set -e
+          "$python" .github/scripts/check_no_pxr_failures.py widgets-no-openusd.xml --min-passed 5000
+          xvfb-run -a "$python" -m pytest -q -rs \
+            --import-mode=importlib ovui/tests/test_backend_default_policy.py \
+            ovui/tests/test_opengl_markdown_exit.py \
+            ovui/tests/test_standalone_thread_progress.py \
+            ovui/tests/test_standalone_present_wait.py \
+            ovui/tests/test_standalone_resize_present.py \
+            ovui/tests/test_standalone_os_clipboard.py
 
-  build-app-wheelhouse-windows:
-    name: Build app wheelhouse (Windows x64, Vulkan + CUDA)
+      # The steps above deselect every test that needs ovstage. These contract
+      # tests need only the ovstage wheel, so they run here with the current
+      # ovstage. They cover the stage hierarchy, the stage units, the
+      # attributes that ovstage populates only on request, the camera
+      # shutter edits with their undo and redo, and the cancel of a number
+      # edit (Escape) with no undo step.
+      - name: Run ovstage contract tests with the current ovstage
+        if: matrix.standalone_openusd
+        env:
+          PYTHONNOUSERSITE: "1"
+          PYTHONPATH: ""
+        run: |
+          set -euo pipefail
+          python="$RUNNER_TEMP/ovui-widgets-all-clean-install/bin/python"
+          "$python" -m pip install \
+            --index-url https://pypi.org/simple \
+            --extra-index-url https://pypi.nvidia.com \
+            "ovstage"
+          cd ovui-data-adapters
+          "$python" -m pytest -q -rs \
+            ovui_data_adapters/ovstage/tests/test_hierarchy_selection_contract.py \
+            ovui_data_adapters/ovstage/tests/test_transform_bounds_units_contract.py \
+            ovui_data_adapters/ovstage/tests/test_property_inspection_contract.py \
+            ovui_data_adapters/ovstage/tests/test_value_authoring_contract.py::test_camera_shutter_edits_read_back_and_undo_to_the_start_value \
+            ovui_data_adapters/ovstage/tests/test_value_authoring_contract.py::test_cancelled_channel_edit_restores_the_start_value_and_keeps_redo \
+            ovui_data_adapters/ovstage/tests/test_value_authoring_contract.py::test_cancelled_edit_without_undo_manager_writes_the_start_value_back
+
+
+  # One native ovui wheel per interpreter.
+  # combine-app-wheelhouse-windows merges the four of each package.
+  build-native-wheels-windows:
+    name: Build native wheels (Windows x64, Python ${{ matrix.python }}, Vulkan + CUDA)
     needs: resolve-source
     runs-on: windows-2022
     timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14", "3.15"]
 
     env:
       CMAKE_GENERATOR: Visual Studio 17 2022
@@ -492,11 +793,18 @@ jobs:
           "OVUI_BUILD_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "EXPECTED_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Set up Python 3.12
+      - name: Select the MSVC 14.38 toolset (the toolset Kit ships)
+        shell: pwsh
+        run: |
+          & .\.github\scripts\select_msvc_toolset.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           architecture: "x64"
+          allow-prereleases: true
 
       - name: Install CUDA 12.8 compiler and runtime
         shell: pwsh
@@ -568,22 +876,32 @@ jobs:
       - name: Upgrade pip toolchain
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip wheel setuptools build cmake pybind11==2.11.1
+          python -m pip install --upgrade pip wheel setuptools build cmake "pybind11>=2.13.6,<3"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip install --no-deps ovrtx
+          $tag = python -c "import sys; print('cp%d%d' % sys.version_info[:2])"
+          "PYTAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build native ovui wheel
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path wheelhouse | Out-Null
-          $ovrtxInclude = python -c "from importlib.util import find_spec; from pathlib import Path; print(Path(find_spec('ovrtx').origin).parent / 'include')"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:OVRTX_INCLUDE_DIR = $ovrtxInclude.Trim()
-          # Only ovrtx headers are offered. ovui depends on no scene library;
-          # a scene provider lives in its own ovui-data-adapters package.
+          # No product headers are offered: ovui depends on no renderer and no
+          # scene library. Both live in their own packages.
           python -m pip wheel .\ovui --no-deps -w wheelhouse\ -v
 
+      - name: Assert the ovui wheel carries no ovrtx ABI
+        shell: pwsh
+        run: |
+          # @(...) keeps this an array. A single match unrolls to a bare
+          # string, and splatting a string splats it one character per
+          # argument, so the guard was handed 'D', ':', '\', ... instead
+          # of the wheel path.
+          $wheels = @(Get-ChildItem wheelhouse/ovui-*.whl | ForEach-Object { $_.FullName })
+          python .github/scripts/assert_no_ovrtx_abi.py @wheels
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Verify native Win32 window title propagation
+        if: matrix.python == '3.12'
         shell: pwsh
         run: |
           $inventoryJson = (& ctest --test-dir ovui\build\pip `
@@ -611,6 +929,74 @@ jobs:
             -C Release `
             -R "^win32_window_title$" `
             --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check the wheels are for this interpreter only
+        shell: pwsh
+        run: |
+          $tag = $env:PYTAG
+          foreach ($prefix in @("ovui")) {
+            $wheels = @(Get-ChildItem "wheelhouse\$prefix-*-$tag-$tag-win_amd64.whl" | ForEach-Object { $_.FullName })
+            if ($wheels.Count -ne 1) { throw "Expected exactly one $prefix $tag wheel, found $($wheels.Count)" }
+            python .github\scripts\combined_wheel.py modules $wheels[0] --python-tag $tag
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Upload the interpreter wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-wheelhouse-windows-x64-py${{ matrix.python }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  # Merge the four interpreter wheels of each package into one combined-tag wheel,
+  # build the pure-Python wheels once, and check the wheelhouse.
+  combine-app-wheelhouse-windows:
+    name: Combine app wheelhouse (Windows x64)
+    needs: [resolve-source, build-native-wheels-windows]
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Resolve checked-out commit
+        shell: pwsh
+        run: |
+          $sha = git rev-parse HEAD
+          "EXPECTED_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Download the interpreter wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "native-wheelhouse-windows-x64-py*"
+          path: parts
+
+      - name: Combine the native wheels
+        shell: pwsh
+        run: |
+          python .github\scripts\combined_wheel.py selftest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path wheelhouse | Out-Null
+          foreach ($prefix in @("ovui")) {
+            $native = @(Get-ChildItem "parts\native-wheelhouse-windows-x64-py*\$prefix-*-cp3*-cp3*-win_amd64.whl" | ForEach-Object { $_.FullName })
+            python .github\scripts\combined_wheel.py combine @native --out-dir wheelhouse
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $all = @(Get-ChildItem wheelhouse\*.whl | ForEach-Object { $_.FullName })
+          python .github\scripts\combined_wheel.py check @all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ovui = @(Get-ChildItem wheelhouse\ovui-*.whl | ForEach-Object { $_.FullName })
+          python .github\scripts\assert_no_ovrtx_abi.py @ovui
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build ovui-widgets and data-adapter wheels
@@ -670,7 +1056,7 @@ jobs:
             Write-Host "${Label}: $($matches[0].Name)"
           }
 
-          Require-One "ovui-*-cp312-cp312-win_amd64.whl" "ovui win_amd64"
+          Require-One "ovui-*-$env:COMBINED_TAG-win_amd64.whl" "ovui win_amd64"
           Require-One "ovui_data_adapters_common-*-py3-none-any.whl" "ovui-data-adapters-common"
           Require-One "ovui_data_adapters_services-*-py3-none-any.whl" "ovui-data-adapters-services"
           Require-One "ovui_data_adapters_openusd-*-py3-none-any.whl" "ovui-data-adapters-openusd"
@@ -684,6 +1070,7 @@ jobs:
           Require-One "ovui_widgets_app-*-py3-none-any.whl" "ovui-widgets-app"
           Require-One "ovui_widgets_all-*-py3-none-any.whl" "ovui-widgets-all"
           $wheelCount = @(Get-ChildItem wheelhouse\*.whl).Count
+          # One native wheel plus twelve pure-Python wheels.
           if ($wheelCount -ne 13) {
             Get-ChildItem wheelhouse\*.whl | Sort-Object Name
             throw "Expected 13 wheels in Windows wheelhouse, found $wheelCount"
@@ -698,6 +1085,107 @@ jobs:
             python -m zipfile -l $wheel.FullName
           }
 
+      - name: Upload app wheelhouse as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ovui-app-wheelhouse-windows-x64
+          path: wheelhouse/*
+          if-no-files-found: error
+
+  # Install the combined wheels that were just made, the way a user does, and run
+  # the package tests on each supported interpreter.
+  test-app-wheelhouse-windows:
+    name: Test app wheelhouse (Windows x64, Python ${{ matrix.python }})
+    needs: [resolve-source, combine-app-wheelhouse-windows]
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14", "3.15"]
+        include:
+          # usd-core 25.11, the tested version, has wheels for Python 3.12 and
+          # 3.13 only, so the steps that install it cannot run on 3.14 and 3.15.
+          # The install, import and no-OpenUSD test steps still do.
+          - python: "3.12"
+            standalone_openusd: true
+          - python: "3.13"
+            standalone_openusd: true
+          - python: "3.14"
+            standalone_openusd: false
+          - python: "3.15"
+            standalone_openusd: false
+
+    env:
+      CMAKE_GENERATOR: Visual Studio 17 2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Resolve checked-out commit
+        shell: pwsh
+        run: |
+          $sha = git rev-parse HEAD
+          "OVUI_BUILD_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "EXPECTED_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: "x64"
+          allow-prereleases: true
+
+      - name: Install Vulkan headers and loader
+        shell: pwsh
+        run: |
+          if (-not $env:VCPKG_INSTALLATION_ROOT) {
+            throw "VCPKG_INSTALLATION_ROOT is not set on this runner"
+          }
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe"
+          if (-not (Test-Path $vcpkg)) {
+            throw "vcpkg.exe was not found at $vcpkg"
+          }
+          & $vcpkg install vulkan-headers:x64-windows vulkan-loader:x64-windows
+          $installed = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows"
+          $includeDir = Join-Path $installed "include"
+          $header = Join-Path $includeDir "vulkan\vulkan.h"
+          if (-not (Test-Path $header)) {
+            throw "Expected Vulkan header was not created: $header"
+          }
+          $releaseLibrary = Join-Path $installed "lib\vulkan-1.lib"
+          $debugLibrary = Join-Path $installed "debug\lib\vulkan-1.lib"
+          if (Test-Path $releaseLibrary) {
+            $library = Get-Item $releaseLibrary
+          } elseif (Test-Path $debugLibrary) {
+            $library = Get-Item $debugLibrary
+          } else {
+            throw "Expected Vulkan import library was not found under $installed"
+          }
+          $releaseLoaderDll = Join-Path $installed "bin\vulkan-1.dll"
+          $debugLoaderDll = Join-Path $installed "debug\bin\vulkan-1.dll"
+          if (Test-Path $releaseLoaderDll) {
+            $loaderDll = Get-Item $releaseLoaderDll
+          } elseif (Test-Path $debugLoaderDll) {
+            $loaderDll = Get-Item $debugLoaderDll
+          } else {
+            throw "Expected Vulkan loader DLL was not found under $installed"
+          }
+          "Vulkan_INCLUDE_DIR=$includeDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Vulkan_LIBRARY=$($library.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Vulkan_DLL_DIR=$($loaderDll.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $loaderDll.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Download the app wheelhouse
+        uses: actions/download-artifact@v4
+        with:
+          name: ovui-app-wheelhouse-windows-x64
+          path: wheelhouse
+
       - name: Smoke test wheelhouse install without external deps
         shell: pwsh
         env:
@@ -705,7 +1193,7 @@ jobs:
           OMNIUI_BACKEND: "vulkan"
           OVUIINSPECT_ENABLED: "0"
         run: |
-          $native = @(Get-ChildItem wheelhouse\ovui-*-cp312-cp312-win_amd64.whl)
+          $native = @(Get-ChildItem wheelhouse\ovui-*-$env:COMBINED_TAG-win_amd64.whl)
           if ($native.Count -ne 1) { throw "Expected one native ovui wheel for smoke test, found $($native.Count)" }
           $repoWheels = @($native[0].FullName)
           $repoWheels += @(Get-ChildItem wheelhouse\*.whl | Where-Object { $_.Name -notmatch '^ovui-' } | ForEach-Object { $_.FullName })
@@ -723,9 +1211,19 @@ jobs:
           if p and hasattr(os, "add_dll_directory"):
               os.add_dll_directory(p)
 
+          import sys
+
           import omni.ui
           import omni.ui_scene
           import ovui_widgets.app
+          from omni.ui import _standalone, _ui
+          from omni.ui_scene import _scene
+
+          # Each native module is the one of this interpreter.
+          want = "cp%d%d-win_amd64" % sys.version_info[:2]
+          for module in (_ui, _standalone, _scene):
+              assert want in os.path.basename(module.__file__), module.__file__
+              print("loaded", module.__file__)
 
           expected_commit = os.environ["EXPECTED_COMMIT_SHA"]
           commit = getattr(omni.ui, "__commit__", None)
@@ -756,8 +1254,11 @@ jobs:
           components = {ep.name for ep in eps.select(group="ovui_widgets.components")}
           assert {"openusd", "ovstage"} <= adapters, adapters
           assert {"ovstage_physics_controls"} <= components, components
+          # No optional renderer pacing provider is installed. The viewport
+          # presents on the ordinary UI tick and reports hooks_unavailable.
           frame_pacing = omni.ui.get_frame_pacing_status()
-          assert frame_pacing["supported"], frame_pacing
+          assert frame_pacing["supported"] is False, frame_pacing
+          assert frame_pacing["status_reason"] == "hooks_unavailable", frame_pacing
           print("wheelhouse smoke OK")
           '@
           $scriptPath = Join-Path $env:RUNNER_TEMP "wheelhouse_smoke.py"
@@ -768,6 +1269,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Download clean-install dependencies
+        if: matrix.standalone_openusd
         shell: pwsh
         run: |
           python -m pip download `
@@ -776,6 +1278,16 @@ jobs:
             "numpy>=1.20" `
             "usd-core==25.11" `
             "pydantic>=2"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download the numpy clean-install dependency (no OpenUSD)
+        if: ${{ !matrix.standalone_openusd }}
+        shell: pwsh
+        run: |
+          python -m pip download `
+            --only-binary=:all: `
+            --dest clean-install-deps `
+            "numpy>=1.20"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Clean-install common livestream package
@@ -803,6 +1315,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Clean-install ovui-widgets-all with standalone OpenUSD
+        if: matrix.standalone_openusd
         shell: pwsh
         env:
           PYTHONNOUSERSITE: "1"
@@ -829,6 +1342,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run hosted package tests
+        if: matrix.standalone_openusd
         shell: pwsh
         env:
           PYTHONNOUSERSITE: "1"
@@ -841,7 +1355,7 @@ jobs:
           $services = @(Get-ChildItem wheelhouse\ovui_data_adapters_services-*-py3-none-any.whl)
           $ovstage = @(Get-ChildItem wheelhouse\ovui_data_adapters_ovstage-*-py3-none-any.whl)
           if ($services.Count -ne 1 -or $ovstage.Count -ne 1) {
-            throw "Expected one services and ovstage wheel"
+            throw "Expected one services wheel and one ovstage wheel"
           }
           & $python -m pip install `
             $services[0].FullName `
@@ -853,83 +1367,16 @@ jobs:
             "imageio-ffmpeg>=0.6" `
             "ovstream==0.4.5"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # ovrtx ships the attribute definition file of its render settings.
+          # The tests that apply a scene's stored settings read it, and need no
+          # GPU to do so. The step above already checks the install without it.
+          & $python -m pip install --no-deps ovrtx
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $python -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 
-          $nativeTestBootstrap = Join-Path $env:RUNNER_TEMP "ovui_native_test_bootstrap.py"
-          $nativeTestBootstrapSource = @'
-          import importlib
-          import os
-          from pathlib import Path
-          import sys
-
-          import pytest
-
-
-          def fail(message):
-              print(f"[native-test-bootstrap] ERROR: {message}", file=sys.stderr, flush=True)
-              raise SystemExit(2)
-
-
-          if sys.platform != "win32":
-              fail(f"Windows is required, but sys.platform is {sys.platform!r}")
-
-          add_dll_directory = getattr(os, "add_dll_directory", None)
-          if not callable(add_dll_directory):
-              fail("callable os.add_dll_directory is required")
-
-          raw_vulkan_dir = os.environ.get("Vulkan_DLL_DIR")
-          if raw_vulkan_dir is None or not raw_vulkan_dir.strip():
-              fail("Vulkan_DLL_DIR must name the directory containing vulkan-1.dll")
-
-          try:
-              vulkan_dir = Path(raw_vulkan_dir).expanduser().resolve(strict=True)
-          except OSError as exc:
-              fail(f"Vulkan_DLL_DIR does not resolve to an existing directory: {raw_vulkan_dir!r}: {exc}")
-          if not vulkan_dir.is_dir():
-              fail(f"Vulkan_DLL_DIR is not a directory: {vulkan_dir}")
-
-          vulkan_dll = vulkan_dir / "vulkan-1.dll"
-          if not vulkan_dll.is_file():
-              fail(f"Vulkan loader DLL is missing: {vulkan_dll}")
-          vulkan_dll = vulkan_dll.resolve(strict=True)
-
-          try:
-              _DLL_DIRECTORY_HANDLES = [add_dll_directory(str(vulkan_dir))]
-          except OSError as exc:
-              fail(f"could not register Vulkan DLL directory {vulkan_dir}: {exc}")
-
-          # A script normally puts its own directory at sys.path[0]. Match
-          # `python -m pytest` by restoring the invocation's working directory.
-          if sys.path:
-              sys.path[0] = os.getcwd()
-          else:
-              sys.path.append(os.getcwd())
-
-          print(f"[native-test-bootstrap] registered Vulkan DLL directory: {vulkan_dir}", flush=True)
-          print(f"[native-test-bootstrap] verified Vulkan loader: {vulkan_dll}", flush=True)
-          print(f"[native-test-bootstrap] pytest working directory: {os.getcwd()}", flush=True)
-
-          try:
-              ui = importlib.import_module("omni.ui")
-              ui_native = importlib.import_module("omni.ui._ui")
-              ui_scene = importlib.import_module("omni.ui_scene")
-              scene_native = importlib.import_module("omni.ui_scene._scene")
-          except Exception as exc:
-              fail(
-                  "native ovui preflight failed after registering "
-                  f"{vulkan_dir}: {type(exc).__name__}: {exc}"
-              )
-
-          print(f"[native-test-bootstrap] omni.ui package: {ui.__file__}", flush=True)
-          print(f"[native-test-bootstrap] omni.ui._ui native module: {ui_native.__file__}", flush=True)
-          print(f"[native-test-bootstrap] omni.ui_scene package: {ui_scene.__file__}", flush=True)
-          print(f"[native-test-bootstrap] omni.ui_scene._scene native module: {scene_native.__file__}", flush=True)
-
-          raise SystemExit(pytest.main(sys.argv[1:]))
-          '@
-          Set-Content -LiteralPath $nativeTestBootstrap -Value $nativeTestBootstrapSource -Encoding utf8
+          $nativeTestBootstrap = ".github\scripts\native_test_bootstrap.py"
 
           Remove-Item Env:OVUI_DATA_ADAPTER_PROVIDER -ErrorAction SilentlyContinue
           Push-Location ovui-data-adapters
@@ -949,13 +1396,69 @@ jobs:
             -m "not inspector_qa and not performance and not requires_cuda_vulkan_gl_interop and not (requires_ovstage or requires_ovphysx or requires_ovrtx)"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+          # test_opengl_markdown_exit.py and
+          # test_standalone_thread_progress.py and test_standalone_present_wait.py
+          # are not run here. ovui cannot
+          # open a window on this hosted runner: glfwCreateWindow fails for
+          # OpenGL and vkCreateInstance returns -9, although a plain Win32
+          # window opens (the win32_window_title test above). The Linux jobs
+          # run them. Windows coverage requires a local GPU desktop run.
           & $python $nativeTestBootstrap -q -rs `
             --import-mode=importlib ovui\tests\test_backend_default_policy.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload app wheelhouse as workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ovui-app-wheelhouse-windows-x64
-          path: wheelhouse/*
-          if-no-files-found: error
+      # usd-core 25.11 has no wheel for this interpreter, so the tests that need
+      # pxr cannot run (see the Linux job). Everything else runs, in the
+      # environment of the smoke test above.
+      - name: Run package tests without OpenUSD
+        if: ${{ !matrix.standalone_openusd }}
+        shell: pwsh
+        env:
+          PYTHONNOUSERSITE: "1"
+          PYTHONPATH: ""
+          OVUI_TEST_INSTALLED_RELEASE: "1"
+          OVUI_WIDGETS_REQUIRE_OVRTX: "0"
+        run: |
+          $python = "$env:RUNNER_TEMP\ovui-app-wheelhouse-venv\Scripts\python.exe"
+          & $python -m pip install numpy "pydantic>=2" "pytest>=7,<10" pytest-timeout Pillow `
+            "imageio-ffmpeg>=0.6" "ovstream==0.4.5" `
+            -r skills\omniverse-ui-inspector\requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python -m pip install --no-deps ovrtx
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $nativeTestBootstrap = ".github\scripts\native_test_bootstrap.py"
+          Remove-Item Env:OVUI_DATA_ADAPTER_PROVIDER -ErrorAction SilentlyContinue
+          Push-Location ovui-data-adapters
+          & $python -m pytest -q -rs tests `
+            -m "not (requires_ovstage or requires_ovphysx or requires_ovrtx)" `
+            --ignore=tests/openusd --ignore=tests/test_fixture_smoke.py `
+            --ignore=tests/test_viewport_image_scale.py `
+            --ignore=tests/common/test_livestream_async.py `
+            --ignore=tests/common/test_livestream_tap.py `
+            --deselect tests/common/test_runtime_versions.py::test_openusd_session_reports_the_loaded_ovrtx `
+            --deselect tests/common/test_render_product_stream.py::test_authored_product_switch_does_not_recompose_owned_session
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+          Push-Location skills\omniverse-ui-inspector
+          & $python -m pytest -q -rs tests
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+          & $python $nativeTestBootstrap -q -rs `
+            --import-mode=importlib --continue-on-collection-errors `
+            --junitxml=widgets-no-openusd.xml `
+            --deselect tests/test_application_headless_export.py::test_setup_treats_init_returning_false_as_failure `
+            --deselect tests/test_application_renderer.py::TestPreconstructOrdering::test_failed_early_attempt_is_not_retried_after_stage_open `
+            --deselect tests/test_content_browser_e2e.py::TestFullFlowOpenSave::test_open_failure_leaves_app_in_clean_state `
+            --deselect tests/test_keyboard_shortcuts.py::TestDeleteSelected::test_with_selection_begins_group `
+            --deselect tests/test_step70_wiring.py::TestOpenStageWiring::test_open_stage_sets_stage_adapter `
+            --deselect tests/test_step70_wiring.py::TestOpenStageWiring::test_open_stage_no_crash_without_windows `
+            --deselect tests/test_step70_wiring.py::TestOpenStageWiring::test_open_stage_twice_no_crash `
+            -c ovui-widgets\pyproject.toml ovui-widgets\tests `
+            -m "not inspector_qa and not performance and not requires_cuda_vulkan_gl_interop and not (requires_ovstage or requires_ovphysx or requires_ovrtx)"
+          & $python .github\scripts\check_no_pxr_failures.py widgets-no-openusd.xml --min-passed 5000
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python $nativeTestBootstrap -q -rs `
+            --import-mode=importlib ovui\tests\test_backend_default_policy.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

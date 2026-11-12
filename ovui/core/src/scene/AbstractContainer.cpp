@@ -24,6 +24,19 @@ AbstractContainer::AbstractContainerData::~AbstractContainerData()
 AbstractContainer::AbstractContainer(AbstractContainerData* dataPtr)
     : AbstractItem(dataPtr ? dataPtr : new AbstractContainerData)
 {
+    // A caching SceneView keeps draw buffers from frame to frame, and visibility is not part of what dirties them.
+    // A non-caching view rebuilds every buffer each frame, so a hidden container draws nothing and a container shown
+    // again draws everything. Do the same here: refill (or, while hidden, clear) this container's buffers and those
+    // of its descendants, and mark its ancestors so that they visit it again.
+    this->_setVisibleChangedFn(
+        [this](const bool&)
+        {
+            if (this->_isCaching())
+            {
+                this->dirtyHierarchy();
+                this->forceDirty(DirtyReason::kDirtyReasonContentChanged);
+            }
+        });
 }
 
 AbstractContainer::~AbstractContainer()
@@ -53,8 +66,30 @@ void AbstractContainer::destroy()
 void AbstractContainer::_preDrawContent(
     const MouseInput& input, const Matrix44& projection, const Matrix44& view, float width, float height)
 {
-    for (auto& child : _getChildren())
+    // capture a single snapshot of the children for the entire draw
+    // cycle. Child callbacks (gestures, model updates, manipulator on_build, etc.)
+    // can call addChild/clear/destroy on this container during the draw, which
+    // would otherwise reallocate m_children and dangle the active iterator. The
+    // snapshot keeps each child alive via shared_ptr ref-count, and is reused
+    // unchanged by _drawChildren and _postDrawContent so all three phases iterate
+    // the same set of children (preserving the preDrawContent/postDrawContent
+    // pairing contract in AbstractItem.cpp). _postDrawContent clears it at the end.
+    auto& data = _getData<AbstractContainerData>();
+    data.m_drawSnapshot = data.m_children;
+
+    for (auto& child : data.m_drawSnapshot)
     {
+        // Follow-up: the snapshot keeps each child alive, but a
+        // previous child's callback may have called clear()/destroy() on this
+        // container, which nulls every detached child's parent and scene via
+        // AbstractItem::destroy(). Draw-phase callbacks on those detached
+        // children are unsafe - for example Transform::_preDrawContent
+        // dereferences getParent() when look_at or scale_to is set. Skip any
+        // snapshot entry that this container no longer owns.
+        if (child->getParent() != this)
+        {
+            continue;
+        }
         child->preDrawContent(input, projection, view, width, height);
     }
 
@@ -74,10 +109,23 @@ void AbstractContainer::_postDrawContent(const Matrix44& projection, const Matri
     {
         this->_getDrawBufferIndex().setDirty(false);
     }
-    for (auto& child : _getChildren())
+    // reuse the snapshot captured in _preDrawContent so every child
+    // that was pre-drawn is also post-drawn (and none that was skipped), then
+    // release it. See _preDrawContent for the snapshot rationale and the
+    // detached-child guard.
+    auto& data = _getData<AbstractContainerData>();
+    for (auto& child : data.m_drawSnapshot)
     {
+        if (child->getParent() != this)
+        {
+            continue;
+        }
         child->postDrawContent(projection, view);
     }
+
+    // Release the snapshot now the draw cycle is complete so it does not keep
+    // children alive past the frame.
+    data.m_drawSnapshot.clear();
 }
 
 Vector3 AbstractContainer::transformSpace(Space fromSpace, Space toSpace, const Vector3& point) const
@@ -213,6 +261,9 @@ void AbstractContainer::dirtyHierarchy()
 {
     DrawBufferIndex& drawBufferIndex = this->_getDrawBufferIndex();
     drawBufferIndex.setContentDirty(true);
+    // A caching container visits a nested transform only when its own descendants are dirty. The nested buffers
+    // invalidated below must be refilled, not only cleared.
+    drawBufferIndex.setDescendantDirty(true);
 
     auto drawList = this->_getDrawList();
     if (OMNIUI_LIKELY(drawList))
@@ -320,8 +371,16 @@ void AbstractContainer::_drawChildren(const Matrix44& projection, const Matrix44
         return true;
     };
 
-    for (auto& child : _getChildren())
+    // reuse the snapshot captured in _preDrawContent so this phase
+    // iterates the same children, and skip any the container no longer owns. See
+    // _preDrawContent for the rationale and the detached-child guard.
+    auto& data = _getData<AbstractContainerData>();
+    for (auto& child : data.m_drawSnapshot)
     {
+        if (child->getParent() != this)
+        {
+            continue;
+        }
         if (needDrawChild(child))
         {
             child->drawContent(projection, view);

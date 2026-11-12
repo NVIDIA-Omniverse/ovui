@@ -304,7 +304,7 @@ class AttributesWidget(SimplePropertyWidget):
             return
         from ovui_widgets.property.parts.group_context_menu import show_group_context_menu
         self._window._active_context_menu = show_group_context_menu(
-            adapter, group, x, y
+            adapter, group, x, y, undo_manager=self._window._undo_manager_ref
         )
 
     def _build_attribute_row(self, prop: AttributeMetadata) -> None:

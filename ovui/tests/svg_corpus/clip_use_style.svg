@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128">
+  <defs>
+    <path id="p" d="M8 8H120V120H8Z M40 40H88V88H40Z"/>
+    <clipPath id="c"><use href="#p" clip-rule="evenodd"/></clipPath>
+  </defs>
+  <rect width="128" height="128" fill="red" clip-path="url(#c)"/>
+</svg>

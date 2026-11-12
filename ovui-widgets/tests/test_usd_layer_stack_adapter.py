@@ -1,10 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for :class:`UsdLayerStackAdapter` (LAYERS-PLAN Step 4).
-
-All tests skip when ``pxr`` is not available.
-"""
+"""Tests for :class:`UsdLayerStackAdapter` (LAYERS-PLAN Step 4)."""
 
 from __future__ import annotations
 
@@ -13,7 +10,6 @@ from typing import Callable, List
 
 import pytest
 
-pytest.importorskip("pxr", reason="pxr (OpenUSD) not available")
 from ovui_data_adapters.common import (
     LayerEvent,
     LayerHandle,
@@ -588,6 +584,114 @@ class TestRemoveSublayerMutation:
         assert paths[0] == sub_a_path
 
 
+@pytest.fixture
+def nested_file_stage(tmp_path):
+    """On-disk ``root.usda`` → ``a.usda`` → ``sub/a2.usda``, as in the regression."""
+    (tmp_path / "sub").mkdir()
+    for path, sublayers in (
+        (tmp_path / "sub" / "a2.usda", []),
+        (tmp_path / "a.usda", ["sub/a2.usda"]),
+        (tmp_path / "root.usda", ["a.usda"]),
+    ):
+        layer = Sdf.Layer.CreateNew(str(path))
+        for sublayer in sublayers:
+            layer.subLayerPaths.append(sublayer)
+        Sdf.CreatePrimInLayer(layer, "/World")
+        layer.Save()
+    stage = Usd.Stage.Open(str(tmp_path / "root.usda"))
+    # ``Sdf.Layer.Find``, not ``FindOrOpen``: after a ``FindOrOpen`` call
+    # USD keeps the layer alive, and a remove would no longer destroy it.
+    return (
+        stage,
+        Sdf.Layer.Find(str(tmp_path / "a.usda")).identifier,
+        Sdf.Layer.Find(str(tmp_path / "sub" / "a2.usda")).identifier,
+    )
+
+
+class TestRemoveParentOfNestedLayer:
+    """Regression: remove ``a.usda`` while its sublayer is in use."""
+
+    def test_removed_layer_reads_as_unknown(self, nested_file_stage, undo):
+        stage, a_id, _a2_id = nested_file_stage
+        adapter = UsdLayerStackAdapter(stage, undo)
+        # The Layers window reads the prim specs of the expanded row.
+        assert adapter.get_prim_specs(a_id)
+        adapter.remove_sublayer(stage.GetRootLayer().identifier, 0)
+        # USD destroys the removed layer. A read through the stale cache
+        # stopped the process; the layer must read as unknown.
+        with pytest.raises(KeyError):
+            adapter.get_prim_specs(a_id)
+
+    def test_remove_moves_edit_target_out_of_removed_layer(
+        self, nested_file_stage, undo
+    ):
+        from ovui_widgets.common.selection import SelectionBus
+        from ovui_widgets.layers.commands import RemoveSublayerCommand
+
+        stage, _a_id, a2_id = nested_file_stage
+        adapter = UsdLayerStackAdapter(stage, undo)
+        root_id = stage.GetRootLayer().identifier
+        adapter.set_edit_target(a2_id)
+        cmd = RemoveSublayerCommand(adapter, SelectionBus(), root_id, 0)
+        cmd.do()
+        assert stage.GetEditTarget().IsValid()
+        assert adapter.get_edit_target_identifier() == root_id
+        cmd.undo()
+        assert adapter.get_edit_target_identifier() == a2_id
+
+    @pytest.mark.parametrize("mute_second_parent", [True, False])
+    def test_second_parent_keeps_edit_target_only_when_unmuted(
+        self, tmp_path, undo, mute_second_parent
+    ):
+        # ``b.usda`` lists the same ``sub/a2.usda`` as ``a.usda``. USD
+        # leaves a muted ``b.usda`` and its sublayers out of the
+        # composition, so then the remove of ``a.usda`` takes a2 out.
+        from ovui_widgets.common.selection import SelectionBus
+        from ovui_widgets.layers.commands import RemoveSublayerCommand
+
+        (tmp_path / "sub").mkdir()
+        for path, sublayers in (
+            (tmp_path / "sub" / "a2.usda", []),
+            (tmp_path / "a.usda", ["sub/a2.usda"]),
+            (tmp_path / "b.usda", ["sub/a2.usda"]),
+            (tmp_path / "root.usda", ["a.usda", "b.usda"]),
+        ):
+            layer = Sdf.Layer.CreateNew(str(path))
+            for sublayer in sublayers:
+                layer.subLayerPaths.append(sublayer)
+            Sdf.CreatePrimInLayer(layer, "/World")
+            layer.Save()
+        stage = Usd.Stage.Open(str(tmp_path / "root.usda"))
+        b_id = Sdf.Layer.Find(str(tmp_path / "b.usda")).identifier
+        a2_id = Sdf.Layer.Find(str(tmp_path / "sub" / "a2.usda")).identifier
+        adapter = UsdLayerStackAdapter(stage, undo)
+        root_id = stage.GetRootLayer().identifier
+        b_handle = adapter.find_layer(b_id)
+        if mute_second_parent:
+            adapter.set_mute(b_id, True)
+        # The Layers window still lists the rows below a muted layer: the
+        # adapter opens its file again, so the muted b.usda stays loaded
+        # and still names a2 as a sublayer.
+        assert adapter.get_sublayer_identifiers(b_handle) == [a2_id]
+        adapter.set_edit_target(a2_id)
+        moves: List[tuple] = []
+        cmd = RemoveSublayerCommand(
+            adapter,
+            SelectionBus(),
+            root_id,
+            0,
+            on_edit_target_moved=lambda *ids: moves.append(ids),
+        )
+        cmd.do()
+        assert stage.GetEditTarget().IsValid()
+        if mute_second_parent:
+            assert adapter.get_edit_target_identifier() == root_id
+            assert moves == [(a2_id, root_id)]
+        else:
+            assert adapter.get_edit_target_identifier() == a2_id
+            assert moves == []
+
+
 class TestMoveSublayerMutation:
     def test_same_parent_reorder(self, file_stage, undo):
         stage, sub_a_path, sub_b_path = file_stage
@@ -604,6 +708,102 @@ class TestMoveSublayerMutation:
         root_id = empty_stage.GetRootLayer().identifier
         with pytest.raises(IndexError):
             simple_adapter.move_sublayer(root_id, 5, root_id, 0)
+
+
+@pytest.fixture
+def time_offset_stage(tmp_path):
+    """Regression: ``root.usda`` lists ``anim.usda`` with a time offset.
+
+    ``anim.usda`` moves ``/World/Mover`` from X -200 at time 0 to X 200 at
+    time 20. The entry has offset -20 and scale 2, so at stage time 0 the
+    layer time is (0 + 20) / 2 = 10, where the mover is at X 0. Without
+    the offset and the scale the mover is at X -200.
+    """
+    anim = Sdf.Layer.CreateNew(str(tmp_path / "anim.usda"))
+    mover = Sdf.CreatePrimInLayer(anim, "/World/Mover")
+    mover.specifier = Sdf.SpecifierDef
+    mover.typeName = "Xform"
+    translate = Sdf.AttributeSpec(
+        mover, "xformOp:translate", Sdf.ValueTypeNames.Double3
+    )
+    for time, x in ((0, -200.0), (20, 200.0)):
+        anim.SetTimeSample(translate.path, time, (x, 0.0, 0.0))
+    order = Sdf.AttributeSpec(
+        mover,
+        "xformOpOrder",
+        Sdf.ValueTypeNames.TokenArray,
+        variability=Sdf.VariabilityUniform,
+    )
+    order.default = ["xformOp:translate"]
+    anim.Save()
+    Sdf.Layer.CreateNew(str(tmp_path / "static.usda")).Save()
+
+    root = Sdf.Layer.CreateNew(str(tmp_path / "root.usda"))
+    root.subLayerPaths.append("anim.usda")
+    root.subLayerPaths.append("static.usda")
+    root.subLayerOffsets[0] = Sdf.LayerOffset(-20, 2)
+    root.Save()
+    return Usd.Stage.Open(str(tmp_path / "root.usda"))
+
+
+def _mover_x(stage) -> float:
+    mover = UsdGeom.Xformable(stage.GetPrimAtPath("/World/Mover"))
+    return mover.ComputeLocalToWorldTransform(0).ExtractTranslation()[0]
+
+
+class TestSublayerTimeOffset:
+    """Regression: a reorder, its undo and the undo of a remove keep the offset."""
+
+    def test_reorder_and_its_undo_keep_the_offset(self, time_offset_stage, undo):
+        from ovui_widgets.common.selection import SelectionBus
+        from ovui_widgets.layers.commands import MoveSublayerCommand
+
+        stage = time_offset_stage
+        root = stage.GetRootLayer()
+        adapter = UsdLayerStackAdapter(stage, undo)
+        assert _mover_x(stage) == pytest.approx(0.0)
+
+        cmd = MoveSublayerCommand(
+            adapter, SelectionBus(), root.identifier, 0, root.identifier, 2
+        )
+        cmd.do()
+        assert list(root.subLayerPaths) == ["static.usda", "anim.usda"]
+        assert list(root.subLayerOffsets) == [
+            Sdf.LayerOffset(),
+            Sdf.LayerOffset(-20, 2),
+        ]
+        assert _mover_x(stage) == pytest.approx(0.0)
+
+        cmd.undo()
+        assert list(root.subLayerPaths) == ["anim.usda", "static.usda"]
+        assert list(root.subLayerOffsets) == [
+            Sdf.LayerOffset(-20, 2),
+            Sdf.LayerOffset(),
+        ]
+        assert _mover_x(stage) == pytest.approx(0.0)
+
+    def test_undo_of_remove_restores_the_entry(self, time_offset_stage, undo):
+        from ovui_widgets.common.selection import SelectionBus
+        from ovui_widgets.layers.commands import RemoveSublayerCommand
+
+        stage = time_offset_stage
+        root = stage.GetRootLayer()
+        adapter = UsdLayerStackAdapter(stage, undo)
+
+        cmd = RemoveSublayerCommand(adapter, SelectionBus(), root.identifier, 0)
+        cmd.do()
+        assert list(root.subLayerPaths) == ["static.usda"]
+        assert not stage.GetPrimAtPath("/World/Mover")
+
+        cmd.undo()
+        # The same entry as in the file: the relative path, the offset
+        # and the scale.
+        assert list(root.subLayerPaths) == ["anim.usda", "static.usda"]
+        assert list(root.subLayerOffsets) == [
+            Sdf.LayerOffset(-20, 2),
+            Sdf.LayerOffset(),
+        ]
+        assert _mover_x(stage) == pytest.approx(0.0)
 
 
 class TestSaveLayerMutation:
@@ -681,6 +881,19 @@ class TestSaveLayerAsMutation:
             )
             is None
         )
+
+    def test_save_as_write_error_raises_with_its_cause(
+        self, simple_adapter, empty_stage, tmp_path
+    ):
+        # A regular file where the folder must be: the write fails for any
+        # user. The error must name the cause, not only "failed".
+        blocker = tmp_path / "not_a_folder"
+        blocker.write_text("")
+        root_id = empty_stage.GetRootLayer().identifier
+        with pytest.raises(OSError, match="not_a_folder"):
+            simple_adapter.save_layer_as(
+                root_id, str(blocker / "out.usda"), replace_in_parent=False
+            )
 
 
 # ─── Persistence (LAYERS-PLAN Step 7) ─────────────────────────────────────────
@@ -865,7 +1078,7 @@ class TestTransferRootContentStripsPersistenceKeys:
         reason="Pre-existing segfault in pxr's CopyLayerMetadata path on this "
         "USD build — reproduces in a clean subprocess and on main "
         "(pre-issue-35). Unrelated to OvGear shutdown sequencing. "
-        "Tracked separately; issue #35 final-suite gate skips it."
+        "Tracked separately; the regression final-suite gate skips it."
     )
     def test_child_does_not_inherit_ovgear_layer_data(
         self, empty_stage, undo, tmp_path

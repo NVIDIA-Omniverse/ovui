@@ -34,7 +34,7 @@ re-exported here — import it from
 :mod:`ovui_data_adapters.openusd` directly when ``pxr`` is available
 (Step 15 of the data-adapters refactor relocated it out of widgets).
 The :class:`LayerStackAdapter` ABC lives in
-:mod:`ovui_data_adapters.common` (issue #38).
+:mod:`ovui_data_adapters.common`.
 """
 
 from ovui_widgets.layers.commands import AbstractLayerCommand

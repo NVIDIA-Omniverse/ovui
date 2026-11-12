@@ -45,7 +45,7 @@ void wrapWindowHandle(module& m)
 
     OMNIUI_IGNOREWARNING_MSC_WITH_PUSH(4996) // deprecation for WindowHandle::setVisible
     class_<WindowHandle, std::shared_ptr<WindowHandle>>(m, "WindowHandle", windowHandleDoc)
-        .def("notify_app_window_change", [](WindowHandle& self, pybind11::object window) { self.notifyAppWindowChange(appWindowFromPython(window)); },
+        .def("notify_app_window_change", [](WindowHandle& self, AppWindowObject window) { self.notifyAppWindowChange(appWindowFromPython(window)); },
              OMNIUI_PYBIND_DOC_WindowHandle_notifyAppWindowChange)
         .def_property_readonly("title", &WindowHandle::getTitle, OMNIUI_PYBIND_DOC_WindowHandle_getTitle)
         .def_property("position_x", &WindowHandle::getPositionX, &WindowHandle::setPositionX,

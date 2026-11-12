@@ -3,7 +3,7 @@
 
 """Unit tests for the dialog-list ``_clear_open_dialogs`` helpers.
 
-Issue #35, Step 4 + Step 4b.
+Regression, Step 4 + Step 4b.
 
 These tests hand-wire fake dialogs into the module-scope
 ``_OPEN_DIALOGS`` lists and invoke the registered ``clear_all()`` —

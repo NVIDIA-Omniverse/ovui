@@ -169,8 +169,6 @@ void wrapShapeGesture(module& m)
 
     class_<ShapeGesture, AbstractGesture, std::shared_ptr<ShapeGesture>> shapeGesture(m, "ShapeGesture", shapeGestureDoc);
     shapeGesture /* */
-        .def("__repr__",
-             [](const std::shared_ptr<ShapeGesture>& self) -> std::string { return "<ShapeGesture " + (self ? self->getName(): "") + ">"; })
         .def_property_readonly("sender", &ShapeGesture::getSender)
         .def_property_readonly("raw_input", &ShapeGesture::getRawInput)
         /* */;
@@ -192,9 +190,7 @@ void wrapShapeGesture(module& m)
                       OMNIUI_PYBIND_DOC_ClickGesture_mouseButtons)
         .def_property("modifiers", &ClickGesture::getModifiers, &ClickGesture::setModifiers,
                       OMNIUI_PYBIND_DOC_ClickGesture_modifiers)
-        .def("__repr__",
-             [](const std::shared_ptr<ClickGesture>& self) -> std::string { return "<ClickGesture " + (self ? self->getName(): "") + ">"; })
-        .OMNIUI_PYBIND_DEF_CALLBACK(on_ended, ClickGesture, OnEnded)
+       .OMNIUI_PYBIND_DEF_CALLBACK(on_ended, ClickGesture, OnEnded)
         /**/;
 
     constexpr const char* doubleClickGestureDoc = OMNIUI_PYBIND_CLASS_DOC(DoubleClickGesture);
@@ -209,9 +205,34 @@ void wrapShapeGesture(module& m)
                      OMNIUI_PYBIND_INIT(PyDoubleClickGesture, onEnded ? wrapPythonCallback(std::move(onEnded)) : nullptr)
                  }),
              arg("_on_ended") = nullptr, doubleClickGestureConstructorDoc)
-        .def("__repr__",
-             [](const std::shared_ptr<DoubleClickGesture>& self) -> std::string { return "<DoubleClickGesture " + (self ? self->getName(): "") + ">"; })
-        .OMNIUI_PYBIND_DEF_CALLBACK(on_ended, DoubleClickGesture, OnEnded)
+       .OMNIUI_PYBIND_DEF_CALLBACK(on_ended, DoubleClickGesture, OnEnded)
+        /**/;
+
+    // ``with gesture.following():`` for DragGesture.
+    struct DragGestureFollowing
+    {
+        std::shared_ptr<DragGesture> gesture;
+        bool active = false;
+    };
+    class_<DragGestureFollowing>(m, "_DragGestureFollowing")
+        .def("__enter__",
+             [](DragGestureFollowing& self) -> DragGestureFollowing& {
+                 if (!self.active)
+                 {
+                     self.active = true;
+                     self.gesture->beginFollowing();
+                 }
+                 return self;
+             })
+        .def("__exit__",
+             [](DragGestureFollowing& self, object, object, object) {
+                 if (self.active)
+                 {
+                     self.active = false;
+                     self.gesture->endFollowing();
+                 }
+                 return false;
+             })
         /**/;
 
     constexpr const char* dragGestureDoc = OMNIUI_PYBIND_CLASS_DOC(DragGesture);
@@ -228,8 +249,10 @@ void wrapShapeGesture(module& m)
                       OMNIUI_PYBIND_DOC_Gesture_modifiers)
         .def_property("check_mouse_moved", &DragGesture::isCheckMouseMoved, &DragGesture::setCheckMouseMoved,
                       OMNIUI_PYBIND_DOC_DragGesture_checkMouseMoved)
-        .def("__repr__",
-             [](const std::shared_ptr<DragGesture>& self) -> std::string { return "<DragGesture " + (self ? self->getName(): "") + ">"; })
+        .def(
+            "following",
+            [](const std::shared_ptr<DragGesture>& self) { return DragGestureFollowing{ self }; },
+            OMNIUI_PYBIND_DOC_DragGesture_following)
         .OMNIUI_PYBIND_DEF_CALLBACK(on_began, DragGesture, OnBegan)
         .OMNIUI_PYBIND_DEF_CALLBACK(on_changed, DragGesture, OnChanged)
         .OMNIUI_PYBIND_DEF_CALLBACK(on_ended, DragGesture, OnEnded)
@@ -247,9 +270,7 @@ void wrapShapeGesture(module& m)
                       OMNIUI_PYBIND_DOC_HoverGesture_mouseButtons)
         .def_property("modifiers", &HoverGesture::getModifiers, &HoverGesture::setModifiers,
                       OMNIUI_PYBIND_DOC_HoverGesture_modifiers)
-        .def("__repr__",
-             [](const std::shared_ptr<HoverGesture>& self) -> std::string { return "<HoverGesture " + (self ? self->getName(): "") + ">"; })
-        .OMNIUI_PYBIND_DEF_CALLBACK(on_began, HoverGesture, OnBegan)
+       .OMNIUI_PYBIND_DEF_CALLBACK(on_began, HoverGesture, OnBegan)
         .OMNIUI_PYBIND_DEF_CALLBACK(on_changed, HoverGesture, OnChanged)
         .OMNIUI_PYBIND_DEF_CALLBACK(on_ended, HoverGesture, OnEnded)
         /**/;
@@ -269,8 +290,6 @@ void wrapShapeGesture(module& m)
                       OMNIUI_PYBIND_DOC_ScrollGesture_mouseButtons)
         .def_property("modifiers", &ScrollGesture::getModifiers, &ScrollGesture::setModifiers,
                       OMNIUI_PYBIND_DOC_ScrollGesture_modifiers)
-        .def("__repr__",
-             [](const std::shared_ptr<ScrollGesture>& self) -> std::string { return "<ScrollGesture " + (self ? self->getName(): "") + ">"; })
         .def_property_readonly(
             "scroll", [](const ScrollGesture& self) { return vector2ToPython(self.getScroll()); },
             OMNIUI_PYBIND_DOC_ScrollGesture_getScroll)

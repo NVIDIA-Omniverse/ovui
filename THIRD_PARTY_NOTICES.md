@@ -359,7 +359,7 @@ must have installed to build or run `omni-ui`.
 | `glfw3` | 3.3 | Zlib |
 | `OpenGL` | (unpinned) | MIT (Khronos headers); vendor-licensed runtime ICD |
 | `PkgConfig` | (unpinned) | GPL-2.0-or-later (build-time tool, not redistributed) |
-| `pybind11` | 2.11.1 | BSD-3-Clause |
+| `pybind11` | 2.13.6 | BSD-3-Clause |
 | `Python3` | (unpinned) | Python-2.0 (Python Software Foundation License v2) |
 | `Vulkan` | (unpinned) | Apache-2.0 (Khronos headers + LunarG/Khronos loader) |
 
@@ -578,7 +578,7 @@ at install time and are not vendored.
 | Package | Required version | License |
 |---|---|---|
 | `cmake` | >=3.22 | Apache-2.0 AND BSD-3-Clause |
-| `pybind11` | ==2.11.1 | BSD-3-Clause |
+| `pybind11` | >=2.13.6,<3 | BSD-3-Clause |
 | `setuptools` | >=84.0.0 (`ovui`), >=68 (all other packages) | MIT |
 | `wheel` | (unpinned) | MIT |
 
@@ -589,7 +589,7 @@ at install time and are not vendored.
 | `fastapi` | >=0.100.0 | MIT | runtime (inspector skill) |
 | `httpx` | >=0.25.0 | BSD-3-Clause | runtime (inspector skill) |
 | `pydantic` | >=2 | MIT | runtime (inspector skill) |
-| `python-multipart` | >=0.0.7 | Apache-2.0 | runtime (inspector skill) |
+| `python-multipart` | ==0.0.33 | Apache-2.0 | runtime (inspector skill) |
 | `uvicorn` | >=0.23.0 (`[standard]` extra) | BSD-3-Clause | runtime (inspector skill) |
 | `numpy` | >=1.20 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | runtime: `ovui-data-adapters-common`, `ovui-data-adapters-openusd`, `ovui-widgets-viewport` |
 | `numpy` | >=1.21 | (as above) | optional: `ovui[examples]` |
@@ -613,8 +613,8 @@ Notes:
 ### 6c. Optional packages that users install separately
 
 These packages are not bundled in any `ovui` wheel. They are installed from
-PyPI only when the user installs them or asks for the extra. Shipped `ovui`
-code uses them when they are present.
+PyPI (Python) or npm (JavaScript) only when the user installs them or asks
+for the extra. Shipped `ovui` code uses them when they are present.
 
 | Package | Version | License | How it is used |
 |---|---|---|---|
@@ -623,6 +623,14 @@ code uses them when they are present.
 | `ovstream` | (unpinned) | LicenseRef-NvidiaProprietary (NVIDIA package) | `ovui-widgets-app[media]`, `ovui-data-adapters-openusd[livestream]` |
 | `ovrtx` | (not declared) | LicenseRef-NvidiaProprietary (NVIDIA package) | renderer for `ovui-widgets` and `ovui-data-adapters` |
 | `ovstage` | (not declared) | LicenseRef-NvidiaProprietary (NVIDIA package) | runtime for `ovui-data-adapters-ovstage` |
+| `@mermaid-js/mermaid-cli` (npm) | (not declared) | MIT | `omni.ui.markdown_providers` (`mermaid.py`) runs its `mmdc` command if the user has installed it |
+| `@mathjax/src` (npm) | (not declared) | Apache-2.0 | `omni.ui.markdown_providers` (`math.py`) runs it with Node.js if the user has installed it |
+
+Note on Mermaid CLI: `ovui` does not distribute `@mermaid-js/mermaid-cli` or
+any of its dependencies. When a user installs it, npm also installs its
+dependencies, which include `elkjs` (EPL-2.0) and `DOMPurify`
+(MPL-2.0 OR Apache-2.0). Section 7b lists the versions that the repository's
+own test project locks.
 
 Note on FFmpeg: `imageio-ffmpeg` installs or downloads an FFmpeg executable.
 `ovui` does not distribute FFmpeg. Depending on where that FFmpeg build comes
@@ -639,8 +647,8 @@ NOTICE AND DISCLAIMER: This software automatically retrieves, accesses or intera
 ## 7. Build, test and development tools (not distributed)
 
 The tools below are used only to build, test or develop `ovui`. They are
-**not distributed**: they are not part of any `ovui` wheel or release
-artifact. Only direct dependencies are listed.
+**not distributed**: no `ovui` wheel or release artifact contains their
+code. Only direct dependencies are listed.
 
 ### 7a. Python
 
@@ -671,35 +679,63 @@ artifact. Only direct dependencies are listed.
 | `playwright` | (unpinned) | Apache-2.0 | Markdown quality harness (`render_oracle.py`) |
 | `ovphysx` | (not declared) | LicenseRef-NVIDIA-Omniverse (NVIDIA package) | optional import in `ovui-data-adapters` tests |
 
-CI workflows also pin `ovrtx` (==0.5.0.377615, ==0.5.1.385782), `ovstage`
-(==0.2.1.385922) and `ovstream` (==0.4.5) for tests; see section 6c.
+CI workflows also install the current `ovrtx` and `ovstage` releases, and
+pin `ovstream` (==0.4.5), for tests; see section 6c.
 
 ### 7b. JavaScript
 
 Two private npm projects under `ovui/markdown/quality_harness/` are used
 for Markdown tests and local showcases. Constraints are from their
 `package.json` files; locked versions are from their `package-lock.json`
-files. CI also runs one npm tool.
+files. CI also runs one npm tool. Both projects constrain `katex` to ^0.18.2
+with an npm override. `oracle` also overrides `postcss-selector-parser` to
+^7.1.6 for `@tailwindcss/typography`. Both projects need Node.js 22.12 or
+newer, as the `engines` field in each `package.json` states.
 
 | Package | Constraint (locked) | License | Used by |
 |---|---|---|---|
 | `@streamdown/code` | ^1.1.1 (1.1.1) | Apache-2.0 | `oracle` |
-| `@streamdown/math` | ^1.0.2 (1.0.2) | Apache-2.0 | `oracle` |
+| `@streamdown/math` | ^1.0.2 (1.0.3) | Apache-2.0 | `oracle` |
 | `react` | ^18.3.1 (18.3.1) | MIT | `oracle` |
 | `react-dom` | ^18.3.1 (18.3.1) | MIT | `oracle` |
 | `remark-github-blockquote-alert` | ^2.1.0 (2.1.0) | MIT | `oracle` |
-| `streamdown` | ^2.5.0 (2.5.0) | Apache-2.0 | `oracle` |
-| `@tailwindcss/typography` | ^0.5.15 (0.5.19) | MIT | `oracle` (dev) |
-| `@types/react` | ^18.3.12 (18.3.28) | MIT | `oracle` (dev) |
+| `streamdown` | ^2.5.0 (2.7.1) | Apache-2.0 | `oracle` |
+| `@tailwindcss/postcss` | ^4.3.3 (4.3.3) | MIT | `oracle` (dev) |
+| `@tailwindcss/typography` | ^0.5.20 (0.5.20) | MIT | `oracle` (dev) |
+| `@types/react` | ^18.3.12 (18.3.31) | MIT | `oracle` (dev) |
 | `@types/react-dom` | ^18.3.1 (18.3.7) | MIT | `oracle` (dev) |
-| `@vitejs/plugin-react` | ^4.3.4 (4.7.0) | MIT | `oracle` (dev) |
-| `autoprefixer` | ^10.4.20 (10.5.0) | MIT | `oracle` (dev) |
-| `postcss` | ^8.4.49 (8.5.10) | MIT | `oracle` (dev) |
-| `tailwindcss` | ^3.4.17 (3.4.19) | MIT | `oracle` (dev) |
+| `@vitejs/plugin-react` | ^5.2.0 (5.2.0) | MIT | `oracle` (dev) |
+| `postcss` | ^8.5.23 (8.5.31) | MIT | `oracle` (dev) |
+| `tailwindcss` | ^4.3.3 (4.3.3) | MIT | `oracle` (dev) |
 | `typescript` | ^5.6.3 (5.9.3) | Apache-2.0 | `oracle` (dev) |
-| `vite` | ^5.4.11 (5.4.21) | MIT | `oracle` (dev) |
-| `@mathjax/src` | ^4.0.0 (4.1.2) | Apache-2.0 | `providers` |
-| `@mermaid-js/mermaid-cli` | ^11.12.0 (11.12.0) | MIT | `providers` |
+| `vite` | ^7.3.7 (7.3.7) | MIT | `oracle` (dev) |
+| `@mathjax/src` | ^4.0.0 (4.1.3) | Apache-2.0 | `providers` |
+| `@mermaid-js/mermaid-cli` | ^11.17.0 (11.17.0) | MIT | `providers` |
+| `puppeteer` | ^25.16.0 (25.16.0) | Apache-2.0 | `providers` |
+
+Some packages in the lock files have licenses that need a license check and
+are not in the table above. None of them is distributed. The wheels hold only
+the Python packages and the package data that each `setup.py` or
+`pyproject.toml` lists, and no wheel contains a file of `quality_harness`. The
+release source archives (`git archive` of the release commit) contain the
+`package.json` and `package-lock.json` files of the two npm projects. Those
+files list package names and versions only. No `node_modules` folder, npm
+package code or JavaScript bundle is in any wheel or release archive.
+
+| Package | Locked | License | Pulled in by |
+|---|---|---|---|
+| `lightningcss` | 1.32.0 | MPL-2.0 | `oracle` (dev): `@tailwindcss/postcss` and `vite` |
+| `elkjs` | 0.9.3 | EPL-2.0 | `providers`: `@mermaid-js/layout-elk` of `@mermaid-js/mermaid-cli` |
+| `dompurify` | 3.4.17 | MPL-2.0 OR Apache-2.0 (Apache-2.0 elected) | `providers`: `mermaid` of `@mermaid-js/mermaid-cli` |
+| `@fortawesome/fontawesome-free` | 7.3.1 | CC-BY-4.0 AND OFL-1.1 AND MIT | `providers`: `@mermaid-js/mermaid-cli` |
+| `khroma` | 2.1.0 | MIT (from the package's `license` file; its `package.json` has no `license` field) | `providers`: `mermaid` of `@mermaid-js/mermaid-cli` |
+
+Note on DOMPurify: DOMPurify is dual-licensed under the Mozilla Public
+License 2.0 and the Apache License 2.0. NVIDIA elects the Apache License 2.0.
+Attribution: DOMPurify, (c) Cure53 and other contributors,
+<https://github.com/cure53/DOMPurify>. The upstream package has no NOTICE
+file. The full Apache License 2.0 text is in this repository's `LICENSE` file
+and in `ovui/resources/fonts/LICENSE-Apache-2.0.txt`.
 
 ---
 

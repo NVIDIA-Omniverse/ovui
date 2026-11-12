@@ -554,7 +554,7 @@ def test_first_party_dependencies_pin_the_release_version(declared_dependencies)
     All first-party packages are released together and change their APIs
     together. A lower bound such as ``>=0.1.0`` lets ``pip install --upgrade``
     keep an older ``ovui`` or ``ovui-data-adapters-common`` next to new
-    packages, and ``pip check`` does not report it (NVBug 6881459).
+    packages, and ``pip check`` does not report it.
     """
     version = (MONOREPO_ROOT / "VERSION.md").read_text(encoding="utf-8").strip()
     project_dirs = sorted(

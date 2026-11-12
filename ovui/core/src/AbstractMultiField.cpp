@@ -97,6 +97,11 @@ void AbstractMultiField::onStyleUpdated()
 
 void AbstractMultiField::onModelUpdated(const std::shared_ptr<const AbstractItemModel::AbstractItem>& item)
 {
+    // The fields live in m_mainLayout, which is created without a parent, so the forceRasterDirty() a field raises
+    // when its value changes stops at that layout and never reaches a rasterized ancestor. Invalidate from the
+    // multi-field itself, or an AUTO-rasterized window keeps drawing the old values until something else repaints it.
+    this->forceRasterDirty(BakeDirtyReason::eContentChanged);
+
     if (item != nullptr)
     {
         return;

@@ -23,8 +23,6 @@ import math
 
 import pytest
 
-pytest.importorskip("pxr")
-
 from ovui_data_adapters.common import BoundCameraPose
 from ovui_data_adapters.openusd.bound_camera import read_bound_camera, read_camera_pose
 from pxr import Gf, Sdf, Usd, UsdGeom

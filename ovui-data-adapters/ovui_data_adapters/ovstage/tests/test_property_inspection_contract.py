@@ -327,7 +327,9 @@ def test_multiselect_is_intersection_ordered_and_reports_component_ambiguity() -
     assert "onlyA" not in adapter.get_attribute_names()
     assert "typeMismatch" not in adapter.get_attribute_names()
     assert adapter.is_ambiguous("float2Value") is True
-    assert adapter.get_value("float2Value") is None
+    # A vector that differs gives the value of the first object; the row
+    # shows "Mixed" only on the channel that differs.
+    assert adapter.get_value("float2Value") == pytest.approx((1.0, 2.0))
     assert adapter.get_per_component_ambiguity("float2Value") == [False, True]
     assert adapter.is_ambiguous("pointValue") is True
     assert adapter.get_per_component_ambiguity("pointValue") == [False, True, False]
@@ -404,6 +406,265 @@ def test_exact_wheel_properties_use_native_semantics_and_truth(
     assert clipping.is_time_sampled is False
     assert "xformOp:translate" not in translated.get_attribute_names()
     assert "test:label" not in custom.get_attribute_names()
+
+
+def test_time_sampled_custom_attribute_shows_its_default_value(
+    tmp_path: Path,
+    ovstage_runtime: Any,
+) -> None:
+    path = tmp_path / "sampled.usda"
+    path.write_text(
+        '''#usda 1.0
+
+def Cube "Sampled"
+{
+    custom float b29:sampled = 3.5
+    custom float b29:sampled.timeSamples = {
+        -10: 1,
+        90: 2,
+    }
+}
+''',
+        encoding="utf-8",
+    )
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(path))
+    try:
+        sampled = create_property_adapter(scene, ["/Sampled"])
+        assert "b29:sampled" in sampled.get_attribute_names()
+        assert sampled.get_value("b29:sampled") == 3.5
+    finally:
+        session.shutdown_scene()
+
+
+def test_sampled_custom_attributes_keep_their_type_name_and_instances(
+    tmp_path: Path,
+    ovstage_runtime: Any,
+) -> None:
+    path = tmp_path / "sampled-kinds.usda"
+    path.write_text(
+        '''#usda 1.0
+
+def Xform "World"
+{
+    def Cube "C"
+    {
+        custom string label = "hello"
+        custom string label.timeSamples = {
+            0: "a",
+            1: "b",
+        }
+        custom float omni:fabric:sample = 5.5
+        custom float omni:fabric:sample.timeSamples = {
+            0: 1,
+            1: 2,
+        }
+    }
+    def Xform "I1" (
+        instanceable = true
+        references = </Proto>
+    )
+    {
+    }
+    def Xform "I2" (
+        instanceable = true
+        references = </Proto>
+    )
+    {
+    }
+}
+
+class Xform "Proto"
+{
+    def Cube "C"
+    {
+        custom float sampleProto = 8.5
+        custom float sampleProto.timeSamples = {
+            0: 8,
+            1: 9,
+        }
+    }
+}
+''',
+        encoding="utf-8",
+    )
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(path))
+    try:
+        cube = create_property_adapter(scene, ["/World/C"])
+        assert cube.get_value("label") == "hello"
+        assert cube.get_attribute_metadata("label").type_name == "string"
+        assert cube.get_value("omni:fabric:sample") == 5.5
+        for instance_child in ("/World/I1/C", "/World/I2/C"):
+            child = create_property_adapter(scene, [instance_child])
+            assert child.get_value("sampleProto") == 8.5
+    finally:
+        session.shutdown_scene()
+
+
+def test_sampled_property_without_a_default_keeps_its_row(
+    tmp_path: Path,
+    ovstage_runtime: Any,
+) -> None:
+    """A sampled property with no default has no value at the default time.
+
+    The OpenUSD adapter still shows its row, with the zero value of its type.
+    The time samples must not stand in for a default.
+    """
+
+    path = tmp_path / "no-default.usda"
+    path.write_text(
+        '''#usda 1.0
+
+def Cube "N"
+{
+    custom float number.timeSamples = {
+        0: 6,
+        1: 7,
+    }
+    custom string text.timeSamples = {
+        0: "a",
+    }
+}
+''',
+        encoding="utf-8",
+    )
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(path))
+    try:
+        cube = create_property_adapter(scene, ["/N"])
+        assert cube.get_value("number") == 0.0
+        assert cube.get_attribute_metadata("number").type_name == "float"
+        assert cube.get_value("text") == ""
+        assert cube.get_attribute_metadata("text").type_name == "string"
+    finally:
+        session.shutdown_scene()
+
+
+def test_sampled_matrix_and_color_without_a_default_use_their_fallbacks(
+    tmp_path: Path,
+    ovstage_runtime: Any,
+) -> None:
+    """A matrix without a default shows identity, and a color4f shows alpha 1.
+
+    These are the values the OpenUSD adapter shows. Zero would read as a
+    singular matrix and a transparent color.
+    """
+
+    path = tmp_path / "no-default-math.usda"
+    path.write_text(
+        '''#usda 1.0
+
+def Cube "C"
+{
+    custom matrix4d matrix.timeSamples = {
+        0: ((2, 0, 0, 0), (0, 2, 0, 0), (0, 0, 2, 0), (0, 0, 0, 1)),
+    }
+    custom color4f rgba.timeSamples = {
+        0: (1, 0, 0, 0.5),
+    }
+}
+''',
+        encoding="utf-8",
+    )
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(path))
+    try:
+        cube = create_property_adapter(scene, ["/C"])
+        assert tuple(cube.get_value("matrix")) == (
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        assert cube.get_attribute_metadata("matrix").type_name == "matrix4d"
+        assert tuple(cube.get_value("rgba")) == (0.0, 0.0, 0.0, 1.0)
+        assert cube.get_attribute_metadata("rgba").type_name == "color4f"
+    finally:
+        session.shutdown_scene()
+
+
+def test_one_sampled_name_with_a_string_and_a_token_opens(
+    tmp_path: Path,
+    ovstage_runtime: Any,
+) -> None:
+    path = tmp_path / "mixed.usda"
+    path.write_text(
+        '''#usda 1.0
+
+def Cube "A"
+{
+    custom string mixed = "hello"
+    custom string mixed.timeSamples = {
+        0: "a",
+        1: "b",
+    }
+}
+def Cube "B"
+{
+    custom token mixed = "world"
+    custom token mixed.timeSamples = {
+        0: "c",
+        1: "d",
+    }
+}
+def Cube "C"
+{
+    custom uint64 mixed = 123
+    custom uint64 mixed.timeSamples = {
+        0: 4,
+        1: 5,
+    }
+}
+''',
+        encoding="utf-8",
+    )
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(path))
+    try:
+        string = create_property_adapter(scene, ["/A"])
+        assert string.get_value("mixed") == "hello"
+        assert string.get_attribute_metadata("mixed").type_name == "string"
+        assert create_property_adapter(scene, ["/B"]).get_value("mixed") == "world"
+        assert create_property_adapter(scene, ["/C"]).get_value("mixed") == 123
+    finally:
+        session.shutdown_scene()
+
+
+def test_one_sampled_name_with_a_string_and_a_float_opens(
+    tmp_path: Path,
+    ovstage_runtime: Any,
+) -> None:
+    path = tmp_path / "string-and-float.usda"
+    path.write_text(
+        '''#usda 1.0
+
+def Cube "A"
+{
+    custom string mixed = "hello"
+    custom string mixed.timeSamples = {
+        0: "a",
+        1: "b",
+    }
+}
+def Cube "B"
+{
+    custom float mixed = 2.5
+    custom float mixed.timeSamples = {
+        0: 1.0,
+        1: 2.0,
+    }
+}
+''',
+        encoding="utf-8",
+    )
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(path))
+    try:
+        assert create_property_adapter(scene, ["/A"]).get_value("mixed") == "hello"
+        assert create_property_adapter(scene, ["/B"]).get_value("mixed") == pytest.approx(2.5)
+    finally:
+        session.shutdown_scene()
 
 
 def test_exact_wheel_values_are_python_owned_after_native_group_release(

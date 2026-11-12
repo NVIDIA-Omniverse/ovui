@@ -35,6 +35,7 @@ markdown/quality_harness/
 │   ├── fuse_qa_comparison.py         side-by-side panels
 │   ├── llm_judge_qa.py               Claude-as-judge report
 │   ├── render_oracle.py              corpus/* → streamdown → PNG
+│   ├── check_oracle_capture.py       checks that long tables and code show in full
 │   ├── render_sut.py                 corpus/* → ovui widget → PNG
 │   ├── compare.py                    SSIM / pixel-diff metrics
 │   ├── build_sidebyside.py           2-panel oracle|SUT composites
@@ -69,9 +70,14 @@ npm install             # once
 cd ..
 
 python3 scripts/render_oracle.py           # ground-truth renders
+python3 scripts/check_oracle_capture.py    # long tables and code show in full
 DISPLAY=:100 python3 scripts/render_sut.py # widget renders
 python3 scripts/compare.py                 # diffs + metrics
 ```
+
+The oracle needs Node.js 22.12 or newer (`engines` in `oracle/package.json`).
+Node 20 gives an `EBADENGINE` warning for `commander@15`, and a strict
+install (`engine-strict=true`) fails.
 
 Update `tracker/markers.yaml` to promote markers red → yellow → green as
 gates pass.

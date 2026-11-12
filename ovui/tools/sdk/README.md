@@ -14,7 +14,8 @@ For CMake consumers, set `ovui-sdk_DIR` to the extracted `omni/ui/sdk/cmake` dir
 
 Build the real artifact with `python -m pip wheel ./ovui --no-deps -w ./dist`.
 The packaged manifest records each SDK file and its producing source revision.
-The SDK uses Kit's pybind11 2.11.1 and shared ImGui configuration. The imported
+The SDK carries the pybind11 2.13 headers the wheel was built with and the shared ImGui configuration. Build consumers that share types with the wheel's modules with pybind11 2.13.6 or later below 3. On Windows, `ovui::core` gives a consumer the wheel's key of the shared type registry, which has no compiler version, so the wheel's modules also share types with modules built with pybind11 2.11.1 (Kit's). The SDK is not tied to a Python version. The imported
 `ovui::imgui` target resolves the same drawing library used by `ovui::core`;
-Windows includes its `imgui.lib` alongside the core and scene import libraries.
+Windows includes its `imgui.lib` alongside the core and scene import libraries,
+and `tools/generate_ui_forwarders.py`, which generates the `omni.ui.dll` forwarders to `ovui.dll` for a host that has its own `omni.ui.dll`.
 No additional test or example consumer is installed in the repository.

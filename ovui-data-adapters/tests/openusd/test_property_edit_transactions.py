@@ -14,7 +14,6 @@ import gc
 
 import pytest
 
-pxr = pytest.importorskip("pxr")
 from pxr import Usd, UsdGeom  # noqa: E402
 
 from ovui_data_adapters.openusd.property_adapter import UsdPropertyAdapter  # noqa: E402

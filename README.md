@@ -4,7 +4,7 @@
 
 **ovui** is a standalone Python UI toolkit for building native scene, viewport, and data applications, exposing the Omniverse UI framework through the familiar `omni.ui` (windows, layout, value models, widgets) and `omni.ui_scene` (SceneView, gestures, manipulators) Python APIs over a native C++ core. It loads and edits OpenUSD stages, presents rendered viewports from an external renderer such as ovrtx, runs headlessly for automation, and can be inspected by AI agents through a screenshot-first loop. Its defining trait is that it runs standalone — **no Omniverse Kit installation required**.
 
-ovui is a disaggregated piece of the Omniverse platform: the `omni.ui` UI framework decoupled from the Kit extension system and shipped as an independently installable library, available as a peer to the other `ov` libraries (ovrtx, ovgraph, ovphysx, and more). It pairs the native runtime with **ovui-widgets** (production-shaped scene widgets) and **ovui-data-adapters** (a backend boundary for OpenUSD and custom data sources), keeping the UI layer cleanly separate from the data layer so teams can build tools against their own backends.
+ovui is a disaggregated piece of the Omniverse platform: the `omni.ui` UI framework decoupled from the Kit extension system and shipped as an independently installable library, available as a peer to the other `ov` libraries (ovrtx, ovphysx, and more). It pairs the native runtime with **ovui-widgets** (production-shaped scene widgets) and **ovui-data-adapters** (a backend boundary for OpenUSD and custom data sources), keeping the UI layer cleanly separate from the data layer so teams can build tools against their own backends.
 
 > *ovui is pre-release software and is not enterprise-supported.*
 ---
@@ -19,7 +19,7 @@ ovui is a disaggregated piece of the Omniverse platform: the `omni.ui` UI framew
 - **Stay backend-independent** — implement adapter contracts (`StageAdapter`, `PropertyAdapter`, `TransformAdapter`, `RendererAdapter`) to wire widgets to OpenUSD or your own data source; OpenUSD + ovrtx implementations are included.
 - **Run headless and prove output remotely** — Vulkan/offscreen runs, programmatic screenshots, and frame-loop draining for CI and automation.
 - **Drive it with AI coding agents** — the repo ships `AGENTS.md` and task-level skills (atomic UI APIs, widget composition, styling, screenshot-first inspection) so agents work from real patterns instead of inventing UI code.
-- **Install in pieces** — a monorepo of independently installable distributions (`ovui`, `ovui-widgets-*`, `ovui-data-adapters-*`) that share one version, so you take only what you need.
+- **Install in pieces** — a monorepo of independently installable distributions (`ovui`, `ovui-widgets-*`, `ovui-data-adapters-*`) that share one version, so you take only what you need. See [Packages](#4a-packages).
 
 **Who benefits:**
 
@@ -35,6 +35,7 @@ ovui is a disaggregated piece of the Omniverse platform: the `omni.ui` UI framew
 - **Quickstart & install:** <https://github.com/NVIDIA-Omniverse/ovui#readme>
 - **Native UI framework guide:** <https://github.com/NVIDIA-Omniverse/ovui/blob/main/ovui/README.md>
 - **USD Viewer app & widgets guide:** <https://github.com/NVIDIA-Omniverse/ovui/blob/main/ovui-widgets/README.md>
+- **USD Viewer install and launch skill:** <https://github.com/NVIDIA-Omniverse/ovui/blob/main/skills/omniverse-ui-widgets-app/SKILL.md>
 - **Data adapters guide:** <https://github.com/NVIDIA-Omniverse/ovui/blob/main/ovui-data-adapters/README.md>
 - **Architecture overview:** <https://github.com/NVIDIA-Omniverse/ovui/tree/main/docs>
 - **Source (GitHub):** <https://github.com/NVIDIA-Omniverse/ovui>
@@ -47,12 +48,51 @@ ovui is a disaggregated piece of the Omniverse platform: the `omni.ui` UI framew
 
 ## 4. System requirements
 
-- **Python 3.12+**
-- **Linux** (Ubuntu 22.04 / Debian) and **Windows** (Windows 11 / Windows Server 2022), x86_64
+- **Python 3.12** for the published 0.2.0 and 0.3.0 wheels (CPython; the `ovui` wheels have only the `cp312` tag). The 0.3.1 native UI release builds one wheel per platform for **Python 3.12, 3.13, 3.14 and 3.15**; see [Python versions](ovui/README.md#python-versions) for the known dependency limits
+- **Linux** (Ubuntu 22.04 / Debian) and **Windows** (Windows 11 / Windows Server 2022), x86_64. The `ovui` wheels are also published for Linux aarch64, but PyPI has no Linux aarch64 wheel of the `usd-core` version that the `standalone` extra pins
 - **NVIDIA RTX-capable GPU + compatible driver** for rendered viewport output via ovrtx; a Vulkan-capable environment (including headless/Lavapipe) is supported for UI and offscreen paths
 - **Build toolchain for source installs:** CMake with Visual Studio 2022 ("Desktop development with C++") on Windows, or `build-essential` on Linux; Vulkan headers + loader for the optional Vulkan backend
-- **Current release:** ovui 0.3.0 (Early Access)
+- **Current release:** ovui 0.3.1 (Early Access)
+- **ovrtx and ovstage:** ovui does not install or pin them. In 0.3.1, the ovstage adapter reads both native tensor layouts, so earlier ovstage releases keep working and existing users do not need to upgrade. See `ovui-data-adapters/README.md` for details
 - The rendered viewport path depends on an external renderer (ovrtx), which is not provided by this repository. The OpenUSD data-adapter provider additionally requires OpenUSD (`pxr`) Python bindings — from its `standalone` extra or the environment — while the native OVStage provider uses the external native OVStage runtime and needs no OpenUSD bindings
+
+### 4a. Packages
+
+The **0.3.1** release contains these 13 first-party distributions. Install all first-party packages at the same version.
+
+| Wheel | What it gives you |
+|---|---|
+| `ovui` | The UI framework (`omni.ui`, `omni.ui_scene`), the native C++ core, the standalone backend, and the C++ SDK. One wheel for each platform. |
+| `ovui-data-adapters-common` | The adapter interfaces and shared code. |
+| `ovui-data-adapters-services` | Shared services for the adapters. |
+| `ovui-data-adapters-openusd` | The OpenUSD data adapter. |
+| `ovui-data-adapters-ovstage` | The native OVStage data adapter. `ovui-widgets-all` does not install it. It also needs the external `ovstage` and `ovrtx` packages. |
+| `ovui-widgets-common` | Shared widget code, styles and icons. |
+| `ovui-widgets-content` | The Content Browser. |
+| `ovui-widgets-stage` | The Stage Browser. |
+| `ovui-widgets-layers` | The Layers panel. |
+| `ovui-widgets-property` | The Property Inspector. |
+| `ovui-widgets-viewport` | The Viewport widget. |
+| `ovui-widgets-app` | The USD Viewer application, its menus, and the `ovui-widgets` command. |
+| `ovui-widgets-all` | A meta-package. It installs `ovui`, the common, services and OpenUSD data adapters, and all `ovui-widgets-*` packages above, and the standalone OpenUSD package `usd-core`. It does not install `ovui-data-adapters-ovstage` or `ovrtx`. |
+
+**Menus.** The Create menu has these items: Mesh, Shape, Light, Camera, Scope, Xform, and Material > USD Materials > USD Preview Surface. When the `ovui-data-adapters-ovstage` wheel is installed, it adds a Physics menu for OVStage sessions that expose physics controls.
+
+**Stored render settings.** Some scenes store render settings in `customLayerData['renderSettings']` of the root layer. Starting with 0.3.1, the adapters apply these settings when a scene opens. They apply only the stored keys that the installed `ovrtx` maps to a Camera or RenderProduct attribute. Earlier 0.3.0 wheels did not apply them, so affected scenes could render black.
+
+**How to install.** The viewport needs the external renderer `ovrtx`. The app exits with an error at start-up if `ovrtx` is not installed and `OVRTX_ROOT` is not set. This is also so when no scene is given, because the app first opens an empty stage. Install it with the ovui wheels:
+
+```bash
+python -m pip install ovui-widgets-all ovrtx
+python -m ovui_widgets.app path/to/scene.usda
+```
+
+To use the native OVStage provider, also install the wheel `ovui-data-adapters-ovstage` and the external `ovstage` package, and set `OVUI_DATA_ADAPTER_PROVIDER=ovstage`. The 0.3.0 wheels need the `ovstage` and `ovrtx` of the 0.3.0 release. With the `ovstage` and `ovrtx` that came after 0.3.0, the start camera is zoomed in on the objects and a selected prim gets no move gizmo. The section [ovstage + ovrtx](skills/omniverse-ui-widgets-app/SKILL.md#ovstage--ovrtx-native-ovstage) of the skill gives the command for each release. See also [`ovui-widgets/README.md`](ovui-widgets/README.md).
+
+The skill [`skills/omniverse-ui-widgets-app/SKILL.md`](skills/omniverse-ui-widgets-app/SKILL.md) gives the install commands for each data adapter and each published release, with the `ovrtx` and `ovstage` of that release, and the launch commands with their aliases.
+
+Install the packages together at the same version. To find out what you have, run `python -m pip list | grep -i ovui`.
+
 
 ---
 
@@ -69,7 +109,6 @@ The following third-party components are checked into this repository and keep t
 | Component | Path | License | License file |
 |---|---|---|---|
 | Dear ImGui | `ovui/third_party/imgui/` | MIT | [`ovui/third_party/imgui/LICENSE.txt`](ovui/third_party/imgui/LICENSE.txt) |
-| md4c | `ovui/third_party/md4c/` | MIT | [`ovui/third_party/md4c/LICENSE.md`](ovui/third_party/md4c/LICENSE.md) |
 | Noto Sans fonts | `ovui/resources/fonts/NotoSans-*.ttf` | SIL Open Font License 1.1 | [`ovui/resources/fonts/OFL.txt`](ovui/resources/fonts/OFL.txt) |
 | Open Sans font | `ovui/resources/fonts/OpenSans-SemiBold.ttf` | Apache License 2.0 | [`ovui/resources/fonts/LICENSE-Apache-2.0.txt`](ovui/resources/fonts/LICENSE-Apache-2.0.txt) |
 | Roboto font | `ovui/resources/fonts/roboto_medium.ttf` | Apache License 2.0 | [`ovui/resources/fonts/LICENSE-Apache-2.0.txt`](ovui/resources/fonts/LICENSE-Apache-2.0.txt) |
@@ -77,7 +116,7 @@ The following third-party components are checked into this repository and keep t
 
 The ImGui compatibility files `imgui_kit_compat.h`, `imgui_kit_compat.cpp` and `imgui_ovrtx_compat.cpp` in `ovui/third_party/imgui/` are written by NVIDIA and licensed under the Apache License 2.0, not MIT.
 
-Components fetched at build time (for example glm, stb, glfw, freetype) and their license texts are listed in `THIRD_PARTY_NOTICES.md`.
+Components fetched at build time (for example md4c, glm, stb, glfw, freetype) and their license texts are listed in `THIRD_PARTY_NOTICES.md`.
 
 ### House rule: copies of the root LICENSE
 

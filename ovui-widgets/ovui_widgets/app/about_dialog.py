@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
+import os
 import platform
 from importlib import metadata
 from typing import Any, Iterable, Optional
 
 import omni.ui as ui
-from ovui_data_adapters.common.ovrtx_import import ovrtx_root_version
+from ovui_data_adapters.common.ovrtx_import import OVRTX_ROOT_ENV, ovrtx_root_version
 
 
 _COMPONENT_DISTRIBUTIONS = (
@@ -27,16 +28,19 @@ def installed_component_versions(
     runtime_component_versions: Iterable[tuple[str, str]] = (),
 ) -> tuple[tuple[str, str], ...]:
     """Return truthful installed versions without importing native runtimes."""
+    runtime_versions = dict(runtime_component_versions)
     rows = []
     for label, distribution in _COMPONENT_DISTRIBUTIONS:
-        try:
-            version = metadata.version(distribution)
-        except Exception:
-            version = ""
-        if not version and distribution == "ovrtx":
+        # The active adapter reports the ovrtx and ovstage it loaded.
+        version = runtime_versions.get(label, "")
+        if not version and distribution == "ovrtx" and os.environ.get(OVRTX_ROOT_ENV, "").strip():
             version = ovrtx_root_version()
+        elif not version:
+            try:
+                version = metadata.version(distribution)
+            except Exception:
+                version = ""
         rows.append((label, version or "Unavailable"))
-    runtime_versions = dict(runtime_component_versions)
     openusd = runtime_versions.get("OpenUSD") or "Unavailable"
     rows.extend((
         ("OpenUSD", openusd),

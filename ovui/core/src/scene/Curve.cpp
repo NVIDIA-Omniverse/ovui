@@ -15,6 +15,8 @@
 
 #include "AbstractShapeData.h"
 
+#include <utility>
+
 #include <numeric>
 #include <limits>
 #include <cmath>
@@ -51,8 +53,14 @@ Curve::Curve(const std::vector<Vector3>& positions)
     : AbstractShape(new CurveData)
 {
     this->_setPositionsChangedFn(std::bind(&This::_dirtyCache, this));
-    this->_setColorsChangedFn(std::bind(&This::_dirtyCache, this));
-    this->_setThicknessesChangedFn(std::bind(&This::_dirtyCache, this));
+    this->_setColorsChangedFn([this](const auto&) {
+        _getData<CurveData>().m_cacheIsDirty = true;
+        this->_dirtyAppearance();
+    });
+    this->_setThicknessesChangedFn([this](const auto&) {
+        _getData<CurveData>().m_cacheIsDirty = true;
+        this->_dirtyAppearance();
+    });
     this->_setCurveTypeChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setTessellationChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setIntersectionThicknessChangedFn([this](const auto&) {
@@ -137,8 +145,9 @@ void Curve::intersect(const Vector3 origin,
         stateGesturePayload = std::make_unique<CurveGesturePayload>();
     }
 
-    Vector3 lastClosestPoint = data.m_lastGesturePayload.rayClosestPoint;
-    Float lastMovedDistance = data.m_lastGesturePayload.curveDistance;
+    const bool held = std::exchange(data.m_baselineHeld, false);
+    Vector3 lastClosestPoint = held ? data.m_baselinePoint : data.m_lastGesturePayload.rayClosestPoint;
+    Float lastMovedDistance = held ? data.m_baselineA : data.m_lastGesturePayload.curveDistance;
 
     auto transform = this->getParent()->getAccumulatedTransform();
 
@@ -204,6 +213,20 @@ void Curve::intersect(const Vector3 origin,
 
     // Copy
     *stateGesturePayload = data.m_lastGesturePayload;
+}
+
+bool Curve::_getFollowReport(Vector3& moved) const
+{
+    const auto& payload = _getData<CurveData>().m_lastGesturePayload;
+    moved = payload.moved;
+    return true;
+}
+
+void Curve::_captureBaseline() const
+{
+    auto& data = _getData<CurveData>();
+    data.m_baselinePoint = data.m_lastGesturePayload.rayClosestPoint;
+    data.m_baselineA = data.m_lastGesturePayload.curveDistance;
 }
 
 const Curve::CurveGesturePayload* Curve::getGesturePayload() const

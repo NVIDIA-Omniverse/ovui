@@ -15,8 +15,6 @@ Covers:
 - Worker-thread USD mutation still routes through the flush.
 - Re-entrance: a subscriber that mutates USD during dispatch re-arms a
   fresh flush without losing the original event batch.
-
-All tests skip when ``pxr`` is not available.
 """
 
 from __future__ import annotations
@@ -29,7 +27,6 @@ from typing import Callable, List
 
 import pytest
 
-pytest.importorskip("pxr", reason="pxr (OpenUSD) not available")
 from ovui_data_adapters.common import LayerEvent, LayerEventType
 from ovui_data_adapters.openusd.layer_stack_adapter import UsdLayerStackAdapter
 from pxr import Sdf, Usd, UsdGeom

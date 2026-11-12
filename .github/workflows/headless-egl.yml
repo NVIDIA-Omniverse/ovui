@@ -51,11 +51,23 @@ jobs:
       - name: Guard — verify EGL tests are registered
         run: |
           if ctest --test-dir build -N \
-              -R "headless_egl|egl_platform_unit|egl_texture_upload|egl_screenshot_error" \
+              -R "headless_egl|egl_platform_unit|egl_texture_upload|egl_screenshot_error|egl_upload_completion|^presentation_key_render$" \
             | grep -q "Total Tests: 0"; then
             echo "ERROR: no EGL tests registered in CTest"
             exit 1
           fi
+
+      - name: Guard — verify the presentation-key render test is selected
+        # The run step below selects tests by a fixed pattern. This step fails when
+        # presentation_key_render is not registered or is not matched by the pattern.
+        run: |
+          ctest --test-dir build -N \
+              -R "headless_egl|egl_platform_unit|egl_texture_upload|egl_screenshot_error|^presentation_key_render$" \
+            | tee /tmp/egl_select.log
+          grep -q "presentation_key_render$" /tmp/egl_select.log || {
+            echo "ERROR: presentation_key_render is not selected"
+            exit 1
+          }
 
       - name: Run EGL tests (surfaceless, no GPU)
         shell: bash
@@ -64,7 +76,7 @@ jobs:
           OMNIUI_EGL_FORCE_SURFACELESS=1 \
           MESA_GL_VERSION_OVERRIDE=3.3 \
             ctest --test-dir build \
-              -R "headless_egl|egl_platform_unit|egl_texture_upload|egl_screenshot_error" \
+              -R "headless_egl|egl_platform_unit|egl_texture_upload|egl_screenshot_error|egl_upload_completion|^presentation_key_render$" \
               --output-on-failure 2>&1 | tee /tmp/egl_test.log
 
       - name: Verify surfaceless strategy logged

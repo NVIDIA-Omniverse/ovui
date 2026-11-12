@@ -12,6 +12,12 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Callable
 
+from ovui_data_adapters.ovstage._handles import (
+    native_prim_path,
+    native_token,
+    read_groups,
+    release_read_group,
+)
 from ovui_data_adapters.common import ChangeEvent, ChangeEventType
 from ovui_data_adapters.common._command import (
     history_consistent_interrupt,
@@ -19,11 +25,12 @@ from ovui_data_adapters.common._command import (
     interrupt_copy,
 )
 from ovui_data_adapters.common._subscription import SubscriptionProtocol
-from ovui_data_adapters.ovstage._native import resolve_query_names
+from ovui_data_adapters.ovstage._native import path_strings, resolve_query_names
 from ovui_data_adapters.ovstage._scene import (
     _KitTopologySnapshot,
     _kit_topology_snapshot,
     _record_deleted_paths,
+    classify_native_writes,
 )
 from ovui_data_adapters.ovstage._stage_write import (
     discard_recorded_stage_writes,
@@ -119,6 +126,9 @@ class OvstageChangeStream:
         self._poll_scheduled = False
         self._suppressed = 0
         self._suppressed_until_ordinal: int | None = None
+        # Newest ordinal whose suppressed writes a poll dropped undelivered;
+        # reset once a transform publication delivers it.
+        self._discarded_through_ordinal = 0
         self._closed = False
         # PROVIDER-OWNED delivery receipts (round 11): every genuinely
         # ACCEPTED visibility publication (past the closed/suppressed and
@@ -195,6 +205,11 @@ class OvstageChangeStream:
     @property
     def has_pending_suppressed_range(self) -> bool:
         return self._suppressed > 0 or self._suppressed_until_ordinal is not None
+
+    @property
+    def discarded_through_ordinal(self) -> int:
+        """Newest ordinal a poll skipped past without delivering its writes."""
+        return self._discarded_through_ordinal
 
     @property
     def accepted_visibility_ordinal(self) -> int:
@@ -304,6 +319,16 @@ class OvstageChangeStream:
         if stage is None or current_ordinal is None:
             return ()
         current = int(current_ordinal)
+        if _is_native_kit_stage(stage):
+            # While the stage still keeps them, find out whether the new
+            # ordinals of other writers (such as solver results) wrote only
+            # values, so that the hierarchy caches do not count them as
+            # structure changes. Also during suppressed edits.
+            self._profile_call(
+                "OvstageChangeStream.classify_native_writes",
+                classify_native_writes,
+                stage,
+            )
         native_dirty_result: Any = None
         if self._native_dirty_pending:
             native_dirty_result = self._profile_call(
@@ -413,6 +438,9 @@ class OvstageChangeStream:
         current_ordinal = getattr(self._scene, "current_ordinal", None)
         if current_ordinal is not None:
             self._advance_last_ordinal(int(current_ordinal))
+            if self._discarded_through_ordinal <= int(current_ordinal):
+                # This publication delivers the dropped transform state.
+                self._discarded_through_ordinal = 0
         self._suppressed_until_ordinal = None
         event = _info_event(
             changed,
@@ -595,6 +623,7 @@ class OvstageChangeStream:
             return
         drop_until = min(current, suppressed_until)
         if drop_until > self._last_ordinal:
+            self._discarded_through_ordinal = drop_until
             self._advance_last_ordinal(drop_until)
         if self._last_ordinal >= suppressed_until:
             self._suppressed_until_ordinal = None
@@ -1476,7 +1505,7 @@ def _query_native_kit_topology_paths(
 
             topology_paths: set[str] = set()
             path_order: list[str] = []
-            for raw_path in paths.get_path_strings(handle):
+            for raw_path in path_strings(paths, handle):
                 path = str(raw_path)
                 if not _is_user_change_path(path, scene=scene):
                     continue
@@ -1552,16 +1581,16 @@ def _merge_native_dirty_handles(
     scene: Any | None,
 ) -> None:
     for attribute_token, prim_paths in raw_groups:
-        attribute_name = paths.token_to_string(int(attribute_token))
+        attribute_name = paths.token_to_string(native_token(paths, attribute_token))
         attribute_paths = dirty.setdefault(attribute_name, set())
         for prim_path in prim_paths:
-            path = paths.path_to_string(int(prim_path))
+            path = paths.path_to_string(native_prim_path(paths, prim_path))
             if _is_user_change_path(path, scene=scene):
                 attribute_paths.add(path)
 
 
 def _prepare_native_dirty_attribute_tokens(result: Any, paths: Any) -> list[int]:
-    attributes = [int(token) for token in getattr(result, "attributes", ())]
+    attributes = [native_token(paths, token) for token in getattr(result, "attributes", ())]
     # A column created after the query population snapshot is writable and
     # render-visible, but is not necessarily returned by unscoped attribute
     # discovery immediately. Explicitly include the adapter's semantic columns.
@@ -1634,19 +1663,6 @@ def _native_dirty_paths_by_attribute(
             current,
             getattr(result, "total_prim_count", None),
         )
-        # The Python-only fallback uses the same already-completed query.
-        # Compare interned handles, not whole-scene attribute/path strings.
-        get_paths = getattr(paths, "get_paths", None)
-        handle = getattr(result, "all_handle", 0)
-        if callable(get_paths) and handle:
-            membership = tuple(sorted(get_paths(handle)))
-            previous = getattr(stage, "_ovui_kit_dirty_membership", None)
-            revision = int(getattr(stage, "_ovui_kit_dirty_membership_revision", 0))
-            if membership != previous:
-                revision += 1
-                stage._ovui_kit_dirty_membership = membership
-                stage._ovui_kit_dirty_membership_revision = revision
-            stage._ovui_kit_dirty_topology += (revision,)
         attributes = _run_profiled(
             profile_call,
             "OvstageChangeStream.native_dirty.prepare_attributes",
@@ -1672,14 +1688,11 @@ def _native_dirty_paths_by_attribute(
         )
 
         def fetch_groups() -> None:
-            while True:
-                group = read.fetch_next()
-                if group is None:
-                    break
+            for group in read_groups(iter(lambda: read.fetch_next(), None)):
                 try:
-                    attr_name = paths.token_to_string(int(group.attribute))
+                    attr_name = paths.token_to_string(native_token(paths, group.attribute))
                     group_paths = tuple(
-                        str(path) for path in paths.get_path_strings(group.prim_list)
+                        str(path) for path in path_strings(paths, group.prim_list)
                     )
                     attr_paths = dirty.setdefault(attr_name, set())
                     for local in range(int(group.prim_count)):
@@ -1691,7 +1704,7 @@ def _native_dirty_paths_by_attribute(
                             continue
                 finally:
                     try:
-                        stage.release_group(group)
+                        release_read_group(stage, group)
                     except Exception:
                         pass
 
@@ -1706,6 +1719,20 @@ def _native_dirty_paths_by_attribute(
             _normalize_native_dirty_paths,
             dirty,
         )
+        # After the dirty read: ovstage may release all_handle with the result.
+        # The Python-only fallback uses the same already-completed query.
+        # Compare interned handles, not whole-scene attribute/path strings.
+        get_paths = getattr(paths, "get_paths", None)
+        handle = getattr(result, "all_handle", 0)
+        if callable(get_paths) and handle:
+            membership = tuple(sorted(get_paths(handle)))
+            previous = getattr(stage, "_ovui_kit_dirty_membership", None)
+            revision = int(getattr(stage, "_ovui_kit_dirty_membership_revision", 0))
+            if membership != previous:
+                revision += 1
+                stage._ovui_kit_dirty_membership = membership
+                stage._ovui_kit_dirty_membership_revision = revision
+            stage._ovui_kit_dirty_topology += (revision,)
         return dirty, True
     except Exception:
         return dirty, False
@@ -1763,14 +1790,11 @@ def _native_dirty_topology_paths(
                 ) as read:
                     wait_operation(read)
                     dirty_paths: set[str] = set()
-                    while True:
-                        group = read.fetch_next()
-                        if group is None:
-                            break
+                    for group in read_groups(iter(lambda: read.fetch_next(), None)):
                         try:
                             group_paths = tuple(
                                 str(path)
-                                for path in paths.get_path_strings(group.prim_list)
+                                for path in path_strings(paths, group.prim_list)
                             )
                             for local in range(int(group.prim_count)):
                                 try:
@@ -1780,7 +1804,7 @@ def _native_dirty_topology_paths(
                                 except Exception:
                                     continue
                         finally:
-                            stage.release_group(group)
+                            release_read_group(stage, group)
                     return dirty_paths, True
     except Exception:
         return set(), False

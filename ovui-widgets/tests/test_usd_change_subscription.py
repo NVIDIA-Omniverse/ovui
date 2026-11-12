@@ -1,21 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for UsdStageAdapter Tf.Notice subscription (Step 24).
+"""Tests for UsdStageAdapter Tf.Notice subscription (Step 24)."""
 
-Tests are skipped if pxr (usd-core) is not installed.
-"""
-
-import pytest
 from ovui_data_adapters.common import VIEWPORT_CAMERA_POSE_SOURCE
 
-try:
-    from pxr import Sdf, Usd, UsdGeom
-    HAS_USD = True
-except ImportError:
-    HAS_USD = False
-
-pytestmark = pytest.mark.skipif(not HAS_USD, reason="usd-core not installed")
+from pxr import Sdf, Usd, UsdGeom
 
 
 def _make_adapter(stage, call_later=None):

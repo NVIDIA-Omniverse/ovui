@@ -9,6 +9,7 @@ import importlib.util
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 
 import pytest
@@ -101,13 +102,16 @@ def missing_runtime_modules(marker_name: str) -> tuple[str, ...]:
     return tuple(name for name in modules if not _runtime_module_is_discoverable(name))
 
 
-def runtime_skip_reason(marker_name: str) -> str | None:
-    """Return the collection-time skip reason for ``marker_name``, if any."""
+def runtime_failure_reason(marker_name: str) -> str | None:
+    """Return why a test with ``marker_name`` cannot run here, if it cannot."""
     missing = missing_runtime_modules(marker_name)
     if not missing:
         return None
     joined = ", ".join(missing)
-    return f"{marker_name}: missing runtime module(s): {joined}"
+    return (
+        f"{marker_name}: missing runtime module(s): {joined}; "
+        f"install them or deselect with -m 'not {marker_name}'"
+    )
 
 
 def pytest_configure(config) -> None:
@@ -123,17 +127,58 @@ def pytest_configure(config) -> None:
         "markers",
         "requires_ovrtx: test needs the ovrtx runtime module",
     )
+    config.addinivalue_line(
+        "markers",
+        "own_process: test runs in a pytest process of its own (it makes a "
+        "renderer whose process-wide settings would change later tests)",
+    )
+
+
+_MISSING_RUNTIME = pytest.StashKey[str]()
+
+#: Set in the pytest process that runs one ``own_process`` test. The renderer
+#: library takes its process-wide settings (the log file, the caches) from the
+#: first renderer of a process, so a test that makes a renderer with other
+#: settings than the adapters would change the tests that run after it.
+OWN_PROCESS_ENV = "OVUI_DATA_ADAPTER_TEST_OWN_PROCESS"
+
+
+def _run_in_own_process(item) -> None:
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", item.nodeid],
+        cwd=str(item.config.rootpath),
+        env={**os.environ, OWN_PROCESS_ENV: "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if done.returncode != 0:
+        pytest.fail(
+            f"{item.nodeid} failed in its own process:\n{done.stdout[-8000:]}{done.stderr[-2000:]}",
+            pytrace=False,
+        )
 
 
 def pytest_collection_modifyitems(config, items) -> None:
-    skip_reasons = {
-        marker_name: runtime_skip_reason(marker_name)
+    # Check at collection, before a test can put a stand-in module into
+    # sys.modules. A missing package fails the test;
+    # runs that intentionally lack a runtime deselect its marker with -m.
+    failure_reasons = {
+        marker_name: runtime_failure_reason(marker_name)
         for marker_name in RUNTIME_MARKER_MODULES
     }
     for item in items:
-        for marker_name, reason in skip_reasons.items():
+        for marker_name, reason in failure_reasons.items():
             if reason is not None and marker_name in item.keywords:
-                item.add_marker(pytest.mark.skip(reason=reason))
+                item.stash[_MISSING_RUNTIME] = reason
+        if "own_process" in item.keywords and not os.environ.get(OWN_PROCESS_ENV):
+            item.runtest = lambda item=item: _run_in_own_process(item)
+
+
+def pytest_runtest_setup(item) -> None:
+    reason = item.stash.get(_MISSING_RUNTIME, None)
+    if reason is not None:
+        pytest.fail(reason, pytrace=False)
 
 
 @pytest.fixture(scope="session")

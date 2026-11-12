@@ -10,6 +10,7 @@ their full code paths.
 """
 
 import asyncio
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -214,6 +215,51 @@ class TestNextFrameReturnsFrameInfo(unittest.TestCase):
 
         self.assertIsInstance(info, FrameInfo)
         self.assertEqual(info.index, 0)
+
+
+class TestGilHandOverIsSpacedOut(unittest.TestCase):
+    """The tick must not hand the GIL over on every frame.
+
+    Handing the GIL over to other Python threads means a short sleep, which
+    really takes about 55 us on Linux — longer than a whole uncapped
+    frame. One hand-over per frame halved the headless frame rate.
+    The tick now waits between hand-overs, so they cost about one frame in
+    a hundred while other threads still get their turns.
+    """
+
+    def test_hand_over_is_spaced_out_while_another_thread_lives(self):
+        stop = threading.Event()
+        other = threading.Thread(target=stop.wait, daemon=True)
+        other.start()
+        real_sleep = time.sleep
+        hand_overs = []
+
+        def counting_sleep(seconds):
+            hand_overs.append(seconds)
+            real_sleep(seconds)
+
+        try:
+            with _NoopTickPatch():
+                standalone._last_gil_yield = 0.0
+                frames = 0
+                with patch.object(standalone.time, "sleep", counting_sleep):
+                    start = time.perf_counter()
+                    while time.perf_counter() - start < 0.2:
+                        standalone._tick_one_frame()
+                        frames += 1
+                    elapsed = time.perf_counter() - start
+        finally:
+            stop.set()
+            other.join()
+
+        # The other thread still gets its turns.
+        self.assertGreater(len(hand_overs), 0)
+        # But the loop ticks far more often than it hands the GIL over.
+        self.assertGreater(frames, len(hand_overs))
+        # At most one hand-over per wait, plus the one on the first frame.
+        self.assertLessEqual(
+            len(hand_overs), elapsed / standalone._GIL_YIELD_WAIT + 1
+        )
 
 
 if __name__ == "__main__":

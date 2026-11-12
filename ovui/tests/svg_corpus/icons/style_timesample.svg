@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Keyframe diamond: the universal animation-key motif used in
+       timeline editors. Monochrome status-info blue. -->
+  <path d="M8 1.5L14.5 8 8 14.5 1.5 8z" fill="#4488CC"/>
+  <path d="M8 4L12 8 8 12 4 8z" fill="#1F2123" fill-opacity="0.35"/>
+</svg>

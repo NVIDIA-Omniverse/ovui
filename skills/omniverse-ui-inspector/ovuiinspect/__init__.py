@@ -38,7 +38,7 @@ __all__ = [
     "register_command",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 9910
@@ -169,9 +169,15 @@ class _State:
             self.queue.append(command)
 
     def snapshot(self) -> dict[str, Any]:
+        extensions = _extension_status()
         with self.lock:
             return {
-                "status": "degraded" if self.startup_error or self.contribution_error else "ok",
+                "status": (
+                    "degraded"
+                    if self.startup_error or self.contribution_error
+                    or any(item.get("degraded") for item in extensions.values())
+                    else "ok"
+                ),
                 "version": __version__,
                 "host": _host(),
                 "port": _port(),
@@ -186,7 +192,45 @@ class _State:
                 "contribution_error": self.contribution_error,
                 "last_error": self.last_error,
                 "last_error_at": self.last_error_at,
+                "extensions": extensions,
             }
+
+
+#: Entry-point group: each entry is ``callable() -> dict``. Its result is shown in ``health`` under
+#: ``extensions``; when it holds ``"degraded": True`` the status of ``health`` is ``degraded``.
+#: An installed Python module uses it to make a failure that the application does not show visible
+#: (for example the render failures of ovui-data-adapters-common).
+STATUS_ENTRY_POINT_GROUP = "ovui.inspector_status"
+
+_STATUS_PROVIDERS: Optional[list] = None
+
+
+def _extension_status() -> dict[str, Any]:
+    global _STATUS_PROVIDERS
+    from importlib.metadata import entry_points
+
+    if _STATUS_PROVIDERS is None:
+        providers = []
+        for entry in entry_points(group=STATUS_ENTRY_POINT_GROUP):
+            try:
+                providers.append((entry.name, entry.load()))
+            except Exception as exc:  # noqa: BLE001 - reported in health
+                providers.append((entry.name, _failed_provider(exc)))
+        _STATUS_PROVIDERS = providers
+    result: dict[str, Any] = {}
+    for name, provider in _STATUS_PROVIDERS:
+        try:
+            result[name] = provider()
+        except Exception as exc:  # noqa: BLE001 - reported in health
+            result[name] = {"degraded": True, "error": f"{type(exc).__name__}: {exc}"}
+    return result
+
+
+def _failed_provider(error: Exception):
+    def provider() -> dict[str, Any]:
+        return {"degraded": True, "error": f"{type(error).__name__}: {error}"}
+
+    return provider
 
 
 _STATE = _State()
@@ -252,6 +296,32 @@ def attach_application(application: Any) -> None:
             with _STATE.lock:
                 _STATE.contribution_error = f"{type(exc).__name__}: {exc}"
             print(f"[ovuiinspect] Application commands unavailable: {exc}", file=sys.stderr)
+    _register_entry_point_commands(application)
+
+
+#: Entry-point group: each entry is ``callable(application) -> iterable[Command]``.
+#: An installed Python module can add commands to every attached application this way,
+#: without a change to ovui or to the application (for example the render diagnostics
+#: of ovui-data-adapters-common).
+ENTRY_POINT_GROUP = "ovui.inspector_commands"
+
+
+def _register_entry_point_commands(application: Any) -> None:
+    from importlib.metadata import entry_points
+
+    for entry in entry_points(group=ENTRY_POINT_GROUP):
+        try:
+            for command in entry.load()(application):
+                # An application command of the same name keeps its name.
+                if command.name not in _STATE.commands:
+                    register_command(command)
+        except Exception as exc:  # noqa: BLE001 - reported in health; the Inspector keeps working
+            message = f"{entry.name}: {type(exc).__name__}: {exc}"
+            with _STATE.lock:
+                _STATE.contribution_error = (
+                    f"{_STATE.contribution_error}; {message}" if _STATE.contribution_error else message
+                )
+            print(f"[ovuiinspect] Commands of entry point {entry.name} unavailable: {exc}", file=sys.stderr)
 
 
 def detach_application(application: Optional[Any] = None) -> tuple[asyncio.Future, ...]:

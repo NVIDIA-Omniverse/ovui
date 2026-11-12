@@ -4,6 +4,7 @@
  */
 
 #include "HeadlessVulkanPlatform.h"
+#include "HeadlessClipboard.h"
 #include "NativeFramePacing.h"
 #include "VulkanBackend.h"
 #include "VulkanByteImageGpu.h"
@@ -13,6 +14,8 @@
 #include "ImGuiKeyTranslation.h"
 #include "NativeTiming.h"
 
+#include <omni/ui/ImageProvider/ImageProvider.h>
+#include <omni/ui/ImageProvider/PresentationKeyGuard.h>
 #include <omni/ui/platform/PlatformRegistry.h>
 #include <omni/ui/Font.h>
 
@@ -145,6 +148,7 @@ WindowId HeadlessVulkanPlatform::createWindow(const char* title, int width, int 
     OVUI_PERFORMANCE_PHASE_SCOPE(imGuiInitPhase, kImGuiInitPhaseName);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    installHeadlessClipboard();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
@@ -268,7 +272,7 @@ WindowId HeadlessVulkanPlatform::createWindow(const char* title, int width, int 
     m_vulkanBackend->initImGui();
     OVUI_PERFORMANCE_PHASE_STOP(imGuiInitPhase);
     {
-        OVUI_PERFORMANCE_PHASE_SCOPE(ovrtxIntegrationInitPhase, kOvrtxIntegrationInitPhaseName);
+        OVUI_PERFORMANCE_PHASE_SCOPE(framePacingInitPhase, kFramePacingInitPhaseName);
         registerNativeFramePacingBackend(m_vulkanBackend.get());
     }
 
@@ -531,6 +535,8 @@ bool HeadlessVulkanPlatform::tick()
 
     // Draw all omni.ui windows
     {
+        // Image changes given from other threads run on this thread before the draw.
+        omni::ui::ImageProvider::applyPublishedUpdates();
         StandaloneWindowCallbackManager* wcm = getStandaloneWindowCallbackManager();
         if (wcm)
             wcm->drawAllWindows(elapsed);
@@ -538,6 +544,8 @@ bool HeadlessVulkanPlatform::tick()
 
     // Render ImGui
     ImGui::Render();
+    // A presentation key without a drawable must not reach the renderer back end.
+    omni::ui::dropUnmappedPresentationKeys(ImGui::GetDrawData());
 
     // Drain deferred queue
     drainDeferredQueue();

@@ -20,12 +20,23 @@ Property Inspector, Viewport, and the common plus OpenUSD
 data-adapter packages. It requests the OpenUSD adapter's `standalone` extra so
 a clean aggregate installation also receives the supported `usd-core` runtime.
 
+Python 3.12 and 3.13 only: that extra pins `usd-core==25.11`, which has no wheel
+for Python 3.14 or 3.15, so this package cannot be installed there. On Python
+3.14 and 3.15 install the component packages and either the OVStage provider
+(`ovui-data-adapters-ovstage`) or the plain `ovui-data-adapters-openusd` with a
+matching `pxr` from the environment.
+
 Install this package when a project wants the full scene-tooling surface rather
 than one widget distribution at a time. Kit and custom-USD environments that
 must retain their matching `pxr` runtime should install the component packages
 and plain `ovui-data-adapters-openusd` instead of this standalone aggregate.
 """}
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 
 [tool.setuptools.packages.find]
 namespaces = true

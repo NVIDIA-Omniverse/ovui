@@ -290,3 +290,28 @@ def test_native_pacing_update_has_balanced_development_child_scopes():
     finally:
         app._adapter_session = None
         _release(app)
+
+
+def test_a_second_scene_open_releases_the_cycles_of_the_first():
+    """Defect: frozen objects of a replaced scene are never collected."""
+    import gc
+    import weakref
+
+    from ovui_widgets.app import application
+
+    class _Node:
+        pass
+
+    gc.unfreeze()
+    try:
+        first = _Node()
+        first.cycle = first
+        alive = weakref.ref(first)
+        application._freeze_scene_open_objects()
+        del first
+        gc.collect()
+        assert alive() is not None, "a frozen object should survive collections"
+        application._freeze_scene_open_objects()
+        assert alive() is None, "the next open must release the previous scene's cycles"
+    finally:
+        gc.unfreeze()

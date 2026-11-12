@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Layout-save witness test for issue #35 — Step 9.
+"""Layout-save witness test for the regression — Step 9.
 
 Step 8 proves the subprocess exits with ``rc=0``. That alone could be
 satisfied by a shutdown path that skipped :meth:`Application._save_layout`

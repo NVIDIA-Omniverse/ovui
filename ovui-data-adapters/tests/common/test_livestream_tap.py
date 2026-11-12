@@ -55,3 +55,27 @@ def test_rgba8_mapping_accepts_legacy_and_channel_last_layouts(tensor) -> None:
 def test_rgba8_mapping_rejects_incompatible_layouts(tensor) -> None:
     with pytest.raises(ValueError, match="OVRTX LdrColor|LdrColor mapping"):
         common_tap._validate_rgba8_mapping_tensor(tensor, 8, 6)
+
+
+class _RecordingCDLL:
+    """Stand-in for ``ctypes.CDLL`` that loads every name and records it."""
+
+    def __init__(self) -> None:
+        self.names: list[str] = []
+
+    def __call__(self, name: str) -> SimpleNamespace:
+        self.names.append(name)
+        return SimpleNamespace(name=name)
+
+
+def test_cuda_libraries_load_by_windows_dll_names_on_windows(monkeypatch) -> None:
+    cdll = _RecordingCDLL()
+    monkeypatch.setattr(common_swap.ctypes, "CDLL", cdll)
+    monkeypatch.setattr(common_swap.ctypes.util, "find_library", lambda name: None)
+    with monkeypatch.context() as windows:
+        windows.setattr(common_tap.os, "name", "nt")
+        driver = common_swap._Driver._load()
+        cudart = common_tap._Cudart._load_libcudart()
+    assert driver.name == "nvcuda.dll"
+    assert cudart.name == "cudart64_12.dll"
+    assert not any(".so" in name for name in cdll.names)

@@ -7,7 +7,6 @@ from unittest.mock import Mock
 
 import pytest
 
-pytest.importorskip("pxr")
 from ovui_data_adapters.openusd.renderer_adapter import OvRtxRendererAdapter
 from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
 from pxr import Sdf, Usd, UsdGeom
@@ -24,8 +23,8 @@ def test_camera_lens_live_updates_do_not_relax_structural_edits(kind):
                              custom=kind == "non_camera").Set(18)
     paths = ("/Camera.focalLength",)
     if kind == "mixed":
-        UsdGeom.Sphere.Define(stage, "/Sphere").GetRadiusAttr().Set(2)
-        paths += ("/Sphere.radius",)
+        UsdGeom.Sphere.Define(stage, "/Sphere").GetPurposeAttr().Set("guide")
+        paths += ("/Sphere.purpose",)
     if kind == "removed":
         stage.RemovePrim("/Camera")
     if kind == "projection":
@@ -57,7 +56,7 @@ def test_ten_parent_transforms_and_visibility_do_not_replay_static_scene():
     renderer._stop_native_frame_pacing = Mock()
     renderer._reload_live_root_snapshot = Mock(return_value=True)
     renderer._sync_ovrtx_root_snapshot_overlay_from_stage = Mock(return_value=True)
-    renderer._write_prim_transform_to_ovrtx = Mock(return_value=True)
+    renderer._write_prim_transforms_to_ovrtx = Mock()
     events = []
 
     def publish(event):
@@ -77,11 +76,11 @@ def test_ten_parent_transforms_and_visibility_do_not_replay_static_scene():
         assert len(events) == 1
         assert len(events[0].changed_paths) == 20
         assert not events[0].resynced_paths
-        assert renderer._write_prim_transform_to_ovrtx.call_count == 10
+        assert renderer._write_prim_transforms_to_ovrtx.call_count == 1
         assert renderer._renderer.write_attribute.call_count == 10
-        assert {call.args[1] for call in renderer._write_prim_transform_to_ovrtx.call_args_list} == {
+        assert [path for _prim, path in renderer._write_prim_transforms_to_ovrtx.call_args.args[0]] == [
             f"/Parcel{i}" for i in range(10)
-        }
+        ]
         renderer._reload_live_root_snapshot.assert_not_called()
         renderer._sync_ovrtx_root_snapshot_overlay_from_stage.assert_not_called()
 
@@ -92,7 +91,8 @@ def test_ten_parent_transforms_and_visibility_do_not_replay_static_scene():
                 op.Set((2, 3, 4))
         queued.pop()()
         renderer._renderer.write_attribute.assert_not_called()
-        assert renderer._write_prim_transform_to_ovrtx.call_count == 20
+        assert renderer._write_prim_transforms_to_ovrtx.call_count == 2
+        assert len(renderer._write_prim_transforms_to_ovrtx.call_args.args[0]) == 10
 
         # Deletion still requires conservative structural synchronization.
         stage.RemovePrim("/Parcel0")

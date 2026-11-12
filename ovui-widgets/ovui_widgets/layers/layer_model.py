@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import omni.ui as ui
@@ -129,11 +129,18 @@ class LayerModel(ui.AbstractItemModel):
         services: "Optional[WidgetServices]" = None,
         settings: "Optional[DefaultLayerSettings | LayerSettings]" = None,
         before_save_all_fn: "Optional[Callable[[], bool | None]]" = None,
+        before_root_save_fn: "Optional[Callable[[bool], bool | None]]" = None,
     ) -> None:
         super().__init__()
         self._adapter: Optional[LayerStackAdapter] = None
         self._services: "Optional[WidgetServices]" = services
         self._before_save_all_fn = before_save_all_fn
+        # Runs just before Save All or the Save of its row writes the root
+        # layer. Its argument is ``True`` when Save All already ran
+        # ``before_save_all_fn`` in the same click. ``False`` as the result
+        # means the root layer must not be saved: it keeps its modified
+        # mark. See :meth:`_root_save_allowed`.
+        self._before_root_save_fn = before_root_save_fn
         # Step 52 — accept either the persistent :class:`LayerSettings`
         # (real app path) or the dataclass :class:`DefaultLayerSettings`
         # (unit-test path). Both expose the same attribute surface so
@@ -1851,8 +1858,13 @@ class LayerModel(ui.AbstractItemModel):
             # Force a clean re-propagation so the
             # ``_has_edit_target_descendant`` chain rebuilds on any
             # fresh :class:`LayerItem` instances created by
-            # :meth:`_load_sublayers` (Logic U4).
+            # :meth:`_load_sublayers` (Logic U4). Move to a new target
+            # first: the root and session items survive the reload,
+            # and only this step clears the flag of the old target
+            # (Undo of a remove changes the sublayers and the target
+            # in one batch; else two rows read "Authoring Layer").
             current_edit = self._adapter.get_edit_target_identifier()
+            self._update_edit_target(current_edit)
             self._edit_target_identifier = ""
             self._update_edit_target(current_edit)
             # Step 51 — structural events can add / remove sublayers
@@ -2162,6 +2174,10 @@ class LayerModel(ui.AbstractItemModel):
         if item.is_anonymous:
             self._request_save_as(item)
             return
+        if not self._root_save_allowed(
+            item.identifier, layer_state_saved=False,
+        ):
+            return
         services = self._services
         if services is None:
             self._adapter.save_layer(item.identifier)
@@ -2206,6 +2222,17 @@ class LayerModel(ui.AbstractItemModel):
         :meth:`SaveAllValueModel.get_dirty_identifiers` so the
         badge and this click path use the exact same rule.
 
+        A dirty layer that lists an anonymous sublayer would write the
+        in-memory ``anon:`` identifier into its file, and that sublayer
+        is missing when the file is opened again. Save-All first asks
+        for a file path for each such anonymous sublayer
+        (:meth:`_save_anonymous_sublayers_then_save_all`). A layer that
+        still lists an anonymous sublayer after that (Cancel, a failed
+        Save-As, or no dialog in headless use) is not saved; it stays
+        dirty and :meth:`_save_dirty_layers` reports it. When a Save-As
+        moved the authoring layer to a new file, the layer-state hook
+        runs again before the layers are saved (:meth:`_finish_save_all`).
+
         No-op when nothing is dirty (prevents an empty ``begin / end``
         pair from firing a ``_notify`` on the undo stack) or when the
         model has been detached / destroyed.
@@ -2225,14 +2252,300 @@ class LayerModel(ui.AbstractItemModel):
         dirty_ids = self.get_save_all_model().get_dirty_identifiers()
         if not dirty_ids:
             return
+        anonymous_ids = self._anonymous_sublayers_of(dirty_ids)
+        if anonymous_ids and self._services is not None:
+            self._save_anonymous_sublayers_then_save_all(
+                _SaveAllRun(
+                    pending=anonymous_ids,
+                    total=len(anonymous_ids),
+                    edit_target=self._adapter.get_edit_target_identifier(),
+                )
+            )
+            return
+        self._save_dirty_layers()
+
+    def _anonymous_sublayers_of(self, identifiers: List[str]) -> List[str]:
+        """Return the anonymous sublayers of ``identifiers``, children first.
+
+        The walk continues through anonymous sublayers, because the
+        Save-As of an anonymous layer writes the identifiers of its own
+        sublayers into the new file. A child comes before its parent so
+        the parent's file gets the new file path of the child.
+        """
+        adapter = self._adapter
+        result: List[str] = []
+        visited: set = set()
+
+        def _visit(parent_id: str) -> None:
+            handle = adapter.find_layer(parent_id)
+            if handle is None:
+                return
+            for child_id in adapter.get_sublayer_identifiers(handle):
+                if child_id in visited:
+                    continue
+                child = adapter.find_layer(child_id)
+                if child is None or not adapter.is_anonymous(child):
+                    continue
+                visited.add(child_id)
+                _visit(child_id)
+                result.append(child_id)
+
+        for identifier in identifiers:
+            _visit(identifier)
+        return result
+
+    def _save_anonymous_sublayers_then_save_all(self, run: "_SaveAllRun") -> None:
+        """Ask for a file path for each pending layer of ``run``, then save all.
+
+        One Save-As dialog opens at a time (:meth:`_ask_anonymous_layer_path`).
+        Save pushes a :class:`SaveLayerAsCommand` that writes the file and
+        replaces the ``anon:`` identifier in each parent with the new path.
+        Cancel (here or in the replace-file prompt) or a failed Save-As
+        asks for no more paths. A layer that still lists an anonymous
+        sublayer is never written, because its new file would keep the
+        ``anon:`` identifier. In all cases :meth:`_finish_save_all` then
+        saves each dirty layer that lists no anonymous sublayer.
+        """
+        if self._destroyed or self._adapter is None:
+            return
+        if not run.pending or self._anonymous_sublayers_of(run.pending[:1]):
+            self._finish_save_all(run)
+            return
+        self._ask_anonymous_layer_path(run)
+
+    def _ask_anonymous_layer_path(self, run: "_SaveAllRun", problem: str = "") -> None:
+        """Open the Save-As dialog for the first pending layer of ``run``.
+
+        All anonymous rows have the same name in the Layers window, so the
+        dialog gives the number of the layer, its ``anon:`` identifier (the
+        tooltip of the row shows it) and its place under its parent. The
+        default name is a file that does not exist yet. A path that the
+        open scene uses, or a file that this Save-All wrote, is refused:
+        the dialog opens again and ``problem`` gives the cause.
+        """
+        from ovui_widgets.common.file_dialogs import save_file_dialog
+
+        identifier = run.pending[0]
+        number = run.total - len(run.pending) + 1
+        root_id = self._root_item.identifier if self._root_item else ""
+        root_dir = os.path.dirname(root_id)
+        folder = root_dir if os.path.isdir(root_dir) else os.getcwd()
+        message = f"Layer: {identifier}{self._sublayer_place(identifier)}."
+        if problem:
+            message = f"{message}\n{problem}"
+
+        def _commit(chosen_path: str) -> None:
+            failure = self._save_anonymous_layer_as(identifier, chosen_path)
+            if failure:
+                self._finish_save_all(run, failure)
+                return
+            run.written.append(chosen_path)
+            run.pending = run.pending[1:]
+            self._save_anonymous_sublayers_then_save_all(run)
+
+        def _on_selected(chosen_path: str) -> None:
+            in_use = self._save_all_path_in_use(chosen_path, run.written)
+            if in_use:
+                refusal = (
+                    f"Save All did not save {identifier} to '{chosen_path}': "
+                    f"{in_use}. Choose a different file."
+                )
+                ErrorReporter.log_warning("Layers", refusal)
+                ErrorReporter.show_warning(refusal)
+                self._ask_anonymous_layer_path(run, refusal)
+                return
+            if os.path.exists(chosen_path):
+                from ovui_widgets.common.dialogs import confirm_dialog
+
+                confirm_dialog(
+                    title="Replace Existing Layer",
+                    message=(
+                        f"A file already exists at '{chosen_path}'.\n"
+                        "Replace it with this layer?"
+                    ),
+                    on_confirm=lambda: _commit(chosen_path),
+                    on_cancel=lambda: self._finish_save_all(run),
+                    confirm_label="Replace",
+                    cancel_label="Cancel",
+                )
+                return
+            _commit(chosen_path)
+
+        save_file_dialog(
+            title=f"Save All: save anonymous layer {number} of {run.total} as...",
+            default_name=self._free_save_all_name(
+                folder, self._resolve_layer_display_name(identifier), run.written,
+            ),
+            on_selected=_on_selected,
+            on_cancelled=lambda: self._finish_save_all(run),
+            default_dir=folder,
+            message=message,
+        )
+
+    def _sublayer_place(self, identifier: str) -> str:
+        """Return ", sublayer <n> of <parent>" for ``identifier``, or ``""``."""
+        adapter = self._adapter
+        for parent_id in adapter.get_layer_stack_identifiers(
+            include_session=True, include_anonymous=True,
+        ):
+            parent = adapter.find_layer(parent_id)
+            if parent is None:
+                continue
+            children = adapter.get_sublayer_identifiers(parent)
+            if identifier in children:
+                parent_name = (
+                    parent_id
+                    if adapter.is_anonymous(parent)
+                    else self._resolve_layer_display_name(parent_id)
+                )
+                return f", sublayer {children.index(identifier) + 1} of {parent_name}"
+        return ""
+
+    def _save_all_path_in_use(
+        self,
+        path: str,
+        written: List[str],
+        scene_keys: Optional[set] = None,
+    ) -> str:
+        """Return why Save-All must not write an anonymous layer to ``path``.
+
+        Returns ``""`` when ``path`` is free. A file that this Save-All
+        wrote holds the edits of another anonymous layer, and a file that
+        the open scene uses (a layer of the stack, a reference, a payload,
+        a sublayer of the session layer) holds its own content: writing
+        over either loses it. ``scene_keys`` is the result of
+        :meth:`_scene_file_keys`, when the caller already has it.
+        """
+        key = _path_key(path)
+        if any(_path_key(other) == key for other in written):
+            return "Save All saved another anonymous layer to this file"
+        if scene_keys is None:
+            scene_keys = self._scene_file_keys()
+        if key in scene_keys:
+            return "the open scene uses this file"
+        return ""
+
+    def _scene_file_keys(self) -> set:
+        """Return the path keys of the files that the open scene uses."""
+        return {
+            _path_key(identifier)
+            for identifier in self._adapter.get_scene_file_identifiers()
+        }
+
+    def _free_save_all_name(
+        self,
+        folder: str,
+        display_name: str,
+        written: List[str],
+    ) -> str:
+        """Return a default file name in ``folder`` that no file uses yet."""
+        name = _default_save_as_filename_from_name(display_name)
+        stem, extension = os.path.splitext(name)
+        scene_keys = self._scene_file_keys()
+        number = 1
+        while os.path.exists(
+            os.path.join(folder, name)
+        ) or self._save_all_path_in_use(
+            os.path.join(folder, name), written, scene_keys,
+        ):
+            name = f"{stem}_{number}{extension}"
+            number += 1
+        return name
+
+    def _save_anonymous_layer_as(self, identifier: str, path: str) -> str:
+        """Save the anonymous ``identifier`` to ``path`` for Save-All.
+
+        Returns the failure report of the :class:`SaveLayerAsCommand`
+        (with its cause), or an empty string when the write succeeded.
+        An error after the write, for example when USD refuses the new
+        sublayer path in a parent, is also a failure report: Save-All
+        must stop and show it, not lose it in the log.
+        """
+        services = self._services
+        reports = _FailureReports()
+        try:
+            services.undo_manager.push(
+                SaveLayerAsCommand(
+                    self._adapter,
+                    services.selection_bus,
+                    identifier,
+                    path,
+                    replace_in_parent=True,
+                    error_reporter=reports,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - reported by the caller
+            reports.show_error(
+                f"Save-As of {identifier} to '{path}' failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        return " ".join(reports.messages)
+
+    def _finish_save_all(self, run: "_SaveAllRun", failure: str = "") -> None:
+        """Save the dirty layers after the Save-As dialogs of ``run``.
+
+        The Save-As of the authoring layer moves the authoring layer to
+        the new file. The layer-state hook then runs again, so that the
+        saved root layer names the file and not the ``anon:`` identifier
+        that the first run of the hook stored.
+        """
+        if self._destroyed or self._adapter is None:
+            return
+        if (
+            self._before_save_all_fn is not None
+            and self._adapter.get_edit_target_identifier() != run.edit_target
+            and self._before_save_all_fn() is False
+        ):
+            return
+        self._save_dirty_layers(failure)
+
+    def _save_dirty_layers(self, failure: str = "") -> None:
+        """Save each dirty layer that lists no anonymous sublayer.
+
+        A layer that lists an anonymous sublayer is not saved, because
+        its file would refer to a layer that exists only in memory. The
+        layer stays dirty, and a report gives its name and the cause:
+        ``failure`` (the report of a failed Save-As) when given.
+        """
+        if self._destroyed or self._adapter is None:
+            return
+        save_ids: List[str] = []
+        kept_names: List[str] = []
+        for identifier in self.get_save_all_model().get_dirty_identifiers():
+            if self._anonymous_sublayers_of([identifier]):
+                kept_names.append(self._resolve_layer_display_name(identifier))
+            else:
+                save_ids.append(identifier)
+        if failure:
+            message = failure
+            if kept_names:
+                message = f"Save All did not save {', '.join(kept_names)}: {failure}"
+            ErrorReporter.log_error("Layers", message)
+            ErrorReporter.show_error(message)
+        elif kept_names:
+            message = (
+                f"Save All did not save {', '.join(kept_names)}: "
+                "an anonymous sublayer has no file. Save that sublayer "
+                "with Save As, then use Save All again."
+            )
+            ErrorReporter.log_warning("Layers", message)
+            ErrorReporter.show_warning(message)
+        root_id = self._root_item.identifier if self._root_item else None
+        # Save All ran ``before_save_all_fn`` before it came here.
+        if root_id in save_ids and not self._root_save_allowed(
+            root_id, layer_state_saved=self._before_save_all_fn is not None,
+        ):
+            save_ids.remove(root_id)
+        if not save_ids:
+            return
         services = self._services
         if services is None:
-            for identifier in dirty_ids:
+            for identifier in save_ids:
                 self._adapter.save_layer(identifier)
             return
         services.undo_manager.begin_group("Save All")
         try:
-            for identifier in dirty_ids:
+            for identifier in save_ids:
                 cmd = SaveLayerCommand(
                     self._adapter,
                     services.selection_bus,
@@ -2242,6 +2555,26 @@ class LayerModel(ui.AbstractItemModel):
                 services.undo_manager.push(cmd)
         finally:
             services.undo_manager.end_group()
+
+    def _root_save_allowed(
+        self, identifier: str, layer_state_saved: bool,
+    ) -> bool:
+        """Run the root-save hook when ``identifier`` is the root layer.
+
+        ``layer_state_saved`` is passed to the hook: ``True`` when Save All
+        already ran ``before_save_all_fn`` in the same click.
+
+        Return ``False`` only when the hook returned ``False``: then the
+        root layer is not saved and keeps its modified mark. The hook
+        reports its own failure. Other layers are always allowed.
+        """
+        if (
+            self._before_root_save_fn is None
+            or self._root_item is None
+            or identifier != self._root_item.identifier
+        ):
+            return True
+        return self._before_root_save_fn(layer_state_saved) is not False
 
     # ── Save-As flow (LAYERS-PLAN Step 36) ───────────────────────────
 
@@ -2381,18 +2714,25 @@ class LayerModel(ui.AbstractItemModel):
            look up its dirty state. A missing parent / out-of-range
            position silently no-ops (a late click after the stack
            shifted beneath us).
-        2. Clean (non-dirty) layers skip the dialog entirely and push
-           a :class:`RemoveSublayerCommand` straight through the
-           undo manager — same shape as Step-30 behaviour.
-        3. Dirty layers open
-           :func:`~ovui_widgets.common.dialogs.confirm_dirty_remove_dialog`. The
-           three buttons route to:
+        2. The remove takes the layer *and its nested sublayers* out
+           of the stack, so the dirty guard checks the whole sublayer
+           tree (:meth:`_dirty_layers_in_tree`). A clean tree skips
+           the dialog entirely and pushes a
+           :class:`RemoveSublayerCommand` straight through the undo
+           manager — same shape as Step-30 behaviour.
+        3. A tree with unsaved changes opens
+           :func:`~ovui_widgets.common.dialogs.confirm_dirty_remove_dialog`
+           with the names of the layers that have them. The three
+           buttons route to:
 
-           - **Save & Remove** — push a :class:`SaveLayerCommand`
-             followed by a :class:`RemoveSublayerCommand` inside an
-             undo group labelled ``"Save & Remove"``. The save itself
-             is ``non_undoable`` so the group ends up storing just
-             the remove command for Undo history purposes.
+           - **Save & Remove** — push a :class:`SaveLayerCommand` for
+             each layer of the tree with unsaved changes, then a
+             :class:`RemoveSublayerCommand`, inside an undo group
+             labelled ``"Save & Remove"``. The saves are
+             ``non_undoable`` so the group ends up storing just the
+             remove command for Undo history purposes. When a layer
+             still has unsaved changes after the saves, the remove
+             does not run (:meth:`_save_layer_tree`).
            - **Remove Without Saving** — push a plain
              :class:`RemoveSublayerCommand` that discards the edits.
            - **Cancel** — no command pushed; the dialog dismissal
@@ -2415,24 +2755,14 @@ class LayerModel(ui.AbstractItemModel):
         if position < 0 or position >= len(children):
             return
         child_id = children[position]
-        child_handle = self._adapter.find_layer(child_id)
-        is_dirty = (
-            child_handle is not None
-            and self._adapter.is_dirty(child_handle)
-        )
+        dirty_ids = self._dirty_layers_in_tree(child_id)
 
         services = self._services
-        if not is_dirty:
+        if not dirty_ids:
             if services is None:
                 self._adapter.remove_sublayer(parent_id, position)
                 return
-            cmd = RemoveSublayerCommand(
-                self._adapter,
-                services.selection_bus,
-                parent_id,
-                position,
-            )
-            services.undo_manager.push(cmd)
+            self._push_remove_command(parent_id, position)
             return
 
         if services is None:
@@ -2446,6 +2776,10 @@ class LayerModel(ui.AbstractItemModel):
         from ovui_widgets.common.dialogs import confirm_dirty_remove_dialog
 
         layer_name = self._resolve_layer_display_name(child_id)
+        dirty_layer_names = [
+            self._resolve_layer_display_name(identifier)
+            for identifier in dirty_ids
+        ]
 
         def _on_save_and_remove() -> None:
             self._perform_save_and_remove(parent_id, position, child_id)
@@ -2457,6 +2791,103 @@ class LayerModel(ui.AbstractItemModel):
             layer_name=layer_name,
             on_save_and_remove=_on_save_and_remove,
             on_remove_without_saving=_on_remove_without_saving,
+            dirty_layer_names=dirty_layer_names,
+        )
+
+    def _dirty_layers_in_tree(self, identifier: str) -> List[str]:
+        """Return ``identifier`` and the layers below it with unsaved changes.
+
+        A remove takes the whole sublayer tree of a layer out of the
+        stack, and USD can then destroy those layers with their unsaved
+        changes. So an unsaved edit in a nested sublayer needs the same
+        question as one in the removed layer itself. The order is the
+        tree order (the layer first), for the dialog text.
+        """
+        dirty: List[str] = []
+        visited: set = set()
+        pending = [identifier]
+        while pending:
+            current = pending.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            handle = self._adapter.find_layer(current)
+            if handle is None:
+                continue
+            if self._adapter.is_dirty(handle):
+                dirty.append(current)
+            pending.extend(self._adapter.get_sublayer_identifiers(handle))
+        return dirty
+
+    def _save_layer_tree(self, identifier: str, skip_id: str = "") -> bool:
+        """Save each layer of ``identifier``'s tree that has unsaved changes.
+
+        Pushes one :class:`SaveLayerCommand` for each such layer (except
+        ``skip_id`` and anonymous layers, which have no file). Returns
+        ``False`` and shows an error when a layer still has unsaved
+        changes after the saves (an anonymous sublayer, or a save that
+        failed): the caller then keeps the layer in the stack, so that
+        no unsaved edit is lost.
+        """
+        services = self._services
+        for layer_id in self._dirty_layers_in_tree(identifier):
+            handle = self._adapter.find_layer(layer_id)
+            if (
+                layer_id == skip_id
+                or handle is None
+                or self._adapter.is_anonymous(handle)
+            ):
+                continue
+            services.undo_manager.push(
+                SaveLayerCommand(
+                    self._adapter,
+                    services.selection_bus,
+                    layer_id,
+                    ErrorReporter,
+                )
+            )
+        unsaved = [
+            self._resolve_layer_display_name(layer_id)
+            for layer_id in self._dirty_layers_in_tree(identifier)
+            if layer_id != skip_id
+        ]
+        if not unsaved:
+            return True
+        ErrorReporter.show_error(
+            f"{self._resolve_layer_display_name(identifier)!r} was not "
+            f"removed: unsaved changes remain in "
+            f"{', '.join(repr(name) for name in unsaved)}."
+        )
+        return False
+
+    def _push_remove_command(self, parent_id: str, position: int) -> None:
+        """Push a :class:`RemoveSublayerCommand` and report an authoring move.
+
+        The command moves the Authoring Layer to root when the remove
+        takes it out of the stack (the removed layer or a layer below
+        it). A status warning tells the user where the next edit goes,
+        on the first remove and on each Redo of it.
+        """
+        services = self._services
+        services.undo_manager.push(
+            RemoveSublayerCommand(
+                self._adapter,
+                services.selection_bus,
+                parent_id,
+                position,
+                on_edit_target_moved=self._report_edit_target_moved,
+            )
+        )
+
+    def _report_edit_target_moved(self, previous_id: str, current_id: str) -> None:
+        """Show which layer is the Authoring Layer after a remove moved it."""
+        if self._destroyed or self._adapter is None:
+            return
+        ErrorReporter.show_warning(
+            f"Authoring Layer switched to "
+            f"{self._resolve_layer_display_name(current_id)!r} — "
+            f"{self._resolve_layer_display_name(previous_id)!r} was "
+            f"removed from the layer stack"
         )
 
     def _perform_remove_sublayer(
@@ -2478,13 +2909,7 @@ class LayerModel(ui.AbstractItemModel):
         if services is None:
             self._adapter.remove_sublayer(parent_id, position)
             return
-        cmd = RemoveSublayerCommand(
-            self._adapter,
-            services.selection_bus,
-            parent_id,
-            position,
-        )
-        services.undo_manager.push(cmd)
+        self._push_remove_command(parent_id, position)
 
     def _perform_save_and_remove(
         self,
@@ -2492,12 +2917,15 @@ class LayerModel(ui.AbstractItemModel):
         position: int,
         child_id: str,
     ) -> None:
-        """Save ``child_id`` to disk, then remove it from the parent stack.
+        """Save ``child_id``'s tree to disk, then remove it from the parent.
 
-        Wraps a :class:`SaveLayerCommand` + :class:`RemoveSublayerCommand`
-        pair in an undo group so Undo rewinds the remove as a single
-        history entry. The save itself is ``non_undoable`` so the
-        group collapses to the remove in the undo stack (Step 33).
+        Wraps the :class:`SaveLayerCommand` of each layer of the tree
+        with unsaved changes (the removed layer and its nested
+        sublayers) and the :class:`RemoveSublayerCommand` in an undo
+        group so Undo rewinds the remove as a single history entry.
+        The saves are ``non_undoable`` so the group collapses to the
+        remove in the undo stack (Step 33). When a layer still has
+        unsaved changes after the saves, the remove does not run.
         Anonymous layers cannot be saved directly — Save & Remove
         on an anonymous layer delegates the save to
         :meth:`_request_save_as`, which opens a file picker; the
@@ -2523,20 +2951,8 @@ class LayerModel(ui.AbstractItemModel):
             return
         services.undo_manager.begin_group("Save & Remove")
         try:
-            save_cmd = SaveLayerCommand(
-                self._adapter,
-                services.selection_bus,
-                child_id,
-                ErrorReporter,
-            )
-            services.undo_manager.push(save_cmd)
-            remove_cmd = RemoveSublayerCommand(
-                self._adapter,
-                services.selection_bus,
-                parent_id,
-                position,
-            )
-            services.undo_manager.push(remove_cmd)
+            if self._save_layer_tree(child_id):
+                self._push_remove_command(parent_id, position)
         finally:
             services.undo_manager.end_group()
 
@@ -2556,7 +2972,10 @@ class LayerModel(ui.AbstractItemModel):
         target the now-rewritten reference, so we look up the
         fresh child identifier after the save and route through a
         standard :class:`RemoveSublayerCommand`. Cancel on the
-        dialog leaves the layer in place.
+        dialog leaves the layer in place. Nested sublayers with
+        unsaved changes are saved first; when one of them still has
+        unsaved changes after that, the save-as and the remove do not
+        run and the layer stays.
         """
         if self._destroyed or self._adapter is None:
             return
@@ -2576,6 +2995,8 @@ class LayerModel(ui.AbstractItemModel):
         def _on_selected(chosen_path: str) -> None:
             services.undo_manager.begin_group("Save & Remove")
             try:
+                if not self._save_layer_tree(child_id, skip_id=child_id):
+                    return
                 save_as_cmd = SaveLayerAsCommand(
                     self._adapter,
                     services.selection_bus,
@@ -2590,13 +3011,7 @@ class LayerModel(ui.AbstractItemModel):
                 # newly-concrete sublayer at the original slot —
                 # positions are stable because the save-as swap is
                 # in-place.
-                remove_cmd = RemoveSublayerCommand(
-                    self._adapter,
-                    services.selection_bus,
-                    parent_id,
-                    position,
-                )
-                services.undo_manager.push(remove_cmd)
+                self._push_remove_command(parent_id, position)
             finally:
                 services.undo_manager.end_group()
 
@@ -2756,6 +3171,35 @@ def _extract_file_paths(source: Any) -> Optional[List[str]]:
                 paths.append(entry.strip())
         return paths or None
     return None
+
+
+@dataclass
+class _SaveAllRun:
+    """State of one Save-All that asks for paths of anonymous sublayers."""
+
+    pending: List[str]
+    """Anonymous layers that still need a path, children first."""
+    total: int
+    """Number of anonymous layers in this Save-All."""
+    edit_target: str
+    """Authoring layer when the Save-All started."""
+    written: List[str] = field(default_factory=list)
+    """Files that this Save-All wrote for anonymous layers."""
+
+
+def _path_key(path: str) -> str:
+    """Return a form of ``path`` that is the same for the same file."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+class _FailureReports:
+    """Error reporter that keeps the failure reports of one command."""
+
+    def __init__(self) -> None:
+        self.messages: List[str] = []
+
+    def show_error(self, message: str) -> None:
+        self.messages.append(message)
 
 
 def _default_save_as_filename_from_name(display_name: str) -> str:

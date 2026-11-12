@@ -3,7 +3,7 @@
 
 """Tests for Step 7 — OS X-button polling via lazy ``_ui`` import.
 
-Issue #35, Step 7 (Codex Round 1 F9 + F10).
+Regression, Step 7 (Codex Round 1 F9 + F10).
 
 The plan adds a module-level :func:`ovui_widgets.app.application._should_close`
 helper that lazily imports :mod:`omni.ui._ui` and reads the private

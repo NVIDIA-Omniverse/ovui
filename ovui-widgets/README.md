@@ -32,34 +32,23 @@ through either GLFW/OpenGL (desktop) or Vulkan (headless / server).
 
 The supported way to install and run the USD Viewer is from the built
 distributions. For the OpenUSD provider path you do not need to build USD or
-ovui from source (the native OVStage provider is different — see below: it
-requires one matched Kit/OVStage/OVRTX rendering build).
+ovui from source (for the native OVStage provider, see below: it needs a compatible
+`ovstage` and `ovrtx` pair).
 
-**Availability:** as of this writing only the `ovui` core wheel is published
-on public PyPI; the `ovui-widgets-*` and `ovui-data-adapters-*` 0.2
-distributions are not yet on the public index, and **no complete public 0.2
-wheel channel exists yet**. The 0.2 release wheel set (17 wheels: five
-platform `ovui` wheels plus the twelve pure-Python distributions; it
-has no standalone `ovui-inspector` distribution because the Inspector skill
-is embedded and validated in each `ovui` application wheel) is attached to
-release pages on the
-**access-restricted development repository** — the public repository's
-releases currently carry only 0.1.x assets. If you have access to those
-wheels (a restricted release download, a CI wheelhouse artifact, or a
-wheelhouse you built from this source tree), install from that directory; the
-plain PyPI commands apply once the 0.2 distributions are published:
+**Release packages:** 0.3.1 includes the `ovui` wheels,
+the four `ovui-data-adapters-*` wheels, and the eight `ovui-widgets-*` wheels
+(`all`, `app`, `common`, `content`, `layers`, `property`, `stage`,
+`viewport`). See [Packages](../README.md#4a-packages) for what each wheel
+gives you.
 
 ```bash
-# From a directory of wheels you have access to. `--pre` is necessary while
-# the version in VERSION.md is a release candidate: without it pip takes the
-# 0.2.0 final release from PyPI and ignores the wheels in the directory.
-python -m pip install --pre --find-links /path/to/wheels \
-    ovui-widgets-app "ovui-data-adapters-openusd[standalone]" ovrtx
-# Directly from PyPI (applies once the 0.2 distributions are published):
 python -m pip install ovui-widgets-app "ovui-data-adapters-openusd[standalone]" ovrtx
-
 python -m ovui_widgets.app path/to/scene.usda
 ```
+
+To install from a directory of wheels, add `--find-links /path/to/wheels`. Add
+`--pre` while the version in `VERSION.md` is a release candidate: without it,
+pip takes the final release from PyPI and ignores the wheels in the directory.
 
 - **Upgrade from 0.2** — include the application package in the upgrade
   command, for example
@@ -73,6 +62,11 @@ python -m ovui_widgets.app path/to/scene.usda
   supported `usd-core==25.11` runtime. If your environment already provides
   a compatible `pxr`, install the plain `ovui-data-adapters-openusd` wheel
   instead and do not add the extra on top of it.
+  `usd-core==25.11` has wheels for Python 3.8 to 3.13 and none for Python
+  3.14 or 3.15, so the extra, and with it `ovui-widgets-all`, cannot be
+  installed on Python 3.14 or 3.15 (`ovui-widgets-all` lists only 3.12 and
+  3.13). There, use the OVStage provider or a matching `pxr` from the
+  environment.
 - **Renderer** — the rendered viewport uses the external `ovrtx` renderer,
   importable from the environment or resolved through `OVRTX_ROOT`. Setting
   `OVUI_WIDGETS_REQUIRE_OVRTX=0` opts into a fallback renderer **only for
@@ -80,18 +74,23 @@ python -m ovui_widgets.app path/to/scene.usda
   `ovstage` provider always requires ovrtx in BORROW mode and fails closed.
 - **Native OVStage provider** — `ovui-data-adapters-ovstage` drives the
   external native OVStage runtime and attaches ovrtx in BORROW mode for
-  rendering and picking. Its `ovstage`/`ovrtx` runtimes are **one matched
-  Kit/OVStage/OVRTX rendering build** (not independently mixed wheels),
-  importable from the environment or resolved via `OVSTAGE_ROOT` /
-  `OVRTX_ROOT`; durable new-document/save/export/layer-composition
-  workflows are unavailable natively. See
-  [`ovui-data-adapters/docs/kit-runtime.md`](../ovui-data-adapters/docs/kit-runtime.md)
-  for the runtime contract, and note that the current native end-to-end
-  validation is Linux; Windows native end-to-end validation is incomplete.
+  rendering and picking. The 0.3.1 provider reads both supported tensor
+  layouts; install a compatible `ovstage` and `ovrtx` pair from PyPI. Historical 0.3.0
+  wheels need the `ovstage` and `ovrtx` of the 0.3.0 release: with the ones
+  that came after 0.3.0, the start camera is zoomed in on the objects and a
+  selected prim gets no move gizmo. The section
+  [ovstage + ovrtx](../skills/omniverse-ui-widgets-app/SKILL.md#ovstage--ovrtx-native-ovstage)
+  of the USD Viewer skill gives the command for each release. A Kit
+  rendering build can also supply them, importable from the environment or
+  resolved via `OVSTAGE_ROOT` / `OVRTX_ROOT`; see
+  [`ovui-data-adapters/docs/kit-runtime.md`](../ovui-data-adapters/docs/kit-runtime.md).
+  Durable new-document/save/export/layer-composition workflows are
+  unavailable natively. The current native end-to-end validation is Linux;
+  Windows native end-to-end validation is incomplete.
 
-Everything from **Prerequisites** through **Building `libovstream.so`**
+Everything from **Prerequisites** through **Install ovrtx**
 below is a **historical source-build recipe** (custom non-monolithic USD
-build plus early internal ovrtx builds). It is retained for reference only
+build plus early ovrtx builds). It is retained for reference only
 and is not the supported installation path; several of its pins and layouts
 predate the current distribution topology.
 
@@ -126,7 +125,7 @@ predate the current distribution topology.
 
 This historical recipe builds **OpenUSD v25.11** non-monolithically with
 **oneTBB 2021.13.x** under Python 3.12. Within this specific custom-build
-recipe the PyPI `usd-core` wheel is not used, because the early internal
+recipe the PyPI `usd-core` wheel is not used, because the early
 `ovrtx` builds it targeted bundled their own USD and conflicted with a
 monolithic build. This is not a general statement: the **supported** current
 path installs `usd-core==25.11` through the OpenUSD adapter's `standalone`
@@ -251,207 +250,6 @@ historical recipe.
 pip install ovrtx
 ```
 
-(This historical recipe was validated against an earlier ovrtx pre-release;
-use a compatible published runtime for current packaged-app workflows.)
-
-## Building `libovstream.so` from `kit-livestream`
-
-USD Viewer's optional WebRTC livestream tap (`ovui_widgets.viewport._livestream_tap`)
-loads the **OVSTREAM SDK** native library (`libovstream.so`) at runtime
-through the `ovstream` Python package. The pip-installed `ovstream` wheel
-**does not bundle the .so** in this layout — it expects to find the
-library either in `$OVSTREAM_LIB_PATH` or alongside an in-tree
-`kit-livestream` checkout at
-`<repo>/_build/linux-x86_64/release/sdk/libovstream.so`.
-
-Without it, every frame logs:
-```
-[ovgear/livestream] server bring-up failed:
-libovstream.so: cannot open shared object file: No such file or directory
-```
-
-The upstream `build.sh` / `repo.sh build` flow uses NVIDIA-internal package
-infrastructure that is not reachable outside NVIDIA-internal networks. The
-recipe below builds the SDK directly from the source tree using system
-CMake — no NVIDIA-internal package access required.
-
-### What ships with the source vs. what you install
-
-| Dependency        | Where it comes from                              |
-|-------------------|--------------------------------------------------|
-| **StreamSDK** (NvStreamBase / NvStreamServer / AudioStreamShared / Poco / cudart / OpenSSL `_nvst` fork) | Already vendored under `kit-livestream/source/extensions/omni.kit.livestream.webrtc/streamsdk/lib/linux/x86_64/` — proprietary, prebuilt, no fetch needed. |
-| **GStreamer 1.20** + `gst-rtsp-server` + `glib 2.72` | Ubuntu 22.04 `apt` packages. The upstream build pins 1.24 from NVIDIA-internal packages, but the SDK only uses stable 1.x APIs (`appsrc`, `rtsp-server`, `video`) and links against 1.20 cleanly. |
-| **CUDA driver** (`libcuda.so.1`)                | NVIDIA display driver (already on this VM). |
-| **CUDA toolkit / nvcc**                          | Only needed to build the C *examples* (`.cu` files). Not needed for `libovstream.so` itself. |
-
-### 1. Install system prerequisites
-
-```bash
-sudo apt-get install -y \
-    libgstreamer1.0-dev \
-    libgstreamer-plugins-base1.0-dev \
-    libgstrtspserver-1.0-dev \
-    libglib2.0-dev \
-    cmake patchelf build-essential
-```
-
-Verify pkg-config sees them:
-
-```bash
-pkg-config --modversion gstreamer-1.0 gstreamer-rtsp-server-1.0 \
-                       gstreamer-app-1.0 gstreamer-video-1.0 glib-2.0
-# → 1.20.3 / 1.20.1 / 1.20.1 / 1.20.1 / 2.72.4
-```
-
-### 2. Drop a `CMakeLists.txt` next to `sdk/premake5.lua`
-
-The upstream SDK uses premake5 (`sdk/premake5.lua`), which is wired
-through `repo.sh` and the NVIDIA-internal package system. The CMake recipe
-below is a stripped-down
-equivalent that compiles the same `sdk/src/**/*.cpp` set, links against
-the vendored StreamSDK and the apt-installed GStreamer, and produces a
-single `libovstream.so` with `$ORIGIN` RPATH:
-
-```cmake
-# kit-livestream/sdk/CMakeLists.txt
-cmake_minimum_required(VERSION 3.18)
-project(ovstream LANGUAGES CXX)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
-set(SDK_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
-set(REPO_ROOT ${SDK_ROOT}/..)
-set(STREAMSDK_DIR ${REPO_ROOT}/source/extensions/omni.kit.livestream.webrtc/streamsdk)
-
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET
-    gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0
-    gstreamer-rtsp-server-1.0 glib-2.0 gobject-2.0
-)
-
-file(GLOB_RECURSE OVSTREAM_SRC ${SDK_ROOT}/src/*.cpp ${SDK_ROOT}/src/*.h)
-
-add_library(ovstream SHARED ${OVSTREAM_SRC})
-target_include_directories(ovstream PRIVATE
-    ${SDK_ROOT}/include ${SDK_ROOT}/src ${STREAMSDK_DIR}/include)
-target_compile_definitions(ovstream PRIVATE OVSTREAM_BUILD)
-target_link_directories(ovstream PRIVATE
-    ${STREAMSDK_DIR}/lib/linux/x86_64)
-target_link_libraries(ovstream PRIVATE
-    PkgConfig::GSTREAMER NvStreamBase NvStreamServer AudioStreamShared)
-set_target_properties(ovstream PROPERTIES
-    BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
-```
-
-This file lives next to `sdk/premake5.lua` and is independent of it —
-the premake build is untouched.
-
-### 3. Configure and build
-
-```bash
-cd ~/dev/kit-livestream
-cmake -S sdk -B _build_local -DCMAKE_BUILD_TYPE=Release
-cmake --build _build_local -j$(nproc)
-```
-
-Build artefact: `_build_local/libovstream.so` (≈ 130 KB, all real
-work is in the linked `libNvStreamServer.so` / GStreamer / etc.).
-
-### 4. Stage at the path the `ovstream` Python wheel expects
-
-`ovstream._bindings._find_library` walks four paths in order
-(`OVSTREAM_LIB_PATH`, the wheel's own dir, the distribution-zip layout,
-then the dev-tree `_build/linux-x86_64/release/sdk/`). Stage there and
-copy the StreamSDK runtime libs alongside so `$ORIGIN` resolves:
-
-```bash
-SDK_OUT=~/dev/kit-livestream/_build/linux-x86_64/release/sdk
-mkdir -p "$SDK_OUT"
-cp ~/dev/kit-livestream/_build_local/libovstream.so "$SDK_OUT/"
-
-SS=~/dev/kit-livestream/source/extensions/omni.kit.livestream.webrtc/streamsdk/lib/linux/x86_64
-cp -a \
-    "$SS"/libNvStreamBase.so \
-    "$SS"/libNvStreamServer.so \
-    "$SS"/libAudioStreamShared.so \
-    "$SS"/libPoco.so \
-    "$SS"/libcrypto_nvst.so.3 \
-    "$SS"/libssl_nvst.so.3 \
-    "$SS"/libNicllsHandlerServer.so \
-    "$SS"/libcudart.so.12 \
-    "$SDK_OUT/"
-
-# Force RUNPATH→RPATH = $ORIGIN so the staged StreamSDK libs are
-# preferred over anything CMake baked in from absolute link dirs.
-patchelf --force-rpath --set-rpath '$ORIGIN' "$SDK_OUT/libovstream.so"
-```
-
-Note: GStreamer / glib are **not** copied here — the system loader
-resolves them from `/lib/x86_64-linux-gnu/` since they're apt-installed.
-The upstream NVIDIA-internal build copies them in because it ships its
-own GStreamer 1.24; for an in-place dev build against system 1.20 they
-already exist on the loader's default path.
-
-### 5. Verify
-
-Two checks. First a raw `ctypes.CDLL` to confirm every transitive
-`NEEDED` symbol resolves:
-
-```bash
-python3 -c "import ctypes; \
-    ctypes.CDLL('$HOME/dev/kit-livestream/_build/linux-x86_64/release/sdk/libovstream.so'); \
-    print('OK')"
-# → OK
-```
-
-Then through the `ovstream` Python wheel inside the ovui-widgets venv. The
-wheel's dev-layout walk only matches if the `ovstream` package is
-imported from `<repo>/sdk/python/ovstream/`; for a pip-installed wheel
-in `_venv312`, set `OVSTREAM_LIB_PATH` instead:
-
-```bash
-export OVSTREAM_LIB_PATH=$HOME/dev/kit-livestream/_build/linux-x86_64/release/sdk/libovstream.so
-
-~/dev/ovui/ovui-widgets/_venv312/bin/python -c "
-import ovstream
-ovstream.initialize()
-print('version:', ovstream.get_version())
-ovstream.shutdown()
-"
-# → version: 0.1.2
-```
-
-And finally that USD Viewer's livestream tap module imports without the
-`OSError`:
-
-```bash
-~/dev/ovui/ovui-widgets/_venv312/bin/python -c \
-    "from ovui_widgets.viewport._livestream_tap import LivestreamTap; print('ok')"
-# → ok
-```
-
-Add `OVSTREAM_LIB_PATH` to the env-var block alongside
-`OVRTX_SKIP_USD_CHECK` / `PYTHONPATH` / `LD_LIBRARY_PATH` for any shell
-that runs USD Viewer with the livestream tap enabled.
-
-### Caveats
-
-- **No `gstnvenc` plugin.** The full upstream build also produces a
-  custom NVENC GStreamer plugin (built from source under
-  `source/extensions/omni.kit.livestream.rtsp/gstnvenc/`, LGPL).
-  Without it, RTSP streams of *raw CUDA buffers* fail to negotiate the
-  encoder. **Pre-encoded RTSP** (the caller hands H.264/H.265 bytes)
-  and **all WebRTC streaming** (encoded inside StreamSDK) work without
-  it — that covers USD Viewer's current livestream tap which feeds
-  pre-encoded frames. If you need raw-CUDA RTSP, build `gstnvenc`
-  separately and place `libgstnvenc.so` under `$SDK_OUT/gst-plugins/`
-  with `GST_PLUGIN_PATH` pointing at it.
-- **GStreamer version skew.** apt's 1.20.3 vs. upstream's 1.24 has not
-  been observed to cause runtime issues for the SDK's appsrc → RTSP
-  path on this VM, but no test sweep has been done against 1.20.
-
 ## Environment Variables
 
 The variables the application reads at runtime. Rows marked *historical
@@ -464,9 +262,9 @@ recipe above and are **not** used on the supported built-wheel path:
 | `OVRTX_ROOT`          | path to an external ovrtx install root          | Optional. Used only when `import ovrtx` from the active environment fails; the app checks `$OVRTX_ROOT/python` and `$OVRTX_ROOT`. |
 | `OVSTAGE_ROOT`        | path to an external ovstage checkout/install root | Optional. Used only when the ovstage provider is selected and `import ovstage` from the active environment fails; the app checks source-layout Python roots and derives ovstage native runtime paths from the root. |
 | `OVUI_WIDGETS_REQUIRE_OVRTX` | unset or `1`                                | ovrtx is required by default. False values allow a fallback only for providers that support one; the native `ovstage` provider always requires OVRTX BORROW and fails closed. |
+| `PXR_WORK_THREAD_LIMIT` | unset or a thread count                       | OpenUSD's own setting for its work thread pool. When it is unset, OpenUSD is installed, and the process may use fewer CPUs than the host has (its CPU affinity or its cgroup CPU quota), the application sets it to that CPU count at start, before anything loads OpenUSD, and writes one line about it. A value that you set is kept. |
 | `PYTHONPATH`          | `~/dev/usd-build/install/lib/python:$PYTHONPATH`| Historical custom-USD recipe only: resolve `pxr` to the custom 25.11 build ahead of any other `usd-core` wheel in the environment. The supported built-wheel path uses `ovui-data-adapters-openusd[standalone]` (`usd-core==25.11`) and needs no `PYTHONPATH` override. |
 | `LD_LIBRARY_PATH`     | `~/dev/usd-build/install/lib:$LD_LIBRARY_PATH`  | Historical custom-USD recipe only: so the 61 non-monolithic `libusd_*.so` files find each other. `omni.ui`'s own native libs set `$ORIGIN` RPATH at build time so they do **not** need to be on this path. Not needed on the supported built-wheel path. |
-| `OVSTREAM_LIB_PATH`   | `~/dev/kit-livestream/_build/linux-x86_64/release/sdk/libovstream.so` | Only when running with the WebRTC livestream tap. See *Building `libovstream.so` from `kit-livestream`* above. |
 
 ## Running USD Viewer
 
@@ -482,6 +280,36 @@ ovgear                                 # backward-compatible alias
 
 For headless / server deployments set `OMNIUI_HEADLESS=1 OMNIUI_BACKEND=vulkan`
 before launch; no `DISPLAY` needed.
+
+**When the viewport renders.** By default (`app.renderer.renderPolicy` is
+`on_change`) the viewport renders a new picture only after a change: the camera
+moves, the viewport size changes, the stage is edited, the selection or a
+render setting changes, or another scene opens. After each change it renders
+`app.renderer.renderSettleFrames` (512) more frames, so that the renderer's
+accumulation settles and the real-time picture is sharp, and then it keeps the
+picture on screen. The renderer
+keeps some memory on every step, so a viewer that renders a still picture again
+and again grows without limit. A change of Eco Mode renders
+nothing: Eco Mode only says when the renderer stops refining a still picture.
+The renderer gets the value, and the picture stays. Only when Eco Mode stopped
+the picture on screen early (before the renderer's default frame limit), and the
+change lets the renderer refine it further, is the picture rendered again.
+A setting change that keeps the effective value (for example the
+reset of a render mode that is set to its default) renders nothing and does not
+restart the renderer. The OpenUSD renderer adapter also stores the picture of
+each render-settings state (at most 4 pictures, 128 MiB). When Undo or Redo
+returns to a stored state and nothing else changed (camera, size, scene,
+selection), the stored picture is shown again: no frame is rendered and the
+renderer is not restarted. A picture that was left before it settled is
+finished while a stored picture is on screen, with steps that are not shown.
+The renderer gets the settings of the picture on screen before it renders again.
+Path tracing renders until the
+sample target (*Total Samples per Pixel*) of the active render product; with no
+target (0) it renders every frame. While a livestream, point clouds, render-var
+outputs, several render products or a pick need frames, the viewport renders
+every frame. The queued render flow of the OVStage provider
+(`--/app/renderer/flowMode=fast`) also renders every frame, as before. To render
+every frame always, start with `--/app/renderer/renderPolicy=continuous`.
 
 **Historical custom-USD environment only** — when running inside the
 historical source-build recipe above, activate its `_venv312` and export its

@@ -118,10 +118,12 @@ class LayerWindow(ManagedWindow):
         adapter: Optional[LayerStackAdapter] = None,
         settings: "Optional[DefaultLayerSettings | LayerSettings]" = None,
         before_save_all_fn: "Optional[Callable[[], bool | None]]" = None,
+        before_root_save_fn: "Optional[Callable[[bool], bool | None]]" = None,
     ) -> None:
         self._services = services
         self._adapter = adapter
         self._before_save_all_fn = before_save_all_fn
+        self._before_root_save_fn = before_root_save_fn
         # Step 52 — resolve the :class:`LayerSettings` wrapper once at
         # construction time. Explicit ``settings`` arg wins (tests pass
         # ``DefaultLayerSettings`` for isolation); otherwise probe
@@ -342,6 +344,7 @@ class LayerWindow(ManagedWindow):
                 services=self._services,
                 settings=self._settings,
                 before_save_all_fn=self._before_save_all_fn,
+                before_root_save_fn=self._before_root_save_fn,
             )
         # Step 17 — a single :class:`LayerDelegate` instance survives
         # frame rebuilds; re-using it matches the model's lifecycle and
@@ -1233,6 +1236,7 @@ class LayerWindow(ManagedWindow):
                 services=self._services,
                 settings=self._settings,
                 before_save_all_fn=self._before_save_all_fn,
+                before_root_save_fn=self._before_root_save_fn,
             )
         # Step 38 — keep the context-menu builder in lockstep with
         # the current model so its predicates read fresh state
@@ -1724,7 +1728,7 @@ class LayerWindow(ManagedWindow):
         super().destroy()
 
 
-# ── Issue #35 Step 3: register the module-scope provider cache so
+# ── register the module-scope provider cache so
 # Application.shutdown() drops every ui.RasterImageProvider it holds
 # before omni.ui.shutdown() runs.
 from ovui_widgets.common.icon_caches import register_dict as _register_dict_for_shutdown

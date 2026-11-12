@@ -22,13 +22,12 @@ from typing import List
 import pytest
 
 from ovui_widgets.viewport.camera_controller import CameraController
-from ovui_widgets.viewport.camera_gesture import TumbleGesture
+from ovui_widgets.viewport.camera_gesture import NavigationOptions, TumbleGesture
 from ovui_widgets.viewport.camera_inertia import (
     DEFAULT_MAX_HANDOFF_AGE,
     DEFAULT_MIN_SPEED,
     DEFAULT_TIME_CONSTANT,
     DT_CLAMP_MAX,
-    DT_CLAMP_MIN,
     TUMBLE_INERTIA_SETTING,
     AngularVelocityTracker,
     TumbleInertia,
@@ -67,15 +66,17 @@ class TestConstruction:
         assert not inertia.is_active
         assert inertia.velocity == (0.0, 0.0)
 
-    def test_constants_match_plan(self):
-        # the viewport behavior pins these.
-        assert DEFAULT_TIME_CONSTANT == pytest.approx(0.15)
-        assert DEFAULT_MIN_SPEED == pytest.approx(0.001)
-        assert TUMBLE_INERTIA_SETTING == "viewport.navigation.tumble_inertia"
+    def test_the_default_coast_decays_with_a_0_2_s_time_constant(self):
+        cam = CameraController()
+        cam.state.elevation = 0.0
+        inertia = TumbleInertia(cam)  # the default time constant
+        inertia.start(1.0, 0.0)
+        for _ in range(20):
+            inertia.tick(0.01)
+        assert inertia.velocity[0] == pytest.approx(math.exp(-0.2 / 0.2), rel=1e-6)
 
     def test_dt_clamp_bounds(self):
         # the viewport behavior calls for clamping into [0.001, 0.1].
-        assert DT_CLAMP_MIN == pytest.approx(0.001)
         assert DT_CLAMP_MAX == pytest.approx(0.1)
 
     def test_time_constant_from_model(self):
@@ -253,14 +254,16 @@ class TestTick:
         # Camera orbited by velocity * DT_CLAMP_MAX, not by velocity * 10.
         assert cam.state.azimuth == pytest.approx(1.0 * DT_CLAMP_MAX, abs=1e-6)
 
-    def test_dt_clamped_low(self):
-        cam = CameraController()
-        cam.state.elevation = 0.0
-        inertia = TumbleInertia(cam, time_constant=1.0)
-        inertia.start(1.0, 0.0)
-        # Request dt well below DT_CLAMP_MIN — clamped up, not a no-op.
-        inertia.tick(1e-6)
-        assert cam.state.azimuth == pytest.approx(1.0 * DT_CLAMP_MIN, abs=1e-6)
+    def test_many_small_ticks_coast_like_one(self):
+        """The camera is evaluated several times a frame: tiny steps must add up exactly."""
+        cams = [CameraController(), CameraController()]
+        inertias = [TumbleInertia(cam, time_constant=1.0) for cam in cams]
+        for inertia in inertias:
+            inertia.start(1.0, 0.0)
+        inertias[0].tick(0.01)
+        for _ in range(100):
+            inertias[1].tick(1e-4)
+        assert cams[1].state.azimuth == pytest.approx(cams[0].state.azimuth, rel=1e-2)
 
     def test_returns_active_state(self):
         inertia = _make_inertia()
@@ -288,106 +291,47 @@ class TestTick:
 
 
 class TestAngularVelocityTracker:
-    def test_first_record_stores_timestamp_only(self):
+    @staticmethod
+    def _drag(tracker, clock, rates, step=0.005):
+        """Record one step every ``step`` seconds at each rate (rad/s) of ``rates``."""
+        for rate in rates:
+            clock.advance(step)
+            tracker.record(rate * step, 0.0)
+
+    def test_steady_drag_hands_off_its_speed(self):
         clock = _FakeClock()
         t = AngularVelocityTracker(clock=clock)
-        # First non-zero record — no previous timestamp, so velocity
-        # stays (0, 0) but the time is captured.
-        t.record(math.pi, 0.5)
-        assert t._last_velocity == (0.0, 0.0)
-        assert t._last_change_time == pytest.approx(0.0)
+        self._drag(t, clock, [3.0] * 30)
+        assert t.pop_handoff()[0] == pytest.approx(3.0)
 
-    def test_second_record_computes_velocity(self):
+    def test_a_hand_slowing_down_before_the_release_hands_off_the_slower_speed(self):
         clock = _FakeClock()
         t = AngularVelocityTracker(clock=clock)
-        t.record(math.pi, 0.0)  # t=0
-        clock.advance(0.1)
-        t.record(math.pi, 0.0)  # t=0.1, delta still π
-        # v = π / 0.1 = 10π rad/sec
-        assert t._last_velocity[0] == pytest.approx(10 * math.pi)
-        assert t._last_velocity[1] == pytest.approx(0.0)
+        self._drag(t, clock, [8.0] * 20 + [2.0] * 5)
+        vy, _ = t.pop_handoff()
+        assert vy < 4.0
 
-    def test_zero_delta_clears_velocity(self):
-        """Stopping before release — last non-zero delta ages out."""
+    def test_a_hand_that_stopped_before_the_release_does_not_coast(self):
         clock = _FakeClock()
         t = AngularVelocityTracker(clock=clock)
-        t.record(math.pi, 0.0)
-        clock.advance(0.05)
-        t.record(math.pi, 0.0)  # velocity set
-        clock.advance(0.05)
-        t.record(0.0, 0.0)  # user stopped
-        assert t._last_velocity == (0.0, 0.0)
+        self._drag(t, clock, [8.0] * 20)
+        clock.advance(0.04)  # still, with the button held
+        vy, _ = t.pop_handoff()
+        assert abs(vy) < 0.5 * 8.0
 
-    def test_pop_handoff_returns_fresh_velocity(self):
-        clock = _FakeClock()
-        t = AngularVelocityTracker(clock=clock)
-        t.record(1.0, 0.5)
-        clock.advance(0.05)
-        t.record(1.0, 0.5)  # v=(20,10)
-        clock.advance(0.02)
-        vy, vx = t.pop_handoff()
-        assert vy == pytest.approx(20.0)
-        assert vx == pytest.approx(10.0)
-
-    def test_pop_handoff_stale_returns_zero(self):
+    def test_stale_motion_hands_off_nothing(self):
         clock = _FakeClock()
         t = AngularVelocityTracker(clock=clock, max_handoff_age=0.1)
-        t.record(1.0, 0.5)
-        clock.advance(0.05)
-        t.record(1.0, 0.5)  # v=(20,10)
-        clock.advance(1.0)  # > max_handoff_age
-        vy, vx = t.pop_handoff()
-        assert vy == 0.0
-        assert vx == 0.0
+        self._drag(t, clock, [8.0] * 20)
+        clock.advance(1.0)
+        assert t.pop_handoff() == (0.0, 0.0)
 
-    def test_pop_handoff_resets_state(self):
+    def test_pop_handoff_starts_over(self):
         clock = _FakeClock()
         t = AngularVelocityTracker(clock=clock)
-        t.record(1.0, 0.5)
-        clock.advance(0.05)
-        t.record(1.0, 0.5)
+        self._drag(t, clock, [8.0] * 20)
         t.pop_handoff()
-        assert t._last_change_time is None
-        assert t._last_velocity == (0.0, 0.0)
-
-    def test_reset_clears(self):
-        clock = _FakeClock()
-        t = AngularVelocityTracker(clock=clock)
-        t.record(1.0, 0.5)
-        t.reset()
-        assert t._last_change_time is None
-        assert t._last_velocity == (0.0, 0.0)
-
-    def test_default_max_age(self):
-        assert DEFAULT_MAX_HANDOFF_AGE == pytest.approx(0.1)
-
-    def test_unresolvable_gap_yields_no_velocity(self):
-        """Two events the clock cannot tell apart produce no velocity.
-
-        ``record`` divides by the gap, so its ``dt > 1e-6`` guard discards
-        the sample and the previous value stands. This is the failure mode a
-        clock coarser than the 1-8 ms spacing of mouse events causes, and it
-        is silent: the handoff reads a stale velocity rather than erroring.
-        """
-        clock = _FakeClock()  # does not advance between the two records
-        t = AngularVelocityTracker(clock=clock)
-        t.record(1.0, 0.0)
-        t.record(1.0, 0.0)
-        assert t._last_velocity == (0.0, 0.0)
-
-    def test_default_clock_resolves_gaps_finer_than_mouse_events(self):
-        """The default clock must distinguish reads well under a millisecond.
-
-        Granularity is measured by busy-waiting for the first change rather
-        than sleeping, so the result depends on the clock alone and not on
-        scheduler behaviour or machine load.
-        """
-        clock = AngularVelocityTracker()._clock
-        start = clock()
-        now = clock()
-        while now == start:
-            now = clock()
-        assert now - start < 0.001
+        assert t.pop_handoff() == (0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +350,7 @@ class TestTumbleGestureInertia:
         cam.state.elevation = 0.0
         inertia = TumbleInertia(cam, time_constant=0.5)
         clock = _FakeClock()
-        g = TumbleGesture(cam, inertia=inertia, clock=clock)
+        g = TumbleGesture(cam, inertia=inertia, clock=clock, options=NavigationOptions(rotation_gain_max=1.0))
 
         _set_mouse(g, 0.0, 0.0)
         g._on_began()

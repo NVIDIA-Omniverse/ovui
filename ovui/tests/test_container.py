@@ -39,3 +39,20 @@ class TestContainer(OmniUiTest):
         v_stack.clear()
         assert len(ui.Inspector.get_children(v_stack)) == 0
         await self.finalize_test_no_image()
+
+    async def test_percent_child_after_sibling_hidden(self):
+        """A Percent child gets the new available width when a sibling is hidden"""
+        window = await self.create_test_window(400, 200)
+        with window.frame:
+            with ui.HStack(spacing=40):
+                left = ui.Rectangle(width=ui.Percent(50))
+                middle = ui.Rectangle(width=ui.Fraction(1))
+                right = ui.Rectangle(width=ui.Fraction(2))
+        await self.wait_n_updates(3)
+        self.assertEqual(left.computed_width, 156)
+
+        middle.visible = False
+        await self.wait_n_updates(3)
+        self.assertEqual(left.computed_width, 176)
+        self.assertEqual(right.computed_width, 176)
+        await self.finalize_test_no_image()

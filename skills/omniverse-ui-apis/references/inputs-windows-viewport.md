@@ -1,6 +1,6 @@
 # Inputs, Windows, Docking, Viewport, Styling, And QA
 
-This reference covers interaction systems, window management, docking, viewport-adjacent ovrtx embedding, styling, lifecycle, and validation.
+This reference covers interaction systems, window management, docking, viewport-adjacent renderer embedding, styling, lifecycle, and validation.
 
 ## Basic Controls
 
@@ -120,6 +120,7 @@ The reference application scopes shortcuts by focused window/panel:
 - Check `window.focused` for panel-local shortcuts.
 - Keep global application shortcuts in one dispatcher.
 - Do not let a text field shortcut handler delete stage data while the field is focused.
+- A save shortcut must not save a value that an editing field can still cancel. Call `omni.ui.standalone.end_text_input()` to end the edit as a commit (as a click outside the field does), and run the save on the next frame, after the field's end-edit callback. It returns `False` and changes nothing when no field is in typing mode (for example during a mouse drag of a number field); then save at once. The reference application does this for Ctrl+S in the Property Inspector.
 - `key_pressed_fn(key, modifiers, pressed)` should ignore key release unless needed.
 
 Common patterns:
@@ -130,6 +131,14 @@ Common patterns:
 - Ctrl/Shift alter selection behavior.
 
 ## Windows
+
+The standalone host window is separate from dockable `ui.Window` widgets.
+`omni.ui.standalone.set_window_size(width, height)` can resize it immediately
+after `init()`, before a UI loop starts, and returns `True` only when the
+framebuffer matches the request. On Windows, resize dimensions are physical
+pixels and may exceed the desktop size; `init()` scales its initial dimensions
+by the primary monitor's content scale. Read back the framebuffer with
+`get_window_size()`. Nonpositive dimensions and headless resizing return `False`.
 
 `ui.Window(title, dockPreference=..., **kwargs)` creates a dockable or floating window. The `frame` property is the content container.
 
@@ -237,7 +246,7 @@ A viewport-like panel has three independent concerns:
 
 1. Rendered pixels: `ui.ByteImageProvider` or another image provider displayed via `ui.ImageWithProvider`.
 2. Interaction/overlays: `omni.ui_scene.scene.SceneView` for 3D gestures/manipulators, plus `ZStack` HUD layers.
-3. Renderer loop: an ovrtx renderer or adapter that produces frames and supports pick/highlight APIs.
+3. Renderer loop: a renderer or adapter that produces frames and supports pick/highlight APIs.
 
 Atomic viewport shell structure:
 
@@ -262,85 +271,7 @@ with ui.VStack(spacing=0):
 - On each frame, call `provider.set_data_array(frame, [w, h])` for CPU frames.
 - If using GPU zero-copy, call `set_bytes_data_from_gpu(ptr, [w, h])` synchronously and close the GPU mapping afterward.
 
-ovrtx basics (verified against the reference `ovrtx/python/ovrtx/_src/renderer.py`):
-
-- `renderer = ovrtx.Renderer(config=None)`
-- `renderer.add_usd(usd_file_path: str, path_prefix: Optional[str] = None)` loads a USD file from disk.
-- `renderer.add_usd_layer(usd_layer_content: str, path_prefix: Optional[str] = None)` composes a USDA string (a session layer with camera + render product) under an optional prefix.
-- Load order matters: set environment/import order first, construct `ovrtx.Renderer()` early, call `renderer.add_usd(scene_path)` first for the root stage, and only then call `renderer.add_usd_layer(session_usda, path_prefix=...)` for session camera/render-product scaffolding. Calling `add_usd_layer(...)` before the root scene and then `add_usd(...)` can fail with `Root layer can only be added to an empty stage`.
-- `products = renderer.step(render_products: set[str], delta_time: float)` returns a dict-like `RenderProductSetOutputs`. Index it as `products[render_product_path]`; each value has `.frames`, and each frame has `.render_vars` keyed by render-var name.
-- Map a render var to CPU memory inside a context manager, then **copy the tensor before exit** because the underlying buffer is unmapped on `__exit__`:
-
-```python
-import numpy as np
-from ovrtx import Device
-
-with rv.map(device=Device.CPU) as mapping:
-    arr = mapping.tensor.numpy()
-    arr = np.array(arr, copy=True)  # mandatory before context exit
-```
-
-- `LdrColor` is the standard 8-bit RGBA output. Shape: `(H, W, 4)` uint8.
-- Clamp `delta_time` to `[1/300, 0.1]` seconds. Larger values can destabilize ovrtx sensors on stalled frames.
-
-Session-USDA template (the camera + render product + var triplet ovrtx needs). All paths nest under a single root so they cannot collide with the user's stage. The reference adapter uses a fixed session root; a prototype can use any unique root (e.g. `/MyPrototypeSession`):
-
-```usda
-#usda 1.0
-(
-    defaultPrim = "MyPrototypeSession"
-    upAxis = "Y"
-)
-
-def Scope "MyPrototypeSession"
-{
-    def Scope "Cameras"
-    {
-        def Camera "Main"
-        {
-            float focalLength = 18
-            float horizontalAperture = 20.955
-            float verticalAperture = 15.2908
-            float2 clippingRange = (0.01, 10000)
-            token projection = "perspective"
-            matrix4d xformOp:transform = ( (1,0,0,0), (0,1,0,0), (0,0,1,0), (0,0,0,1) )
-            uniform token[] xformOpOrder = ["xformOp:transform"]
-        }
-    }
-    def Scope "Render"
-    {
-        def RenderProduct "Viewport"
-        {
-            rel camera = </MyPrototypeSession/Cameras/Main>
-            rel orderedVars = </MyPrototypeSession/Render/Vars/LdrColor>
-            uniform int2 resolution = (1280, 720)
-        }
-        def Scope "Vars"
-        {
-            def RenderVar "LdrColor"
-            {
-                uniform string sourceName = "LdrColor"
-            }
-        }
-    }
-}
-```
-
-Do not compress USDA metadata or prim bodies into single-line forms such as `( defaultPrim = "X" upAxis = "Y" )` or `def RenderVar "LdrColor" { ... }`; the local USD parser rejected those forms during validation. Load the root scene first, then load the session layer with `renderer.add_usd_layer(usda_string, path_prefix="/MyPrototypeSession")`, and step with `renderer.step({"/MyPrototypeSession/Render/Viewport"}, delta_time=dt)`.
-
-Per-frame camera updates (push intrinsics + world xform into the camera prim) use `renderer.write_attribute([camera_path], "omni:xform", world_mat_4x4, semantic=Semantic.XFORM_MAT4x4)` for the world transform. Intrinsics (focal length, aperture, clipping range) are pushed via separate `write_attribute` calls; for a simple prototype these can be left at the default in the USDA layer.
-
-The reference `OvRtxRendererAdapter` adds the production details (`ovui_data_adapters/openusd/renderer_adapter.py`):
-
-- Import `ovrtx` lazily and set `os.environ.setdefault("OVRTX_SKIP_USD_CHECK", "1")` before import.
-- Construct the ovrtx renderer before the first `pxr.Usd.Stage.Open` in the same process to avoid USD/MDL load-order conflicts.
-- In environments where a user-site `pxr` from `usd-core` collides with ovrtx's bundled USD and crashes with `TF_SCRIPT_MODULE_LOADER` / USD/MDL load-order errors, launch viewport prototypes with `PYTHONNOUSERSITE=1`, set `PYTHONPATH` to only the needed local ovui and ovrtx checkouts, and if numpy disappears under `PYTHONNOUSERSITE`, symlink or copy `numpy`/`numpy.libs` into a temporary site directory instead of exposing the whole user-site. Import/construct ovrtx before opening any `pxr.Usd.Stage`.
-- Mirror camera intrinsics and world transform into ovrtx each frame. Convert a GL view matrix to USD world-row form (transpose `inverse(view)`).
-- Reinject the session layer when render resolution changes, with a debounce window during active resize (8 px threshold, 200 ms active window, 250 ms debounce).
-- Return black frames (`np.zeros((h, w, 4), dtype=np.uint8)`) instead of raising on transient renderer failures.
-- Support `pick(x, y, callback, query_name)`, `pick_rect(...)`, `set_selection_highlight(paths)`, and `shutdown()`.
-
-For a validation prototype, build a temporary atomic shell rather than importing `ViewportWidget` or any high-level adapter. Call `ovrtx.Renderer` directly. If the prototype needs picking or selection highlighting and the user has not pre-authorized using an adapter, **stop and ask the skill maintainer to authorize the adapter or extend the skill** — recreating the picking ray and AABB pipeline from scratch is out of scope.
+The renderer is not part of ovui. To produce real frames, follow `references/renderer-direct.md` in the `omniverse-ui-widgets` skill, which ships with the application packages.
 
 ## Styling And Themes
 
@@ -361,7 +292,7 @@ Theme changes:
 Icon pattern:
 
 - Resolve icon files with `importlib.resources` or the local style URL helper.
-- Use PNG/raster assets with standalone ovui when SVG loading is unreliable.
+- `ui.Image`, `ui.ImageWithProvider` and `ui.MarkdownWidget` draw `.svg` files in standalone ovui when the build has `OMNIUI_ENABLE_SVG=ON` (the default); the two image widgets draw the file at their content size with the same picture, and the Markdown widget at the size of the file. A bad file, or one over a work limit of the SVG reader or painter, logs one error. `<text>`, `<image>`, `<pattern>` paint, masks, filters, markers and a `transform` on `<svg>` are not drawn (one warning names them), so use PNG/raster assets for those and for builds with `OMNIUI_ENABLE_SVG=OFF` (there an `.svg` draws nothing and logs one error that names the option).
 - Cache `ui.RasterImageProvider(path)` per icon path.
 - Render with `ui.ImageWithProvider(provider, width=..., height=...)`.
 
@@ -413,3 +344,38 @@ For lightweight documentation validation, static checks and file inspection are 
 ## Process Safety
 
 When managing long-running UI processes, never use `pkill`, `killall`, or pattern-based process killing. Identify the exact PID and kill only that PID when stopping a process is necessary.
+
+## `DragGesture.on_changed` payload rules
+
+- `on_began` and `on_ended` are called once for each drag. `on_changed` is called in each frame of the drag in which the
+  payload of the shape changed (the item closest point or the ray closest point is not the one of the previous frame),
+  except a frame that only shows the follow of the last call (below). Pointer movements queued before one frame give one
+  call, with the payload of the last of them. A frame in which nothing changed gives no call, also when the pointer is held.
+- The payload changes when the pointer moves, when the camera moves, and when the shape or an item above it is written by
+  any code. Every such change is called, also under a still pointer, however small it is (one unit of the last digit of a
+  number counts): a turn, a scale, an edit of the geometry (a `Points` position edit is called with `moved == 0` and the new
+  `item_closest_point`), a move of the shape. A color, a thickness or a size is not geometry and is not a change.
+- `payload.moved` (and the other `moved_*` values) is the change of the payload values since the last call. The change of a
+  frame that has no call stays in the next call, so the `moved` of the calls add up to the change since the drag began.
+  `angle` of an `sc.Arc` is continuous across the full turn.
+- The follow of the pointer. A consumer that moves the shape, or an `sc.Transform` above it, by the `moved` that a call
+  reported gets no second call for that movement. The next frame has the payload of the new place under the same pointer and
+  camera; it has no call when the pointer and the camera are the same, nothing has written to the shape or above it since the
+  callback returned, and the writes of the callback are the follow. They are the follow when
+  - the consumer declares them: `with gesture.following():` around the write, inside the callback or in a later update that
+    applies the movement. Use it when the write goes through a model, a stage or a parent that turns or scales (the
+    translate gizmo does);
+  - or each is exactly what the movement gives, to the last digit, with only plain translations above (no rotation, scale,
+    `scale_to`, `look_at` or basis): the translation of one `Transform` is the old one plus `moved`; the translations of several `Transform` are each the
+    old one plus `moved` divided by their number; both ends of a `Line`, or every position of a `Points` of any size, are each
+    the old one plus `moved`, each written once in the callback (a second write to the same item is called). A consumer that
+    writes another number (the start plus the sum of the `moved`, an absolute point) is called whenever that number is not the
+    old one plus `moved`: an edit of one unit of the last digit writes the same number, so the call is delivered every time
+    and nothing is learned from it. Declare such a write with `following()` to get no call.
+- Everything else is called, so a consumer must not drop a call because the pointer ray did not change: a write that is one
+  unit of the last digit away from the follow, a snapped write, a write through a parent that turns or scales, an edit of the
+  geometry, and a movement that is applied in a later update without `following()`. Such a call has exactly the data of the
+  call for an independent edit that writes the same numbers (the payload is a function of the scene only), so the two cannot
+  be told apart, and the call is delivered: a lost real update is worse than one extra call.
+- The tests are `ovui/tests/scene/test_drag_changed_follow.py`, `test_drag_changed_edits.py` and
+  `ovui-widgets/tests/test_translate_gizmo_dispatch.py`.

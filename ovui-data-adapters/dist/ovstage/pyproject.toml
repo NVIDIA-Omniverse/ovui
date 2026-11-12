@@ -12,12 +12,19 @@ license = {text = "Apache-2.0"}
 dynamic = ["version", "dependencies"]
 description = "ovstage data-adapter package boundary."
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
 
 [project.entry-points."ovui_data_adapters.adapters"]
 ovstage = "ovui_data_adapters.ovstage.register:register"
 
 [project.entry-points."ovui_data_adapters.native_renderer_factories"]
-ovstage = "ovui_data_adapters.ovstage.renderer_adapter:OvstageRendererAdapter"
+ovstage = "ovui_data_adapters.ovstage.register:register_native_renderer"
 
 [project.entry-points."ovui_widgets.components"]
 ovstage_physics_controls = "ovui_widgets_physx_controls:register"

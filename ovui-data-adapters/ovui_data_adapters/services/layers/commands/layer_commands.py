@@ -91,6 +91,9 @@ class SetLayerMutenessCommand(AbstractLayerCommand):
         self._muted = bool(muted)
 
     def do_impl(self) -> None:
+        # Leave the layer first, so undo can restore it after the unmute.
+        if self._muted and self._adapter.get_edit_target_identifier() == self._identifier:
+            self._adapter.set_edit_target(self._adapter.get_root_layer().identifier)
         self._adapter.set_mute(self._identifier, self._muted)
 
     def undo_impl(self) -> None:
@@ -120,6 +123,9 @@ class SetLayerLockCommand(AbstractLayerCommand):
         self._locked = bool(locked)
 
     def do_impl(self) -> None:
+        # Leave the layer first, so undo can restore it after the unlock.
+        if self._locked and self._adapter.get_edit_target_identifier() == self._identifier:
+            self._adapter.set_edit_target(self._adapter.get_root_layer().identifier)
         self._adapter.set_lock(self._identifier, self._locked)
 
     def undo_impl(self) -> None:

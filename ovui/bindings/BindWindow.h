@@ -11,10 +11,41 @@
 #include <omni/ui/Window.h>
 #include <omni/ui/bind/BindUtils.h>
 #include <omni/ui/bind/BindWindow.h>
+#include <omni/ui/platform/Log.h>
 
 using namespace pybind11;
 
 OMNIUI_NAMESPACE_USING_DIRECTIVE
+
+/**
+ * @brief Inspect the calling Python frame and return its module name (e.g.
+ * "omni.kit.window.console"). When the lookup fails, report the failure with its cause and
+ * return an empty string (unknown owner); the window or toolbar is still created.
+ *
+ * Used by the omni.ui extension-usage telemetry hook to attribute `ui.Window` and
+ * `ui.ToolBar` constructions to the extension that issued them, without per-extension
+ * code. Must be called with the GIL held and before `gil_scoped_release`.
+ *
+ * _getframe(0) — not (1) — because pybind11's tp_init slot is a C call and pushes no
+ * Python frame, so the top of the Python stack is already the user's caller.
+ */
+inline std::string getCallingPythonModuleName()
+{
+    std::string moduleName;
+    try
+    {
+        pybind11::object sys = pybind11::module_::import("sys");
+        pybind11::object frame = sys.attr("_getframe")(0);
+        moduleName = frame.attr("f_globals")["__name__"].cast<std::string>();
+    }
+    catch (const pybind11::error_already_set& error)
+    {
+        OMNIUI_LOG_WARN("Could not find the Python module that creates this window or toolbar: %s. "
+                        "Its owner module is left empty.",
+                        error.what());
+    }
+    return moduleName;
+}
 
 void wrapWindow(module& m)
 {
@@ -69,14 +100,34 @@ void wrapWindow(module& m)
 
     class_<Window, WindowHandle, std::shared_ptr<Window>>(m, "Window", windowDoc)
         .def(init([](std::string title, Window::DockPreference dockPreference, kwargs kwargs) {
-                 OMNIUI_PYBIND_INIT(Window, title, dockPreference)
+                 // Capture the calling Python module BEFORE releasing the GIL — used by the
+                 // extension-usage telemetry hook to attribute clicks back to the owning ext.
+                 const std::string ownerModule = getCallingPythonModuleName();
+
+                 std::shared_ptr<Window> result;
+                 {
+                     pybind11::gil_scoped_release gil;
+                     result = Window::create(title, dockPreference);
+                 }
+                 if (result)
+                 {
+                     result->setOwnerModule(ownerModule);
+                     OMNIUI_PYBIND_INIT_BEGIN
+                         OMNIUI_PYBIND_INIT_Window
+                     OMNIUI_PYBIND_INIT_END
+                 }
+                 return result;
              }),
              arg("title"), arg("dockPreference") = Window::DockPreference::eDisabled, windowConstructorDoc)
+        .def_property_readonly("owner_module", &Window::getOwnerModule,
+             "The Python module name that constructed this Window (e.g. 'omni.kit.window.console'). "
+             "Empty when created from C++ or an unattributable context. Used by the omni.ui "
+             "extension-usage telemetry hook.")
         .def("destroy", &Window::destroy, OMNIUI_PYBIND_DOC_Window_destroy)
-        .def("notify_app_window_change", [](Window& self, pybind11::object window) { self.notifyAppWindowChange(appWindowFromPython(window)); }, OMNIUI_PYBIND_DOC_Window_notifyAppWindowChange)
+        .def("notify_app_window_change", [](Window& self, AppWindowObject window) { self.notifyAppWindowChange(appWindowFromPython(window)); }, OMNIUI_PYBIND_DOC_Window_notifyAppWindowChange)
         .def("get_window_callback", &Window::getWindowCallback, OMNIUI_PYBIND_DOC_Window_getWindowCallback,
              pybind11::return_value_policy::reference)
-        .def("move_to_app_window", [](Window& self, pybind11::object window) { self.moveToAppWindow(appWindowFromPython(window)); }, OMNIUI_PYBIND_DOC_Window_moveToAppWindow)
+        .def("move_to_app_window", [](Window& self, AppWindowObject window) { self.moveToAppWindow(appWindowFromPython(window)); }, OMNIUI_PYBIND_DOC_Window_moveToAppWindow)
         .def("set_top_modal", &Window::setTopModal, OMNIUI_PYBIND_DOC_Window_setTopModal)
         .def_property("visible", &Window::isVisible, &Window::setVisible, OMNIUI_PYBIND_DOC_Window_visible)
         .def_property("title", &Window::getTitle, &Window::setTitle, OMNIUI_PYBIND_DOC_Window_title)

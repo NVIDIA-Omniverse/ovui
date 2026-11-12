@@ -74,70 +74,69 @@ def _translation_matrix(x: float, y: float, z: float) -> list[float]:
     ]
 
 
-def _line(start: tuple[float, float, float], end: tuple[float, float, float]) -> Any:
-    return sc.Line(
-        list(start),
-        list(end),
-        color=LIGHT_GIZMO_COLOR,
-        thickness=LIGHT_GIZMO_THICKNESS,
-    )
+Point3 = tuple[float, float, float]
+# ("line", start, end) or ("arc", radius, axis, z_offset)
+LightPrimitive = tuple[Any, ...]
 
 
-def _arc(radius: float, axis: int) -> Any:
-    return sc.Arc(
-        radius,
-        color=LIGHT_GIZMO_COLOR,
-        thickness=LIGHT_GIZMO_THICKNESS,
-        axis=axis,
-        wireframe=True,
-        sector=False,
-    )
+def _line(start: Point3, end: Point3) -> LightPrimitive:
+    return ("line", start, end)
 
 
-def _emission_rays(starts: tuple[tuple[float, float, float], ...], length: float) -> None:
+def _arc(radius: float, axis: int, z_offset: float = 0.0) -> LightPrimitive:
+    return ("arc", radius, axis, z_offset)
+
+
+def _emission_rays(starts: tuple[Point3, ...], length: float) -> list[LightPrimitive]:
     head_half_width = length * 0.16
     head_length = length * 0.24
+    primitives: list[LightPrimitive] = []
     for x, y, z in starts:
-        _line((x, y, z), (x, y, z - length))
-        _line(
-            (x, y, z - length),
-            (x - head_half_width, y, z - length + head_length),
+        primitives.append(_line((x, y, z), (x, y, z - length)))
+        primitives.append(
+            _line(
+                (x, y, z - length),
+                (x - head_half_width, y, z - length + head_length),
+            )
         )
-        _line(
-            (x, y, z - length),
-            (x + head_half_width, y, z - length + head_length),
+        primitives.append(
+            _line(
+                (x, y, z - length),
+                (x + head_half_width, y, z - length + head_length),
+            )
         )
+    return primitives
 
 
-def build_light_geometry(
+def light_geometry_primitives(
     light_type: str,
     geometry: tuple[float, float, float] = (1.0, 1.0, 1.0),
-) -> None:
-    """Emit a world-space silhouette and local ``-Z`` emission direction."""
+) -> list[LightPrimitive]:
+    """Describe the light silhouette as local-space lines and arcs.
+
+    Drawing and viewport picking both use this description, so a click lands
+    on exactly the shape the selected light draws.
+    """
     geometry_x, geometry_y, geometry_z = geometry
     if light_type == "DomeLight":
-        _arc(geometry_x, 0)
-        _arc(geometry_x, 1)
-        _arc(geometry_x, 2)
-        return
+        return [_arc(geometry_x, 0), _arc(geometry_x, 1), _arc(geometry_x, 2)]
     if light_type == "SphereLight":
         radius = geometry_x
-        _arc(radius, 0)
-        _arc(radius, 1)
-        _arc(radius, 2)
-        _line(
-            (0.0, 0.0, -radius - 0.15 * geometry_z),
-            (0.0, 0.0, -radius - 0.45 * geometry_z),
-        )
-        return
+        return [
+            _arc(radius, 0),
+            _arc(radius, 1),
+            _arc(radius, 2),
+            _line(
+                (0.0, 0.0, -radius - 0.15 * geometry_z),
+                (0.0, 0.0, -radius - 0.45 * geometry_z),
+            ),
+        ]
     if light_type == "DistantLight":
-        _arc(0.42 * geometry_x, 2)
         ray_offset = 0.5 * geometry_x
-        _emission_rays(
+        return [_arc(0.42 * geometry_x, 2)] + _emission_rays(
             ((-ray_offset, 0.0, 0.0), (0.0, 0.0, 0.0), (ray_offset, 0.0, 0.0)),
             1.65 * geometry_z,
         )
-        return
     if light_type == "RectLight":
         half_width = 0.5 * geometry_x
         half_height = 0.5 * geometry_y
@@ -147,32 +146,63 @@ def build_light_geometry(
             (half_width, half_height, 0.0),
             (-half_width, half_height, 0.0),
         )
-        for index, corner in enumerate(corners):
+        primitives = [
             _line(corner, corners[(index + 1) % len(corners)])
+            for index, corner in enumerate(corners)
+        ]
         ray_offset = half_width * 0.64
-        _emission_rays(
+        return primitives + _emission_rays(
             ((-ray_offset, 0.0, 0.0), (0.0, 0.0, 0.0), (ray_offset, 0.0, 0.0)),
             0.75 * geometry_z,
         )
-        return
     if light_type == "DiskLight":
         radius = geometry_x
-        _arc(radius, 2)
         ray_offset = radius * 0.59
-        _emission_rays(
+        return [_arc(radius, 2)] + _emission_rays(
             ((-ray_offset, 0.0, 0.0), (0.0, 0.0, 0.0), (ray_offset, 0.0, 0.0)),
             0.75 * geometry_z,
         )
-        return
     if light_type == "CylinderLight":
         radius = geometry_x
         half_length = 0.5 * geometry_z
-        with sc.Transform(transform=_translation_matrix(0.0, 0.0, -half_length)):
-            _arc(radius, 2)
-        with sc.Transform(transform=_translation_matrix(0.0, 0.0, half_length)):
-            _arc(radius, 2)
+        primitives = [_arc(radius, 2, -half_length), _arc(radius, 2, half_length)]
         for x, y in ((-radius, 0.0), (radius, 0.0), (0.0, -radius), (0.0, radius)):
-            _line((x, y, -half_length), (x, y, half_length))
+            primitives.append(_line((x, y, -half_length), (x, y, half_length)))
+        return primitives
+    return []
+
+
+def build_light_geometry(
+    light_type: str,
+    geometry: tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> None:
+    """Emit a world-space silhouette and local ``-Z`` emission direction."""
+    for primitive in light_geometry_primitives(light_type, geometry):
+        if primitive[0] == "line":
+            sc.Line(
+                list(primitive[1]),
+                list(primitive[2]),
+                color=LIGHT_GIZMO_COLOR,
+                thickness=LIGHT_GIZMO_THICKNESS,
+            )
+            continue
+        _, radius, axis, z_offset = primitive
+        if z_offset:
+            with sc.Transform(transform=_translation_matrix(0.0, 0.0, z_offset)):
+                _emit_arc(radius, axis)
+        else:
+            _emit_arc(radius, axis)
+
+
+def _emit_arc(radius: float, axis: int) -> Any:
+    return sc.Arc(
+        radius,
+        color=LIGHT_GIZMO_COLOR,
+        thickness=LIGHT_GIZMO_THICKNESS,
+        axis=axis,
+        wireframe=True,
+        sector=False,
+    )
 
 
 class LightManipulator(sc.Manipulator):
@@ -270,5 +300,6 @@ __all__ = [
     "LightManipulator",
     "SUPPORTED_LIGHT_TYPES",
     "build_light_geometry",
+    "light_geometry_primitives",
     "normalized_light_geometry",
 ]

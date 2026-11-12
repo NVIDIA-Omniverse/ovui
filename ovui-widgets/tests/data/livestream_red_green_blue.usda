@@ -1,0 +1,92 @@
+#usda 1.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+# Issue 510 livestream test scene: three cubes with distinct, saturated colors.
+# Left = red, middle = green, right = blue. Emissive materials keep the hue
+# clear under any lighting, so a decoded stream frame can be checked by color.
+def Xform "World"
+{
+    def Scope "Looks"
+    {
+        def Material "Red"
+        {
+            token outputs:surface.connect = </World/Looks/Red/Shader.outputs:surface>
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (1, 0, 0)
+                color3f inputs:emissiveColor = (1, 0, 0)
+                float inputs:roughness = 1
+                token outputs:surface
+            }
+        }
+        def Material "Green"
+        {
+            token outputs:surface.connect = </World/Looks/Green/Shader.outputs:surface>
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0, 1, 0)
+                color3f inputs:emissiveColor = (0, 1, 0)
+                float inputs:roughness = 1
+                token outputs:surface
+            }
+        }
+        def Material "Blue"
+        {
+            token outputs:surface.connect = </World/Looks/Blue/Shader.outputs:surface>
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0, 0, 1)
+                color3f inputs:emissiveColor = (0, 0, 1)
+                float inputs:roughness = 1
+                token outputs:surface
+            }
+        }
+    }
+
+    def Cube "RedCube" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double size = 2
+        color3f[] primvars:displayColor = [(1, 0, 0)]
+        rel material:binding = </World/Looks/Red>
+        double3 xformOp:translate = (-2.6, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Cube "GreenCube" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double size = 2
+        color3f[] primvars:displayColor = [(0, 1, 0)]
+        rel material:binding = </World/Looks/Green>
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Cube "BlueCube" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double size = 2
+        color3f[] primvars:displayColor = [(0, 0, 1)]
+        rel material:binding = </World/Looks/Blue>
+        double3 xformOp:translate = (2.6, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def DomeLight "Dome"
+    {
+        float inputs:intensity = 1000
+    }
+}

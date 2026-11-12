@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "BindWindow.h" // getCallingPythonModuleName
+
 #include <omni/ui/ToolBar.h>
 #include <omni/ui/Window.h>
 #include <omni/ui/bind/BindToolBar.h>
@@ -21,8 +23,25 @@ void wrapToolBar(module& m)
     constexpr const char* toolBarDoc = OMNIUI_PYBIND_CLASS_DOC(ToolBar);
     static constexpr char toolBarConstructorDoc[] = OMNIUI_PYBIND_CONSTRUCTOR_DOC(ToolBar, ToolBar);
     class_<ToolBar, Window, std::shared_ptr<ToolBar>>(m, "ToolBar", toolBarDoc)
-        .def(init([](std::string title, kwargs kwargs) { OMNIUI_PYBIND_INIT(ToolBar, title) }), arg("title"),
-             toolBarConstructorDoc)
+        .def(init([](std::string title, kwargs kwargs) {
+                 // Capture the calling Python module BEFORE releasing the GIL — used by the
+                 // extension-usage telemetry hook to attribute clicks back to the owning ext.
+                 const std::string ownerModule = getCallingPythonModuleName();
+                 std::shared_ptr<ToolBar> result;
+                 {
+                     pybind11::gil_scoped_release gil;
+                     result = ToolBar::create(title);
+                 }
+                 if (result)
+                 {
+                     result->setOwnerModule(ownerModule);
+                     OMNIUI_PYBIND_INIT_BEGIN
+                         OMNIUI_PYBIND_INIT_ToolBar
+                     OMNIUI_PYBIND_INIT_END
+                 }
+                 return result;
+             }),
+             arg("title"), toolBarConstructorDoc)
         .def_property("axis", &ToolBar::getAxis, &ToolBar::setAxis)
         .def("set_axis_changed_fn", [](ToolBar& self, std::function<void(ToolBar::Axis)> fn) {
             self.setAxisChangedFn(wrapPythonCallback(std::move(fn)));

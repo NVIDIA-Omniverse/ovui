@@ -534,7 +534,7 @@ class NavigationDelegate(ui.AbstractItemDelegate):
         widget.set_mouse_pressed_fn(_on_pressed)
 
 
-# ── Issue #35 Step 3: register the module-scope provider cache so
+# ── register the module-scope provider cache so
 # Application.shutdown() drops every ui.RasterImageProvider it holds
 # before omni.ui.shutdown() runs.
 from ovui_widgets.common.icon_caches import register_dict as _register_dict_for_shutdown

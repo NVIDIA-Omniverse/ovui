@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""NVRTC-compiled in-place R/B channel-swap kernel.
+"""In-place R/B channel-swap kernel, loaded as PTX by the CUDA driver.
 
-Issue #34 Step 1.5. ovrtx LdrColor is RGBA8; ovstream NVENC consumes
+ovrtx LdrColor is RGBA8; ovstream NVENC consumes
 BGRA8. Step 1.6 will wire this kernel into the livestream tap so each
 streamed frame has its red and blue channels exchanged before NVENC
 sees it.
@@ -12,9 +12,15 @@ Design
 ------
 
 * No `cupy` / `cuda-python` runtime dependency. The module talks to
-  libnvrtc and libcuda directly via `ctypes`, mirroring the
+  libcuda directly via `ctypes`, mirroring the
   `_Cudart` thunk used elsewhere in the provider-neutral `_livestream_tap.py`.
-* Lazy compile on first use, cached at module scope. Subsequent
+* The kernels are PTX text. The CUDA driver compiles them for the GPU
+  when the module loads, so no NVRTC (CUDA toolkit) library is used. An NVRTC
+  found on the computer made the stream fail: on Windows its
+  builtins DLL was not on the DLL search path (``nvrtcCompileProgram
+  rc=7``), and on Linux a toolkit newer than the driver made PTX that the
+  driver rejects (``cuModuleLoadData rc=222``).
+* Lazy load on first use, cached at module scope. Subsequent
   launches reuse the loaded `CUmodule` / `CUfunction`.
 * 16×16 thread block. Launch grid is **ceil-div**:
   ``((width + 15) // 16, (height + 15) // 16)``. Floor-div would
@@ -34,47 +40,144 @@ the kernel synchronously w.r.t. the host (``cuLaunchKernel`` is async
 on the device, but the host-side return is immediate; the encode
 pipeline's CUDA stream synchronises the work).
 
-``warm_up()`` — eagerly compile + module-load. Step 1.5 lets the tap
-warm the cache during ``_ensure_server`` so the first streamed frame
-does not eat the ~50-200 ms NVRTC JIT.
+``warm_up()`` — eagerly module-load. The tap loads the kernels during
+``_ensure_server`` so the first streamed frame does not wait for the
+driver's PTX compile, and a stream that cannot swap R/B does not start.
 """
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import os
 import threading
 from typing import Any, Tuple
 
 # ---------------------------------------------------------------------------
-# Kernel source. Kept inline so the module has no companion .cu file and is
+# Kernel PTX. Kept inline so the module has no companion file and is
 # trivially shippable with the Python wheel.
+#
+# PTX ISA 4.1 is the first version with the sm_52 target, the default
+# target of the CUDA 12 NVRTC that compiled these kernels before, and the
+# code uses only PTX ISA 2.0 instructions. So each driver since CUDA 6.5
+# loads it and compiles it for each GPU from sm_52 on. A newer `.version`
+# makes an older driver reject the module (CUDA_ERROR_UNSUPPORTED_PTX_VERSION).
 # ---------------------------------------------------------------------------
 
 _KERNEL_NAME = b"swap_rb_in_place"
 
-_KERNEL_SRC = """
-extern "C" __global__
-void swap_rb_in_place(unsigned char* p, int w, int h, unsigned long long pitch)
+_PTX = r"""
+.version 4.1
+.target sm_52
+.address_size 64
+
+// swap_rb_in_place(unsigned char* p, int w, int h, unsigned long long pitch)
+// Thread (x, y) exchanges bytes 0 and 2 of the pixel at p + y * pitch + x * 4.
+.visible .entry swap_rb_in_place(
+    .param .u64 swap_rb_in_place_param_0,
+    .param .u32 swap_rb_in_place_param_1,
+    .param .u32 swap_rb_in_place_param_2,
+    .param .u64 swap_rb_in_place_param_3
+)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-    unsigned char* pixel = p + (unsigned long long)y * pitch + (unsigned long long)x * 4;
-    unsigned char tmp = pixel[0];
-    pixel[0] = pixel[2];
-    pixel[2] = tmp;
+    .reg .pred %p<4>;
+    .reg .b16 %rs<3>;
+    .reg .b32 %r<11>;
+    .reg .b64 %rd<9>;
+
+    ld.param.u64 %rd1, [swap_rb_in_place_param_0];
+    ld.param.u32 %r3, [swap_rb_in_place_param_1];
+    ld.param.u32 %r4, [swap_rb_in_place_param_2];
+    ld.param.u64 %rd2, [swap_rb_in_place_param_3];
+    // x = blockIdx.x * blockDim.x + threadIdx.x; y likewise.
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %tid.x;
+    mad.lo.s32 %r1, %r6, %r5, %r7;
+    mov.u32 %r8, %ntid.y;
+    mov.u32 %r9, %ctaid.y;
+    mov.u32 %r10, %tid.y;
+    mad.lo.s32 %r2, %r9, %r8, %r10;
+    // if (x >= w || y >= h) return;
+    setp.ge.s32 %p1, %r1, %r3;
+    setp.ge.s32 %p2, %r2, %r4;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra $L__BB0_2;
+
+    cvt.s64.s32 %rd3, %r2;
+    mul.lo.s64 %rd4, %rd3, %rd2;
+    mul.wide.s32 %rd5, %r1, 4;
+    add.s64 %rd6, %rd4, %rd5;
+    cvta.to.global.u64 %rd7, %rd1;
+    add.s64 %rd8, %rd7, %rd6;
+    ld.global.u8 %rs1, [%rd8];
+    ld.global.u8 %rs2, [%rd8+2];
+    st.global.u8 [%rd8], %rs2;
+    st.global.u8 [%rd8+2], %rs1;
+
+$L__BB0_2:
+    ret;
 }
 
-extern "C" __global__
-void copy_swap_rb(const unsigned char* src, unsigned long long src_pitch,
-                  unsigned char* dst, unsigned long long dst_pitch, int w, int h)
+// copy_swap_rb(const unsigned char* src, unsigned long long src_pitch,
+// unsigned char* dst, unsigned long long dst_pitch, int w, int h)
+// Thread (x, y) reads the 32-bit RGBA pixel p of src and writes
+// (p & 0xFF00FF00) | ((p & 0xFF) << 16) | ((p >> 16) & 0xFF) to dst.
+.visible .entry copy_swap_rb(
+    .param .u64 copy_swap_rb_param_0,
+    .param .u64 copy_swap_rb_param_1,
+    .param .u64 copy_swap_rb_param_2,
+    .param .u64 copy_swap_rb_param_3,
+    .param .u32 copy_swap_rb_param_4,
+    .param .u32 copy_swap_rb_param_5
+)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
-    unsigned int p = *(const unsigned int*)(src + (unsigned long long)y * src_pitch + (unsigned long long)x * 4);
-    *(unsigned int*)(dst + (unsigned long long)y * dst_pitch + (unsigned long long)x * 4) =
-        (p & 0xFF00FF00u) | ((p & 0xFFu) << 16) | ((p >> 16) & 0xFFu);
+    .reg .pred %p<4>;
+    .reg .b32 %r<19>;
+    .reg .b64 %rd<15>;
+
+    ld.param.u64 %rd1, [copy_swap_rb_param_0];
+    ld.param.u64 %rd2, [copy_swap_rb_param_1];
+    ld.param.u64 %rd3, [copy_swap_rb_param_2];
+    ld.param.u64 %rd4, [copy_swap_rb_param_3];
+    ld.param.u32 %r3, [copy_swap_rb_param_4];
+    ld.param.u32 %r4, [copy_swap_rb_param_5];
+    // x = blockIdx.x * blockDim.x + threadIdx.x; y likewise.
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %tid.x;
+    mad.lo.s32 %r1, %r5, %r6, %r7;
+    mov.u32 %r8, %ntid.y;
+    mov.u32 %r9, %ctaid.y;
+    mov.u32 %r10, %tid.y;
+    mad.lo.s32 %r2, %r9, %r8, %r10;
+    // if (x >= w || y >= h) return;
+    setp.ge.s32 %p1, %r1, %r3;
+    setp.ge.s32 %p2, %r2, %r4;
+    or.pred %p3, %p1, %p2;
+    @%p3 bra $L__BB1_2;
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvt.s64.s32 %rd6, %r2;
+    mul.lo.s64 %rd7, %rd6, %rd2;
+    mul.wide.s32 %rd8, %r1, 4;
+    add.s64 %rd9, %rd7, %rd8;
+    add.s64 %rd10, %rd5, %rd9;
+    ld.global.u32 %r11, [%rd10];
+    and.b32 %r12, %r11, -16711936;
+    shl.b32 %r13, %r11, 16;
+    and.b32 %r14, %r13, 16711680;
+    or.b32 %r15, %r14, %r12;
+    shr.u32 %r16, %r11, 16;
+    and.b32 %r17, %r16, 255;
+    or.b32 %r18, %r15, %r17;
+    mul.lo.s64 %rd11, %rd6, %rd4;
+    add.s64 %rd12, %rd11, %rd8;
+    cvta.to.global.u64 %rd13, %rd3;
+    add.s64 %rd14, %rd13, %rd12;
+    st.global.u32 [%rd14], %r18;
+
+$L__BB1_2:
+    ret;
 }
 """
 
@@ -82,94 +185,10 @@ _COPY_KERNEL_NAME = b"copy_swap_rb"
 
 
 class CudaSwapError(RuntimeError):
-    """Raised on any failure from the NVRTC compile, the driver-API
-    module load, or ``cuLaunchKernel``. The error message includes the
-    underlying CUDA / NVRTC return code so the caller can disable the
-    streaming leg with a clear log line."""
-
-
-# ---------------------------------------------------------------------------
-# libnvrtc binding — compile a program string and extract its PTX.
-# ---------------------------------------------------------------------------
-
-class _Nvrtc:
-    def __init__(self) -> None:
-        self._lib = self._load()
-        L = self._lib
-        L.nvrtcCreateProgram.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_char_p, ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.POINTER(ctypes.c_char_p),
-            ctypes.POINTER(ctypes.c_char_p),
-        ]
-        L.nvrtcCreateProgram.restype = ctypes.c_int
-        L.nvrtcCompileProgram.argtypes = [
-            ctypes.c_void_p, ctypes.c_int,
-            ctypes.POINTER(ctypes.c_char_p),
-        ]
-        L.nvrtcCompileProgram.restype = ctypes.c_int
-        L.nvrtcGetPTXSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
-        L.nvrtcGetPTXSize.restype = ctypes.c_int
-        L.nvrtcGetPTX.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        L.nvrtcGetPTX.restype = ctypes.c_int
-        L.nvrtcGetProgramLogSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
-        L.nvrtcGetProgramLogSize.restype = ctypes.c_int
-        L.nvrtcGetProgramLog.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        L.nvrtcGetProgramLog.restype = ctypes.c_int
-        L.nvrtcDestroyProgram.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-        L.nvrtcDestroyProgram.restype = ctypes.c_int
-
-    @staticmethod
-    def _load() -> Any:
-        candidates = [
-            ctypes.util.find_library("nvrtc"),
-            "libnvrtc.so",
-            "libnvrtc.so.12",
-            "libnvrtc.so.11",
-            "/usr/local/cuda/lib64/libnvrtc.so",
-        ]
-        last_exc: Any = None
-        for c in candidates:
-            if not c:
-                continue
-            try:
-                return ctypes.CDLL(c)
-            except OSError as exc:
-                last_exc = exc
-        raise CudaSwapError(f"libnvrtc not found: {last_exc!r}")
-
-    def compile_to_ptx(self, src: str, name: str = "swap_rb.cu") -> bytes:
-        prog = ctypes.c_void_p(0)
-        rc = self._lib.nvrtcCreateProgram(
-            ctypes.byref(prog), src.encode("utf-8"), name.encode("utf-8"),
-            0, None, None,
-        )
-        if rc != 0:
-            raise CudaSwapError(f"nvrtcCreateProgram rc={rc}")
-        try:
-            opts = (ctypes.c_char_p * 0)()
-            rc = self._lib.nvrtcCompileProgram(prog, 0, opts)
-            if rc != 0:
-                log_size = ctypes.c_size_t(0)
-                self._lib.nvrtcGetProgramLogSize(prog, ctypes.byref(log_size))
-                log = ctypes.create_string_buffer(log_size.value)
-                self._lib.nvrtcGetProgramLog(prog, log)
-                raise CudaSwapError(
-                    f"nvrtcCompileProgram rc={rc}: "
-                    f"{log.value.decode('utf-8', 'replace')}"
-                )
-            ptx_size = ctypes.c_size_t(0)
-            rc = self._lib.nvrtcGetPTXSize(prog, ctypes.byref(ptx_size))
-            if rc != 0:
-                raise CudaSwapError(f"nvrtcGetPTXSize rc={rc}")
-            ptx = ctypes.create_string_buffer(ptx_size.value)
-            rc = self._lib.nvrtcGetPTX(prog, ptx)
-            if rc != 0:
-                raise CudaSwapError(f"nvrtcGetPTX rc={rc}")
-            return ptx.raw[:ptx_size.value]
-        finally:
-            self._lib.nvrtcDestroyProgram(ctypes.byref(prog))
+    """Raised on any failure from the driver-API module load or
+    ``cuLaunchKernel``. The error message includes the underlying CUDA
+    return code so the caller can disable the streaming leg with a
+    clear log line."""
 
 
 # ---------------------------------------------------------------------------
@@ -208,11 +227,16 @@ class _Driver:
 
     @staticmethod
     def _load() -> Any:
-        candidates = [
-            ctypes.util.find_library("cuda"),
-            "libcuda.so",
-            "libcuda.so.1",
-        ]
+        if os.name == "nt":
+            # Windows x64: the CUDA driver library.
+            candidates = ["nvcuda.dll"]
+        else:
+            # Linux x86_64 and Linux ARM64 library names.
+            candidates = [
+                ctypes.util.find_library("cuda"),
+                "libcuda.so",
+                "libcuda.so.1",
+            ]
         last_exc: Any = None
         for c in candidates:
             if not c:
@@ -314,9 +338,9 @@ class _Driver:
 
 
 # ---------------------------------------------------------------------------
-# Module-scope cache. The lock guards the first-time NVRTC compile from a
-# multi-threaded import race. Subsequent calls hit the cache directly with
-# no locking on the hot path.
+# Module-scope cache. The lock guards the first-time driver setup and PTX
+# module load from a multi-threaded import race. Subsequent calls hit the
+# cache directly with no locking on the hot path.
 # ---------------------------------------------------------------------------
 
 _state_lock = threading.Lock()
@@ -350,27 +374,24 @@ def _ensure_compiled() -> dict:
         cached = _cached.get(cache_key)
         if cached is not None:
             return cached
-        nvrtc = _Nvrtc()
-        ptx = nvrtc.compile_to_ptx(_KERNEL_SRC)
-        module = driver.load_module(ptx)
+        module = driver.load_module(_PTX.encode("ascii"))
         func = driver.get_function(module, _KERNEL_NAME)
         cached = {
             "driver": driver,
             "module": module,
             "func": func,
             "copy_func": driver.get_function(module, _COPY_KERNEL_NAME),
-            "ptx": ptx,
         }
         _cached[cache_key] = cached
         return cached
 
 
 def warm_up() -> None:
-    """Eagerly compile + load the kernel into the current CUDA context.
+    """Eagerly load the kernels into the current CUDA context.
 
-    Useful to avoid first-frame NVRTC JIT cost (~50-200 ms on this
-    GPU) on the first push to NVENC. Safe to call repeatedly; cached
-    after the first run.
+    Useful to avoid the driver's first-frame PTX compile on the first
+    push to NVENC, and to find a kernel that cannot load before a
+    stream starts. Safe to call repeatedly; cached after the first run.
     """
     _ensure_compiled()
 

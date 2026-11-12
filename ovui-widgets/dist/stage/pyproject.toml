@@ -23,6 +23,13 @@ The widget reads through `StageAdapter`, so a backend can provide OpenUSD,
 mock, or project-specific hierarchy data while reusing the same browser UI.
 """}
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
 
 [tool.setuptools.packages.find]
 namespaces = true

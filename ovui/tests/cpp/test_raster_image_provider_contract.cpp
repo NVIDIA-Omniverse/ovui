@@ -472,13 +472,14 @@ static void caseCompletedKeysAreReleasedOnce(FakeRasterImageLoader& loader)
     endCase();
 }
 
-/// Only a source-URL change means "the file may have been replaced, read it
-/// again". A provider being destroyed must leave the shared entry alone, or
-/// closing one preview of a file makes the next preview of that same file
-/// decode and upload a second copy of it.
+/// Only setting the same source URL again means "the file may have been
+/// replaced, read it again". Moving to another URL and back, or a provider
+/// being destroyed, must leave the shared entry alone, or a peer still drawing
+/// the file makes the next load of that same file decode and upload a second
+/// copy of it.
 static void caseOnlyReloadInvalidatesTheSharedEntry(FakeRasterImageLoader& loader)
 {
-    beginCase("only_a_source_url_change_invalidates_the_shared_entry");
+    beginCase("only_a_reload_invalidates_the_shared_entry");
     loader.configure("shared", Behavior::eSucceedImmediately, { 32, 32 });
     loader.configure("other", Behavior::eSucceedImmediately, { 8, 8 });
     {
@@ -493,12 +494,17 @@ static void caseOnlyReloadInvalidatesTheSharedEntry(FakeRasterImageLoader& loade
         check(loader.invalidations == std::vector<std::string>{ "shared" },
               "reloading a source URL must stop the previous entry being shared");
 
+        // Browsing to another file and back says nothing about either file.
         provider.setSourceUrl("other");
         advance(provider);
-        check(loader.invalidations == std::vector<std::string>({ "shared", "shared" }),
-              "replacing a source URL invalidates the URL left behind, not the new one");
+        expectImage(provider, { 8, 8 }, "browse to another URL");
+        provider.setSourceUrl("shared");
+        advance(provider);
+        expectImage(provider, { 32, 32 }, "browse back");
+        check(loader.invalidations == std::vector<std::string>{ "shared" },
+              "browsing between URLs must keep the entries left behind shared");
     }
-    check(loader.invalidations == std::vector<std::string>({ "shared", "shared" }),
+    check(loader.invalidations == std::vector<std::string>{ "shared" },
           "a destroyed provider must not invalidate the entry its peers still share");
     endCase();
 }

@@ -29,8 +29,7 @@ class SettingsDialog:
         """Tear down the modal Settings window if present.
 
         Idempotent — safe to call from :meth:`Application.shutdown`
-        regardless of whether :meth:`show` was ever invoked. Issue
-        #35 Step 4b.
+        regardless of whether :meth:`show` was ever invoked.
         """
         window = self._window
         self._window = None

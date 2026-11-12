@@ -22,7 +22,6 @@ import tempfile as _tempfile
 
 import pytest
 
-pxr = pytest.importorskip("pxr")
 from pxr import Sdf, Usd, UsdGeom  # noqa: E402
 
 from ovui_data_adapters.common.instrumentation import (  # noqa: E402
@@ -1004,8 +1003,6 @@ def _make_native_adapter(renderer) -> OvRtxRendererAdapter:
     a._last_pushed_camera_intrinsics = None
     a._dt_clock = 0.0
     a._clock = lambda: 0.0
-    a._last_big_delta_time = float("-inf")
-    a._last_reinject_time = float("-inf")
     a._selected_paths = []
     a._selection_outline_previous_paths = set()
     a._selection_outline_styles_configured = False
@@ -2489,3 +2486,36 @@ def test_single_setting_read_reports_what_the_catalog_reports() -> None:
             group_label_fallback=previous[5],
             builtin_specs=previous[6],
         )
+
+
+class TestRenderDiagnosticsAtLoad:
+    """What the render diagnostics do when the renderer loads a document."""
+
+    def test_the_file_check_is_armed_and_the_material_check_only_when_asked(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("OVUI_VERIFY_MATERIALS", raising=False)
+        root_path = _write_scene(tmp_path, "armed.usda")
+        adapter = _make_adapter(_RecordingRenderer())
+        adapter.load_stage(Usd.Stage.Open(root_path))
+        assert adapter._file_check_due is True and adapter._first_step_done is False
+        assert adapter._live_check_due is False  # it draws extra frames: off by default
+        monkeypatch.setenv("OVUI_VERIFY_MATERIALS", "1")
+        asked = _make_adapter(_RecordingRenderer())
+        asked.load_stage(Usd.Stage.Open(root_path))
+        assert asked._live_check_due is True
+
+    def test_another_document_retires_the_failures_of_the_closed_one(self, tmp_path, monkeypatch):
+        from ovui_data_adapters.common import render_diagnostics as rd
+
+        monkeypatch.setattr(rd, "_DIAGNOSTICS", rd.RenderDiagnostics())
+        monkeypatch.setattr(rd, "_VERIFICATION", {})
+        adapter = _make_adapter(_RecordingRenderer())
+        bad = Usd.Stage.Open(_write_scene(tmp_path, "bad.usda"))
+        adapter.load_stage(bad)
+        rd.get_render_diagnostics().record("/World/Looks/Tex", "./missing_red.png", "texture", "texture unresolved")
+        rd.set_verification({"/World/Looks/Tex": {"state": "mismatch"}})
+        # The same document loaded again (a renderer rebuild): its failures still hold.
+        adapter.load_stage(bad)
+        assert [e["resource"] for e in rd.get_render_diagnostics().events()] == ["./missing_red.png"]
+        # Another document: the failures and the check result of the closed one are gone.
+        adapter.load_stage(Usd.Stage.Open(_write_scene(tmp_path, "good.usda")))
+        assert rd.get_render_diagnostics().events() == [] and rd.get_verification() == {}

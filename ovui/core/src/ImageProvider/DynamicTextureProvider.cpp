@@ -7,6 +7,7 @@
 #include <omni/ui/ImageProvider/IDynamicTextureGpu.h>
 #include "../platform/PlatformRegistry.h"
 #include "../platform/Log.h"
+#include "ImageProviderThreads.h"
 
 namespace omni
 {
@@ -21,6 +22,9 @@ DynamicTextureProvider::DynamicTextureProvider(const std::string& textureName)
 
 DynamicTextureProvider::~DynamicTextureProvider()
 {
+    forgetImageProviderPublications(this, m_id);
+    // Nothing can draw this provider any more, so it can be destroyed on any thread.
+    ImageProviderChangeScope noCheck(m_id, nullptr);
     auto* dtGpu = PlatformRegistry::instance().dynamicTextureGpu();
     if (dtGpu && dtGpu->shouldCleanupOnDestruction())
     {

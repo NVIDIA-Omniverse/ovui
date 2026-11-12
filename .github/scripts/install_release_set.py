@@ -25,6 +25,7 @@ the check fails, because then it proved nothing.
 
 Usage:
     python install_release_set.py --wheels-dir <dir> [--python <exe>]
+    python install_release_set.py --selftest
 """
 
 from __future__ import annotations
@@ -153,14 +154,32 @@ def _install(label: str, wheels: list[Path], find_links: Path, base_python: str)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wheels-dir", required=True, type=Path)
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--wheels-dir", type=Path)
     ap.add_argument("--python", default=sys.executable,
                     help="interpreter used to create the throwaway environments")
-    args = ap.parse_args()
-
+    ap.add_argument("--skip-distribution", action="append", default=[],
+                    help="leave this distribution (wheel file name prefix, for example "
+                         "ovui_widgets_all) out of the check. Use it only when a third-party "
+                         "requirement of the wheel has no release for this interpreter; "
+                         "each skipped wheel is reported")
+    args = ap.parse_args(argv)
+    if args.selftest:
+        return selftest()
+    if args.wheels_dir is None:
+        ap.error("--wheels-dir is required")
     wheels = sorted(args.wheels_dir.rglob("*.whl"))
+    for name in args.skip_distribution:
+        dropped = [w for w in wheels if _WHEEL_RE.match(w.name).group("name") == name]
+        if not dropped:
+            print(f"::error title=Release set install::--skip-distribution {name} matches no wheel")
+            return 1
+        for w in dropped:
+            print(f"::warning title=Release set install::{w.name} is left out of the check "
+                  "(--skip-distribution): a requirement of it has no release for this interpreter")
+        wheels = [w for w in wheels if w not in dropped]
     if not wheels:
         print(f"::error title=Release set install::no wheel found under {args.wheels_dir}")
         return 1
@@ -247,6 +266,64 @@ def main() -> int:
         return 1
     print(f"OK: {len(installed)} wheel(s) of this set installed, "
           f"{len(skipped)} skipped as cross-platform")
+    return 0
+
+
+def _fixture_wheel(directory: Path, name: str, tags: str, wheel_version: str) -> Path:
+    """A minimal wheel with a correct RECORD. `wheel_version` 99.0 makes pip refuse it."""
+    import base64
+    import hashlib
+    import zipfile
+
+    version = "1.0"
+    dist = f"{name}-{version}.dist-info"
+    files = {
+        f"{name}/__init__.py": b"",
+        f"{dist}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n".encode(),
+        f"{dist}/WHEEL": (f"Wheel-Version: {wheel_version}\nGenerator: selftest\n"
+                          f"Root-Is-Purelib: false\nTag: {tags}\n").encode(),
+    }
+    record = []
+    for path, data in files.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+        record.append(f"{path},sha256={digest},{len(data)}")
+    record.append(f"{dist}/RECORD,,")
+    files[f"{dist}/RECORD"] = ("\n".join(record) + "\n").encode()
+    wheel = directory / f"{name}-{version}-{tags}.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path, data in files.items():
+            archive.writestr(path, data)
+    return wheel
+
+
+def selftest() -> int:
+    """Check that every selected wheel is installed and an invalid wheel fails."""
+    import sysconfig
+
+    py = sys.version_info
+    tags = f"cp{py[0]}{py[1]}-cp{py[0]}{py[1]}-" + sysconfig.get_platform().replace("-", "_").replace(".", "_")
+    failures = 0
+    cases = [
+        ("a complete installable set passes", "1.0", [], 0),
+        ("an invalid wheel fails the gate", "99.0", [], 1),
+        ("an explicitly skipped distribution is reported", "99.0", ["selftest_extra"], 0),
+    ]
+    for label, wheel_version, skipped, expected in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            house = Path(tmp)
+            _fixture_wheel(house, "selftest_base", tags, "1.0")
+            _fixture_wheel(house, "selftest_extra", tags, wheel_version)
+            args = ["--wheels-dir", str(house)]
+            for distribution in skipped:
+                args.extend(["--skip-distribution", distribution])
+            code = main(args)
+        ok = code == expected
+        print(f"selftest: {label}: {'ok' if ok else f'FAILED (exit {code}, expected {expected})'}")
+        failures += 0 if ok else 1
+    if failures:
+        print(f"SELFTEST FAILED: {failures} case(s)")
+        return 1
+    print("SELFTEST OK")
     return 0
 
 

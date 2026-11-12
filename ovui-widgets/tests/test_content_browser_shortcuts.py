@@ -372,6 +372,28 @@ class TestClearSelectionOrDismiss:
 
 
 @_skip_no_window
+class TestPathBarKeys:
+    """While the path bar edits, its folder suggestions get Down (issue 509)."""
+
+    _KEY_DOWN = 264
+
+    def test_down_moves_the_suggestion_highlight(self):
+        w = _make_built_window()
+        path_field = w._widget._browser_bar._path_field
+        path_field._enter_edit_mode()
+        path_field._on_autocomplete_results(["Documents/", "Textures/"])
+        handled = w._on_key_pressed(self._KEY_DOWN, 0, True)
+        assert handled is True
+        assert path_field._autocomplete_selected == 0
+        w.destroy()
+
+    def test_down_outside_the_path_bar_is_not_used(self):
+        w = _make_built_window()
+        handled = w._on_key_pressed(self._KEY_DOWN, 0, True)
+        assert handled is False
+        w.destroy()
+
+
 class TestOnKeyPressedDispatch:
     def test_alt_up_calls_go_up(self):
         w = _make_built_window()

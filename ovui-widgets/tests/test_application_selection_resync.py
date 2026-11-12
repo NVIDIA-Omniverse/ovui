@@ -128,6 +128,40 @@ def test_history_reconcile_restores_reparent_by_leaf_after_tree_clear() -> None:
     assert bus.get_snapshot().paths() == ["/World/A/Box"]
 
 
+def test_history_reconcile_ignores_the_prims_of_changed_properties() -> None:
+    bus = SelectionBus()
+    bus.publish([], source="stage")
+    app = SimpleNamespace(
+        _stage_adapter=_PathsAdapter(
+            {"/World", "/World/Cube", "/World/Looks/OmniGlass"}
+        ),
+        _selection_bus=bus,
+        _history_selection_reconcile={
+            "generation": 5,
+            "selected": ("/World/OmniGlass",),
+            "event_paths": [],
+        },
+        _stage_change_listeners=[],
+        _viewport_window=None,
+        _secondary_viewport_window=None,
+        _layer_window=None,
+    )
+
+    # The undo of a material move also changes the binding of the cube, a
+    # sibling of the selected path. The cube was not moved.
+    Application._on_stage_changed(
+        app,
+        ChangeEvent(
+            ("/World/Cube.material:binding",),
+            ("/World/OmniGlass", "/World/Looks/OmniGlass"),
+            ChangeEventType.RESYNC,
+        ),
+    )
+    Application._finish_history_selection_reconcile(app, 5)
+
+    assert bus.get_snapshot().paths() == ["/World/Looks/OmniGlass"]
+
+
 def test_split_reparent_resync_defers_clear_until_added_path_arrives() -> None:
     bus = SelectionBus()
     source = "/World/A/Box"

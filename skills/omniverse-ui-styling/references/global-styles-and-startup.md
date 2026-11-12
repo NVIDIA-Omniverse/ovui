@@ -10,6 +10,7 @@ Read this when authoring `styles.py` (the global style dictionary) or `startup.p
 
 ```python
 """Global styles for ovui surfaces."""
+import omni.ui as ui
 from omni.ui import color as cl
 from omni.ui import constant as fl
 
@@ -89,6 +90,19 @@ GLOBAL_STYLES = {
         "border_radius":    fl.radius_small,
     },
     "Field:pressed": {"background_color": cl.background_secondary},
+
+    # =====================================================================
+    # Slider — the style type of every slider and drag
+    # =====================================================================
+    "Slider": {
+        "draw_mode":        ui.SliderDrawMode.HANDLE,
+        "background_color": cl.background_field,
+        "secondary_color":  cl.border_strong,
+        "border_radius":    fl.radius_small,
+        "border_width":     1.0,
+        "border_color":     cl.border_default,
+    },
+    "Slider:pressed": {"border_color": cl.border_focused},
 
     # =====================================================================
     # TreeView

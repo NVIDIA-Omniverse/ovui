@@ -68,6 +68,25 @@ jobs:
               -R headless \
               --output-on-failure 2>&1 | tee /tmp/lavapipe_test.log
 
+      - name: Guard — verify the presentation-key render test is registered
+        run: |
+          ctest --test-dir build -N -R "^presentation_key_render_vulkan$" | tee /tmp/lavapipe_select.log
+          grep -q "Total Tests: 1" /tmp/lavapipe_select.log || {
+            echo "ERROR: presentation_key_render_vulkan is not registered in CTest"
+            exit 1
+          }
+
+      - name: Run presentation_key_render_vulkan (Lavapipe, no GPU)
+        # Draws presentation-key widgets with the real headless Vulkan renderer and checks
+        # that every image is fully inside the window before it reads a pixel.
+        shell: bash
+        run: |
+          set -o pipefail
+          OMNIUI_LAVAPIPE=1 \
+            ctest --test-dir build \
+              -R "^presentation_key_render_vulkan$" \
+              --output-on-failure 2>&1 | tee /tmp/lavapipe_presentation_key.log
+
       - name: Verify Lavapipe injection logged
         # Re-runs headless_test with --verbose so test stdout is visible even on
         # pass; greps for the VK_DRIVER_FILES injection line emitted by StandaloneInit.

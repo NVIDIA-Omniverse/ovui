@@ -16,6 +16,8 @@
 
 #include "RectangleData.h"
 
+#include <utility>
+
 #include <numeric>
 
 OMNIUI_SCENE_NAMESPACE_OPEN_SCOPE
@@ -31,8 +33,14 @@ Rectangle::Rectangle(Float width, Float height, RectangleData* dataPtr)
 {
     this->_setWidthChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setHeightChangedFn(std::bind(&This::_dirtyCache, this));
-    this->_setThicknessChangedFn(std::bind(&This::_dirtyCache, this));
-    this->_setColorChangedFn(std::bind(&This::_dirtyCache, this));
+    this->_setThicknessChangedFn([this](const auto&) {
+        _getData<RectangleData>().m_cacheIsDirty = true;
+        this->_dirtyAppearance();
+    });
+    this->_setColorChangedFn([this](const auto&) {
+        _getData<RectangleData>().m_cacheIsDirty = true;
+        this->_dirtyAppearance();
+    });
     this->_setAxisChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setWireframeChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setIntersectionThicknessChangedFn([this](const auto&) {
@@ -87,9 +95,10 @@ void Rectangle::intersect(const Vector3 origin,
     }
 
     auto& gesturePayload = data.m_lastGesturePayload;
-    Vector3 lastClosestPoint = gesturePayload.rayClosestPoint;
-    Float lastS = gesturePayload.s;
-    Float lastT = gesturePayload.t;
+    const bool held = std::exchange(data.m_baselineHeld, false);
+    Vector3 lastClosestPoint = held ? data.m_baselinePoint : gesturePayload.rayClosestPoint;
+    Float lastS = held ? data.m_baselineA : gesturePayload.s;
+    Float lastT = held ? data.m_baselineB : gesturePayload.t;
 
     auto transform = this->getParent()->getAccumulatedTransform();
 
@@ -143,6 +152,21 @@ void Rectangle::intersect(const Vector3 origin,
 
     // Copy
     *stateGesturePayload = gesturePayload;
+}
+
+bool Rectangle::_getFollowReport(Vector3& moved) const
+{
+    const auto& payload = _getData<RectangleData>().m_lastGesturePayload;
+    moved = payload.moved;
+    return true;
+}
+
+void Rectangle::_captureBaseline() const
+{
+    auto& data = _getData<RectangleData>();
+    data.m_baselinePoint = data.m_lastGesturePayload.rayClosestPoint;
+    data.m_baselineA = data.m_lastGesturePayload.s;
+    data.m_baselineB = data.m_lastGesturePayload.t;
 }
 
 const Rectangle::RectangleGesturePayload* Rectangle::getGesturePayload() const

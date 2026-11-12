@@ -202,12 +202,20 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
 
     def get_value(self, attr_name: str) -> Any:
         self._ensure_cache_current()
-        if attr_name not in self._attribute_records:
+        record = self._attribute_records.get(attr_name)
+        if record is None:
             raise_not_ready("property value read")
         values = self._values_for_attribute(attr_name)
-        if self._values_are_ambiguous(values):
-            return None
         if not values or values[0] is _MISSING:
+            return None
+        # A vector row shows each channel and marks only the channels that
+        # differ as "Mixed" (get_per_component_ambiguity). So a vector that
+        # differs gives the value of the first object, as in the OpenUSD
+        # adapter: a channel that is equal on all objects, for example the
+        # one that the user just typed, shows its value.
+        if self._values_are_ambiguous(values) and (
+            record.is_array or record.value_type not in _VECTOR_VALUE_TYPES
+        ):
             return None
         return values[0]
 
@@ -260,16 +268,36 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
 
     def set_value(self, attr_name: str, value: Any) -> None:
         record = self._runtime_write_record(attr_name)
+        self._write_values(attr_name, record, lambda _old: value)
+
+    def set_component_value(self, attr_name: str, index: int, value: Any) -> None:
+        """Set channel ``index`` of a vector attribute on each selected prim.
+
+        Each prim keeps its own values in the other channels.
+        """
+        record = self._runtime_write_record(attr_name)
+        if record.is_array or record.value_type not in _VECTOR_VALUE_TYPES:
+            raise ValueError(
+                f"set_component_value: {attr_name!r} is not a vector attribute"
+            )
+
+        def with_component(old: Any) -> tuple[Any, ...]:
+            components = list(old)
+            components[index] = value
+            return tuple(components)
+
+        self._write_values(attr_name, record, with_component)
+
+    def _write_values(
+        self,
+        attr_name: str,
+        record: _AttributeRecord,
+        new_value: Callable[[Any], Any],
+    ) -> None:
+        """Write ``new_value(old)`` to each selected prim with value ``old``."""
         paths = self._normalized_selected_paths()
         if not paths:
             raise_not_ready("property value write")
-        values = tuple(freeze_native_value(value) for _ in paths)
-        values = validate_native_values(
-            self._scene,
-            paths,
-            _native_value_descriptor(record),
-            values,
-        )
         snapshot = self._edit_snapshots.get(attr_name)
         old_values = (
             snapshot.pending_values or snapshot.values
@@ -278,6 +306,13 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
         )
         if not old_values or any(old is _MISSING for old in old_values):
             raise_not_ready("property value write")
+        values = tuple(freeze_native_value(new_value(old)) for old in old_values)
+        values = validate_native_values(
+            self._scene,
+            paths,
+            _native_value_descriptor(record),
+            values,
+        )
         if tuple(old_values) == values:
             return
         self._push_value_command(
@@ -298,7 +333,34 @@ class _NativeOvstagePropertyAdapter(PropertyAdapter):
         # existing group records the whole pointer gesture as one ordinary
         # undo edge; no release-only write is needed here.
         if undo_manager is not None:
-            undo_manager.end_group()
+            if snapshot.pending_values == snapshot.values:
+                # Every object is back at its start value (Escape after
+                # typing): undo the writes and record no undo step.
+                undo_manager.cancel_group()
+            else:
+                undo_manager.end_group()
+
+    def cancel_edit(self, attr_name: str) -> None:
+        """Cancel an active edit: put back the start values, no undo step.
+
+        Escape in a number field ends its edit this way.
+        """
+        snapshot = self._edit_snapshots.pop(attr_name, None)
+        if snapshot is None:
+            return
+        if self._undo_manager is not None:
+            # Undoes every write of this edit and records nothing.
+            self._undo_manager.cancel_group()
+        elif (
+            snapshot.pending_values is not None
+            and snapshot.pending_values != snapshot.values
+        ):
+            self._push_value_command(
+                self._normalized_selected_paths(),
+                self._runtime_write_record(attr_name),
+                snapshot.pending_values,
+                snapshot.values,
+            )
 
     def _is_scene_visibility_write(
         self, record: _AttributeRecord, paths: Sequence[str]
@@ -766,8 +828,14 @@ class OvstagePropertyAdapter(PropertyAdapter):
     def set_value(self, attr_name: str, value: Any) -> None:
         self._native.set_value(attr_name, value)
 
+    def set_component_value(self, attr_name: str, index: int, value: Any) -> None:
+        self._native.set_component_value(attr_name, index, value)
+
     def end_edit(self, attr_name: str) -> None:
         self._native.end_edit(attr_name)
+
+    def cancel_edit(self, attr_name: str) -> None:
+        self._native.cancel_edit(attr_name)
 
     def subscribe_changes(self, callback: Callable[[], None]) -> SubscriptionProtocol:
         return self._native.subscribe_changes(callback)

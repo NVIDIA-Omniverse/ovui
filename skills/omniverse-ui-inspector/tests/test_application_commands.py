@@ -18,6 +18,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ovuiinspect as inspector
 
 
+
+@pytest.fixture(autouse=True)
+def _no_installed_command_entry_points(monkeypatch):
+    """The tests expect the catalog of the application under test; an installed module (for
+    example ovui-data-adapters-common) must not add commands. The entry-point tests set their own."""
+
+    monkeypatch.setattr("importlib.metadata.entry_points", lambda group=None: [])
+    monkeypatch.setattr(inspector, "_STATUS_PROVIDERS", None)
+
+
 @pytest.fixture
 def application(monkeypatch):
     monkeypatch.setattr(inspector, "_STATE", inspector._State())
@@ -51,7 +61,7 @@ def test_discovery_validation_and_owner_thread_execution(application):
         inspector.Command("add", "Add a bounded amount.", Input, handler)
     )
     with TestClient(inspector._create_app()) as client:
-        row = client.get("/commands").json()["commands"][0]
+        row = next(r for r in client.get("/commands").json()["commands"] if r["name"] == "add")
         assert row["endpoint"] == "/commands/add"
         assert row["input_schema"]["additionalProperties"] is False
         assert client.post("/commands/add", json={"amount": 0}).status_code == 422
@@ -325,3 +335,92 @@ def test_drag_timeout_query_parameter_overrides_the_body(application):
     finally:
         inspector._make_drag = original
     assert seen["timeout"] == 90
+
+
+class _EntryPoint:
+    def __init__(self, name, factory):
+        self.name, self._factory = name, factory
+
+    def load(self):
+        return self._factory
+
+
+def _entry_points(monkeypatch, *entries):
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda group=None: list(entries) if group == inspector.ENTRY_POINT_GROUP else [],
+    )
+
+
+def test_an_installed_module_adds_commands_to_every_application(monkeypatch):
+    """An entry point of the group adds commands; ovui does not import the module."""
+
+    seen = []
+
+    def factory(application):
+        seen.append(application)
+        return [inspector.Command("added", "Added.", inspector.Arguments, lambda: {"ok": True})]
+
+    _entry_points(monkeypatch, _EntryPoint("diag", factory))
+    monkeypatch.setattr(inspector, "_STATE", inspector._State())
+    app = SimpleNamespace(events=[])
+    inspector.attach_application(app)
+    assert seen == [app] and set(inspector._STATE.commands) == {"added"}
+    inspector.detach_application(app)
+    assert not inspector._STATE.commands
+
+
+def test_an_application_command_of_the_same_name_is_kept(monkeypatch):
+    own = inspector.Command("added", "Own.", inspector.Arguments, lambda: {"own": True})
+    other = inspector.Command("added", "Other.", inspector.Arguments, lambda: {"own": False})
+    _entry_points(monkeypatch, _EntryPoint("diag", lambda application: [other]))
+    monkeypatch.setattr(inspector, "_STATE", inspector._State())
+    app = SimpleNamespace(get_inspector_commands=lambda: [own])
+    inspector.attach_application(app)
+    assert inspector._STATE.commands["added"].command is own
+    inspector.detach_application(app)
+
+
+def test_a_failing_entry_point_is_reported_and_does_not_stop_the_others(monkeypatch, capsys):
+    def broken(application):
+        raise RuntimeError("cannot build")
+
+    good = _EntryPoint("good", lambda application: [inspector.Command("fine", "Fine.", inspector.Arguments, lambda: {})])
+    _entry_points(monkeypatch, _EntryPoint("broken", broken), good)
+    monkeypatch.setattr(inspector, "_STATE", inspector._State())
+    app = SimpleNamespace()
+    inspector.attach_application(app)
+    assert set(inspector._STATE.commands) == {"fine"}
+    assert "broken: RuntimeError: cannot build" in inspector._STATE.contribution_error
+    assert "Commands of entry point broken unavailable" in capsys.readouterr().err
+    inspector.detach_application(app)
+
+
+def test_health_shows_extension_status_and_is_degraded_when_it_says_so(monkeypatch):
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda group=None: [_EntryPoint("render", lambda: {"degraded": True, "failure_events": 2})]
+        if group == inspector.STATUS_ENTRY_POINT_GROUP else [],
+    )
+    monkeypatch.setattr(inspector, "_STATUS_PROVIDERS", None)
+    monkeypatch.setattr(inspector, "_STATE", inspector._State())
+    status = inspector.status()
+    assert status["status"] == "degraded"
+    assert status["extensions"] == {"render": {"degraded": True, "failure_events": 2}}
+
+
+def test_health_is_ok_without_extensions_and_a_failing_provider_is_reported(monkeypatch):
+    monkeypatch.setattr(inspector, "_STATE", inspector._State())
+    assert inspector.status()["status"] == "ok" and inspector.status()["extensions"] == {}
+
+    def broken():
+        raise RuntimeError("cannot read")
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda group=None: [_EntryPoint("bad", broken)] if group == inspector.STATUS_ENTRY_POINT_GROUP else [],
+    )
+    monkeypatch.setattr(inspector, "_STATUS_PROVIDERS", None)
+    status = inspector.status()
+    assert status["status"] == "degraded"
+    assert status["extensions"]["bad"] == {"degraded": True, "error": "RuntimeError: cannot read"}

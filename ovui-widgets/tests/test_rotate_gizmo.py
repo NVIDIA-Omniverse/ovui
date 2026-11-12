@@ -115,7 +115,7 @@ class TestConstants:
         assert RING_RADIUS == pytest.approx(1.0)
 
     def test_ring_thickness_matches_translate_thin_look(self):
-        # The "thin and elegant, not chunky" design requirement bounds this.
+        # Keep the rotation rings thin and visually unobtrusive.
         assert 1.0 <= RING_THICKNESS <= 3.0
 
     def test_intersection_thickness_is_grabbable(self):

@@ -1767,7 +1767,8 @@ Symptoms:
 Fix:
 
 - Use OpenUSD v25.11 from `$WORKDIR/usd-build/install`.
-- Use ovrtx 0.2.0 runtime from the documented release package.
+- Use the ovrtx runtime from the documented release package that matches the
+  installed ovrtx Python package.
 - Export:
 
 ```bash

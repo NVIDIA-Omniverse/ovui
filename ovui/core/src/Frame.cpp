@@ -246,7 +246,14 @@ void Frame::setComputedContentWidth(float width)
 
     float widthMinusPadding = std::max(width - padding * 2.0f, 0.0f);
 
-    auto& canvas = data.m_canvas;
+    // Hold the child by value, not by reference to the member. The layout call below
+    // can run arbitrary user code -- a MenuDelegate's buildItem executes Python from
+    // MenuHelper::_menuHelperEvalWidth -- which can clear() this Frame. clear() does
+    // std::exchange(data.m_canvas, {}) and destroys the subtree, so a reference would be emptied
+    // mid-call and getComputedWidth() below becomes a virtual call through null (the reported
+    // EXCEPTION_ACCESS_VIOLATION_READ at NULL+offset). Stack::_evaluateSimultaneousLayout snapshots
+    // its children for exactly this reason; Frame was missed.
+    auto canvas = data.m_canvas;
     if (canvas && canvas->isVisible())
     {
         if (isWidthDirty() != SizeDirtyReason::eNone && canvas->getWidth().unit != UnitType::ePixel)
@@ -282,7 +289,9 @@ void Frame::setComputedContentHeight(float height)
 
     float heightMinusPadding = std::max(height - padding * 2.0f, 0.0f);
 
-    auto& canvas = data.m_canvas;
+    // Held by value for the same reason as the width path above: the child's layout
+    // can run user code that clears this Frame, emptying data.m_canvas mid-call.
+    auto canvas = data.m_canvas;
     if (canvas && canvas->isVisible())
     {
         if (isHeightDirty() != SizeDirtyReason::eNone && canvas->getHeight().unit != UnitType::ePixel)

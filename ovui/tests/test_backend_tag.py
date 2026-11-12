@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pathlib
 from contextlib import contextmanager
 
 import pytest
@@ -185,3 +186,87 @@ def test_generate_golden_writes_opengl_capture(monkeypatch, tmp_path):
     )
 
     assert golden_path.exists()
+
+
+def test_golden_capture_failure_raises_without_strict(monkeypatch, tmp_path):
+    """A failed capture fails the test in every mode, not only strict mode."""
+    monkeypatch.delenv("OMNI_UI_GOLDEN_STRICT", raising=False)
+    monkeypatch.delenv("OMNI_UI_GENERATE_GOLDEN", raising=False)
+    monkeypatch.setattr(test_base, "_is_vulkan_backend", lambda: False)
+    monkeypatch.setattr(test_base, "_try_read_pixels", lambda width, height: None)
+
+    golden_path = tmp_path / "golden" / "present.png"
+    golden_path.parent.mkdir()
+    golden_path.write_bytes(b"golden")
+
+    with pytest.raises(AssertionError, match="Golden image capture failed"):
+        asyncio.run(
+            _GoldenHarness()._capture_and_compare_golden(
+                captured_path=tmp_path / "captured" / "present.png",
+                golden_read_path=golden_path,
+                golden_write_path=golden_path,
+                diff_path=tmp_path / "diff.png",
+                width=1,
+                height=1,
+                threshold=0.01,
+                cmp_metric="mean_error",
+            )
+        )
+
+
+def test_missing_golden_raises_without_strict(monkeypatch, tmp_path):
+    """A missing golden fails the test and is not written."""
+    monkeypatch.delenv("OMNI_UI_GOLDEN_STRICT", raising=False)
+    monkeypatch.delenv("OMNI_UI_GENERATE_GOLDEN", raising=False)
+    monkeypatch.setattr(test_base, "_is_vulkan_backend", lambda: False)
+    monkeypatch.setattr(test_base, "_try_read_pixels", lambda width, height: b"\x00\x00\x00\xff")
+
+    golden_path = tmp_path / "golden" / "missing.png"
+    with pytest.raises(AssertionError, match="Golden reference missing"):
+        asyncio.run(
+            _GoldenHarness()._capture_and_compare_golden(
+                captured_path=tmp_path / "captured" / "missing.png",
+                golden_read_path=golden_path,
+                golden_write_path=golden_path,
+                diff_path=tmp_path / "diff.png",
+                width=1,
+                height=1,
+                threshold=0.01,
+                cmp_metric="mean_error",
+            )
+        )
+
+    assert not golden_path.exists()
+
+
+def test_vulkan_capture_crop_error_is_raised(monkeypatch, tmp_path):
+    """An unreadable Vulkan capture raises instead of being compared as-is."""
+    from PIL import UnidentifiedImageError
+    from omni.ui import _ui
+
+    monkeypatch.setenv("OMNI_UI_GENERATE_GOLDEN", "1")
+    monkeypatch.setattr(test_base, "_is_vulkan_backend", lambda: True)
+
+    def _write_unreadable_capture(path):
+        pathlib.Path(path).write_bytes(b"not a png")
+        return True
+
+    monkeypatch.setattr(_ui, "_schedule_screenshot", _write_unreadable_capture)
+    monkeypatch.setattr(_ui, "_poll_screenshot_done", lambda: True)
+
+    golden_path = tmp_path / "golden" / "unreadable.png"
+    with pytest.raises(UnidentifiedImageError):
+        asyncio.run(
+            _GoldenHarness()._capture_and_compare_golden(
+                captured_path=tmp_path / "captured" / "unreadable.png",
+                golden_read_path=golden_path,
+                golden_write_path=golden_path,
+                diff_path=tmp_path / "diff.png",
+                width=1,
+                height=1,
+                threshold=0.01,
+                cmp_metric="mean_error",
+            )
+        )
+
+    assert not golden_path.exists()

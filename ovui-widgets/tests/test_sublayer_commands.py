@@ -361,6 +361,23 @@ class TestRemoveSublayerCommand:
             == "./existing.usda"
         )
 
+    def test_do_keeps_edit_target_that_another_parent_still_brings_in(
+        self, adapter_with_sub, bus
+    ) -> None:
+        # USD allows one layer under two parents. Removing one parent
+        # leaves the layer in the stack, so the target stays.
+        adapter_with_sub.add_sublayer("./existing.usda", "./shared.usda")
+        adapter_with_sub.add_sublayer(ROOT_LAYER_IDENTIFIER, "./other.usda")
+        adapter_with_sub.add_sublayer("./other.usda", "./shared.usda")
+        adapter_with_sub.set_edit_target("./shared.usda")
+        cmd = RemoveSublayerCommand(
+            adapter_with_sub, bus, ROOT_LAYER_IDENTIFIER, 0
+        )
+        cmd.do()
+        assert (
+            adapter_with_sub.get_edit_target_identifier() == "./shared.usda"
+        )
+
     def test_do_does_not_touch_edit_target_when_unrelated(
         self, adapter_with_sub, bus
     ) -> None:

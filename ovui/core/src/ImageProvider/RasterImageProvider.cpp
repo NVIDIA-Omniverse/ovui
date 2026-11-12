@@ -84,15 +84,22 @@ void RasterImageProvider::prepareDraw(float widgetWidth, float widgetHeight)
         if (!mergeTextureOptions(textureOptions))
             return;
 
-        // Release old resources. The source URL was set again, which is how a
-        // replaced file is reloaded, so the old entry must also stop being
-        // shared: the next load has to read the file rather than return the
-        // texture decoded from its previous contents.
+        // Release old resources. Setting the same source URL again is how a
+        // replaced file is reloaded, so in that case the old entry must also
+        // stop being shared: the next load has to read the file rather than
+        // return the texture decoded from its previous contents. Moving to a
+        // different URL says nothing about the file left behind, so its entry
+        // stays shared with the consumers still drawing it, and coming back to
+        // it later reuses that texture instead of uploading another copy.
         loader->releaseLoad(this);
         if (!m_cacheKey.empty())
         {
+            const bool reload = m_cacheKey == loader->getCacheKey(url);
             loader->releaseGpuResource(m_cacheKey);
-            loader->invalidateCacheEntry(m_cacheKey);
+            if (reload)
+            {
+                loader->invalidateCacheEntry(m_cacheKey);
+            }
             m_cacheKey.clear();
         }
 

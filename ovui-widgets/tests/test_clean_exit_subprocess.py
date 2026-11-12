@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Subprocess regression test for issue #35 — Step 8.
+"""Subprocess regression test for the regression — Step 8.
 
 Encodes the Phase 0 reproduction as an automated test:
 
@@ -123,7 +123,7 @@ def _vulkan_gpu_available() -> bool:
     # 2. NVML must be healthy. ovrtx loads NVML during device creation
     # and a broken NVML guarantees a shutdown segfault in
     # libgpu.foundation::DriverShaderCacheManager::shutdown — not a
-    # regression of issue #35.
+    # regression of the regression.
     if shutil.which("nvidia-smi"):
         try:
             smi = subprocess.run(
@@ -400,7 +400,7 @@ def test_clean_exit(headless: bool, run_idx: int, tmp_path: Path) -> None:
     #
     # The original Round 2 F9 list was ``omni.rtx`` and
     # ``omni.ujitso`` — but those are LEAK warnings emitted during
-    # buggy shutdown (Phase 0's run4 log). Now that issue #35 fixes
+    # buggy shutdown (Phase 0's run4 log). Now that the regression fixes
     # the cleanup, those leak markers don't fire. We need markers
     # that appear on EVERY ovrtx-loaded run (clean or buggy):
     #

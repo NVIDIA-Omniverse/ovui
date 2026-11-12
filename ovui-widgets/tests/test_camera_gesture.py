@@ -22,9 +22,11 @@ context.
 import math
 from typing import Tuple
 
+import numpy as np
 import pytest
 from omni.ui_scene import scene as sc
 
+from ovui_widgets.viewport import camera_gesture
 from ovui_widgets.viewport.camera_controller import CameraController
 from ovui_widgets.viewport.camera_gesture import (
     DEFAULT_FOV_Y,
@@ -271,7 +273,7 @@ class TestPanGestureNdcFilter:
         g = PanGesture(cam, viewport_size_fn=_size_fn)
         _set_mouse(g, -2.1308, 2.236)
         g._on_began()
-        assert g._active
+        assert g.is_active
         assert not g._prev_anchored
         _set_mouse(g, 0.0, 0.0)
         g._on_changed()
@@ -402,6 +404,31 @@ class TestPanGestureConstruction:
         g = PanGesture(CameraController())
         assert g._fov_y == pytest.approx(DEFAULT_FOV_Y)
 
+    @staticmethod
+    def _pan_distance(make_gesture) -> float:
+        cam = CameraController()
+        g = make_gesture(cam)
+        _set_mouse(g, 0.0, 0.0)
+        g._on_began()
+        _set_mouse(g, 0.5, 0.0)
+        g._on_changed()
+        return math.dist(cam.state.target, (0.0, 0.0, 0.0))
+
+    def test_the_fourth_argument_is_the_field_of_view_of_the_pan(self):
+        narrow = self._pan_distance(lambda cam: PanGesture(cam, None, _size_fn, math.radians(45.0)))
+        wide = self._pan_distance(lambda cam: PanGesture(cam, None, _size_fn, math.radians(90.0)))
+        assert wide / narrow == pytest.approx(math.tan(math.radians(45.0)) / math.tan(math.radians(22.5)))
+
+    def test_the_viewport_pan_follows_the_camera_field_of_view(self):
+        def viewport_pan(fov):
+            def make(cam):
+                cam.fov_degrees = fov
+                return camera_gesture.NavigationGesture(
+                    cam, viewport_size_fn=_size_fn, mouse_button=MOUSE_MIDDLE, modes={0: "pan"})
+            return make
+        ratio = self._pan_distance(viewport_pan(90.0)) / self._pan_distance(viewport_pan(45.0))
+        assert ratio == pytest.approx(math.tan(math.radians(45.0)) / math.tan(math.radians(22.5)))
+
     def test_callbacks_registered(self):
         g = PanGesture(CameraController())
         assert g.has_on_began_fn()
@@ -485,28 +512,6 @@ class TestPanGestureMath:
         assert all(math.isfinite(value) for value in cam.state.target)
         assert cam.state.target != target_before
 
-    def test_pan_scale_is_cached_for_one_drag(self):
-        cam = CameraController()
-        calls = 0
-
-        def size_fn() -> Tuple[int, int]:
-            nonlocal calls
-            calls += 1
-            return _size_fn()
-
-        g = PanGesture(cam, viewport_size_fn=size_fn)
-        _set_mouse(g, 0.0, 0.0)
-        g._on_began()
-        assert calls == 1
-
-        _set_mouse(g, 0.1, 0.0)
-        g._on_changed()
-        _set_mouse(g, 0.2, 0.0)
-        g._on_changed()
-
-        assert calls == 1
-        assert cam.state.target != pytest.approx([0.0, 0.0, 0.0])
-
 
 class TestPanGestureGating:
     def test_disable_pan_blocks_write(self):
@@ -559,26 +564,23 @@ class TestZoomScrollGestureMath:
         g._on_ended()
         assert cam.state.distance > 10.0
 
-    def test_distance_formula_matches_spec(self):
-        """Pin the ``distance *= exp(-delta_log)`` formula with sign(scroll)."""
+    def test_each_notch_covers_a_sixth_of_the_distance(self):
         cam = CameraController()
         cam.state.distance = 10.0
         g = ZoomScrollGesture(cam)
         _set_wheel(g, 2.0)
         g._on_ended()
-        delta_log = math.log10(1.0 + 2.0 * 0.1) * 1.0
-        expected = 10.0 * math.exp(-delta_log)
-        assert cam.state.distance == pytest.approx(expected, rel=1e-5)
+        assert cam.state.distance == pytest.approx(10.0 * (5.0 / 6.0) ** 2, rel=1e-5)
 
-    def test_negative_scroll_symmetric_formula(self):
+    def test_a_notch_out_undoes_a_notch_in(self):
         cam = CameraController()
         cam.state.distance = 10.0
         g = ZoomScrollGesture(cam)
         _set_wheel(g, -2.0)
         g._on_ended()
-        delta_log = math.log10(1.0 + 2.0 * 0.1) * -1.0
-        expected = 10.0 * math.exp(-delta_log)
-        assert cam.state.distance == pytest.approx(expected, rel=1e-5)
+        _set_wheel(g, 2.0)
+        g._on_ended()
+        assert cam.state.distance == pytest.approx(10.0, rel=1e-9)
 
     def test_zero_scroll_no_op(self):
         cam = CameraController()
@@ -710,3 +712,173 @@ class TestGestureCallbackSignaturesAcceptSender:
 
 
 from types import SimpleNamespace
+
+
+# ---------------------------------------------------------------------------
+# The surface under the cursor
+# ---------------------------------------------------------------------------
+
+
+def _camera_space(cam: CameraController, point) -> np.ndarray:
+    view, _ = cam.get_matrices(VIEWPORT_W, VIEWPORT_H, np.float64)
+    return (view @ np.append(np.asarray(point, dtype=np.float64), 1.0))[:3]
+
+
+def _ndc(cam: CameraController, point) -> Tuple[float, float]:
+    view, proj = cam.get_matrices(VIEWPORT_W, VIEWPORT_H, np.float64)
+    clip = proj @ view @ np.append(np.asarray(point, dtype=np.float64), 1.0)
+    return clip[0] / clip[3], clip[1] / clip[3]
+
+
+class _Renderer:
+    """A renderer adapter that answers each surface query with ``hit`` once ``answer()`` runs."""
+
+    def __init__(self, hit) -> None:
+        self.hit = hit
+        self.asked = 0
+        self.answered = 0
+
+    def query_surface(self, x: float, y: float) -> int:
+        self.asked += 1
+        return self.asked
+
+    def surface_hit(self):
+        return self.answered, self.hit
+
+    def answer(self) -> None:
+        self.answered = self.asked
+
+
+def _surface(renderer, clock=lambda: 0.0) -> camera_gesture.SurfaceQuery:
+    return camera_gesture.SurfaceQuery(lambda: renderer, clock=clock)
+
+
+class TestSurfaceNavigation:
+    def test_the_tumble_turns_about_the_surface_point(self):
+        cam = CameraController()
+        hit = cam.cursor_point(0.3, -0.2, VIEWPORT_W / VIEWPORT_H, depth=2.0)
+        renderer = _Renderer(hit)
+        g = TumbleGesture(cam, viewport_size_fn=_size_fn, surface=_surface(renderer))
+        before = _camera_space(cam, hit)
+        _set_mouse(g, 0.3, -0.2)
+        g._on_began()
+        _set_mouse(g, 0.5, 0.0)
+        g._on_changed()
+        assert cam.state.azimuth == 0.0  # waits for the surface point
+        renderer.answer()
+        cam.advance(0.0)
+        assert cam.state.azimuth != 0.0
+        np.testing.assert_allclose(_camera_space(cam, hit), before, atol=1e-9)
+
+    def test_a_step_waits_for_the_surface_answer(self):
+        cam = CameraController()
+        hit = cam.cursor_point(0.0, 0.0, VIEWPORT_W / VIEWPORT_H, depth=1.0)
+        renderer = _Renderer(hit)
+        g = ZoomScrollGesture(cam, viewport_size_fn=_size_fn, surface=_surface(renderer))
+        _set_wheel(g, 1.0)
+        g._on_ended()
+        assert cam.state.distance == pytest.approx(5.0)  # not answered yet
+        renderer.answer()
+        cam.advance(0.0)
+        eye = cam._get_eye()
+        # The eye came 1/6 closer to the surface point, not to the target.
+        assert np.linalg.norm(eye - hit) == pytest.approx(5.0 / 6.0)
+
+    def test_without_an_answer_the_step_uses_the_target_depth(self):
+        cam = CameraController()
+        now = [0.0]
+        renderer = _Renderer(None)
+        g = ZoomScrollGesture(cam, viewport_size_fn=_size_fn, surface=_surface(renderer, lambda: now[0]))
+        _set_wheel(g, 1.0)
+        g._on_ended()
+        now[0] = camera_gesture.SURFACE_WAIT + 0.01
+        cam.advance(0.0)
+        assert cam.state.distance == pytest.approx(5.0 / 1.2)
+
+    def test_the_wheel_never_passes_the_surface(self):
+        cam = CameraController()
+        hit = cam.cursor_point(-0.4, 0.3, VIEWPORT_W / VIEWPORT_H, depth=0.5)
+        renderer = _Renderer(hit)
+        g = ZoomScrollGesture(cam, viewport_size_fn=_size_fn, surface=_surface(renderer))
+        _set_mouse(g, -0.4, 0.3)
+        for _ in range(40):
+            _set_wheel(g, 1.0)
+            g._on_ended()
+            renderer.answer()
+            cam.advance(0.0)
+        assert _camera_space(cam, hit)[2] < 0.0  # still in front
+        np.testing.assert_allclose(_ndc(cam, hit), (-0.4, 0.3), atol=1e-6)
+        assert renderer.asked == 1  # the answer is kept while the point stays under the cursor
+
+    def test_the_pan_keeps_the_grabbed_surface_under_the_cursor(self):
+        cam = CameraController()
+        hit = cam.cursor_point(0.2, 0.1, VIEWPORT_W / VIEWPORT_H, depth=1.5)
+        renderer = _Renderer(hit)
+        g = PanGesture(cam, viewport_size_fn=_size_fn, surface=_surface(renderer))
+        _set_mouse(g, 0.2, 0.1)
+        g._on_began()
+        renderer.answer()
+        _set_mouse(g, 0.6, -0.3)
+        g._on_changed()
+        np.testing.assert_allclose(_ndc(cam, hit), (0.6, -0.3), atol=1e-9)
+
+    def test_the_drag_zoom_approaches_the_point_under_the_press(self):
+        cam = CameraController()
+        g = camera_gesture.DollyGesture(cam, viewport_size_fn=_size_fn)
+        _set_mouse(g, 0.5, 0.5)
+        g._on_began()
+        point = cam.cursor_point(0.5, 0.5, VIEWPORT_W / VIEWPORT_H)
+        _set_mouse(g, 0.5, 0.75)
+        g._on_changed()
+        assert cam.state.distance < 5.0
+        np.testing.assert_allclose(_ndc(cam, point), (0.5, 0.5), atol=1e-9)
+
+
+class _Generation:
+    effective = True
+
+
+class TestStaleViewport:
+    def test_a_stale_drag_zoom_does_nothing(self):
+        cam = CameraController()
+        generation = _Generation()
+        g = camera_gesture.DollyGesture(cam, viewport_size_fn=_size_fn, generation=generation)
+        _set_mouse(g, 0.0, 0.0)
+        g._on_began()
+        generation.effective = False
+        _set_mouse(g, 0.0, 0.5)
+        g._on_changed()
+        assert cam.state.distance == pytest.approx(5.0)
+
+    def test_a_stale_fly_speed_wheel_does_nothing(self):
+        steps = []
+        generation = _Generation()
+        g = camera_gesture.FlySpeedScrollGesture(SimpleNamespace(step_speed=steps.append), generation)
+        generation.effective = False
+        _set_wheel(g, 1.0)
+        g._on_ended()
+        assert steps == []
+
+
+class TestNativeInput:
+    def test_the_windows_own_cursor_events_drive_the_drag(self, monkeypatch):
+        motion = [(0.0, 0.0, 0.0)]
+        monkeypatch.setattr(camera_gesture, "_native_cursor_motion", lambda: motion.pop() if motion else (0.0, 0.0, 0.0))
+        cam = CameraController()
+        g = LookGesture(cam, viewport_size_fn=_size_fn, options=camera_gesture.NavigationOptions(rotation_gain_max=1.0))
+        _set_mouse(g, 0.0, 0.0)
+        g._on_began()
+        motion.append((100.0, 0.0, 10.0))  # 100 px right: 1/10 of the width
+        _set_mouse(g, 0.3, 0.0)  # ImGui's cursor saw more, but the window's events win
+        g._on_changed()
+        assert cam.state.azimuth == pytest.approx(-0.2 * math.pi)
+
+    def test_injected_input_without_window_events_still_drags(self, monkeypatch):
+        monkeypatch.setattr(camera_gesture, "_native_cursor_motion", lambda: (0.0, 0.0, 0.0))
+        cam = CameraController()
+        g = PanGesture(cam, viewport_size_fn=_size_fn)
+        _set_mouse(g, 0.0, 0.0)
+        g._on_began()
+        _set_mouse(g, 0.2, 0.0)
+        g._on_changed()
+        assert cam.state.target[0] != 0.0

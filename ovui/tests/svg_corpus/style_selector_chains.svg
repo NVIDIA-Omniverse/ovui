@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <style>
+    rect { fill: #c33 }
+    .p > .q .r { fill: #2a7 }
+    .a .b > .c > .d { fill: #36c }
+    g g g g g g g g g g g g .deep { fill: #2a7 }
+    x g g g g g g g g g g g g .deep { fill: #c33 !important }
+    .m > .n { fill: #2a7 }
+  </style>
+  <!-- .r is in an inner .q whose parent is not .p; the outer .q is the child of .p -->
+  <g class="p"><g class="q"><g class="q"><rect class="r" x="4" y="4" width="56" height="56"/></g></g></g>
+  <!-- .d, .c and the inner .b are a chain of children; .a is further up -->
+  <g class="a"><g class="b"><g class="b"><g class="c"><rect class="d" x="68" y="4" width="56" height="56"/></g></g></g></g>
+  <!-- 14 groups: 12 of them and .deep match; there is no x element -->
+  <g><g><g><g><g><g><g><g><g><g><g><g><g><g><rect class="deep" x="4" y="68" width="56" height="56"/></g></g></g></g></g></g></g></g></g></g></g></g></g></g>
+  <!-- .n is a grandchild of .m, not a child: the default red stays -->
+  <g class="m"><g><rect class="n" x="68" y="68" width="56" height="56"/></g></g>
+</svg>

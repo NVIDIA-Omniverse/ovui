@@ -243,7 +243,11 @@ class OvstageLayerStackAdapter(LayerStackAdapter):
         raise_not_ready("layer snapshot restore")
 
     def transfer_layer_content(
-        self, src_identifier: str, dst_identifier: str
+        self,
+        src_identifier: str,
+        dst_identifier: str,
+        *,
+        dst_is_stronger: bool = False,
     ) -> None:
         raise_not_ready("layer content transfer")
 

@@ -18,17 +18,23 @@
     "streamdown": "^2.5.0"
   },
   "devDependencies": {
-    "@tailwindcss/typography": "^0.5.15",
+    "@tailwindcss/postcss": "^4.3.3",
+    "@tailwindcss/typography": "^0.5.20",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.4",
-    "autoprefixer": "^10.4.20",
-    "postcss": "^8.4.49",
-    "tailwindcss": "^3.4.17",
+    "@vitejs/plugin-react": "^5.2.0",
+    "postcss": "^8.5.23",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5.6.3",
-    "vite": "^5.4.11"
+    "vite": "^7.3.7"
   },
   "overrides": {
-    "postcss-selector-parser": "6.1.4"
+    "katex": "^0.18.2",
+    "@tailwindcss/typography": {
+      "postcss-selector-parser": "^7.1.6"
+    }
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

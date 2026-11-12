@@ -28,7 +28,7 @@ These tests boot the real headless Vulkan stack, exercise the
 The tests SKIP when the host doesn't have Vulkan/CUDA hardware so
 they don't break the rest of the suite on machines that lack the
 runtime — but they fully exercise the production path on the GPU
-DGXC VM where issue #34 is being developed.
+DGXC VM where the regression is being developed.
 """
 
 from __future__ import annotations
@@ -51,11 +51,8 @@ def headless_ovui():
     os.environ.setdefault("OMNIUI_HEADLESS", "1")
     os.environ.setdefault("OMNIUI_BACKEND", "vulkan")
 
-    try:
-        from omni.ui import standalone
-        from omni.ui.standalone import headless_frame
-    except Exception as exc:
-        pytest.skip(f"omni.ui not importable: {exc}")
+    from omni.ui import standalone
+    from omni.ui.standalone import headless_frame
 
     # standalone.init returns None on success in this build of ovui
     # (the Python wrapper doesn't surface the C++ bool). Catch
@@ -102,10 +99,7 @@ def test_drain_handoff_then_resize_then_copy(headless_ovui):
     target receives non-zero pitch at the new extent.
     """
     standalone, headless_frame = headless_ovui
-    try:
-        from ovui_data_adapters.openusd._livestream_tap import _Cudart
-    except Exception as exc:
-        pytest.skip(f"_Cudart helper not importable: {exc}")
+    from ovui_data_adapters.openusd._livestream_tap import _Cudart
 
     cudart = _Cudart()
 
@@ -222,13 +216,9 @@ def test_resize_aborts_when_drain_handoff_fails_and_does_not_destroy_interop(
     standalone, headless_frame = headless_ovui
     from omni.ui import _ui as _ui_native
 
-    if not hasattr(_ui_native, "_headless_frame_test_inject_drain_failure"):
-        pytest.skip("ovui build lacks the drain-failure test seam")
+    assert hasattr(_ui_native, "_headless_frame_test_inject_drain_failure")
 
-    try:
-        from ovui_data_adapters.openusd._livestream_tap import _Cudart
-    except Exception as exc:
-        pytest.skip(f"_Cudart helper not importable: {exc}")
+    from ovui_data_adapters.openusd._livestream_tap import _Cudart
     cudart = _Cudart()
 
     # 1. Baseline.
@@ -281,8 +271,7 @@ def test_drain_failure_seam_is_one_shot(headless_ovui):
     standalone, headless_frame = headless_ovui
     from omni.ui import _ui as _ui_native
 
-    if not hasattr(_ui_native, "_headless_frame_test_inject_drain_failure"):
-        pytest.skip("ovui build lacks the drain-failure test seam")
+    assert hasattr(_ui_native, "_headless_frame_test_inject_drain_failure")
 
     # Establish baseline.
     assert headless_frame.resize(384, 288) is True

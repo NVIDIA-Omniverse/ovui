@@ -417,7 +417,7 @@ class TestFrameSelectedMenu:
 
 
 class TestOnExit:
-    """Issue #35 Step 6 (Codex Round 1 F8): ``_on_exit`` no longer
+    """Regression Step 6 (Codex Round 1 F8): ``_on_exit`` no longer
     calls ``ui.shutdown()`` directly — it now flips
     ``Application._running`` via :meth:`Application.request_exit` so
     ``run_async``'s ``finally:`` clause drives :meth:`shutdown` against
@@ -439,7 +439,7 @@ class TestOnExit:
             app._running = True
             _on_exit()
             assert app._running is False, (
-                "issue #35 Step 6: _on_exit must flip _running to False "
+                "the regression Step 6: _on_exit must flip _running to False "
                 "via Application.request_exit() — found _running still True"
             )
         finally:
@@ -480,7 +480,7 @@ class TestOnExit:
                 mb.ui = original_ui  # type: ignore[assignment]
 
             assert ui_shutdown_calls == [], (
-                "_on_exit must NOT call ui.shutdown() (issue #35 Step 6); "
+                "_on_exit must NOT call ui.shutdown() (the regression Step 6); "
                 f"got {len(ui_shutdown_calls)} call(s)"
             )
             assert app._running is False, (

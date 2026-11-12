@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for ovui_widgets.app._input_drain.drain_bridge_into_ui (issue #34, Step 3.3).
+"""Tests for ovui_widgets.app._input_drain.drain_bridge_into_ui (the regression, Step 3.3).
 
 Two layers:
 * The pure helper is exercised against a real :class:`RemoteInputBridge`

@@ -32,7 +32,7 @@ class VulkanBackend;
 /// pixel data via a staging buffer on a one-shot command buffer, and
 /// exposes a VkDescriptorSet (via ImGui_ImplVulkan_AddTexture) as the
 /// ImGui texture reference.
-class OMNIUI_STANDALONE_API VulkanByteImageGpu : public IByteImageGpu
+class OMNIUI_STANDALONE_API VulkanByteImageGpu : public IByteImageGpu, public IByteImageGpuChecked
 {
 public:
     explicit VulkanByteImageGpu(VulkanBackend* backend);
@@ -51,6 +51,26 @@ public:
                              uint32_t textureUsageFlags,
                              uint32_t resourceUsageFlags) override;
 
+    /// Reports what the upload did. Status is eEnqueued when the copy was
+    /// submitted to the queue and may still run (a GPU source with a pending
+    /// fence), eComplete when it finished, and eFailed for any failure,
+    /// including the case where all upload slots are busy. In the busy case
+    /// the plain updateImage still returns the older texture reference.
+    UploadResult updateImageChecked(Handle h,
+                                    const uint8_t* const* mipMapBuffers,
+                                    size_t* mipMapStrides,
+                                    size_t mipMapCount,
+                                    UInt2 size,
+                                    PixelFormat format,
+                                    bool fromGpu,
+                                    uint32_t gpuDeviceMask,
+                                    uint32_t textureUsageFlags,
+                                    uint32_t resourceUsageFlags) override;
+
+    /// The newest upload id whose slot has no pending copy. One Vulkan device
+    /// is used, so there is no per-device state.
+    uint64_t getCompletedUploadId(Handle h) override;
+
     /// Native-pacing-only GPU upload.  The caller must keep the CUDA source
     /// mapping alive on the default stream after this method returns.  The
     /// public IByteImageGpu method remains synchronous because its existing
@@ -60,6 +80,13 @@ public:
                                          size_t rowStride,
                                          UInt2 size,
                                          PixelFormat format);
+    /// Same as updateImageFromGpuAsync, with the checked result. The status is
+    /// eEnqueued while the copy runs. Use getCompletedUploadId to see the end.
+    UploadResult updateImageFromGpuAsyncChecked(Handle h,
+                                                const uint8_t* devicePixels,
+                                                size_t rowStride,
+                                                UInt2 size,
+                                                PixelFormat format);
     void releaseImage(Handle h) override;
 
     /// Whether a GPU-resident upload can actually be performed here.
@@ -98,7 +125,8 @@ private:
                                  uint32_t gpuDeviceMask,
                                  uint32_t textureUsageFlags,
                                  uint32_t resourceUsageFlags,
-                                 bool asynchronousGpuSource);
+                                 bool asynchronousGpuSource,
+                                 UploadResult* checked = nullptr);
     // The probe runs exactly once per backend and every caller — native render
     // thread, UI thread, legacy bridge — waits for that one completed result.
     // Publishing a "probed" flag before the answer let a concurrent caller read

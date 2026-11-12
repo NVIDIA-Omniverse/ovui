@@ -139,6 +139,20 @@ struct TreeView::TreeViewData : public Widget::WidgetData
     // When the node is just selected, it used to scroll the tree view to the node.
     Node* m_scrollHere = nullptr;
 
+    // Cap the number of frames we will keep re-issuing the scroll-to-here request
+    // for a single arm. On the first frame after selection the node heights may still be estimated,
+    // so the initial SetScrollFromPosY target can be off by a row or two; we allow a few frames to
+    // converge, then give up. Without this cap, code that re-sets selection every frame could loop
+    // forever calling SetScrollFromPosY even though the scroll is being fought elsewhere.
+    int32_t m_scrollHereRetriesLeft = 0;
+
+    // The node we most recently finished scrolling to (either because it became
+    // visible or because the retry budget ran out). Used to make setSelection idempotent across
+    // pointer-different-but-logically-same re-pushes: if a model returns a fresh AbstractItem
+    // wrapper for the same row on every call, _setSelection's pointer-equal early-return misses,
+    // but we still recognise the item resolves to the same Node* and skip re-arming.
+    Node* m_lastScrolledTo = nullptr;
+
     // Drag and drop caches.
     mutable std::unique_ptr<char[]> m_dragAndDropPayloadBuffer;
     mutable size_t m_dragAndDropPayloadBufferSize;
@@ -174,6 +188,8 @@ struct TreeView::TreeViewData : public Widget::WidgetData
 
     // Preserve Kit behavior: newly visible descendants invalidate the measured last-column width.
     bool m_lastColumnRemeasureRequested = false;
+    // Widest last-column cell of the rows populated since the last measure. These rows can only widen the column.
+    float m_lastColumnPopulatedMinPx = 0.0f;
 
     // If the column is resizing at this moment, it is the id of the right column. When 0, no resize happens.
     uint32_t m_resizeColumn = 0;
@@ -440,6 +456,13 @@ void TreeView::clearSelection()
 
     this->_clearNodeSelection(data.m_root);
 
+    // dropping the selection cancels any in-flight scroll arm, and a subsequent
+    // re-selection of the previously scrolled-to node must be treated as a fresh request rather
+    // than suppressed by the idempotency check in _setSelection.
+    data.m_scrollHere = nullptr;
+    data.m_scrollHereRetriesLeft = 0;
+    data.m_lastScrolledTo = nullptr;
+
     this->_onSelectionChanged();
 }
 
@@ -487,11 +510,28 @@ bool TreeView::_setSelection(std::vector<std::shared_ptr<const AbstractItemModel
     if (this->isAutoScrollSelection() && data.m_selection.size() == 1)
     {
         // Scroll to the selection only if there is one object selected.
-        data.m_scrollHere = node;
+        // Skip re-arming when the target node is nullptr (item isn't in the tree,
+        // nothing to scroll to), when it's the same Node* we already finished scrolling to, or
+        // when an in-flight arm for the same node is still working through its retry budget.
+        // The m_lastScrolledTo check catches re-pushes that happen after the scroll completes
+        // (fresh-wrapper-per-call model bypasses the pointer-equal early-return at the top); the
+        // m_scrollHere check catches re-pushes that happen while the first scroll is still in
+        // flight — without it, an external handler that re-pushes selection every frame would
+        // keep resetting m_scrollHereRetriesLeft back to 4 and the cap would never fire.
+        if (node != nullptr && node != data.m_lastScrolledTo && node != data.m_scrollHere)
+        {
+            data.m_scrollHere = node;
+            data.m_scrollHereRetriesLeft = 4;
+        }
     }
-    else if (data.m_scrollHere)
+    else
     {
+        // selection is now empty or multi — cancel any in-flight scroll arm and
+        // drop m_lastScrolledTo so that a later single-selection of the previously scrolled-to
+        // node is treated as a fresh request.
         data.m_scrollHere = nullptr;
+        data.m_scrollHereRetriesLeft = 0;
+        data.m_lastScrolledTo = nullptr;
     }
 
     return true;
@@ -748,7 +788,7 @@ void TreeView::_drawContent(float elapsedTime)
     }
     if (data.m_selection != saved_selection)
     {
-        // OMPE-61075: node drawing and model update may happen in different threads but at same time.
+        // node drawing and model update may happen in different threads but at same time.
         // Then if selection changed during the node drawing, _onSelectionChanged will re-populate all tree nodes
         // which leads drawing node becomes invalid and crash happens.
         // So call _onSelectionChanged after all nodes are drawn.
@@ -796,7 +836,9 @@ void TreeView::_drawContent(float elapsedTime)
         }
     }
 
-    if (this->isHeaderVisible() && clipRect.Min.y < std::max(emptySpaceMin.y, emptySpaceMax.y))
+    // Skip the header when it has no height. An empty header (e.g. default delegate)
+    // is drawn last on top and expands to cover the whole content, stealing every row's mouse input.
+    if (this->isHeaderVisible() && headerHeight > 0.0f && clipRect.Min.y < std::max(emptySpaceMin.y, emptySpaceMax.y))
     {
         // Draw a sliding header on top of the table.
         OMNIUI_ASSERT(data.m_headerWidgets.size() == data.m_columnsCount);
@@ -818,8 +860,8 @@ void TreeView::_drawContent(float elapsedTime)
     // Measure last column desired width using visible nodes (first-level) and cache for next frame
     // Only when model just synchronized or content width considered dirty (to avoid per-frame work), and when within
     // a ScrollingFrame with horizontal scroll enabled
-    if ((!data.m_modelSynchronized || data.m_contentWidthDirty || data.m_lastColumnRemeasureRequested)
-        && data.m_columnsCount >= 1)
+    if ((!data.m_modelSynchronized || data.m_contentWidthDirty || data.m_lastColumnRemeasureRequested ||
+         data.m_lastColumnPopulatedMinPx > 0.0f) && data.m_columnsCount >= 1)
     {
         const size_t lastCol = data.m_columnsCount - 1;
         // Only when last column isn't fixed Pixel
@@ -872,15 +914,23 @@ void TreeView::_drawContent(float elapsedTime)
                         }
                     }
                 };
-                measureSubtree(data.m_root);
+                if (!data.m_modelSynchronized || data.m_contentWidthDirty || data.m_lastColumnRemeasureRequested)
+                {
+                    measureSubtree(data.m_root);
+                }
+                else
+                {
+                    measuredMinWidthPx = std::max(data.m_lastColumnMeasuredMinPx, data.m_lastColumnPopulatedMinPx);
+                }
 
-                if (measuredMinWidthPx > 0.0f)
+                if (measuredMinWidthPx > data.m_columnComputedSizes[lastCol])
                 {
                     data.m_lastColumnMeasuredMinPx = measuredMinWidthPx;
                 }
             }
         }
         data.m_lastColumnRemeasureRequested = false;
+        data.m_lastColumnPopulatedMinPx = 0.0f;
     }
 
     float dpiScale = this->getDpiScale();
@@ -1228,6 +1278,19 @@ void TreeView::_populateNodeChildren(TreeView::Node* node)
                 data.m_selection.erase(selectionFoundIterrator);
             }
 
+            // Clear scroll-to bookkeeping if it still points at a node that is
+            // about to be destroyed. Otherwise we would be left with a dangling raw Node* and
+            // either scroll to whatever memory reuses that address next, or trigger a UBSan hit.
+            if (data.m_scrollHere == currentNode)
+            {
+                data.m_scrollHere = nullptr;
+                data.m_scrollHereRetriesLeft = 0;
+            }
+            if (data.m_lastScrolledTo == currentNode)
+            {
+                data.m_lastScrolledTo = nullptr;
+            }
+
             data.m_itemNodeCache.erase(item.get());
         }
     }
@@ -1383,15 +1446,24 @@ void TreeView::_populateNodeWidget(TreeView::Node* node)
         }
     }
 
+    // A row built with its estimated height does not move the rows below.
+    const bool nodeHeightChanged = node->nodeHeight != maxHeight;
     node->nodeHeight = maxHeight;
     node->columnWidthsVersion = data.m_columnWidthsVersion;
     node->heightComputed = true;
     data.m_sumHeights += maxHeight;
     data.m_numHeights++;
     // Lazily populated row cells can expose wider content after the initial width pass.
-    data.m_lastColumnRemeasureRequested = true;
-    data.m_contentHeightDirty = true;
-    this->forceHeightDirty(SizeDirtyReason::eSizeChanged);
+    if (!node->widgets.empty())
+    {
+        data.m_lastColumnPopulatedMinPx =
+            std::max(data.m_lastColumnPopulatedMinPx, node->widgets.back()->getComputedWidth());
+    }
+    if (nodeHeightChanged)
+    {
+        data.m_contentHeightDirty = true;
+        this->forceHeightDirty(SizeDirtyReason::eSizeChanged);
+    }
 }
 
 void TreeView::_populateNodeWidgetsRecursive(TreeView::Node* node)
@@ -1528,13 +1600,26 @@ float TreeView::_drawNodeInTable(const std::unique_ptr<TreeView::Node>& node,
     {
         node->widthComputed = false;
         this->_setNodeComputedWidth(node);
+        // A cell of an already built row can become wider in place, for example when the text of its
+        // value model changes. Feed the new width to the last-column measure, the same way a freshly
+        // populated row does, so the column still grows to fit the text.
+        if (!node->widgets.empty())
+        {
+            data.m_lastColumnPopulatedMinPx =
+                std::max(data.m_lastColumnPopulatedMinPx, node->widgets.back()->getComputedWidth());
+        }
         node->heightComputed = false;
         for (const auto& widget : node->widgets)
             widget->forceHeightDirty(SizeDirtyReason::eChildDirty);
+        const float oldNodeHeight = node->nodeHeight;
         float offset = currentOffset;
         this->_setNodeComputedHeight(node, offset);
-        data.m_contentHeightDirty = true;
-        this->forceHeightDirty(SizeDirtyReason::eChildDirty);
+        // Only a new row height moves the rows below. Otherwise skip the walk over the whole tree.
+        if (node->nodeHeight != oldNodeHeight)
+        {
+            data.m_contentHeightDirty = true;
+            this->forceHeightDirty(SizeDirtyReason::eChildDirty);
+        }
     }
 
     // Lazy-population. Populate node with children and widgets if not populated.
@@ -1850,9 +1935,13 @@ float TreeView::_drawNodeInTable(const std::unique_ptr<TreeView::Node>& node,
         if (visible)
         {
             // We don't need to scroll here if the node is alredy visible.
+            // Record the completed target so a follow-up call to setSelection with
+            // the same logical node does not re-arm the scroll request.
+            data.m_lastScrolledTo = data.m_scrollHere;
             data.m_scrollHere = nullptr;
+            data.m_scrollHereRetriesLeft = 0;
         }
-        else
+        else if (data.m_scrollHereRetriesLeft > 0)
         {
             auto* ctx = ImGui::GetCurrentContext();
             ImGuiWindow* window = ctx->CurrentWindow;
@@ -1864,6 +1953,17 @@ float TreeView::_drawNodeInTable(const std::unique_ptr<TreeView::Node>& node,
             float targetY = cursorAtBeginTableY + currentOffset - window->Pos.y;
             ImGui::SetScrollFromPosY(window, targetY, 0.5f);
             this->forceRasterDirty(BakeDirtyReason::eContentChanged);
+
+            // Decrement retry budget so we cannot loop forever. The first frame
+            // uses estimated node heights; a few frames are enough for the scroll to converge.
+            // Once exhausted, drop the target and leave the scroll wherever SetScrollFromPosY
+            // last landed it.
+            --data.m_scrollHereRetriesLeft;
+            if (data.m_scrollHereRetriesLeft == 0)
+            {
+                data.m_lastScrolledTo = data.m_scrollHere;
+                data.m_scrollHere = nullptr;
+            }
         }
     }
 

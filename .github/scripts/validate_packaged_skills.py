@@ -19,6 +19,7 @@ EXPECTED_SKILLS = {
         "files": (
             "SKILL.md",
             "references/inputs-windows-viewport.md",
+            "references/layout-presets.md",
             "references/layout.md",
             "references/model-view-tree.md",
             "references/recipes.md",

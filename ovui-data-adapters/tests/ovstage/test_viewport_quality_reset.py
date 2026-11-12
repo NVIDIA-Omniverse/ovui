@@ -18,6 +18,7 @@ from test_renderer_livestream import _FakeScene, _patch_adapter_construction
 
 
 QUALITY = "omni:rtx:quality"
+TILE_INDICES = "omni:rtx:viewTile:renderHistoryReset:tileIndices"
 
 
 class _NativeStage:
@@ -349,3 +350,20 @@ def test_failed_reset_preserves_value_and_history(viewport_factory):
     assert undo.undo()
     assert viewport.stage.columns[viewport.product][QUALITY] == 0
     assert undo.can_undo() is False
+
+
+def test_native_setting_at_its_start_value_is_not_authored(viewport_factory, monkeypatch):
+    populate = renderer_module._add_runtime_layer
+
+    def populate_with_tile_indices(population, stage, usda, *, prefix_path):
+        handle = populate(population, stage, usda, prefix_path=prefix_path)
+        stage.columns[prefix_path + "/Render/Viewport"][TILE_INDICES] = 0
+        return handle
+
+    monkeypatch.setattr(renderer_module, "_add_runtime_layer", populate_with_tile_indices)
+    viewport = viewport_factory(37)
+    descriptor = next(
+        item for item in viewport.adapter.list_render_settings(viewport.product).settings
+        if item.setting_id.endswith(TILE_INDICES)
+    )
+    assert descriptor.value_state.authored is False

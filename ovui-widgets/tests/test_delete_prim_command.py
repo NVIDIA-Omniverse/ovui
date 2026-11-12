@@ -17,10 +17,14 @@ class TestDeletePrimCommandNoUsd:
         layer = MagicMock()
         stage.GetEditTarget.return_value.GetLayer.return_value = layer
         path = MagicMock()
+        parent_spec = MagicMock()
+        parent_spec.nameChildren.keys.return_value = [path.name]
+        layer.GetObjectAtPath.side_effect = (
+            lambda p: parent_spec if p is path.GetParentPath() else None
+        )
         return DeletePrimCommand(stage, path), stage, layer, path
 
     def test_do_creates_anonymous_layer_and_applies_batch(self):
-        pytest.importorskip("pxr", reason="pxr not available")
         cmd, stage, layer, path = self._make_command()
         with patch("ovui_data_adapters.openusd.commands.Sdf") as MockSdf:
             tmp_layer = MagicMock()
@@ -32,7 +36,6 @@ class TestDeletePrimCommandNoUsd:
             layer.Apply.assert_called_once()
 
     def test_undo_copies_spec_back(self):
-        pytest.importorskip("pxr", reason="pxr not available")
         cmd, stage, layer, path = self._make_command()
         with patch("ovui_data_adapters.openusd.commands.Sdf") as MockSdf:
             tmp_layer = MagicMock()
@@ -83,7 +86,6 @@ class TestDeletePrimCommandRealStage:
         """Delete /World/Cube, verify it's gone, undo, verify it's back
         with its original ``size`` + ``xformOp:translate`` values.
         """
-        pytest.importorskip("pxr", reason="pxr not available")
         from pxr import Sdf
 
         stage = self._open_simple_scene()
@@ -112,7 +114,7 @@ class TestDeletePrimCommandRealStage:
         assert cube.GetAttribute("size").Get() == 2.0
         assert tuple(cube.GetAttribute("xformOp:translate").Get()) == (-1.5, 0, 0)
         world_children = [p.GetName() for p in stage.GetPrimAtPath("/World").GetChildren()]
-        assert set(world_children) == {"Cube", "Sphere", "Pyramid", "Pillar"}
+        assert world_children == ["Cube", "Sphere", "Pyramid", "Pillar"]
 
     def test_delete_does_not_raise_sdfdata_error(self):
         """The original failure mode: ``Sdf.CopySpec`` raised because the
@@ -121,7 +123,6 @@ class TestDeletePrimCommandRealStage:
         ``Sdf.CreatePrimInLayer``. This test pins that ``cmd.do()`` no
         longer raises the ``Tf.ErrorException`` Codex captured.
         """
-        pytest.importorskip("pxr", reason="pxr not available")
         from pxr import Sdf, Tf
 
         stage = self._open_simple_scene()
@@ -140,7 +141,6 @@ class TestDeletePrimCommandRealStage:
         ``Sdf.CreatePrimInLayer`` it — the pseudo-root already exists.
         Pins the ``parent_path != Sdf.Path.absoluteRootPath`` guard.
         """
-        pytest.importorskip("pxr", reason="pxr not available")
         from pxr import Sdf, Usd, UsdGeom
 
         stage = Usd.Stage.CreateInMemory()
@@ -160,7 +160,6 @@ class TestDeletePrimCommandRealStage:
         ``Sdf.CopySpec`` ancestor-missing failure. Future-proofs the
         fix for non-trivial scene hierarchies.
         """
-        pytest.importorskip("pxr", reason="pxr not available")
         from pxr import Sdf, Usd, UsdGeom
 
         stage = Usd.Stage.CreateInMemory()
@@ -190,7 +189,6 @@ class TestStageAdapterExpiredPrimResilience:
     """
 
     def _stage_with_cube(self):
-        pytest.importorskip("pxr", reason="pxr not available")
         from pxr import Sdf, Usd, UsdGeom
 
         stage = Usd.Stage.CreateInMemory()
@@ -264,7 +262,6 @@ class TestPropertyAdapterInvalidPrimResilience:
     """
 
     def test_get_value_on_deleted_prim_returns_default_sentinel(self):
-        pytest.importorskip("pxr", reason="pxr not available")
         from ovui_data_adapters.openusd.property_adapter import UsdPropertyAdapter
         from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
         from pxr import Sdf, Usd, UsdGeom
@@ -338,7 +335,7 @@ class TestFramePaths:
         Step 17 routed this through ``StageAdapter.compute_world_aabb`` —
         the adapter handles the pseudo-root pre-pass internally, so the
         test now uses a real ``UsdStageAdapter`` instead of a MagicMock."""
-        pxr = pytest.importorskip("pxr", reason="pxr not available")
+        import pxr
         Usd, UsdGeom = pxr.Usd, pxr.UsdGeom
         from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
 
@@ -366,7 +363,7 @@ class TestFramePaths:
     # relocation.
 
     def test_prims_to_bound_for_root_returns_children(self):
-        pxr = pytest.importorskip("pxr", reason="pxr not available")
+        import pxr
         Usd, UsdGeom = pxr.Usd, pxr.UsdGeom
         from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
         stage = Usd.Stage.CreateInMemory()
@@ -377,7 +374,7 @@ class TestFramePaths:
         assert paths == ["/A", "/B"]
 
     def test_prims_to_bound_for_specific_path(self):
-        pxr = pytest.importorskip("pxr", reason="pxr not available")
+        import pxr
         Usd, UsdGeom = pxr.Usd, pxr.UsdGeom
         from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
         stage = Usd.Stage.CreateInMemory()
@@ -387,7 +384,7 @@ class TestFramePaths:
         assert str(prims[0].GetPath()) == "/World/Sphere"
 
     def test_prims_to_bound_for_invalid_path_returns_empty(self):
-        pxr = pytest.importorskip("pxr", reason="pxr not available")
+        import pxr
         Usd = pxr.Usd
         from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
         stage = Usd.Stage.CreateInMemory()
@@ -544,7 +541,7 @@ class TestFramePathsContract:
 
     def test_usd_translated_prim_bounds_center_camera_on_world_position(self):
         """Regression: F-frame must use transformed USD bounds, not local extent."""
-        pxr = pytest.importorskip("pxr", reason="pxr not available")
+        import pxr
         Usd, UsdGeom = pxr.Usd, pxr.UsdGeom
         from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
 
@@ -631,7 +628,7 @@ class TestRadiusRecomputationBackstop:
     """
 
     def test_sphere_radius_change_updates_viewport_bbox(self):
-        pxr = pytest.importorskip("pxr", reason="pxr not available")
+        import pxr
         Usd, UsdGeom = pxr.Usd, pxr.UsdGeom
         from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
 

@@ -53,7 +53,9 @@ class TestMarkdownAssetResolver(unittest.TestCase):
             self.assertTrue(Path(downloaded).exists())
             self.assertGreater(Path(downloaded).stat().st_size, 0)
 
-    def test_svg_resolves_when_cairosvg_is_available(self):
+    def test_svg_resolves_to_the_svg_file_for_the_native_widget(self):
+        # The widget draws the SVG file itself, as ui.Image does, with or
+        # without cairosvg: the resolver gives it the file, not a PNG copy.
         with tempfile.TemporaryDirectory() as tmp:
             resolver = MarkdownAssetResolver(
                 _EXAMPLES / "markdown_feature_showcase.md",
@@ -61,10 +63,5 @@ class TestMarkdownAssetResolver(unittest.TestCase):
             )
             resolved = resolver("test_badge.svg")
 
-            try:
-                import cairosvg  # noqa: F401
-            except Exception:
-                self.assertEqual(resolved, "")
-            else:
-                self.assertTrue(resolved.endswith(".png"))
-                self.assertTrue(Path(resolved).exists())
+            self.assertEqual(resolved, str((_EXAMPLES / "test_badge.svg").resolve()))
+            self.assertEqual(list((Path(tmp) / "cache").iterdir()), [], "no PNG copy is written")

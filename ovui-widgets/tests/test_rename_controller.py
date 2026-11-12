@@ -939,7 +939,7 @@ class TestDelegateAndCardRenameBranch:
 
 
 class TestApplicationF2Dispatch:
-    def test_f2_dispatches_to_content_window(self):
+    def test_f2_dispatches_to_content_window(self, monkeypatch):
         """Simulates the F2 branch of :meth:`Application._on_key_pressed`.
 
         Instead of spinning up a full Application (heavy), assemble the
@@ -954,11 +954,16 @@ class TestApplicationF2Dispatch:
         app._undo_manager = None
         app._main_win = None
         app._property_window = None
+        # No field edits: F2 is the rename shortcut.
+        monkeypatch.setattr(app_module, "_is_text_input_active", lambda: False)
 
         stage_calls: List[str] = []
         content_calls: List[str] = []
 
         class _Stage:
+            def is_filter_editing(self) -> bool:
+                return False
+
             def begin_rename_selected(self) -> None:
                 stage_calls.append("stage")
 

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <clipPath id="circle">
+      <circle cx="16" cy="16" r="12"/>
+    </clipPath>
+    <clipPath id="bbox" clipPathUnits="objectBoundingBox">
+      <rect x="0" y="0" width="0.5" height="1"/>
+    </clipPath>
+    <clipPath id="star">
+      <path d="M48 2 L57 28 L34 12 H62 L39 28 Z" clip-rule="evenodd"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#circle)">
+    <rect x="0" y="0" width="32" height="16" fill="#e53935"/>
+    <rect x="0" y="16" width="32" height="16" fill="#1e88e5"/>
+  </g>
+  <rect x="34" y="0" width="30" height="30" fill="#43a047" clip-path="url(#star)"/>
+  <circle cx="16" cy="48" r="12" fill="#8e24aa" clip-path="url(#bbox)"/>
+  <rect x="36" y="36" width="24" height="24" fill="#fb8c00" stroke="#212121" stroke-width="4" clip-path="url(#bbox)"/>
+</svg>

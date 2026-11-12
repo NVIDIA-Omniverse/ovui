@@ -78,3 +78,33 @@ def is_text_input_active() -> bool:
         return bool(query())
     except Exception:
         return False
+
+
+def end_text_input() -> bool:
+    """End the keyboard edit of the text input that owns the keyboard.
+
+    Calls ``omni.ui.standalone.end_text_input``. The edit ends in the same way
+    as when the user clicks outside the field: the field keeps the typed text,
+    and when it is drawn next it calls its end-edit callbacks as a commit.
+    Returns ``False`` and changes nothing when no text input is in typing
+    mode (``is_text_input_active()`` is ``False``), for example during a
+    mouse drag of a number field.
+
+    An ovui build with no standalone backend, or older than
+    ``omni.ui.standalone.end_text_input``, cannot end the edit. This is
+    reported as a warning, and ``False`` is returned, so the caller acts as
+    with no active text input.
+    """
+    try:
+        from omni.ui import standalone
+    except ImportError as exc:
+        cause = f"omni.ui.standalone cannot be imported ({exc})"
+    else:
+        end = getattr(standalone, "end_text_input", None)
+        if callable(end):
+            return bool(end())
+        cause = "this ovui build has no omni.ui.standalone.end_text_input"
+    from ovui_widgets.common.error_reporter import ErrorReporter
+
+    ErrorReporter.log_warning("keyboard", f"cannot end the active text input: {cause}")
+    return False

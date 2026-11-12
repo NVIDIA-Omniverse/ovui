@@ -349,3 +349,110 @@ class TestDisplayUpdate:
         assert item in delegate._rename_items
         ctrl.commit_rename("Done")
         assert item not in delegate._rename_items
+
+
+# ---------------------------------------------------------------------------
+# A text that is not a prim name, with the OpenUSD adapter
+# ---------------------------------------------------------------------------
+
+class TestInvalidNameWithOpenUsd:
+    def test_commit_keeps_the_prim_and_shows_the_name_used(self, app):
+        from pxr import Usd
+
+        from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
+        from ovui_widgets.app.status_bar import StatusBar
+        from ovui_widgets.common.error_reporter import ErrorReporter
+        from ovui_widgets.common.undo import UndoManager
+        from ovui_widgets.stage.hierarchy_model import HierarchyModel
+        from ovui_widgets.stage.rename_controller import RenameController
+        from ovui_widgets.stage.stage_delegate import StageDelegate
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.DefinePrim("/World", "Xform")
+        stage.DefinePrim("/World/Car_Lift_Adjust/Part", "Mesh")
+        undo = UndoManager()
+        adapter = UsdStageAdapter(stage, undo)
+        model = HierarchyModel(adapter)
+        delegate = StageDelegate()
+        ctrl = RenameController(adapter, model, delegate)
+        delegate.set_rename_controller(ctrl)
+        bar = StatusBar(ui.Frame())
+        ErrorReporter._set_status_bar(bar)
+
+        def world_child_names():
+            root = model.get_item_children(None)[0]
+            world = model.get_item_children(root)[0]
+            return [adapter.get_display_name(child.adapter_item)
+                    for child in model.get_item_children(world)]
+
+        try:
+            root = model.get_item_children(None)[0]
+            world = model.get_item_children(root)[0]
+            item = model.get_item_children(world)[0]
+            ctrl.request_rename_f2(item)
+            ctrl.commit_rename("a b/c")
+
+            assert world_child_names() == ["a_b_c"]
+            assert stage.GetPrimAtPath("/World/a_b_c/Part").IsValid()
+            assert bar.label.text == (
+                "'a b/c' is not a valid prim name. The prim is renamed to 'a_b_c'."
+            )
+            assert bar.label.name == "warning"
+
+            undo.undo()
+            assert world_child_names() == ["Car_Lift_Adjust"]
+            assert stage.GetPrimAtPath("/World/Car_Lift_Adjust/Part").IsValid()
+
+            undo.redo()
+            assert world_child_names() == ["a_b_c"]
+        finally:
+            ErrorReporter._clear_status_bar()
+
+    def test_commit_of_a_name_that_a_sibling_has_shows_the_failure(self, app):
+        from pxr import Usd
+
+        from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
+        from ovui_widgets.app.status_bar import StatusBar
+        from ovui_widgets.common.error_reporter import ErrorReporter
+        from ovui_widgets.common.undo import UndoManager
+        from ovui_widgets.stage.hierarchy_model import HierarchyModel
+        from ovui_widgets.stage.rename_controller import RenameController
+        from ovui_widgets.stage.stage_delegate import StageDelegate
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.DefinePrim("/World", "Xform")
+        stage.DefinePrim("/World/Car_Lift_Adjust/Part", "Mesh")
+        stage.DefinePrim("/World/Robot_Arm_Adjust/Arm", "Mesh")
+        undo = UndoManager()
+        adapter = UsdStageAdapter(stage, undo)
+        model = HierarchyModel(adapter)
+        delegate = StageDelegate()
+        ctrl = RenameController(adapter, model, delegate)
+        delegate.set_rename_controller(ctrl)
+        bar = StatusBar(ui.Frame())
+        ErrorReporter._set_status_bar(bar)
+
+        def world_children():
+            root = model.get_item_children(None)[0]
+            world = model.get_item_children(root)[0]
+            return model.get_item_children(world)
+
+        try:
+            item = world_children()[0]
+            ctrl.request_rename_f2(item)
+            ctrl.commit_rename("Robot Arm Adjust")
+
+            # "Robot Arm Adjust" gives "Robot_Arm_Adjust", the name of the
+            # sibling. Nothing is renamed, and the message says so and why.
+            assert [adapter.get_display_name(child.adapter_item)
+                    for child in world_children()] == ["Car_Lift_Adjust", "Robot_Arm_Adjust"]
+            assert stage.GetPrimAtPath("/World/Car_Lift_Adjust/Part").IsValid()
+            assert stage.GetPrimAtPath("/World/Robot_Arm_Adjust/Arm").IsValid()
+            assert bar.label.text == (
+                "Cannot rename prim: ValueError: The prim /World/Robot_Arm_Adjust "
+                "already exists ('Robot Arm Adjust' gives the name 'Robot_Arm_Adjust')"
+            )
+            assert bar.label.name == "error"
+            assert not undo.can_undo()
+        finally:
+            ErrorReporter._clear_status_bar()

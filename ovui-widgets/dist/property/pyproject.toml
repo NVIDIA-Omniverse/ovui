@@ -23,6 +23,13 @@ The inspector supports multi-selection ambiguity, reset behavior, edit
 begin/set/end calls, and extension through the property scheme registry.
 """}
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
 
 [tool.setuptools.packages.find]
 namespaces = true

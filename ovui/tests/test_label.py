@@ -180,5 +180,29 @@ class TestLabel(OmniUiTest):
 
         await self.finalize_test()
 
+    async def test_multiline_font_size(self):
+        """Testing that multi-line and centered word_wrap ui.Label keep their widest line on one line"""
+        window = await self.create_test_window(width=512, height=192)
+
+        with window.frame:
+            with ui.VStack(style={"Rectangle": {"background_color": 0xFFFFFFFF}}):
+                for size in (13, 15, 17):
+                    ui.Label(
+                        "00790 drop src=Group_000/Item_000_03 tgt=Group_002 loc=-1\n00791 selection_changed",
+                        height=0,
+                        style={"font_size": size},
+                    )
+                    ui.Rectangle(height=4)
+                ui.Label(
+                    "Apply changes 23",
+                    word_wrap=True,
+                    alignment=ui.Alignment.CENTER_TOP,
+                    height=0,
+                    style={"font_size": 23},
+                )
+                ui.Rectangle(height=4)
+
+        await self.finalize_test()
+
     # SKIPPED: test_mouse_released_fn -- requires omni.kit.ui_test (mouse emulation)
     # SKIPPED: test_exact_content_size -- relies on exact pixel metrics that may differ in standalone

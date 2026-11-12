@@ -25,6 +25,12 @@ Typical per-frame sequence after one ovui tick has run::
     # caller consumes the pitched buffer (encode, swap channels, etc.)
     headless_frame.signal_consumed()
 
+The pixels are RGBA8 and premultiplied by alpha. The pixels that no widget
+draws hold the clear color: opaque by default, transparent after
+``omni.ui.standalone.set_clear_color(0, 0, 0, 0)``. Composite such a frame
+over another image with ``out = frame.rgb + image.rgb * (1 - frame.alpha)``.
+See "Clear color and alpha" in ``HEADLESS.md``.
+
 The init/shutdown calls are safe to repeat. A second :func:`init`
 returns ``False`` (already-initialised is not an error, but the call
 is a no-op and reports ``False``); :func:`shutdown` after teardown is
@@ -77,7 +83,10 @@ def extent() -> tuple[int, int]:
 
 
 def format() -> str:
-    """Return the pixel format of the exported frame (e.g. ``'rgba8'``)."""
+    """Return the pixel format of the exported frame (e.g. ``'rgba8'``).
+
+    The ``'rgba8'`` pixels are premultiplied by alpha.
+    """
     return _ui._headless_frame_format()
 
 

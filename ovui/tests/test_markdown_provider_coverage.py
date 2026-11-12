@@ -32,28 +32,23 @@ if str(_PYTHON) not in sys.path:
     sys.path.insert(0, str(_PYTHON))
 
 
-try:  # pragma: no cover - import guard for partial worktrees.
-    from omni.ui.markdown_providers import (  # noqa: E402
-        AsyncProviderPlugin,
-        MarkdownAssetResolver,
-        MarkdownProviderChain,
-        MarkdownProviderDocumentRenderer,
-        MarkdownProviderRequest,
-        MarkdownProviderResult,
-        PythonAssetProvider,
-        PythonAssetRequest,
-        PythonAssetResult,
-        stable_digest,
-    )
-    from omni.ui.markdown_providers import core as provider_core  # noqa: E402
-    from omni.ui.markdown_providers import http as provider_http  # noqa: E402
-    from omni.ui.markdown_providers import math as provider_math  # noqa: E402
-    from omni.ui.markdown_providers import mermaid as provider_mermaid  # noqa: E402
-    from omni.ui.markdown_providers import svg as provider_svg  # noqa: E402
-
-    _HAVE_PROVIDERS = True
-except Exception:  # noqa: BLE001 - tolerate missing native modules in source-only checkouts.
-    _HAVE_PROVIDERS = False
+from omni.ui.markdown_providers import (  # noqa: E402
+    AsyncProviderPlugin,
+    MarkdownAssetResolver,
+    MarkdownProviderChain,
+    MarkdownProviderDocumentRenderer,
+    MarkdownProviderRequest,
+    MarkdownProviderResult,
+    PythonAssetProvider,
+    PythonAssetRequest,
+    PythonAssetResult,
+    stable_digest,
+)
+from omni.ui.markdown_providers import core as provider_core  # noqa: E402
+from omni.ui.markdown_providers import http as provider_http  # noqa: E402
+from omni.ui.markdown_providers import math as provider_math  # noqa: E402
+from omni.ui.markdown_providers import mermaid as provider_mermaid  # noqa: E402
+from omni.ui.markdown_providers import svg as provider_svg  # noqa: E402
 
 
 class _SyncExecutor:
@@ -86,37 +81,35 @@ class _ManualExecutor:
         self.shutdown_calls.append(kwargs)
 
 
-if _HAVE_PROVIDERS:
+class _CorePlugin(AsyncProviderPlugin):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.render_calls = 0
+        self.cancel_generations = []
 
-    class _CorePlugin(AsyncProviderPlugin):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.render_calls = 0
-            self.cancel_generations = []
+    def can_handle(self, request: MarkdownProviderRequest) -> bool:
+        return request.kind == "demo"
 
-        def can_handle(self, request: MarkdownProviderRequest) -> bool:
-            return request.kind == "demo"
+    def cache_key(self, request: MarkdownProviderRequest) -> str:
+        return f"demo:{request.source}"
 
-        def cache_key(self, request: MarkdownProviderRequest) -> str:
-            return f"demo:{request.source}"
+    def render(self, request: MarkdownProviderRequest) -> MarkdownProviderResult:
+        self.render_calls += 1
+        if request.source == "boom":
+            raise RuntimeError("render exploded")
+        return MarkdownProviderResult(state="ready", path=f"/tmp/{request.source}.png", source=request.source)
 
-        def render(self, request: MarkdownProviderRequest) -> MarkdownProviderResult:
-            self.render_calls += 1
-            if request.source == "boom":
-                raise RuntimeError("render exploded")
-            return MarkdownProviderResult(state="ready", path=f"/tmp/{request.source}.png", source=request.source)
-
-        def cancel_generation(self, generation: int) -> None:
-            self.cancel_generations.append(generation)
-
-    class _CachedPlugin(_CorePlugin):
-        def cached_result(self, request: MarkdownProviderRequest):
-            if request.source == "cached":
-                return MarkdownProviderResult(state="ready", path="/cached.png", source=request.source)
-            return None
+    def cancel_generation(self, generation: int) -> None:
+        self.cancel_generations.append(generation)
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
+class _CachedPlugin(_CorePlugin):
+    def cached_result(self, request: MarkdownProviderRequest):
+        if request.source == "cached":
+            return MarkdownProviderResult(state="ready", path="/cached.png", source=request.source)
+        return None
+
+
 class TestCoreProviderPrimitives(unittest.TestCase):
     def test_stable_digest_uses_boundaries_and_length(self):
         self.assertEqual(len(stable_digest("one", "two", length=12)), 12)
@@ -192,7 +185,6 @@ class TestCoreProviderPrimitives(unittest.TestCase):
         self.assertEqual(provider.request(PythonAssetRequest(source="x")).error, "x")
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestAsyncProviderBranches(unittest.TestCase):
     def _request(self, source: str) -> MarkdownProviderRequest:
         return MarkdownProviderRequest(kind="demo", source=source)
@@ -322,7 +314,6 @@ class _QueueChain:
         self.shutdowns += 1
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestDocumentRendererBranches(unittest.TestCase):
     def _renderer(self, tmp: str, chain: _QueueChain) -> MarkdownProviderDocumentRenderer:
         source = Path(tmp) / "doc.md"
@@ -392,7 +383,6 @@ class TestDocumentRendererBranches(unittest.TestCase):
             self.assertEqual(chain.shutdowns, 1)
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestMarkdownAssetResolverBranches(unittest.TestCase):
     def test_empty_data_relative_file_uri_missing_and_lifecycle(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -451,6 +441,31 @@ class TestMarkdownAssetResolverBranches(unittest.TestCase):
             self.assertEqual(chain.requests[0].base_dir, root)
             self.assertEqual(chain.requests[0].cache_dir, root / "cache")
 
+    def test_svg_without_a_provider_goes_to_the_widget_as_the_svg_file(self):
+        # With no SVG provider (cairosvg is not installed), MarkdownWidget draws
+        # the .svg file itself, as ui.Image does, instead of its placeholder.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            markdown = root / "doc.md"
+            markdown.write_text("# Doc\n", encoding="utf-8")
+            (root / "badge.svg").write_text("<svg/>", encoding="utf-8")
+            (root / "badge.svgz").write_bytes(b"\x1f\x8b")
+            no_cairosvg = "Install optional dependency 'cairosvg' to rasterize SVG images."
+            chain = _QueueChain(
+                MarkdownProviderResult("pending", source="badge.svg"),
+                MarkdownProviderResult("unsupported", error=no_cairosvg, source="badge.svg"),
+                MarkdownProviderResult("unsupported", error=no_cairosvg, source="badge.svgz"),
+            )
+            resolver = MarkdownAssetResolver(markdown, cache_dir=root / "cache", chain=chain)
+
+            self.assertEqual(resolver("badge.svg"), "", "a pending provider keeps the placeholder")
+            with self.assertLogs("omni.ui.markdown_providers.resolver", level="INFO") as logs:
+                self.assertEqual(resolver("badge.svg"), str((root / "badge.svg").resolve()))
+            self.assertIn("cairosvg", logs.output[0])
+            self.assertEqual(resolver.last_result.error, no_cairosvg, "the cause is kept")
+            # The widget cannot read compressed SVG: it keeps the placeholder.
+            self.assertEqual(resolver("badge.svgz"), "")
+
 
 class _FakeResponse:
     def __init__(self, headers=None, chunks=None):
@@ -484,7 +499,6 @@ class _FakeOpener:
         return self.response
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestHttpProviderBranches(unittest.TestCase):
     def test_ip_and_host_policy_helpers(self):
         self.assertTrue(provider_http._ip_is_internal("127.0.0.1"))
@@ -605,7 +619,6 @@ class TestHttpProviderBranches(unittest.TestCase):
                 handler.redirect_request(req, None, 302, "found", {}, "https://internal.test/target")
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestSvgProviderBranches(unittest.TestCase):
     def test_can_handle_cache_key_cached_and_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -667,7 +680,6 @@ class TestSvgProviderBranches(unittest.TestCase):
             self.assertEqual(Path(ready.path).read_bytes(), f"{svg_path}:64".encode("utf-8"))
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestMermaidProviderBranches(unittest.TestCase):
     def test_can_handle_target_cached_and_unsupported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -741,7 +753,6 @@ class TestMermaidProviderBranches(unittest.TestCase):
                 self.assertIn(expected, result.error)
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestMathJaxProviderBranches(unittest.TestCase):
     def test_can_handle_cache_color_and_cached_result(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -239,7 +239,7 @@
       <p>The property inspector follows selection. When selected paths change, <code>PropertyWindow</code> asks its factory for a fresh <code>PropertyAdapter</code>, then rebuilds the visible sections for those objects. The widget does not need to know how the backend stores attributes.</p>
       <ul>
         <li><code>AttributesWidget</code> is the default catch-all property section; it groups attributes from metadata and builds rows for supported value types.</li>
-        <li><code>AttributeModelBase</code> handles value reads, buffered edits, write-through edits, ambiguity checks, and change subscriptions for individual rows.</li>
+        <li><code>AttributeModelBase</code> handles value reads, buffered edits, write-through edits, ambiguity checks, and change subscriptions for individual rows. It refuses a typed value that cannot be stored (a value that is not finite for a transform, or a value outside the range of a 16-bit or 32-bit float attribute), keeps the old value, and shows a message that names the field and the cause.</li>
         <li><code>PropertySchemeRegistry</code> lets additional property sections opt into a selected payload while the default attribute section remains available.</li>
         <li>The adapter supplies selected paths, attribute names, metadata, current values, per-component ambiguity, reset support, and edit begin/set/end calls.</li>
       </ul>
@@ -262,10 +262,10 @@
       <h2>Viewport and rendered output</h2>
       <p>The viewport combines rendered pixels with scene interaction. <code>ViewportWidget</code> owns the toolbar, rendered image, <code>SceneView</code> gestures, HUD values, selection outline, camera controller, and transform manipulator.</p>
       <ul>
-        <li><code>RendererAdapter</code> loads the stage into the renderer, renders RGBA frames, supports picking, rectangle picking, selection highlights, and shutdown.</li>
+        <li><code>RendererAdapter</code> loads the stage into the renderer, renders RGBA frames, supports picking, rectangle picking, selection highlights, and shutdown. While the renderer builds the scene again after a stage edit (for example a rename) or a layer mute, <code>scene_update_pending()</code> is true and the frame calls return no new picture: the viewport keeps its last picture, also when native frame pacing presents it (the paused session keeps presenting that picture), and shows "STATUS Updating the scene..." in the HUD. A viewport pick of that time resolves when the scene is built, against the scene after the edits; when another document is opened first, or the application exits, the pick is a miss and selects nothing. At shutdown, the OpenUSD adapter waits at most 120 s for that step; when the limit runs out, it reports the step, keeps the renderer, and the application exits with status 1.</li>
         <li><code>ImageBridge</code> pushes the returned frame into an ovui image provider so the viewport can show renderer output.</li>
         <li><code>CameraController</code> handles orbit, pan, zoom, look, focus, view matrices, and projection matrices.</li>
-        <li><code>PrimTransformModel</code> uses <code>TransformAdapter</code>, <code>StageAdapter</code>, <code>UndoManager</code>, and snapping to drive drag edits on selected prims.</li>
+        <li><code>PrimTransformModel</code> uses <code>TransformAdapter</code>, <code>StageAdapter</code>, <code>UndoManager</code>, and snapping to drive drag edits on selected prims. A selected prim whose edit policy is blocked is not changed. When all selected prims are blocked, the Move, Rotate and Scale controls are off and show the cause as their tooltip; when the user asks for a transform tool (W, E, R or the Tools menu, also for the tool that is already active), the status bar also shows the cause, one time for each request. When a drag starts and some selected prims are blocked, the drag reports each of these prims and its cause in the log and in the status bar.</li>
       </ul>
       <p>The viewport is reusable because rendering, transforms, selection, and camera motion meet through explicit objects. A renderer swap changes where frames come from; the toolbar, camera gestures, HUD, and manipulator can remain the same.</p>
     </section>

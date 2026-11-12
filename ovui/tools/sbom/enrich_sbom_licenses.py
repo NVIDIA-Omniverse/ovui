@@ -117,10 +117,10 @@ PYTHON_COMPONENTS = [
     },
     {
         "type": "library",
-        "bom-ref": "pkg:pypi/pybind11@2.11",
+        "bom-ref": "pkg:pypi/pybind11@2.13.6",
         "name": "pybind11",
-        "version": "2.11",
-        "purl": "pkg:pypi/pybind11@2.11",
+        "version": "2.13.6",
+        "purl": "pkg:pypi/pybind11@2.13.6",
         "licenses": [{"license": {"id": "BSD-3-Clause"}}],
         "properties": [{"name": "ovui:dep-type", "value": "build-system"}],
     },

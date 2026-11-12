@@ -619,12 +619,17 @@ class _Cudart:
     @staticmethod
     def _load_libcudart() -> Any:
         last_exc: Optional[OSError] = None
-        candidates = [
-            ctypes.util.find_library("cudart"),
-            "libcudart.so",
-            "libcudart.so.12",
-            "libcudart.so.1",
-        ]
+        if os.name == "nt":
+            # Windows x64: the CUDA runtime DLL that omni.ui ships.
+            candidates = ["cudart64_12.dll", "cudart64_11.dll"]
+        else:
+            # Linux x86_64 and Linux ARM64 library names.
+            candidates = [
+                ctypes.util.find_library("cudart"),
+                "libcudart.so",
+                "libcudart.so.12",
+                "libcudart.so.1",
+            ]
         for candidate in candidates:
             if not candidate:
                 continue
@@ -822,11 +827,6 @@ class LivestreamTap:
         self._ring_len = _resolve_buffer_ring_len()
         # Step 1.6: gate the R/B swap kernel. Default ON.
         self._format_fix = _format_fix_enabled()
-        # Set to True if a CudaSwapError surfaces from the kernel; the
-        # rest of the session falls back to no-swap so the stream
-        # keeps flowing (cosmetically wrong is better than dark).
-        self._swap_disabled = False
-        self._swap_error_logged = False
 
         # Connection-status atom (Step 1.4). The SDK fires the
         # ``on_connection`` callback on a worker thread; ovgear's main
@@ -848,7 +848,7 @@ class LivestreamTap:
 
         self._server: Any = None
         self._size: Tuple[int, int] = (0, 0)
-        # Tier 3 input bridge (issue #34, Step 3.6). When set via
+        # Tier 3 input bridge. When set via
         # :meth:`set_input_bridge`, ``_ensure_server`` registers the
         # ``on_input`` / ``on_unicode`` / ``on_connection`` callbacks
         # on the ovstream :class:`Server` so remote keyboard/mouse
@@ -857,7 +857,7 @@ class LivestreamTap:
         # callback assignment lands on a null pointer on the C side
         # and is silently dropped — same lesson as Step 1.4).
         self._input_bridge: Any = None
-        # Tier 3 custom-message dispatcher (issue #34, Step 3.7).
+        # Tier 3 custom-message dispatcher.
         # Set via :meth:`set_message_dispatcher`. When attached,
         # ``_ensure_server`` registers the dispatcher's ``on_message``
         # on the ovstream :class:`Server` before ``Server.start(cfg)``
@@ -1254,6 +1254,9 @@ class LivestreamTap:
         try:
             for _ in range(self._ring_len):
                 new_ring.append(self._cudart.malloc(nbytes))
+            if self._format_fix:
+                # After the allocation, which makes the CUDA context current: the kernel loads into it.
+                self._load_swap_kernel()
             ovstream = self._ovstream
             new_server = ovstream.Server(self._server_type)
             cfg = ovstream.ServerConfig(
@@ -1347,23 +1350,6 @@ class LivestreamTap:
             self._status_state = _STATE_LISTENING
             self._status_n_clients = 0
             self._status_last_error = None
-        # Step 1.5/1.6: warm the NVRTC compile NOW so the first streamed
-        # frame doesn't pay the ~50-200 ms JIT cost. A warm-up failure
-        # disables only the format fix, not the whole tap — a cosmetic
-        # R/B-swapped stream is better than no stream.
-        if self._format_fix and not self._swap_disabled:
-            try:
-                _swap_kernel.warm_up()
-            except Exception as exc:
-                self._swap_disabled = True
-                if not self._swap_error_logged:
-                    print(
-                        f"[ovgear/livestream] R/B swap kernel warm-up "
-                        f"failed ({type(exc).__name__}: {exc}); falling "
-                        f"back to legacy R/B-swapped stream",
-                        file=sys.stderr,
-                    )
-                    self._swap_error_logged = True
         print(
             f"[ovgear/livestream] scratch ring allocated: {self._ring_len} buffers × "
             f"{nbytes} bytes ({width}x{height}x4)",
@@ -1375,6 +1361,46 @@ class LivestreamTap:
             f"({width}x{height} @ {self._fps}fps target)",
             file=sys.stderr,
         )
+
+    def _load_swap_kernel(self) -> None:
+        """Load the R/B swap kernel; raise and latch ERROR when it cannot load.
+
+        Every streamed frame needs the swap: without it the client shows
+        red and blue exchanged. So a stream without it does not start,
+        and the tap stays disabled.
+        """
+        try:
+            _swap_kernel.warm_up()
+        except Exception as exc:
+            message = (
+                f"R/B color correction is not available ({type(exc).__name__}: {exc}); "
+                f"the stream does not start, because clients would show red and blue "
+                f"exchanged. Make sure that the NVIDIA driver and its CUDA library "
+                f"(libcuda or nvcuda.dll) operate"
+            )
+            self._disabled = True
+            self._set_error_status(message)
+            print(f"[ovgear/livestream] {message}", file=sys.stderr)
+            raise RuntimeError(message) from exc
+
+    def _disable_after_swap_failure(self, exc: Exception) -> None:
+        """Disable the livestream leg after an R/B swap kernel failure.
+
+        The frame is not sent: without the swap the client shows red and
+        blue exchanged.
+        """
+        self._frames_skipped += 1
+        self._disabled = True
+        self._set_error_status(f"R/B swap kernel failed: {type(exc).__name__}: {exc}")
+        if not self._stream_error_logged:
+            print(
+                f"[ovgear/livestream] R/B swap kernel failed "
+                f"({type(exc).__name__}: {exc}); livestream leg disabled, "
+                f"so that clients do not get red and blue exchanged",
+                file=sys.stderr,
+            )
+            self._stream_error_logged = True
+        self._maybe_report()
 
     # ── Public surface ──
 
@@ -1471,25 +1497,17 @@ class LivestreamTap:
         # expects BGRA8; without this the streamed frame's red and
         # blue are exchanged. The kernel runs in-place on the scratch
         # ring slot we just filled. A swap failure disables this leg
-        # for the rest of the session and falls back to the legacy
-        # R/B-swapped stream — cosmetic regression beats dark stream.
+        # for the rest of the session and sends no frame.
         swap_ran = False
-        if self._format_fix and not self._swap_disabled:
+        if self._format_fix:
             try:
                 _swap_kernel.swap_rb_in_place(
                     scratch, width, height, pitch_bytes,
                 )
                 swap_ran = True
             except Exception as exc:
-                self._swap_disabled = True
-                if not self._swap_error_logged:
-                    print(
-                        f"[ovgear/livestream] R/B swap kernel failed "
-                        f"({type(exc).__name__}: {exc}); falling back "
-                        f"to legacy R/B-swapped stream",
-                        file=sys.stderr,
-                    )
-                    self._swap_error_logged = True
+                self._disable_after_swap_failure(exc)
+                return False
 
         # Step 1.6 fix: block the host until the swap kernel actually
         # writes the scratch buffer. ``_swap_kernel.swap_rb_in_place``
@@ -1497,10 +1515,9 @@ class LivestreamTap:
         # without the sync, ``Server.stream_video`` may hand NVENC a
         # buffer whose R/B swap hasn't finished, producing tearing or
         # the legacy R/B-swapped output it was meant to fix. Skip the
-        # sync if the kernel didn't run (format fix off, or kernel
-        # error already logged) — there is nothing to wait for and
-        # ``cudaStreamSynchronize`` would unnecessarily drain other
-        # CUDA work the renderer may have queued.
+        # sync if the kernel didn't run (format fix off) — there is
+        # nothing to wait for and ``cudaStreamSynchronize`` would
+        # unnecessarily drain other CUDA work the renderer may have queued.
         if swap_ran:
             try:
                 self._cudart.stream_synchronize(0)
@@ -1662,8 +1679,8 @@ class LivestreamTap:
         - permanent disable (``_disabled = True``) on a non-OvstreamError
           from ``stream_video`` or on a sync failure;
         - frame-skip on ``OvstreamError`` (transient encoder hiccup);
-        - swap-kernel failure disables only the format fix (legacy
-          R/B-swapped stream is better than dark stream);
+        - permanent disable on a swap-kernel failure, with no frame
+          sent (the client would show red and blue exchanged);
         - frame-skip if no client is attached.
 
         Returns ``True`` on a successful push, ``False`` on skip /
@@ -1696,28 +1713,21 @@ class LivestreamTap:
         # R/B swap in place on the caller-owned linear buffer. Same
         # gating + disable policy as ``tee_to_ovstream``.
         swap_ran = False
-        if self._format_fix and not self._swap_disabled:
+        if self._format_fix:
             try:
                 _swap_kernel.swap_rb_in_place(
                     int(dev_ptr), int(width), int(height), int(pitch_bytes),
                 )
                 swap_ran = True
             except Exception as exc:
-                self._swap_disabled = True
-                if not self._swap_error_logged:
-                    print(
-                        f"[ovgear/livestream] R/B swap kernel failed "
-                        f"({type(exc).__name__}: {exc}); falling back "
-                        f"to legacy R/B-swapped stream",
-                        file=sys.stderr,
-                    )
-                    self._swap_error_logged = True
+                self._disable_after_swap_failure(exc)
+                return False
 
         # Block the host until the swap kernel actually writes the
         # buffer — Step 1.6 fix replicated for the linear path. If the
-        # kernel didn't run (format fix off / swap disabled) skip the
-        # sync; there's nothing to wait for and ``cudaStreamSynchronize``
-        # would unnecessarily drain unrelated CUDA work.
+        # kernel didn't run (format fix off) skip the sync; there's
+        # nothing to wait for and ``cudaStreamSynchronize`` would
+        # unnecessarily drain unrelated CUDA work.
         if swap_ran:
             try:
                 self._cudart.stream_synchronize(0)

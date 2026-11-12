@@ -717,3 +717,57 @@ def test_notify_transform_changed_preserves_source_after_suppressed_write(
     assert "/World/TransformCases/NestedParent" in stage_events[0].changed_paths
     assert scene.change_stream.poll() == ()
     subscription.cancel()
+
+
+def test_notify_transform_changed_publishes_after_poll_drops_preview(
+    open_scene: Any,
+) -> None:
+    scene = open_scene
+    path = "/World/TransformCases/NestedParent"
+    moved = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [5.0, 6.0, 7.0, 1.0],
+    ]
+    scheduled: list[Any] = []
+
+    def run_scheduled() -> None:
+        callbacks = list(scheduled)
+        scheduled.clear()
+        for callback in callbacks:
+            callback()
+
+    stage_adapter = OvstageStageAdapter(
+        scene,
+        call_later=lambda _delay, callback: scheduled.append(callback),
+    )
+    transform_adapter = OvstageTransformAdapter(scene)
+    stage_events: list[ChangeEvent] = []
+    subscription = stage_adapter.subscribe_changes(stage_events.append)
+
+    # A gizmo drag: the live preview writes the final matrix while
+    # notifications are suppressed, and the scheduled poll drops that range.
+    with scene.change_stream.suppress_notifications():
+        transform_adapter.set_local_transform(path, moved)
+    run_scheduled()
+    assert stage_events == []
+
+    # Mouse release: the commit writes the same matrix, so no ordinal is added.
+    ordinal = scene.current_ordinal
+    with stage_adapter.suppress_change_notifications():
+        transform_adapter.set_local_transform(path, moved)
+    assert scene.current_ordinal == ordinal
+
+    stage_adapter.notify_transform_changed([path], source="viewport-manipulator")
+    run_scheduled()
+
+    assert len(stage_events) == 1
+    assert stage_events[0].source == "viewport-manipulator"
+    assert path in stage_events[0].changed_paths
+
+    # The move is delivered now; a repeated hook call must not deliver it again.
+    stage_adapter.notify_transform_changed([path], source="viewport-manipulator")
+    run_scheduled()
+    assert len(stage_events) == 1
+    subscription.cancel()

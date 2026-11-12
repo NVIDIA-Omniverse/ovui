@@ -28,9 +28,9 @@ struct OMNIUI_STANDALONE_API NativeFramePacingStats
     bool supported = false;
     bool active = false;
     double presentRate = 0.0;
-    uint32_t ovrtxVersionMajor = 0;
-    uint32_t ovrtxVersionMinor = 0;
-    uint32_t ovrtxVersionPatch = 0;
+    uint32_t rendererVersionMajor = 0;
+    uint32_t rendererVersionMinor = 0;
+    uint32_t rendererVersionPatch = 0;
     /// Identifies the active borrow. Zero while inactive. Only the holder of
     /// this token owns the session the other counters describe.
     uint64_t sessionToken = 0;
@@ -50,6 +50,10 @@ struct OMNIUI_STANDALONE_API NativeFramePacingStats
     uint64_t selectedRendererFrames = 0;
     uint64_t lastSelectedRendererFrameSerial = 0;
     uint64_t presentedRendererFrames = 0;
+    /// Identities of the threads that render and present this session. The
+    /// same values across sessions mean the workers were reused.
+    uint64_t renderWorkerThread = 0;
+    uint64_t presentWorkerThread = 0;
     uint64_t lastPresentedRendererFrameSerial = 0;
     uint64_t rendererFrameOrderViolations = 0;
     uint64_t presentSubmitCalls = 0;
@@ -124,6 +128,9 @@ struct OMNIUI_STANDALONE_API NativeFramePacingStats
     bool renderLoopExited = false;
     bool renderLoopFatal = false;
     bool renderPaused = false;
+    /// The render worker waits, no render is due and no frame group is pending:
+    /// under "on_change" the picture on screen has its settle frames.
+    bool renderIdle = false;
     std::array<double, 16> selectedCameraWorld{};
     std::array<double, 16> predictedCameraWorld{};
     std::array<double, 16> authoritativeCameraWorld{};
@@ -138,7 +145,7 @@ struct OMNIUI_STANDALONE_API NativeFramePacingStats
 OMNIUI_STANDALONE_API bool setNativeFramePacingPresentRate(double framesPerSecond);
 OMNIUI_STANDALONE_API double getNativeFramePacingPresentRate();
 
-/// Borrow an existing ovrtx renderer. Python remains the sole owner and must
+/// Borrow an existing renderer. Python remains the sole owner and must
 /// call stopNativeFramePacing() before replacing or destroying it.
 OMNIUI_STANDALONE_API uint64_t startNativeFramePacing(
     uintptr_t renderer,
@@ -170,9 +177,25 @@ OMNIUI_STANDALONE_API bool publishNativeFramePacingState(
 OMNIUI_STANDALONE_API bool pauseNativeFramePacingRender(uint64_t token);
 
 /// Resume the drained render worker under the same presentation-session token.
-OMNIUI_STANDALONE_API bool resumeNativeFramePacingRender(uint64_t token);
+/// With ``render`` false, the resume itself does not render under
+/// ``"on_change"``: the caller changed nothing that the picture shows. A
+/// changed camera or size, a render request and the settle frames left still
+/// render.
+OMNIUI_STANDALONE_API bool resumeNativeFramePacingRender(uint64_t token, bool render);
 
-/// Revoke the renderer borrow, drain the non-cancellable ovrtx operations with
+/// When the render worker renders: ``"continuous"`` (the default) whenever
+/// the slot ring can take a frame; ``"on_change"`` only for a changed camera
+/// or size, a new session, a resume or requestNativeFramePacingRender, and
+/// then ``settleFrames`` more frames (the renderer's temporal accumulation
+/// settles), so an idle viewport does not render. False for an unknown
+/// policy or a stale token.
+OMNIUI_STANDALONE_API bool setNativeFramePacingRenderPolicy(uint64_t token, const char* policy, uint32_t settleFrames);
+
+/// Under ``"on_change"``: render once more (and the settle frames), for a
+/// change the camera does not show, such as a stage edit.
+OMNIUI_STANDALONE_API bool requestNativeFramePacingRender(uint64_t token);
+
+/// Revoke the renderer borrow, drain the non-cancellable renderer operations with
 /// bounded individual waits, join both native threads, and retire all slots.
 OMNIUI_STANDALONE_API bool stopNativeFramePacing(uint64_t token);
 

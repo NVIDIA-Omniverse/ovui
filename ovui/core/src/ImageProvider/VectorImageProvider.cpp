@@ -80,6 +80,10 @@ void VectorImageProvider::prepareDraw(float widgetWidth, float widgetHeight)
         {
             rasterizer->releaseGpuResource(m_cacheKey);
             m_cacheKey.clear();
+            // The texture behind the published image is gone. Stop publishing
+            // it, so that a failed load below leaves no image instead of a
+            // reference to freed GPU memory.
+            setImageData(nullptr, { 0, 0 }, PixelFormat::eUnknown);
         }
 
         TextureOptions textureOptions = { 0 };

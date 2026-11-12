@@ -54,6 +54,7 @@ def save_file_dialog(
     on_cancelled: Optional[Callable[[], None]] = None,
     filter_ext: str = ".usda",
     default_dir: Optional[str] = None,
+    message: Optional[str] = None,
 ) -> Optional["_SaveFileDialog"]:
     """Open a modal Save-As dialog and return it for reference-keeping.
 
@@ -82,6 +83,9 @@ def save_file_dialog(
         Directory the path input starts in. Defaults to the current
         working directory so the relative-path guess lands somewhere
         reasonable on every platform.
+    message:
+        Text above the path input, for example which layer the dialog
+        is for. No text line when ``None``.
 
     Returns
     -------
@@ -99,6 +103,7 @@ def save_file_dialog(
             on_cancelled=on_cancelled_effective,
             filter_ext=filter_ext,
             default_dir=default_dir or os.getcwd(),
+            message=message,
         )
     except Exception:
         # ovui window construction can fail in a headless / uninit
@@ -128,6 +133,7 @@ class _SaveFileDialog:
         on_cancelled: Callable[[], None],
         filter_ext: str,
         default_dir: str,
+        message: Optional[str] = None,
     ) -> None:
         self._on_selected = on_selected
         self._on_cancelled = on_cancelled
@@ -139,7 +145,7 @@ class _SaveFileDialog:
         self._window = ui.Window(
             title,
             width=520,
-            height=180,
+            height=240 if message else 180,
             flags=ui.WINDOW_FLAGS_MODAL,
             style_type_name_override="Dialog",
         )
@@ -156,6 +162,15 @@ class _SaveFileDialog:
                         style_type_name_override="Dialog.SectionTitle",
                     )
                     ui.Spacer(width=8)
+                if message:
+                    with ui.HStack(height=0):
+                        ui.Spacer(width=8)
+                        ui.Label(
+                            message,
+                            word_wrap=True,
+                            style_type_name_override="Dialog.Message",
+                        )
+                        ui.Spacer(width=8)
                 with ui.HStack(height=24):
                     ui.Spacer(width=8)
                     ui.Label("Path", width=48)
@@ -272,7 +287,7 @@ def _has_usd_extension(path: str) -> bool:
     return any(lower.endswith(ext) for ext in _USD_EXTENSIONS)
 
 
-# ── Issue #35 Step 4: registry-driven shutdown cleanup ────────────────
+# ── registry-driven shutdown cleanup ────────────────
 # Same pattern as ovui_widgets.app/dialogs.py.
 def _clear_open_dialogs() -> None:
     """Destroy every dialog in _OPEN_DIALOGS and empty the list.

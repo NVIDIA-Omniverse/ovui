@@ -254,6 +254,26 @@ public:
      */
     OMNIUI_API
     static void onWindowVisibilityChanged(const std::string& title, bool visible);
+
+    /**
+     * @brief Set a callback to be fired the first time the user clicks inside any ui.Window.
+     *
+     * Used by the omni.ui Python extension-usage telemetry hook. The callback receives the
+     * Window title and the Python module name that constructed the Window (may be empty if
+     * unattributable). The Python side resolves the module to an extension id via the
+     * extension manager. Invoked at most once per Window lifetime. nullptr disables the hook.
+     */
+    OMNIUI_API
+    static void setWindowFirstInteractionCallback(
+        std::function<void(const std::string& title, const std::string& ownerModule)> callbackFn);
+
+    /**
+     * @brief Internal: invoked by Window::_draw the first time a mouse click is observed inside
+     * a Window. Forwards to the registered first-interaction callback if any.
+     */
+    OMNIUI_API
+    static void onWindowFirstInteraction(const std::string& title, const std::string& ownerModule);
+
 private:
     friend class Window;
     friend class ToolBar;

@@ -38,6 +38,14 @@ struct GpuState
     /// the swap). When this flips relative to ``m_useDirectInterop`` for a
     /// BGRA texture, the texture must be recreated.
     bool textureForDirectInterop = true;
+    /// Id of the last upload that updateImageChecked accepted.
+    uint64_t uploadSerial = 0;
+    /// Highest upload id with proof that its copy finished.
+    uint64_t completedSerial = 0;
+    /// Fence after the newest accepted upload. OpenGL runs the copy later, so
+    /// only this fence proves that it ended. Older uploads end before it.
+    GLsync completionFence = nullptr;
+    uint64_t completionFenceSerial = 0;
 
 #if OMNIUI_HAS_CUDA
     // Either a registered PBO (PBO path) or the registered texture itself
@@ -399,6 +407,11 @@ void OpenGLByteImageGpu::destroyState(Handle h)
 #if OMNIUI_HAS_CUDA
     releaseCudaInterop(state);
 #endif
+    if (state->completionFence)
+    {
+        glDeleteSync(state->completionFence);
+        state->completionFence = nullptr;
+    }
     if (state->texture)
     {
         glDeleteTextures(1, &state->texture);
@@ -854,6 +867,100 @@ IByteImageGpu::UpdateResult OpenGLByteImageGpu::updateImage(
     UpdateResult result;
     result.imGuiReference = reinterpret_cast<void*>(static_cast<intptr_t>(state->texture));
     return result;
+}
+
+UploadResult OpenGLByteImageGpu::updateImageChecked(
+    Handle h,
+    const uint8_t* const* mipMapBuffers,
+    size_t* mipMapStrides,
+    size_t mipMapCount,
+    UInt2 size,
+    PixelFormat format,
+    bool fromGpu,
+    uint32_t gpuDeviceMask,
+    uint32_t textureUsageFlags,
+    uint32_t resourceUsageFlags)
+{
+    UploadResult out;
+    out.requestedDeviceMask = gpuDeviceMask;
+    if (!isSingleDeviceMaskSupported(gpuDeviceMask))
+    {
+        // One GL context, one device. Another device cannot be served, and
+        // nothing is uploaded.
+        // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+        fprintf(stderr, "OpenGLByteImageGpu: device mask 0x%x asks for devices this backend does not have\n",
+                (unsigned)gpuDeviceMask);
+        out.cause = "the device mask asks for a device that the OpenGL backend does not have";
+        return out;
+    }
+    // Errors that other code left are not errors of this upload. They are
+    // reported here and taken out, so the check below sees only ours. OpenGL
+    // keeps at most one error per kind; the limit only guards against a
+    // context that keeps reporting an error.
+    for (int i = 0; i < 16; ++i)
+    {
+        const GLenum earlier = glGetError();
+        if (earlier == GL_NO_ERROR)
+            break;
+        // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+        fprintf(stderr,
+                "OpenGLByteImageGpu: GL error 0x%x was raised by earlier code before this upload; it is not counted "
+                "as an upload failure\n",
+                static_cast<unsigned>(earlier));
+    }
+    out.update = updateImage(h, mipMapBuffers, mipMapStrides, mipMapCount, size, format, fromGpu, gpuDeviceMask,
+                             textureUsageFlags, resourceUsageFlags);
+    const GLenum glError = glGetError();
+    if (glError != GL_NO_ERROR)
+    {
+        // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+        fprintf(stderr, "OpenGLByteImageGpu: upload raised GL error 0x%x\n", static_cast<unsigned>(glError));
+        out.cause = "the OpenGL upload raised a GL error";
+        return out;
+    }
+    auto* state = static_cast<GpuState*>(h);
+    if (state == nullptr || out.update.imGuiReference == nullptr)
+    {
+        out.cause = state == nullptr ? "the OpenGL backend got no texture state" : "the OpenGL backend made no texture";
+        return out;
+    }
+    // The GL calls were queued. A fence after them proves the end.
+    GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (fence == nullptr)
+    {
+        // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+        fprintf(stderr, "OpenGLByteImageGpu: glFenceSync failed, the upload cannot be tracked\n");
+        out.cause = "glFenceSync failed, so the upload cannot be tracked";
+        return out;
+    }
+    glFlush();
+    if (state->completionFence)
+        glDeleteSync(state->completionFence);
+    state->completionFence = fence;
+    out.status = UploadStatus::eEnqueued;
+    out.uploadId = ++state->uploadSerial;
+    state->completionFenceSerial = out.uploadId;
+    out.uploadedDeviceMask = gpuDeviceMask;
+    return out;
+}
+
+uint64_t OpenGLByteImageGpu::getCompletedUploadId(Handle h)
+{
+    auto* state = static_cast<GpuState*>(h);
+    if (!state)
+        return 0;
+    if (state->completionFence)
+    {
+        // Needs the GL context of the upload to be current on this thread.
+        const GLenum wait = glClientWaitSync(state->completionFence, 0, 0);
+        if (wait == GL_ALREADY_SIGNALED || wait == GL_CONDITION_SATISFIED)
+        {
+            state->completedSerial = state->completionFenceSerial;
+            glDeleteSync(state->completionFence);
+            state->completionFence = nullptr;
+        }
+    }
+    return state->completedSerial;
 }
 
 void OpenGLByteImageGpu::releaseImage(Handle h)

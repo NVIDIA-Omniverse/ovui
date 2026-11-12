@@ -228,7 +228,8 @@ Stage row -> viewport -> Property:
 1. `StageWidget` inside `StageWindow` calls
    `selection_bus.publish(paths, source="stage")` from user row selection.
 2. `ViewportWidget._on_bus_selection_changed(event)` receives the event,
-   calls `renderer.set_selection_highlight(paths)`, updates
+   calls `renderer.set_selection_highlight(paths)` (it renders again unless
+   that returns `False`: no outline before and none now), updates
    `ManipulatorRegistry`, updates `PrimTransformModel.set_selection(paths)`,
    and invalidates the transform manipulator and selection outline.
 3. `PropertyWindow._on_bus_selection_changed(event)` calls
@@ -239,7 +240,18 @@ Stage row -> viewport -> Property:
 Viewport pick -> Stage row -> Property:
 
 1. `ViewportWidget` point and rectangle pick gestures call `renderer.pick(...)`
-   or `renderer.pick_rect(...)`.
+   or `renderer.pick_rect(...)`. The renderer reports geometry only. For a point
+   pick, the viewport then calls `resolve_pick_path(render_x, render_y, path)`:
+   a click on a drawn line of the light gizmo selects that light instead of the
+   renderer's answer. Only the single selected UsdLux light draws a gizmo, so a
+   light that is not selected never takes a click. The gizmo of a dome or
+   distant light does not take a click from a mesh under it. A hidden light
+   (also through a hidden parent) is skipped. Lights that the app adds under
+   `/OvGearSession` (the fallback dome light of a scene that has no light) are
+   not picked. When a read of the selected light or the camera fails, the
+   viewport reports the cause through `ErrorReporter` and keeps the renderer's
+   answer.
+   Rectangle picks do not include lights.
 2. The viewport merges hits and calls
    `selection_bus.publish(merged, source="viewport")`.
 3. `StageWidget._on_bus_selection_changed(event)` expands ancestors, sets the
@@ -258,7 +270,12 @@ Viewport manipulation -> Property -> renderer:
    `PrimTransformModel.on_drag_scaled(...)` write USD transforms through
    `UsdTransformAdapter.set_local_transform(...)` while suppressing raw USD
    stage notices, then emit an explicit live transform event with
-   `source="viewport-manipulator-live"`.
+   `source="viewport-manipulator-live"`. `set_local_transform` writes the
+   new values into the translate, rotate and scale operations of the prim;
+   it writes one matrix operation only when those operations cannot give the
+   matrix (for example a shear). Then it returns a note with the prim and
+   the cause, and `PrimTransformModel.on_drag_ended()` shows the note in the
+   status bar and writes it to the log.
 4. The app's `stage_adapter.subscribe_changes(self._on_stage_changed)` callback
    forwards each live event to `ViewportWidget.notify_stage_changed(event)`.
 5. `OvRtxRendererAdapter.notify_stage_changed(event)` mirrors live transform
@@ -274,16 +291,54 @@ Viewport manipulation -> Property -> renderer:
 Property edit -> viewport (property-to-viewport flow):
 
 1. Property row widgets use `AttributeModelBase.begin_edit()`,
-   `set_value(value)`, and `end_edit()`.
+   `set_value(value)`, and `end_edit()`. A vector row uses
+   `set_component_value(index, vector)` in place of `set_value(value)`.
+   The row of a matrix transform operation (`xformOp:transform`) has
+   Translate, Rotate and Scale fields above its 4x4 grid; a field uses
+   `set_matrix_part_value(part, index, value, matrix)`. The parts come from
+   `ovui_data_adapters.common.matrix_transform`: Rotate is in degrees, X
+   first, then Y, then Z; an edit of Rotate or Scale keeps the shear, the
+   translation and the other channels of the matrix. A flat object (a zero
+   scale) shows its true parts and can be edited. Rotate and Scale of a
+   matrix with nan show nan, and an edit of them is refused with a message
+   (`MatrixPartError` gives the cause).
+   When the user presses Escape in a decimal number field (the float,
+   vector, color and matrix rows), its model reports `is_edit_cancelled()`
+   in the end-edit callback, and the row calls `cancel_edit()` in place of
+   `end_edit()`: the adapter puts back the exact value from before the edit
+   and records no undo step. An integer field puts back its exact old text
+   on Escape and still calls `end_edit()`; the adapter sees the start value
+   of every object and does the same. In both cases a layer that had no
+   unsaved change before the edit shows as not modified again, with no
+   reload of the layer.
 2. `AttributeModelBase.set_value()` delegates to
    `UsdPropertyAdapter.set_value(attr_name, value)`.
-3. `UsdPropertyAdapter.set_value()` writes the USD attribute with
-   `attr.Set(usd_value)` and notifies adapter subscribers.
+   `AttributeModelBase.set_component_value()` delegates to
+   `UsdPropertyAdapter.set_component_value(attr_name, index, value)`, which
+   changes only that channel: each selected prim keeps its other channels.
+   `AttributeModelBase.set_matrix_part_value()` delegates to
+   `UsdPropertyAdapter.set_matrix_part_value(attr_name, part, index, value)`,
+   which changes one channel of one part of the matrix of each selected
+   prim, from its matrix at the start of the edit.
+   Before it delegates, the model refuses a value that cannot be stored: a
+   number that is not finite (nan, inf) for a transform operation
+   (`xformOp:*`), and a value outside the range of a 16-bit or 32-bit float
+   attribute. The old value stays: when the drag field already wrote values
+   while the user typed, the model cancels the edit (`cancel_edit`) and
+   starts a new one. A message in the status bar names the field and the
+   cause.
+3. `UsdPropertyAdapter` writes the USD attribute with
+   `attr.Set(usd_value)` and notifies adapter subscribers. A float vector
+   keeps the precision of the USD type of each selected attribute
+   (`double3` is written as `Gf.Vec3d`, `half4` as `Gf.Vec4h`).
 4. USD `Tf.Notice` flows through `UsdStageAdapter.subscribe_changes(...)` to
    the app's `_on_stage_changed`.
 5. `_on_stage_changed` calls `ViewportWidget.notify_stage_changed(event)`.
 6. `ViewportWidget.notify_stage_changed(event)` forwards to
    `OvRtxRendererAdapter.notify_stage_changed(event)` and invalidates overlays.
+   It asks for a render unless `RendererAdapter.stage_change_keeps_picture(event)`
+   returns `True` (for example an edit of a created Xform that draws nothing):
+   ovrtx keeps memory on each render step.
 7. The next viewport render shows the changed attribute or transform. For
    transform fields such as `xformOp:translate`, the selected prim moves in the
    real ovrtx viewport.

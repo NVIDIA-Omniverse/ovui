@@ -24,7 +24,6 @@ from ovui_widgets.app.inspector_state import (
     capture_application_state,
 )
 
-pxr = pytest.importorskip("pxr")
 from ovui_data_adapters.openusd.layer_stack_adapter import (  # noqa: E402
     UsdLayerStackAdapter,
 )

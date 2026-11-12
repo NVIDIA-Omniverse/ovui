@@ -24,14 +24,15 @@ _SIZE = 64
 _RED = (255, 0, 0)
 
 
-def _write_png(path: pathlib.Path, rgb, size: int = 8) -> None:
-    """Write an opaque solid-colour RGBA8 PNG without requiring Pillow."""
+def _write_png(path: pathlib.Path, rgb, size: int = 8, odd_rgb=None) -> None:
+    """Write an opaque RGBA8 PNG without requiring Pillow; ``odd_rgb`` colours odd columns."""
 
     def chunk(tag: bytes, payload: bytes) -> bytes:
         return len(payload).to_bytes(4, "big") + tag + payload + zlib.crc32(tag + payload).to_bytes(4, "big")
 
     header = size.to_bytes(4, "big") + size.to_bytes(4, "big") + bytes((8, 6, 0, 0, 0))
-    raw = b"".join(b"\x00" + bytes((*rgb, 255)) * size for _ in range(size))
+    row = b"".join(bytes((*(odd_rgb if x % 2 and odd_rgb else rgb), 255)) for x in range(size))
+    raw = b"".join(b"\x00" + row for _ in range(size))
     path.write_bytes(
         b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
     )
@@ -47,11 +48,11 @@ class TestImageLocalFile(OmniUiTest):
         await super().asyncTearDown()
         self._tmp.cleanup()
 
-    async def _center_pixel(self, source: str):
+    async def _center_pixel(self, source: str, image_size: int = _SIZE):
         """Draw ``ui.Image(source)`` over a black window and return its centre pixel."""
         window = await self.create_test_window(_SIZE, _SIZE)
         with window.frame:
-            ui.Image(source, width=_SIZE, height=_SIZE, fill_policy=ui.FillPolicy.STRETCH)
+            ui.Image(source, width=image_size, height=image_size, fill_policy=ui.FillPolicy.STRETCH)
         await self.wait_n_updates(4)
 
         capture = self._root / "capture.png"
@@ -65,7 +66,7 @@ class TestImageLocalFile(OmniUiTest):
         from PIL import Image
 
         with Image.open(capture) as img:
-            return img.convert("RGB").getpixel((_SIZE // 2, _SIZE // 2))
+            return img.convert("RGB").getpixel((image_size // 2, image_size // 2))
 
     def _assert_red(self, pixel, where: str) -> None:
         for got, want in zip(pixel, _RED):
@@ -83,6 +84,15 @@ class TestImageLocalFile(OmniUiTest):
         url = png.as_uri()  # file:///.../dir%20with%20space/red.png
         self.assertIn("%20", url)
         self._assert_red(await self._center_pixel(url), "ui.Image(file:// URL)")
+
+    async def test_shrunk_image_is_smooth(self):
+        # 1 px white and black stripes drawn 3 times smaller must blend to grey
+        # through the mip chain, not show single stripes (jagged small icons).
+        png = self._root / "stripes.png"
+        _write_png(png, (255, 255, 255), size=48, odd_rgb=(0, 0, 0))
+        pixel = await self._center_pixel(str(png), image_size=16)
+        for channel in pixel:
+            self.assertTrue(64 <= channel <= 192, f"centre pixel is {pixel}, expected grey")
 
     async def test_missing_file_logs_an_error(self):
         missing = self._root / "does_not_exist.png"

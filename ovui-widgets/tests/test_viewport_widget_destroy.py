@@ -3,7 +3,7 @@
 
 """Tests for Step 5b — ViewportWidget.destroy() try/finally guarantee.
 
-Issue #35, Step 5b. The plan (Round 3 F4) restructures
+Regression, Step 5b. The plan (Round 3 F4) restructures
 ``ViewportWidget.destroy()`` so ``super().destroy()`` ALWAYS runs in
 the ``finally`` clause, even if ``self._renderer.shutdown()`` raises.
 Without this, a renderer-shutdown failure would skip

@@ -75,8 +75,16 @@ public:
     OMNIUI_SCENE_API
     virtual Float getIntersectionDistance() const;
 
+    /**
+     * @brief Internal, for DragGesture. The ``moved`` of the payload that the shape has now, and the absolute point of it that
+     * a consumer can follow. Returns false for a shape whose payload has none.
+     */
+    OMNIUI_SCENE_API
+    virtual bool _getFollowReport(Vector3& moved) const;
+
 protected:
     friend class ShapeGesture;
+    friend class DragGesture;
     struct AbstractShapeData;
 
     OMNIUI_SCENE_API
@@ -87,6 +95,24 @@ protected:
         const MouseInput& input, const Matrix44& projection, const Matrix44& view, float width, float height) override;
 
     void _setParent(const AbstractContainer* const& parent) override;
+
+    /**
+     * @brief For DragGesture. Takes the payload that the shape has now (the payload of a call) as the baseline that
+     * ``moved`` is measured from in the next frame that is held.
+     */
+    virtual void _captureBaseline() const;
+
+    /**
+     * @brief For DragGesture. The next intersection measures ``moved`` and the other ``moved_*`` values from the baseline
+     * instead of from the previous frame: a frame that has no call keeps its movement for the next call.
+     */
+    void _holdPayloadBaseline(bool hold = true) const;
+
+    /**
+     * @brief A property that is only drawn (a color, a thickness, a size) has changed: the shape is redrawn, but this is not
+     * a write that can change the payload of a gesture, so it takes no write stamp.
+     */
+    void _dirtyAppearance();
 
     void _collectManagers(std::unordered_set<GestureManager*>& managers) const override;
 

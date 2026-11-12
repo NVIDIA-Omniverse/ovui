@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-pytest.importorskip("pxr")
 from ovui_data_adapters.openusd import renderer_adapter as module
 from pxr import Gf, Usd, UsdGeom
 

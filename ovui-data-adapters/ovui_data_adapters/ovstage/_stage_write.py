@@ -16,6 +16,8 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
+from ovui_data_adapters.ovstage._handles import handle_number
+
 _WRITE_JOURNAL_ATTRIBUTE = "_ovui_native_write_journal"
 _WRITE_JOURNAL_MAX_ORDINALS = 256
 
@@ -273,7 +275,7 @@ class StageWriteBatch:
         if len(token_values) != len(self.prim_paths):
             raise ValueError("token value count must match prim path count")
         ids = np.asarray(
-            [self._paths.intern_token(value) for value in token_values],
+            [handle_number(self._paths.intern_token(value)) for value in token_values],
             dtype=np.uint64,
         )
         semantic = getattr(self._module.AttributeSemantic, "TOKEN_ID")
@@ -292,7 +294,7 @@ class StageWriteBatch:
             raise ValueError("relationship writes require exactly one prim path")
         target_values = tuple(str(value) for value in targets)
         ids = np.asarray(
-            [self._paths.intern_path(value) for value in target_values],
+            [handle_number(self._paths.intern_path(value)) for value in target_values],
             dtype=np.uint64,
         )
         dtype = self._module.numpy_to_dldatatype(ids.dtype, lanes=1)

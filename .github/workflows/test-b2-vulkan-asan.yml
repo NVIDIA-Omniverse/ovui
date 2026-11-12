@@ -19,11 +19,17 @@
 #     (NOT via pip install — no Python interpreter is involved).
 #   * Builds the native test binaries (markdown_model_tests,
 #     markdown_fuzz_tests, raster_image_provider_contract_tests,
-#     standalone_raster_image_loader_tests). These are pure-CPU C++
-#     executables that exercise the markdown
+#     standalone_raster_image_loader_tests, png_zlib_compress_tests,
+#     standalone_file_io_tests, byte_image_upload_status_tests,
+#     standalone_svg_rasterizer_tests, opengl3_renderer_upload_tests).
+#     These are pure-CPU C++ executables that exercise the markdown
 #     parser/renderer/syntax-highlighter, the RasterImageProvider
-#     load and lifetime contract against a fake loader, and the
-#     standalone loader's texture sharing against a fake GPU — the
+#     load and lifetime contract against a fake loader, the
+#     standalone loader's texture sharing against a fake GPU, the
+#     PNG export compressor against stb's reference bytes, the
+#     standalone file IO's asynchronous reads, the upload results
+#     of ByteImageProvider against a fake GPU backend, and the standalone
+#     SVG rasterizer with a real VectorImageProvider against a fake GPU — the
 #     class of code where ASan-class bugs (UAF, OOB, double-free)
 #     actually live in this repo.
 #   * Runs them via ctest. libasan initializes cleanly because the
@@ -104,7 +110,11 @@ jobs:
         run: |
           cmake --build build/asan \
             --target markdown_model_tests markdown_fuzz_tests raster_image_provider_contract_tests \
-            standalone_raster_image_loader_tests \
+            standalone_raster_image_loader_tests png_zlib_compress_tests \
+            standalone_file_io_tests byte_image_upload_status_tests \
+            presentation_key_tests window_callback_owner_tests image_provider_thread_tests \
+            standalone_svg_rasterizer_tests \
+            opengl3_renderer_upload_tests \
             --parallel $(nproc)
 
       - name: Verify ASan is linked into the test binaries
@@ -115,7 +125,15 @@ jobs:
           set -e
           for bin in build/asan/markdown_model_tests build/asan/markdown_fuzz_tests \
                      build/asan/raster_image_provider_contract_tests \
-                     build/asan/standalone_raster_image_loader_tests; do
+                     build/asan/standalone_raster_image_loader_tests \
+                     build/asan/png_zlib_compress_tests \
+                     build/asan/standalone_file_io_tests \
+                     build/asan/byte_image_upload_status_tests \
+                     build/asan/presentation_key_tests \
+                     build/asan/window_callback_owner_tests \
+                     build/asan/image_provider_thread_tests \
+                     build/asan/standalone_svg_rasterizer_tests \
+                     build/asan/opengl3_renderer_upload_tests; do
             echo "=== ldd $bin ==="
             ldd "$bin"
             if ! ldd "$bin" | grep -qi "libasan"; then
@@ -123,6 +141,17 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Guard — verify the presentation-key test is selected
+        # The test list below is fixed. Without this guard a rename or a CMake change could
+        # drop presentation_key_tests and leave the job green.
+        shell: bash
+        run: |
+          ctest --test-dir build/asan -N -R "^presentation_key_tests$" | tee /tmp/ctest-b2-guard.log
+          grep -q "Total Tests: 1" /tmp/ctest-b2-guard.log || {
+            echo "ERROR: presentation_key_tests is not registered in CTest"
+            exit 1
+          }
 
       - name: Run ctest with ASan
         shell: bash
@@ -137,7 +166,7 @@ jobs:
           set -o pipefail
           ulimit -c 0
           ctest --test-dir build/asan \
-            -R "^(markdown_model_tests|markdown_fuzz_tests|raster_image_provider_contract_tests|standalone_raster_image_loader_tests)$" \
+            -R "^(markdown_model_tests|markdown_fuzz_tests|raster_image_provider_contract_tests|standalone_raster_image_loader_tests|png_zlib_compress_tests|standalone_file_io_tests|byte_image_upload_status_tests|presentation_key_tests|window_callback_owner_tests|image_provider_thread_tests|standalone_svg_rasterizer_tests|opengl3_renderer_upload_tests)$" \
             --output-on-failure 2>&1 | tee /tmp/ctest-b2.log
 
       - name: Upload ctest log

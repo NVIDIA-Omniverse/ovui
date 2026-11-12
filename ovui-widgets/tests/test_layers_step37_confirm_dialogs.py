@@ -272,7 +272,6 @@ class TestConfirmDialogAPI:
     def test_confirm_click_fires_on_confirm_and_closes(
         self, monkeypatch,
     ) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import _OPEN_DIALOGS, confirm_dialog
 
         confirmed: List[bool] = []
@@ -297,7 +296,6 @@ class TestConfirmDialogAPI:
         assert dialog not in _OPEN_DIALOGS
 
     def test_cancel_click_fires_on_cancel_and_closes(self) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import _OPEN_DIALOGS, confirm_dialog
 
         confirmed: List[bool] = []
@@ -319,7 +317,6 @@ class TestConfirmDialogAPI:
         assert dialog not in _OPEN_DIALOGS
 
     def test_on_cancel_defaults_to_noop(self) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import confirm_dialog
 
         dialog = confirm_dialog(
@@ -333,7 +330,6 @@ class TestConfirmDialogAPI:
         dialog.cancel()
 
     def test_double_click_does_not_fire_twice(self) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import confirm_dialog
 
         confirmed: List[bool] = []
@@ -351,7 +347,6 @@ class TestConfirmDialogAPI:
         assert confirmed == [True]
 
     def test_registry_keeps_dialog_alive_until_dismiss(self) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import _OPEN_DIALOGS, confirm_dialog
 
         before = list(_OPEN_DIALOGS)
@@ -370,9 +365,27 @@ class TestConfirmDialogAPI:
         assert dialog not in _OPEN_DIALOGS
 
 
+def _window_error() -> str:
+    """Return why ovui cannot create a window here, or "" when it can."""
+    import omni.ui as ui
+
+    try:
+        window = ui.Window("__probe_step37__", width=10, height=10)
+    except Exception as error:
+        return f"{type(error).__name__}: {error}"
+    window.destroy()
+    return ""
+
+
+_WINDOW_ERROR = _window_error()
+_skip_no_window = pytest.mark.skipif(
+    bool(_WINDOW_ERROR),
+    reason=f"ovui cannot create a window on this machine ({_WINDOW_ERROR})",
+)
+
+
 class TestConfirmDirtyRemoveDialog:
     def test_save_and_remove_click_fires_save_branch(self) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import confirm_dirty_remove_dialog
 
         events: List[str] = []
@@ -388,7 +401,6 @@ class TestConfirmDirtyRemoveDialog:
         assert events == ["save"]
 
     def test_remove_without_saving_fires_discard_branch(self) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import confirm_dirty_remove_dialog
 
         events: List[str] = []
@@ -404,7 +416,6 @@ class TestConfirmDirtyRemoveDialog:
         assert events == ["discard"]
 
     def test_cancel_fires_cancel_branch(self) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import confirm_dirty_remove_dialog
 
         events: List[str] = []
@@ -420,7 +431,6 @@ class TestConfirmDirtyRemoveDialog:
         assert events == ["cancel"]
 
     def test_only_one_branch_fires(self) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import confirm_dirty_remove_dialog
 
         events: List[str] = []
@@ -438,10 +448,47 @@ class TestConfirmDirtyRemoveDialog:
         dialog.cancel()
         assert events == ["save"]
 
+    @_skip_no_window
+    @pytest.mark.parametrize(
+        ("dirty_layer_names", "first_line"),
+        [
+            (None, "Layer 'A.usda' has unsaved changes."),
+            (["A2.usda"], "Layer 'A.usda' contains unsaved changes in: 'A2.usda'."),
+            (
+                ["A.usda", "A2.usda"],
+                "Layer 'A.usda' contains unsaved changes in: 'A.usda', 'A2.usda'.",
+            ),
+        ],
+    )
+    def test_message_names_the_layers_with_unsaved_changes(
+        self, monkeypatch, dirty_layer_names, first_line,
+    ) -> None:
+        # Regression: the question also names a nested sublayer with
+        # unsaved changes; the text for the removed layer alone stays.
+        from ovui_widgets.common import dialogs
+
+        labels: List[str] = []
+        real_label = dialogs.ui.Label
+        monkeypatch.setattr(
+            dialogs.ui,
+            "Label",
+            lambda text, **kwargs: (labels.append(text), real_label(text, **kwargs))[1],
+        )
+        dialog = dialogs.confirm_dirty_remove_dialog(
+            layer_name="A.usda",
+            on_save_and_remove=lambda: None,
+            on_remove_without_saving=lambda: None,
+            dirty_layer_names=dirty_layer_names,
+        )
+        # This machine can create a window (``_skip_no_window``), so a
+        # dialog that was not built is a software error in the dialog.
+        assert dialog is not None, "the Remove Layer dialog was not built"
+        dialog.cancel()
+        assert labels == [f"{first_line}\nSave before removing?"]
+
 
 class TestConfirmReloadDialog:
     def test_reload_click_fires_on_reload(self) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import confirm_reload_dialog
 
         events: List[str] = []
@@ -456,7 +503,6 @@ class TestConfirmReloadDialog:
         assert events == ["reload"]
 
     def test_cancel_click_fires_on_cancel(self) -> None:
-        pytest.importorskip("omni.ui")
         from ovui_widgets.common.dialogs import confirm_reload_dialog
 
         events: List[str] = []
@@ -624,6 +670,94 @@ class TestRequestRemoveSublayerDirtyRoutesThroughDialog:
         root = adapter._layers[ROOT_LAYER_IDENTIFIER]
         assert "./child.usda" in root.sublayer_identifiers
         assert not app.undo_manager.can_undo()
+
+    def test_dirty_nested_sublayer_opens_dialog_with_its_name(
+        self, adapter, app, model, monkeypatch,
+    ) -> None:
+        # Regression: the remove also takes the sublayers of the removed
+        # layer out of the stack, so their unsaved changes need the same
+        # question.
+        adapter.add_sublayer("./child.usda", "./nested.usda", "nested.usda")
+        adapter.set_dirty("./nested.usda", True)
+
+        captured: List[dict] = []
+        monkeypatch.setattr(
+            "ovui_widgets.common.dialogs.confirm_dirty_remove_dialog",
+            lambda **kwargs: (captured.append(kwargs), None)[1],
+        )
+
+        model._request_remove_sublayer(ROOT_LAYER_IDENTIFIER, 0)
+
+        assert len(captured) == 1
+        assert captured[0]["dirty_layer_names"] == ["nested.usda"]
+        root = adapter._layers[ROOT_LAYER_IDENTIFIER]
+        assert "./child.usda" in root.sublayer_identifiers
+
+        captured[0]["on_save_and_remove"]()
+
+        assert adapter._layers["./nested.usda"].dirty is False
+        assert "./child.usda" not in root.sublayer_identifiers
+
+    def test_save_and_remove_keeps_layer_with_unsaved_nested_layer(
+        self, adapter, app, model, monkeypatch,
+    ) -> None:
+        # An anonymous sublayer has no file to save to. Its changes are
+        # still unsaved after Save & Remove, so the layer must stay.
+        anonymous_id = adapter.create_sublayer("./child.usda", -1, "")
+        adapter.set_dirty(anonymous_id, True)
+
+        captured: List[dict] = []
+        monkeypatch.setattr(
+            "ovui_widgets.common.dialogs.confirm_dirty_remove_dialog",
+            lambda **kwargs: (captured.append(kwargs), None)[1],
+        )
+        errors: List[str] = []
+        monkeypatch.setattr(
+            ErrorReporter, "show_error", lambda message, *_: errors.append(message),
+        )
+
+        model._request_remove_sublayer(ROOT_LAYER_IDENTIFIER, 0)
+        captured[0]["on_save_and_remove"]()
+
+        root = adapter._layers[ROOT_LAYER_IDENTIFIER]
+        assert "./child.usda" in root.sublayer_identifiers
+        assert adapter._layers[anonymous_id].dirty is True
+        assert len(errors) == 1 and anonymous_id in errors[0]
+
+    def test_remove_moves_authoring_out_of_removed_tree_with_message(
+        self, adapter, app, model, monkeypatch,
+    ) -> None:
+        adapter.add_sublayer("./child.usda", "./nested.usda", "nested.usda")
+        adapter.set_edit_target("./nested.usda")
+        warnings: List[str] = []
+        monkeypatch.setattr(
+            ErrorReporter, "show_warning", lambda message, *_: warnings.append(message),
+        )
+
+        model._request_remove_sublayer(ROOT_LAYER_IDENTIFIER, 0)
+
+        assert adapter.get_edit_target_identifier() == ROOT_LAYER_IDENTIFIER
+        assert len(warnings) == 1 and "nested.usda" in warnings[0]
+
+    def test_redo_of_remove_that_moves_authoring_shows_message_again(
+        self, adapter, app, model, monkeypatch,
+    ) -> None:
+        # Undo makes the nested layer the authoring layer again, so the
+        # Redo moves it to root again and must tell the user again.
+        adapter.add_sublayer("./child.usda", "./nested.usda", "nested.usda")
+        adapter.set_edit_target("./nested.usda")
+        warnings: List[str] = []
+        monkeypatch.setattr(
+            ErrorReporter, "show_warning", lambda message, *_: warnings.append(message),
+        )
+        model._request_remove_sublayer(ROOT_LAYER_IDENTIFIER, 0)
+
+        app.undo_manager.undo()
+        assert adapter.get_edit_target_identifier() == "./nested.usda"
+        app.undo_manager.redo()
+
+        assert adapter.get_edit_target_identifier() == ROOT_LAYER_IDENTIFIER
+        assert len(warnings) == 2 and warnings[1] == warnings[0]
 
     def test_missing_parent_no_ops(self, adapter, app, model) -> None:
         # Should not raise.

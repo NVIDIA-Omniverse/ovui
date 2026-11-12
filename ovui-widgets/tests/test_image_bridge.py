@@ -53,6 +53,25 @@ class TestImageBridgeUpdate:
         assert bridge.provider is not None
 
 
+class TestImageBridgeClear:
+    def test_clear_uploads_a_transparent_frame_of_the_current_size(self):
+        bridge = ImageBridge(8, 8)
+        bridge.update(np.full((6, 10, 4), 200, dtype=np.uint8))
+        uploads = []
+        bridge._provider = MagicMock()
+        bridge._provider.set_data_array.side_effect = (
+            lambda frame, size: uploads.append((frame.copy(), size))
+        )
+
+        bridge.clear()
+
+        assert len(uploads) == 1
+        frame, size = uploads[0]
+        assert size == [10, 6]
+        assert frame.shape == (6, 10, 4)
+        assert not frame.any()
+
+
 class TestImageBridgeNoListAllocation:
     """Regression guard: update() must not flatten frames into Python lists.
 
@@ -89,3 +108,81 @@ class TestImageBridgeNoListAllocation:
             ImageBridge(16, 16)
             mock_provider.set_data_array.assert_called_once()
             mock_provider.set_bytes_data.assert_not_called()
+
+
+class TestImageBridgeRejectedUpload:
+    """A rejected upload must be visible to the caller and must start the CPU fallback.
+
+    ovui keeps the previous pixels when it rejects an upload, so the provider
+    still looks valid. Only the return value of the setter tells the truth.
+    """
+
+    @staticmethod
+    def _gpu_frame():
+        from ovui_data_adapters.common import GpuFrame
+
+        return GpuFrame(ptr=0x1000, width=4, height=4)
+
+    def test_cpu_update_returns_the_answer_of_ovui(self):
+        bridge = ImageBridge(4, 4)
+        frame = np.zeros((4, 4, 4), dtype=np.uint8)
+        bridge._provider = MagicMock()
+        bridge._provider.set_data_array.return_value = False
+        assert bridge.update(frame) is False
+        bridge._provider.set_data_array.return_value = True
+        assert bridge.update(frame) is True
+
+    def test_update_without_an_answer_returns_none(self):
+        bridge = ImageBridge(4, 4)
+        bridge._provider = MagicMock()  # an older ovui answers with None
+        bridge._provider.set_data_array.return_value = None
+        assert bridge.update(np.zeros((4, 4, 4), dtype=np.uint8)) is None
+        assert bridge.update(None) is None
+
+    def test_rejected_probe_upload_latches_the_fallback(self):
+        from ovui_data_adapters.common import ZeroCopyState
+
+        state = ZeroCopyState.from_env()
+        state.mode = type(state.mode).PROBING
+        bridge = ImageBridge(4, 4, state=state)
+        bridge._provider = MagicMock()
+        bridge._provider.set_bytes_data_from_gpu.return_value = False
+        with patch("ovui_widgets.viewport.image_bridge._has_gpu_byte_image", return_value=True):
+            assert bridge.update(self._gpu_frame()) is False
+        assert state.mode.value == "fallback"
+        assert "rejected" in state.fallback_reason
+
+    def test_accepted_probe_upload_enables_zero_copy(self):
+        from ovui_data_adapters.common import ZeroCopyState
+
+        state = ZeroCopyState.from_env()
+        state.mode = type(state.mode).PROBING
+        bridge = ImageBridge(4, 4, state=state)
+        bridge._provider = MagicMock()
+        bridge._provider.set_bytes_data_from_gpu.return_value = True
+        with patch("ovui_widgets.viewport.image_bridge._has_gpu_byte_image", return_value=True):
+            assert bridge.update(self._gpu_frame()) is True
+        assert state.mode.value == "enabled"
+
+    def test_rejected_upload_after_enable_latches_the_fallback(self):
+        from ovui_data_adapters.common import ZeroCopyState
+
+        state = ZeroCopyState.from_env()
+        state.mode = type(state.mode).ENABLED
+        bridge = ImageBridge(4, 4, state=state)
+        bridge._provider = MagicMock()
+        bridge._provider.set_bytes_data_from_gpu.return_value = False
+        assert bridge.update(self._gpu_frame()) is False
+        assert state.mode.value == "fallback"
+
+    def test_failure_hook_of_ovui_starts_the_fallback_without_a_renderer_patch(self):
+        """The supported test hook of ovui is enough to test the fallback on a real provider."""
+        from ovui_data_adapters.common import ZeroCopyState
+
+        state = ZeroCopyState.from_env()
+        state.mode = type(state.mode).ENABLED
+        bridge = ImageBridge(4, 4, state=state)
+        bridge.provider.inject_upload_failures(1)
+        assert bridge.update(self._gpu_frame()) is False
+        assert bridge.provider.inject_upload_failures(0) == 0, "the upload of the bridge took the failure"
+        assert state.mode.value == "fallback"

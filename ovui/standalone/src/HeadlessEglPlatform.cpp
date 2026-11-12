@@ -4,6 +4,7 @@
  */
 
 #include "HeadlessEglPlatform.h"
+#include "HeadlessClipboard.h"
 
 #ifdef OMNIUI_HAS_EGL
 
@@ -11,6 +12,8 @@
 #include "StandaloneWindowCallbackManager.h"
 #include "NativeTiming.h"
 
+#include <omni/ui/ImageProvider/ImageProvider.h>
+#include <omni/ui/ImageProvider/PresentationKeyGuard.h>
 #include <omni/ui/platform/PlatformRegistry.h>
 #include <omni/ui/Font.h>
 
@@ -176,6 +179,7 @@ bool HeadlessEglPlatform::setupFboAndImGui(int width, int height)
     OVUI_PERFORMANCE_PHASE_SCOPE(imGuiInitPhase, kImGuiInitPhaseName);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    installHeadlessClipboard();
     m_imguiContextCreated = true;
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -732,12 +736,16 @@ bool HeadlessEglPlatform::tick()
 
     // Caller-driven draw slot: draw all registered omni.ui windows.
     {
+        // Image changes given from other threads run on this thread before the draw.
+        omni::ui::ImageProvider::applyPublishedUpdates();
         StandaloneWindowCallbackManager* wcm = getStandaloneWindowCallbackManager();
         if (wcm)
             wcm->drawAllWindows(elapsed);
     }
 
     ImGui::Render();
+    // A presentation key without a drawable must not reach the renderer back end.
+    omni::ui::dropUnmappedPresentationKeys(ImGui::GetDrawData());
 
     // Drain deferred/observer callbacks registered for end-of-frame.
     drainDeferredQueue();

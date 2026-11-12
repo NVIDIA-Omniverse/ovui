@@ -91,7 +91,7 @@ _KEY_ENTER = 257
 _KEY_KEYPAD_ENTER = 335
 
 
-# Issue #35 Step 4 — module-scope tracking of every dialog whose
+# module-scope tracking of every dialog whose
 # ui.Window is currently materialised. ``show()`` appends ``self``
 # AFTER ``ui.Window(...)`` succeeds (Round 4 / Round 5 F5: register on
 # show, not in __init__ — only dialogs that actually own a live
@@ -218,7 +218,7 @@ class ConfirmOverwriteDialog:
             height=_WINDOW_HEIGHT,
             flags=_WINDOW_FLAGS,
         )
-        # Issue #35 Step 4 / Round 4-5 F5: track only dialogs that
+        # track only dialogs that
         # actually own a live ui.Window. Guard with `not in` so a
         # re-show (idempotent path above this branch) doesn't double-
         # register.
@@ -392,7 +392,7 @@ class ConfirmOverwriteDialog:
 
     def _dismiss(self) -> None:
         """Hide + destroy the popup and drop every ovui reference."""
-        # Issue #35 Step 4: deregister BEFORE we touch the window so
+        # deregister BEFORE we touch the window so
         # _clear_open_dialogs() (called from Application.shutdown())
         # doesn't see a half-torn-down entry.
         try:
@@ -461,7 +461,7 @@ class ConfirmOverwriteDialog:
         self._on_window_key_pressed(key, 0, False)
 
 
-# ── Issue #35 Step 4: registry-driven shutdown cleanup ────────────────
+# ── registry-driven shutdown cleanup ────────────────
 # Same pattern as ovui_widgets.app/dialogs.py and ovui_widgets.app/file_dialogs.py. The
 # _OPEN_DIALOGS list is populated by show() (NOT __init__) so only
 # dialogs that actually own a live ui.Window are tracked

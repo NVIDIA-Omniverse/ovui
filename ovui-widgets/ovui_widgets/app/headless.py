@@ -75,9 +75,11 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     from ovui_widgets.app.native_runtime_bootstrap import (
         install_preconstructed_renderer,
+        limit_openusd_work_threads,
         preconstruct_selected_native_renderer,
     )
 
+    limit_openusd_work_threads()
     bootstrap = preconstruct_selected_native_renderer(args.settings_overrides)
     from ovui_widgets.app.application import Application
     app = Application(settings_overrides=args.settings_overrides)

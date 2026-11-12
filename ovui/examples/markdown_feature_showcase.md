@@ -1,7 +1,7 @@
 # MarkdownWidget Feature Review
 
 This document focuses on the new implementation surface: rich table cells,
-provider-backed HTTP images, optional SVG resolution, granular style groups,
+provider-backed HTTP images, native SVG images, granular style groups,
 font face quality, heading anchors, alerts, and the code-block copy button.
 
 ## Rich Inline Table Cells
@@ -12,7 +12,7 @@ font face quality, heading anchors, alerts, and the code-block copy button.
 | Link | [clickable table link](https://example.com/table-rich-link) in a wrapped cell with more text | Clickable |
 | Local image | icon in table cell: ![local icon](test_icon_32.png) | Rendered |
 | HTTP image | cached provider badge: ![http badge]({{HTTP_ICON_URL}}) | Rendered |
-| SVG image | optional SVG rasterization: ![svg badge](test_badge.svg) | Rasterized |
+| SVG image | native SVG rasterization: ![svg badge](test_badge.svg) | Rasterized |
 
 The link row intentionally wraps so hover/click hit testing can be checked
 inside a table, not only in regular paragraphs.
@@ -97,9 +97,9 @@ a local HTTP server and downloads this HTTP badge into `~/.cache/ovui-markdown-i
 
 ![http image]({{HTTP_ICON_URL}})
 
-SVG support is intentionally provider-owned for now. If `cairosvg` is installed,
-the provider rasterizes the SVG to a cached PNG; otherwise the widget shows its
-normal compact image placeholder.
+The widget draws a local SVG file at its own size with the same SVG painter as
+`ui.Image` and `ui.ImageWithProvider`. The painter does not draw `<text>`, so the
+word in this badge is left out, and one warning names the part that is not drawn.
 
 ![svg badge](test_badge.svg)
 

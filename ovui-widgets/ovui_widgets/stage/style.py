@@ -150,6 +150,8 @@ STAGE_STYLES = {
     #     readable right-edge eye glyph)
     #   - hidden / disabled eye tone  → ``cl.text_disabled`` (#4B4B4B — the
     #     paired quiet token for the toggled-off / non-toggleable states)
+    #   - inherited eye tone          → ``cl.text_disabled`` on the open eye:
+    #     the prim is not hidden itself, a hidden ancestor hides it
     # Visibility icon glyph size is 14 px (``_VISIBILITY_ICON_SIZE`` in
     # ``stage_delegate.py``), bumped from 12 px under UI-006 so the eye
     # reads at the reference's scale; the column-header eye preview in
@@ -236,6 +238,9 @@ STAGE_STYLES = {
         "color": cl.text_secondary,
     },
     "Stage.VisibilityIcon::hidden": {
+        "color": cl.text_disabled,
+    },
+    "Stage.VisibilityIcon::inherited": {
         "color": cl.text_disabled,
     },
     "Stage.VisibilityIcon::disabled": {

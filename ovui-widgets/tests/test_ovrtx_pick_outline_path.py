@@ -10,6 +10,7 @@ import glob as _glob
 import inspect
 import os as _os
 import tempfile as _tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -638,7 +639,7 @@ def test_two_rapid_picks_do_not_inherit_canceled_hit(monkeypatch):
 def test_collapsed_same_render_product_pick_delivers_latest_replacement_hit(monkeypatch):
     """ovrtx 0.3 can collapse rapid same-RenderProduct picks to latest hit.
 
-    Regression coverage: a rapid replacement pick under the same
+    Regression: a rapid replacement pick under the same
     RenderProduct returned the latest hit while the superseded FIFO slot
     was still at the adapter head, then a miss on the live slot. The live
     callback must receive that cached latest hit instead of ``None``.
@@ -878,6 +879,16 @@ class _RootOpenRenderer03:
         self.removed.append(handle)
 
 
+class _FinishedStep:
+    """An ovrtx step operation that is already done, with no render products."""
+
+    def wait(self, timeout_ns=None):
+        return self
+
+    def fetch(self, timeout_ns=None):
+        return {}
+
+
 def _make_load_stage_adapter(renderer) -> OvRtxRendererAdapter:
     adapter = _make_adapter(renderer)
     adapter._usd_handle = None
@@ -894,7 +905,6 @@ def _make_load_stage_adapter(renderer) -> OvRtxRendererAdapter:
 
 
 def _pxr_usd_modules():
-    pytest.importorskip("pxr")
     from pxr import Usd, UsdGeom
 
     return Usd, UsdGeom
@@ -1045,6 +1055,7 @@ def test_prim_resync_reloads_ovrtx_from_live_root_snapshot(tmp_path):
     stage = Usd.Stage.CreateNew(str(scene_path))
     world = UsdGeom.Xform.Define(stage, "/World")
     stage.SetDefaultPrim(world.GetPrim())
+    UsdGeom.Cube.Define(stage, "/World/OldCube")
     stage.GetRootLayer().Save()
 
     renderer = _RootOpenRenderer03()
@@ -1052,12 +1063,13 @@ def test_prim_resync_reloads_ovrtx_from_live_root_snapshot(tmp_path):
     adapter.load_stage(stage)
     renderer.calls.clear()
 
-    UsdGeom.Cube.Define(stage, "/World/NewCube")
-    assert "NewCube" not in scene_path.read_text(encoding="utf-8")
+    # A prim of the opened root is removed: the root is opened again.
+    stage.RemovePrim("/World/OldCube")
+    assert "OldCube" in scene_path.read_text(encoding="utf-8")
 
     adapter.notify_stage_changed(ChangeEvent(
         changed_paths=(),
-        resynced_paths=("/World/NewCube",),
+        resynced_paths=("/World/OldCube",),
         event_type=ChangeEventType.RESYNC,
     ))
 
@@ -1065,10 +1077,551 @@ def test_prim_resync_reloads_ovrtx_from_live_root_snapshot(tmp_path):
     snapshot_path = renderer.calls[0][1]
     assert snapshot_path != str(scene_path)
     assert snapshot_path.startswith(str(tmp_path))
-    assert "NewCube" in open(snapshot_path, encoding="utf-8").read()
+    assert "OldCube" not in open(snapshot_path, encoding="utf-8").read()
     assert renderer.calls[1][0:2] == ("session-string", renderer_mod._SESSION_ROOT_PATH)
     assert "FallbackDome" in renderer.calls[1][2]
     assert adapter._owned_tmp_path == snapshot_path
+
+
+def _loaded_scene_for_created_prims(tmp_path, renderer=None):
+    """A saved scene with /World, /World/OldCube and /World/Looks/Material, loaded."""
+    Usd, UsdGeom = _pxr_usd_modules()
+    from pxr import UsdShade
+
+    scene_path = tmp_path / "scene.usda"
+    stage = Usd.Stage.CreateNew(str(scene_path))
+    world = UsdGeom.Xform.Define(stage, "/World")
+    stage.SetDefaultPrim(world.GetPrim())
+    UsdGeom.Cube.Define(stage, "/World/OldCube")
+    UsdShade.Material.Define(stage, "/World/Looks/Material")
+    stage.GetRootLayer().Save()
+    renderer = renderer or _RootOpenRenderer03()
+    adapter = _make_load_stage_adapter(renderer)
+    adapter._latest_point_cloud_frames = {}  # set by the constructor of the real adapter
+    adapter.load_stage(stage)
+    renderer.calls.clear()
+    return scene_path, stage, renderer, adapter
+
+
+def _resync(adapter, prim_path, *changed):
+    adapter.notify_stage_changed(ChangeEvent(
+        changed_paths=tuple(changed),
+        resynced_paths=(prim_path,),
+        event_type=ChangeEventType.RESYNC,
+    ))
+
+
+def _reference_layer(usda):
+    from pxr import Sdf
+
+    layer = Sdf.Layer.CreateAnonymous(".usda")
+    assert layer.ImportFromString(usda)
+    return layer
+
+
+def test_created_prim_goes_to_ovrtx_as_a_reference_and_undo_removes_it(tmp_path):
+    # Each root open makes ovrtx keep more memory, so a created
+    # prim and its removal do not open the root again.
+    _Usd, UsdGeom = _pxr_usd_modules()
+    scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+
+    UsdGeom.Cube.Define(stage, "/World/NewCube").GetSizeAttr().Set(5.0)
+    _resync(adapter, "/World/NewCube", "/World/NewCube.size")
+
+    assert [call[0:2] for call in renderer.calls] == [("session-string", "/World/NewCube")]
+    reference = _reference_layer(renderer.calls[0][2])
+    assert reference.defaultPrim == "NewCube"
+    assert reference.GetPrimAtPath("/NewCube").typeName == "Cube"
+    assert reference.GetAttributeAtPath("/NewCube.size").default == 5.0
+    assert adapter._owned_tmp_path is None
+    assert "NewCube" not in scene_path.read_text(encoding="utf-8")
+
+    # Undo of the create removes the reference, and the root stays open.
+    stage.RemovePrim("/World/NewCube")
+    _resync(adapter, "/World/NewCube", "/World/NewCube.size")
+
+    assert renderer.removed == [renderer.calls[0][3]]
+    assert len(renderer.calls) == 1
+    assert adapter._owned_tmp_path is None
+
+
+def test_edit_of_a_created_prim_replaces_its_reference(tmp_path):
+    from pxr import Sdf
+
+    _Usd, UsdGeom = _pxr_usd_modules()
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    UsdGeom.Cube.Define(stage, "/World/NewCube")
+    _resync(adapter, "/World/NewCube")
+    first_handle = renderer.calls[0][3]
+
+    # A property that ovrtx does not take as a live write.
+    stage.GetPrimAtPath("/World/NewCube").CreateAttribute(
+        "note", Sdf.ValueTypeNames.String
+    ).Set("edited")
+    _resync(adapter, "/World/NewCube.note")
+
+    assert renderer.removed == [first_handle]
+    assert [call[0:2] for call in renderer.calls] == [
+        ("session-string", "/World/NewCube"),
+        ("session-string", "/World/NewCube"),
+    ]
+    assert _reference_layer(renderer.calls[1][2]).GetAttributeAtPath(
+        "/NewCube.note"
+    ).default == "edited"
+    assert adapter._owned_tmp_path is None
+
+
+def test_resync_of_a_prim_of_the_opened_root_reloads_the_root(tmp_path):
+    # ovrtx already has this prim from the root that it opened.
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    stage.DefinePrim("/World/OldCube", "Sphere")
+    _resync(adapter, "/World/OldCube")
+
+    assert renderer.calls[0][0] == "file"
+    assert not [call for call in renderer.calls if call[0:2] == ("session-string", "/World/OldCube")]
+    assert adapter._live_prim_reference_paths == []
+
+
+@pytest.mark.parametrize("case", ["outside_target", "reference_arc", "session_opinion", "variant_set"])
+def test_created_prim_that_the_root_layer_alone_cannot_give_reloads_the_root(tmp_path, case):
+    # A copy of the root layer specs of the prim would show it wrong; the
+    # root opens again with the prim, as before.
+    from pxr import Sdf, UsdShade
+
+    Usd, UsdGeom = _pxr_usd_modules()
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    prim = UsdGeom.Xform.Define(stage, "/World/NewXform").GetPrim()
+    if case == "outside_target":
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+            UsdShade.Material(stage.GetPrimAtPath("/World/Looks/Material"))
+        )
+    elif case == "reference_arc":
+        other = tmp_path / "other.usda"
+        other_stage = Usd.Stage.CreateNew(str(other))
+        other_stage.SetDefaultPrim(UsdGeom.Xform.Define(other_stage, "/Other").GetPrim())
+        other_stage.GetRootLayer().Save()
+        prim.GetReferences().AddReference(str(other))
+    elif case == "session_opinion":
+        with Usd.EditContext(stage, stage.GetSessionLayer()):
+            prim.CreateAttribute("note", Sdf.ValueTypeNames.String).Set("session")
+    else:
+        prim.GetVariantSets().AddVariantSet("look").AddVariant("red")
+    _resync(adapter, "/World/NewXform")
+
+    assert renderer.calls[0][0] == "file"
+    assert not [call for call in renderer.calls if call[0:2] == ("session-string", "/World/NewXform")]
+    assert adapter._live_prim_reference_paths == []
+
+
+def test_layer_metadata_change_reloads_the_root(tmp_path):
+    # The default prim is metadata of the root layer, which only a reload gives to ovrtx.
+    _Usd, UsdGeom = _pxr_usd_modules()
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    UsdGeom.Xform.Define(stage, "/World/NewXform")
+    _resync(adapter, "/World/NewXform")
+    renderer.calls.clear()
+
+    stage.SetDefaultPrim(stage.GetPrimAtPath("/World/NewXform"))
+    adapter.notify_stage_changed(ChangeEvent(
+        changed_paths=("/World/NewXform",),
+        resynced_paths=(),
+        event_type=ChangeEventType.LAYER_INFO,
+    ))
+
+    assert renderer.calls[0][0] == "file"
+    assert adapter._live_prim_reference_paths == []
+
+
+def test_created_prim_reference_keeps_asset_paths_and_time_codes(tmp_path):
+    from pxr import Sdf
+
+    _Usd, UsdGeom = _pxr_usd_modules()
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    stage.GetRootLayer().timeCodesPerSecond = 30.0
+    renderer.calls.clear()  # the layer metadata change itself is not under test
+    prim = UsdGeom.Cube.Define(stage, "/World/NewCube").GetPrim()
+    prim.CreateAttribute("texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath("./tex.png"))
+    prim.CreateAttribute("weight", Sdf.ValueTypeNames.Float).Set(2.0, 10.0)
+    _resync(adapter, "/World/NewCube")
+
+    assert [call[0:2] for call in renderer.calls] == [("session-string", "/World/NewCube")]
+    reference = _reference_layer(renderer.calls[0][2])
+    # The copy is not beside the root layer, so a relative path resolves as from the root layer.
+    # USD writes the path with forward slashes also on Windows; Path compares the two forms as one path.
+    anchored = reference.GetAttributeAtPath("/NewCube.texture").default.path
+    assert _os.path.isabs(anchored)
+    assert Path(anchored) == tmp_path / "tex.png"
+    # Time samples map to the same stage time as in the root layer.
+    assert reference.timeCodesPerSecond == 30.0
+    assert reference.QueryTimeSample("/NewCube.weight", 10.0) == 2.0
+
+
+def test_renderer_with_root_layer_overlays_keeps_the_path_of_main(tmp_path):
+    # A renderer that has add_usd_layer gets a created prim as on main (here a
+    # reload, for a property that ovrtx cannot take live), not as a reference
+    # of the prim alone.
+    class _OverlayRenderer(_RootOpenRenderer03):
+        def __init__(self):
+            super().__init__()
+            self.opened_texts = []
+
+        def open_usd_from_file(self, path):
+            super().open_usd_from_file(path)
+            with open(path, encoding="utf-8") as stream:
+                self.opened_texts.append(stream.read())
+
+        def add_usd_layer(self, usda, path_prefix=None):
+            handle = f"overlay-{len(self.calls)}"
+            self.calls.append(("overlay", path_prefix, usda, handle))
+            return handle
+
+    from pxr import Sdf
+
+    _Usd, UsdGeom = _pxr_usd_modules()
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(
+        tmp_path, _OverlayRenderer()
+    )
+    cube = UsdGeom.Cube.Define(stage, "/World/NewCube")
+    cube.GetSizeAttr().Set(3.0)
+    cube.GetPrim().CreateAttribute("note", Sdf.ValueTypeNames.String).Set("x")
+    renderer.opened_texts.clear()
+    _resync(adapter, "/World/NewCube", "/World/NewCube.note")
+
+    assert not [call for call in renderer.calls if call[0:2] == ("session-string", "/World/NewCube")]
+    assert adapter._live_prim_reference_paths == []
+    # The scene reloads, and the root that the renderer opens has the Cube with its size.
+    assert [call[0] for call in renderer.calls][:1] == ["file"]
+    reopened = _reference_layer(renderer.opened_texts[0])
+    assert reopened.GetPrimAtPath("/World/NewCube").typeName == "Cube"
+    assert reopened.GetAttributeAtPath("/World/NewCube.size").default == 3.0
+
+
+def test_failed_reload_restores_the_created_prim_references(tmp_path):
+    # When a later reopen fails, the previous native scene comes back, with
+    # the created prims that it showed.
+    class _FailingSnapshotRenderer(_RootOpenRenderer03):
+        allowed_path = None
+
+        def open_usd_from_file(self, path):
+            if self.allowed_path is not None and path != self.allowed_path:
+                raise RuntimeError(f"native root open failed: {path}")
+            super().open_usd_from_file(path)
+
+    _Usd, UsdGeom = _pxr_usd_modules()
+    scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(
+        tmp_path, _FailingSnapshotRenderer()
+    )
+    UsdGeom.Cube.Define(stage, "/World/NewCube")
+    _resync(adapter, "/World/NewCube")
+    UsdGeom.Xform.Define(stage, "/World/NewXform")
+    _resync(adapter, "/World/NewXform")
+    renderer.calls.clear()
+
+    renderer.allowed_path = str(scene_path)
+    stage.RemovePrim("/World/OldCube")
+    _resync(adapter, "/World/OldCube")
+
+    assert ("file", str(scene_path)) in [call[0:2] for call in renderer.calls]
+    assert [call[0:2] for call in renderer.calls if call[1] == "/World/NewCube"] == [
+        ("session-string", "/World/NewCube")
+    ]
+    assert [str(path) for path in adapter._live_prim_reference_paths] == ["/World/NewCube"]
+    assert not [call for call in renderer.calls if call[1] == "/World/NewXform"]
+    assert [str(path) for path in adapter._undrawn_created_prim_paths] == ["/World/NewXform"]
+
+
+def test_created_prim_that_draws_nothing_stays_out_of_ovrtx_and_keeps_the_picture(tmp_path):
+    # ovrtx keeps memory on each render step, and the viewport renders after
+    # each change it is told about; an Xform draws nothing.
+    _Usd, UsdGeom = _pxr_usd_modules()
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    created = ChangeEvent(changed_paths=(), resynced_paths=("/World/NewXform",), event_type=ChangeEventType.RESYNC)
+
+    UsdGeom.Xform.Define(stage, "/World/NewXform")
+    adapter._still_frame_requested = False
+    assert adapter.stage_change_keeps_picture(created) is True
+    adapter.notify_stage_changed(created)
+    assert renderer.calls == [] and renderer.removed == []
+    # The adapter does not ask itself for a step either.
+    assert adapter._still_frame_requested is False
+
+    # An edit of the Xform, and its removal (Undo of Create > Xform), keep the picture too.
+    UsdGeom.Xform(stage.GetPrimAtPath("/World/NewXform")).AddTranslateOp().Set((1.0, 2.0, 3.0))
+    moved = ChangeEvent(
+        changed_paths=("/World/NewXform.xformOp:translate", "/World/NewXform.xformOpOrder"),
+        resynced_paths=(),
+        event_type=ChangeEventType.INFO_CHANGE,
+    )
+    assert adapter.stage_change_keeps_picture(moved) is True
+    adapter.notify_stage_changed(moved)
+    stage.RemovePrim("/World/NewXform")
+    assert adapter.stage_change_keeps_picture(created) is True
+    adapter.notify_stage_changed(created)
+    assert renderer.calls == [] and renderer.removed == []
+    assert adapter._undrawn_created_prim_paths == []
+    assert adapter._owned_tmp_path is None
+    assert adapter._still_frame_requested is False
+
+
+def test_shape_under_a_created_xform_takes_the_xform_to_ovrtx(tmp_path):
+    _Usd, UsdGeom = _pxr_usd_modules()
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    UsdGeom.Xform.Define(stage, "/World/NewXform")
+    _resync(adapter, "/World/NewXform")
+
+    UsdGeom.Sphere.Define(stage, "/World/NewXform/Ball")
+    added = ChangeEvent(changed_paths=(), resynced_paths=("/World/NewXform/Ball",), event_type=ChangeEventType.RESYNC)
+    assert adapter.stage_change_keeps_picture(added) is False
+    adapter.notify_stage_changed(added)
+
+    assert [call[0:2] for call in renderer.calls] == [("session-string", "/World/NewXform")]
+    assert _reference_layer(renderer.calls[0][2]).GetPrimAtPath("/NewXform/Ball").typeName == "Sphere"
+    assert adapter._undrawn_created_prim_paths == []
+
+    # Without the Sphere the Xform draws nothing again: its reference goes away.
+    stage.RemovePrim("/World/NewXform/Ball")
+    assert adapter.stage_change_keeps_picture(added) is False
+    adapter.notify_stage_changed(added)
+    assert renderer.removed == [renderer.calls[0][3]]
+    assert len(renderer.calls) == 1
+    assert [str(path) for path in adapter._undrawn_created_prim_paths] == ["/World/NewXform"]
+
+
+def test_undo_of_a_live_edit_of_a_created_shape_is_written_and_rendered(tmp_path, monkeypatch):
+    # A committed Translate of a created Cube goes to ovrtx as a live write,
+    # not in the text of its reference. Its Undo makes the specs equal to that
+    # text again, but ovrtx still has the edited value: the Undo must be
+    # written to ovrtx and rendered, as on a prim of the opened file.
+    _Usd, UsdGeom = _pxr_usd_modules()
+    renderer = _RootOpenRenderer03()
+    renderer.write_attribute = lambda *args, **kwargs: renderer.calls.append(
+        ("write_attribute", args, kwargs)
+    )
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path, renderer)
+    monkeypatch.setattr(
+        renderer_mod, "_ovrtx",
+        SimpleNamespace(Semantic=SimpleNamespace(XFORM_MAT4x4="matrix")),
+    )
+    translate = UsdGeom.Cube.Define(stage, "/World/NewCube").AddTranslateOp()
+    translate.Set((0.0, 0.0, 50.0))
+    _resync(adapter, "/World/NewCube", "/World/NewCube.xformOp:translate", "/World/NewCube.xformOpOrder")
+    assert [call[0:2] for call in renderer.calls] == [("session-string", "/World/NewCube")]
+
+    def moved():
+        # Each change of the stage is a new event, as in the app.
+        return ChangeEvent(
+            changed_paths=("/World/NewCube.xformOp:translate",),
+            resynced_paths=(),
+            event_type=ChangeEventType.INFO_CHANGE,
+        )
+
+    def last_written_translate():
+        writes = [call for call in renderer.calls if call[0] == "write_attribute"]
+        assert writes and writes[-1][2]["prim_paths"] == ["/World/NewCube"]
+        return tuple(writes[-1][2]["tensor"][0, 3, :3])
+
+    translate.Set((150.0, 0.0, 50.0))
+    edit = moved()
+    assert adapter.stage_change_keeps_picture(edit) is False
+    adapter.notify_stage_changed(edit)
+    assert np.allclose(last_written_translate(), (150.0, 0.0, 50.0))
+    assert len([call for call in renderer.calls if call[0] == "session-string"]) == 1
+
+    # Undo: the specs are again those of the reference text.
+    translate.Set((0.0, 0.0, 50.0))
+    adapter._still_frame_requested = False
+    undo = moved()
+    assert adapter.stage_change_keeps_picture(undo) is False
+    adapter.notify_stage_changed(undo)
+    assert np.allclose(last_written_translate(), (0.0, 0.0, 50.0))
+    assert adapter._still_frame_requested is True
+
+
+def test_a_failed_created_prim_step_is_reported_once_and_the_scene_reloads(tmp_path, monkeypatch, capsys):
+    # The viewport asks stage_change_keeps_picture and then gives the same
+    # change to notify_stage_changed. A failure of the created-prim step is
+    # reported once, with its cause, and the scene reloads with the prim.
+    from pxr import Sdf
+
+    _Usd, UsdGeom = _pxr_usd_modules()
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    copy_spec = Sdf.CopySpec
+
+    def copy_spec_that_fails_for_the_cube(source_layer, source_path, target_layer, target_path, *args):
+        if str(source_path) == "/World/NewCube" and str(target_path) == "/NewCube":
+            raise RuntimeError("the copy failed")
+        return copy_spec(source_layer, source_path, target_layer, target_path, *args)
+
+    monkeypatch.setattr(Sdf, "CopySpec", copy_spec_that_fails_for_the_cube)
+    UsdGeom.Cube.Define(stage, "/World/NewCube")
+    capsys.readouterr()
+    created = ChangeEvent(changed_paths=(), resynced_paths=("/World/NewCube",), event_type=ChangeEventType.RESYNC)
+
+    assert adapter.stage_change_keeps_picture(created) is False
+    adapter.notify_stage_changed(created)
+
+    reports = [line for line in capsys.readouterr().err.splitlines() if "created prims" in line]
+    assert len(reports) == 1, reports
+    assert "cannot prepare" in reports[0] and "RuntimeError: the copy failed" in reports[0]
+    assert not [call for call in renderer.calls if call[0:2] == ("session-string", "/World/NewCube")]
+    assert renderer.calls[0][0] == "file"
+    with open(renderer.calls[0][1], encoding="utf-8") as reopened:
+        assert 'def Cube "NewCube"' in reopened.read()
+
+
+def test_a_failed_prim_lookup_for_the_outline_is_reported_and_the_outline_is_written(monkeypatch, capsys):
+    fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
+    monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
+    renderer = _FakeResettableRenderer()
+    adapter = _make_adapter(renderer)
+
+    def failing_lookup(path):
+        raise RuntimeError("the stage is closed")
+
+    adapter._stage = SimpleNamespace(GetPrimAtPath=failing_lookup)
+    capsys.readouterr()
+
+    assert adapter.set_selection_highlight(["/World/Cube"]) is True
+    assert renderer.outline_group_calls
+    err = capsys.readouterr().err
+    assert "cannot look up '/World/Cube' in the stage for the selection outline" in err
+    assert "RuntimeError: the stage is closed" in err
+
+
+def test_first_create_on_a_new_stage_sends_the_new_parent_with_the_prim(tmp_path):
+    # Create > Mesh > Torus on a stage without /World (File > New) makes /World
+    # and /World/Torus. The first change names only /World/Torus, the next one
+    # /World too. ovrtx adds a missing parent of a reference itself and then
+    # refuses a reference at that parent, so /World goes with the Torus.
+    Usd, UsdGeom = _pxr_usd_modules()
+    stage = Usd.Stage.CreateNew(str(tmp_path / "NewStage.usda"))
+    renderer = _RootOpenRenderer03()
+    adapter = _make_load_stage_adapter(renderer)
+    adapter._latest_point_cloud_frames = {}
+    adapter.load_stage(stage)
+    renderer.calls.clear()
+    UsdGeom.Xform.Define(stage, "/World")
+    UsdGeom.Mesh.Define(stage, "/World/Torus")
+
+    _resync(adapter, "/World/Torus")
+    assert [call[0:2] for call in renderer.calls] == [("session-string", "/World")]
+    assert _reference_layer(renderer.calls[0][2]).GetPrimAtPath("/World/Torus").typeName == "Mesh"
+
+    adapter.notify_stage_changed(ChangeEvent(
+        changed_paths=("/World/Torus.points",),
+        resynced_paths=("/World", "/World/Torus"),
+        event_type=ChangeEventType.RESYNC,
+    ))
+    assert [call[0] for call in renderer.calls if call[0] in ("file", "string")] == []
+    assert not [call for call in renderer.calls if call[0:2] == ("session-string", "/World/Torus")]
+    assert [str(path) for path in adapter._live_prim_reference_paths] == ["/World"]
+
+
+def test_created_prim_after_the_root_file_changed_reloads_the_root(tmp_path):
+    # ovrtx keeps its first read of the root file. Here another program
+    # writes the file without /World after the open, while ovrtx still has
+    # /World: the file no longer tells what ovrtx opened, so a created prim
+    # reloads the scene once, and ovrtx gets no reference where it has a prim.
+    _Usd, UsdGeom = _pxr_usd_modules()
+    scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    scene_path.write_text("#usda 1.0\n", encoding="utf-8")
+    UsdGeom.Cube.Define(stage, "/World/NewCube")
+
+    _resync(adapter, "/World/NewCube")
+
+    assert renderer.calls[0][0] == "file"
+    assert renderer.calls[0][1] != str(scene_path)
+    assert not [call for call in renderer.calls if call[0] == "session-string" and call[1].startswith("/World")]
+    # ovrtx builds the reloaded scene again in its next step, and stage
+    # changes wait for that step. Run the step as the frame loop does.
+    renderer.step_async = lambda **_kwargs: _FinishedStep()
+    while adapter.scene_update_pending():
+        adapter._rebuild_step_runs()
+    # The reloaded root is a snapshot that ovrtx has as it is: the next created prim needs no reload.
+    renderer.calls.clear()
+    UsdGeom.Cube.Define(stage, "/World/OtherCube")
+    _resync(adapter, "/World/OtherCube")
+    assert [call[0:2] for call in renderer.calls] == [("session-string", "/World/OtherCube")]
+
+
+def test_created_xform_with_an_applied_schema_goes_to_ovrtx(tmp_path):
+    # An applied schema (here a light schema) can make the prim draw.
+    from pxr import UsdLux
+
+    _Usd, UsdGeom = _pxr_usd_modules()
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    UsdLux.LightAPI.Apply(UsdGeom.Xform.Define(stage, "/World/NewXform").GetPrim())
+    created = ChangeEvent(changed_paths=(), resynced_paths=("/World/NewXform",), event_type=ChangeEventType.RESYNC)
+
+    assert adapter.stage_change_keeps_picture(created) is False
+    adapter.notify_stage_changed(created)
+    assert ("session-string", "/World/NewXform") in [call[0:2] for call in renderer.calls]
+
+
+def test_created_xform_change_that_needs_a_reload_does_not_keep_the_picture(tmp_path):
+    _Usd, UsdGeom = _pxr_usd_modules()
+    _scene_path, stage, renderer, adapter = _loaded_scene_for_created_prims(tmp_path)
+    UsdGeom.Xform.Define(stage, "/World/NewXform")
+    _resync(adapter, "/World/NewXform")
+
+    stage.SetDefaultPrim(stage.GetPrimAtPath("/World/NewXform"))
+    metadata = ChangeEvent(
+        changed_paths=("/World/NewXform",), resynced_paths=(), event_type=ChangeEventType.LAYER_INFO
+    )
+    assert adapter.stage_change_keeps_picture(metadata) is False
+    # A change of the session layer (the render settings follow it) also renders.
+    session = ChangeEvent(
+        changed_paths=(renderer_mod._LDR_VAR_PATH + ".sourceName",),
+        resynced_paths=("/World/NewXform",),
+        event_type=ChangeEventType.RESYNC,
+    )
+    assert adapter.stage_change_keeps_picture(session) is False
+    # So does a change of a prim of the opened root.
+    stage.RemovePrim("/World/OldCube")
+    removed = ChangeEvent(changed_paths=(), resynced_paths=("/World/OldCube",), event_type=ChangeEventType.RESYNC)
+    assert adapter.stage_change_keeps_picture(removed) is False
+
+
+def test_empty_selection_after_an_empty_selection_writes_nothing(monkeypatch):
+    # The viewport selects no mesh for an Xform that draws nothing: its outline
+    # cannot change, and the viewport needs no render for it.
+    fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
+    monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
+    renderer = _FakeResettableRenderer()
+    adapter = _make_adapter(renderer)
+    adapter._still_frame_requested = False
+
+    assert adapter.set_selection_highlight([]) is False
+    adapter.refresh_selection_highlight([])
+    assert renderer.outline_group_calls == []
+    assert adapter._still_frame_requested is False
+
+    assert adapter.set_selection_highlight(["/World/Cube"]) is True
+    # The clear of an outline changes the picture.
+    assert adapter.set_selection_highlight([]) is True
+    assert adapter._still_frame_requested is True
+
+
+def test_selection_of_a_removed_prim_writes_nothing(monkeypatch):
+    # Undo of Create > Xform removes the selected Xform; the viewport then
+    # gives its path again, and a prim that is gone outlines nothing.
+    Usd, UsdGeom = _pxr_usd_modules()
+    fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
+    monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Cube.Define(stage, "/World/Cube")
+    renderer = _FakeResettableRenderer()
+    adapter = _make_adapter(renderer)
+    adapter._stage = stage
+    adapter._still_frame_requested = False
+
+    assert adapter.set_selection_highlight(["/World/Xform"]) is False
+    adapter.refresh_selection_highlight(["/World/Xform"])
+    assert renderer.outline_group_calls == []
+    assert adapter._still_frame_requested is False
+
+    assert adapter.set_selection_highlight(["/World/Xform", "/World/Cube"]) is True
+    assert renderer.outline_group_calls
 
 
 def test_load_stage_strips_stale_root_session_scaffolding_from_ovrtx_snapshot(
@@ -1252,3 +1805,263 @@ def test_selection_highlight_activates_outline_pass_once(monkeypatch):
     adapter.set_selection_highlight(["/World/Cube"])
     adapter.set_selection_highlight([])
     assert renderer.reset_calls == 2
+
+
+class _ResettableRootOpenRenderer(_RootOpenRenderer03, _FakeResettableRenderer):
+    def __init__(self) -> None:
+        _RootOpenRenderer03.__init__(self)
+        _FakeResettableRenderer.__init__(self)
+
+
+def _with_native_pacing(adapter):
+    """The process can run a native pacing session (renderer hooks and Vulkan)."""
+    adapter._native_frame_pacing_available = lambda: True
+    return adapter
+
+
+def _start_pass_with_first_selection(adapter, path="/World/Cube"):
+    """Select a prim and clear the selection again: the first selection starts the pass."""
+    adapter.set_selection_highlight([path])
+    adapter.set_selection_highlight([])
+
+
+def test_scene_open_leaves_the_outline_pass_off(monkeypatch):
+    """Opening a scene writes no anchor and resets nothing.
+
+    With the anchor in a group at the first render, ovrtx builds the outline
+    pass into that render and the scene appears later. Started right after
+    the first frames, the pass needs a reset and a restart of the rendering
+    session while the user waits for the scene. Only a selection starts it.
+    """
+    from pxr import Usd, UsdGeom
+
+    fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
+    monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Xform.Define(stage, "/World")
+    UsdGeom.Cube.Define(stage, "/World/Cube")
+    renderer = _ResettableRootOpenRenderer()
+    adapter = _with_native_pacing(_make_load_stage_adapter(renderer))
+    stops = []
+    adapter._stop_native_frame_pacing = lambda reason, **kw: stops.append(reason)
+
+    adapter.load_stage(stage)
+
+    hidden_group = renderer_mod._SELECTION_OUTLINE_HIDDEN_GROUP_ID
+    assert not [c for c in renderer.outline_group_calls if c[1] == hidden_group]
+    assert renderer.reset_calls == 0
+    assert adapter._selection_outline_pass_needs_reset is True
+    assert not [reason for reason in stops if "outline" in reason]
+
+
+def test_the_first_selection_resets_once_and_anchors(monkeypatch):
+    """The first selection starts the pass with one reset; later ones need none."""
+    from pxr import Usd, UsdGeom
+
+    fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
+    monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Xform.Define(stage, "/World")
+    UsdGeom.Cube.Define(stage, "/World/Cube")
+    renderer = _ResettableRootOpenRenderer()
+    adapter = _with_native_pacing(_make_load_stage_adapter(renderer))
+    adapter.load_stage(stage)
+
+    adapter.set_selection_highlight(["/World/Cube"])
+    adapter.set_selection_highlight([])
+    adapter.set_selection_highlight(["/World/Cube"])
+
+    assert renderer.reset_calls == 1
+    hidden_group = renderer_mod._SELECTION_OUTLINE_HIDDEN_GROUP_ID
+    assert ([renderer_mod._SELECTION_OUTLINE_ANCHOR_PATH], hidden_group) in renderer.outline_group_calls
+
+
+def _pacing_bindings(present_rate=-1.0, supported=True, backend="vulkan", status_error=None):
+    """``omni.ui``'s native pacing entry points with the given status."""
+
+    def status():
+        if status_error is not None:
+            raise status_error
+        return {"supported": supported, "backend": backend}
+
+    return SimpleNamespace(
+        _get_present_rate=lambda: present_rate,
+        _get_native_frame_pacing_status=status,
+    )
+
+
+@pytest.mark.parametrize(
+    ("bindings", "available"),
+    [
+        (_pacing_bindings(), True),
+        # OpenGL presentation: no standalone Vulkan backend is registered.
+        (_pacing_bindings(backend=""), False),
+        # No RTX Tools: no renderer hooks are installed.
+        (_pacing_bindings(supported=False), False),
+        # Presentation on the ordinary UI tick only.
+        (_pacing_bindings(present_rate=0.0), False),
+        (None, False),
+    ],
+    ids=["hooks-and-vulkan", "opengl", "no-hooks", "present-rate-zero", "no-bindings"],
+)
+def test_native_pacing_needs_renderer_hooks_and_vulkan_presentation(bindings, available):
+    """Only renderer hooks with Vulkan presentation defer the outline pass."""
+    adapter = _make_adapter(_FakeRenderer())
+    adapter._frame_pacing_bindings = lambda: bindings
+
+    assert adapter._native_frame_pacing_available() is available
+
+
+def test_a_failed_pacing_status_read_is_reported_with_its_cause(capsys):
+    """A pacing status that cannot be read is reported, not taken silently as absent."""
+    adapter = _make_adapter(_FakeRenderer())
+    adapter._frame_pacing_bindings = lambda: _pacing_bindings(
+        status_error=RuntimeError("status table is gone")
+    )
+
+    assert adapter._native_frame_pacing_available() is False
+
+    err = capsys.readouterr().err
+    assert "reading the native frame pacing status failed" in err
+    assert "RuntimeError: status table is gone" in err
+
+
+def test_without_native_pacing_the_first_selection_does_not_reset_renderer(monkeypatch):
+    """Without native frame pacing the first click shows its outline at once.
+
+    With no renderer hooks (no RTX Tools), or with OpenGL presentation, no
+    native pacing session runs, so nothing starts the outline pass after the
+    scene's first frames. A reset at the first click then stops the UI and
+    the outline shows late. The anchor is written at scene open instead, and
+    the first selection needs no reset. The pacing status here is that of an
+    app without RTX Tools: Vulkan presentation, no renderer hooks.
+    """
+    from pxr import Usd, UsdGeom
+
+    fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
+    monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Xform.Define(stage, "/World")
+    UsdGeom.Cube.Define(stage, "/World/Cube")
+    renderer = _ResettableRootOpenRenderer()
+    adapter = _make_load_stage_adapter(renderer)
+    adapter._frame_pacing_bindings = lambda: _pacing_bindings(supported=False)
+    adapter.load_stage(stage)
+    hidden_group = renderer_mod._SELECTION_OUTLINE_HIDDEN_GROUP_ID
+    assert ([renderer_mod._SELECTION_OUTLINE_ANCHOR_PATH], hidden_group) in renderer.outline_group_calls
+
+    adapter.set_selection_highlight(["/World/Cube"])
+
+    assert renderer.reset_calls == 0
+    assert (["/World/Cube"], 1) in renderer.outline_group_calls
+
+
+def test_scene_open_anchors_the_outline_pass_on_the_session_mesh(monkeypatch):
+    """No scene prim is the outline anchor; the user can hide any of them.
+
+    An anchor in the user's scene leaves the viewport with no outline after
+    the user hides that prim with its eye and then selects something else.
+    The anchor is the session layer's own mesh instead, which no user can
+    hide or select.
+    """
+    from pxr import Usd, UsdGeom
+
+    fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
+    monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Xform.Define(stage, "/World")
+    UsdGeom.Cube.Define(stage, "/World/Cube")
+    UsdGeom.Sphere.Define(stage, "/World/Sphere")
+    renderer = _ResettableRootOpenRenderer()
+    adapter = _with_native_pacing(_make_load_stage_adapter(renderer))
+
+    adapter.load_stage(stage)
+    _start_pass_with_first_selection(adapter)
+
+    session_usda = renderer.calls[1][2]
+    assert 'def Mesh "OutlineAnchor"' in session_usda
+    anchor_path = getattr(renderer_mod, "_SELECTION_OUTLINE_ANCHOR_PATH", "")
+    hidden_group = renderer_mod._SELECTION_OUTLINE_HIDDEN_GROUP_ID
+    hidden_writes = [
+        paths for paths, group in renderer.outline_group_calls if group == hidden_group
+    ]
+    assert hidden_writes and all(paths == [anchor_path] for paths in hidden_writes)
+    assert adapter._selection_outline_anchor_applied is True
+
+    # The eye of the first scene prim, then a selection somewhere else.
+    UsdGeom.Imageable(stage.GetPrimAtPath("/World/Cube")).MakeInvisible()
+    adapter.set_selection_highlight(["/World/Sphere"])
+
+    assert renderer.reset_calls == 1  # the one reset that started the pass
+    assert (["/World/Sphere"], 1) in renderer.outline_group_calls
+    # The anchor is still the only member of the hidden group.
+    hidden_writes = [
+        paths for paths, group in renderer.outline_group_calls if group == hidden_group
+    ]
+    assert all(paths == [anchor_path] for paths in hidden_writes)
+
+
+def _load_two_rack_stage(monkeypatch):
+    from pxr import Usd, UsdGeom
+
+    fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
+    monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Xform.Define(stage, "/World")
+    UsdGeom.Cube.Define(stage, "/World/RackA/Shelf")
+    UsdGeom.Cube.Define(stage, "/World/RackB/Shelf")
+    renderer = _ResettableRootOpenRenderer()
+    adapter = _make_load_stage_adapter(renderer)
+    adapter.load_stage(stage)
+    return renderer, adapter
+
+
+def test_session_layer_reinject_puts_the_anchor_back(monkeypatch):
+    """A new session layer (for example after a Viewport resize) gets its anchor again."""
+    renderer, adapter = _load_two_rack_stage(monkeypatch)
+    _start_pass_with_first_selection(adapter, "/World/RackA/Shelf")
+    renderer.outline_group_calls.clear()
+
+    adapter._reinject_session_layer()
+
+    assert renderer.outline_group_calls == [(["/OvGearSession/OutlineAnchor"], 2)]
+    assert adapter._selection_outline_pass_needs_reset is False
+
+
+def test_failed_anchor_write_is_reported_and_the_next_session_layer_tries_again(
+    monkeypatch, capsys
+):
+    """A failed anchor write is reported with its cause.
+
+    The first-selection reset stays armed, as on main, and the next session
+    layer (for example after a Viewport resize) writes the anchor again.
+    """
+    from pxr import Usd, UsdGeom
+
+    fake_ovrtx = SimpleNamespace(SelectionGroupStyle=_SelectionGroupStyle)
+    monkeypatch.setattr(renderer_mod, "_ovrtx", fake_ovrtx)
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Cube.Define(stage, "/World/Cube")
+    renderer = _ResettableRootOpenRenderer()
+    # A scene open writes the anchor twice: with its session layer, and again
+    # after it clears the outline state.
+    for _ in range(2):
+        renderer.outline_group_outcomes.append(RuntimeError("injected anchor failure"))
+    adapter = _make_load_stage_adapter(renderer)
+    adapter._selection_outline_armed = True  # an earlier scene already started the pass
+
+    adapter.load_stage(stage)
+
+    err = capsys.readouterr().err
+    assert "selection outline anchor write failed (/OvGearSession/OutlineAnchor)" in err
+    assert "RuntimeError: injected anchor failure" in err
+    assert adapter._selection_outline_anchor_applied is False
+    assert adapter._selection_outline_pass_needs_reset is True
+
+    adapter._reinject_session_layer()
+
+    assert renderer.outline_group_calls[-1] == (["/OvGearSession/OutlineAnchor"], 2)
+    assert adapter._selection_outline_anchor_applied is True
+    assert capsys.readouterr().err == ""
+
+

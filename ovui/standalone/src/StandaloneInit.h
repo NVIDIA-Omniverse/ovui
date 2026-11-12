@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <tuple>
+#include <vector>
 
 #ifdef _WIN32
 #  ifdef OMNIUI_STANDALONE_EXPORTS
@@ -25,6 +27,41 @@ namespace standalone {
 
 OMNIUI_STANDALONE_API bool init(const char* title = "omni.ui", int width = 1280, int height = 720);
 OMNIUI_STANDALONE_API bool tick();
+
+/// Hooks that let a host give up its own lock while this thread waits inside
+/// native presentation (glfwSwapBuffers, vkQueuePresentKHR). ``begin`` runs
+/// just before the wait and returns a token; ``end`` runs right after it with
+/// that token. The hooks apply only to the calling thread, so a native caller
+/// that never sets them is not changed. Pass null pointers to clear them.
+/// Not every present call is covered: the Vulkan FAST presentation mode
+/// presents inside VulkanBackend::endFastFrame() while the frame holds the
+/// native queue lock, outside this scope, so the hooks do not run there.
+using PresentWaitBeginFn = void* (*)();
+using PresentWaitEndFn = void (*)(void* token);
+OMNIUI_STANDALONE_API void setPresentWaitHooks(PresentWaitBeginFn begin, PresentWaitEndFn end);
+
+/// Test seam: make every present wait of the process last at least ``ms``
+/// milliseconds (0 turns it off). The wait runs inside the present-wait scope,
+/// after the hooks ran, so it blocks the same way a slow display does and
+/// needs no special display. The window of the last wait is kept, in seconds
+/// on the ``steady_clock`` (the epoch of Python's ``time.perf_counter()``).
+/// ``end`` is 0 while the wait is still running.
+OMNIUI_STANDALONE_API void setPresentWaitTestDelayMs(int ms);
+OMNIUI_STANDALONE_API void getPresentWaitTestWindow(double* begin, double* end);
+
+/// Scope that runs the present-wait hooks of the calling thread, if any.
+class OMNIUI_STANDALONE_API PresentWaitScope
+{
+public:
+    PresentWaitScope();
+    ~PresentWaitScope();
+    PresentWaitScope(const PresentWaitScope&) = delete;
+    PresentWaitScope& operator=(const PresentWaitScope&) = delete;
+
+private:
+    PresentWaitEndFn m_end = nullptr;
+    void* m_token = nullptr;
+};
 OMNIUI_STANDALONE_API bool shouldClose();
 OMNIUI_STANDALONE_API void shutdown();
 
@@ -78,6 +115,36 @@ OMNIUI_STANDALONE_API void setSoftwareCursor(bool enabled);
 OMNIUI_STANDALONE_API bool isSoftwareCursorEnabled();
 
 // ---------------------------------------------------------------------------
+// SVG rasterizer build state
+//
+// True when this binary was built with OMNIUI_ENABLE_SVG=ON, so `init`
+// registers the SVG rasterizer. It reports the compile-time option, not the
+// registry: a build that forgot to register the rasterizer still returns true,
+// and a test can tell that apart from a build made without the option.
+// ---------------------------------------------------------------------------
+OMNIUI_STANDALONE_API bool isSvgRasterizerBuiltIn();
+
+// ---------------------------------------------------------------------------
+// Native cursor input for camera navigation (GLFW windows only)
+//
+// readCursorMotion returns the cursor motion since the previous call, in
+// window pixels, and the steady-clock time (seconds, the clock of Python's
+// time.perf_counter) of the newest cursor event; false without a window.
+// setCursorCapture hides and locks the cursor, with raw motion where
+// supported, for a navigation drag, or gives it back.
+// ---------------------------------------------------------------------------
+OMNIUI_STANDALONE_API bool readCursorMotion(double* dx, double* dy, double* time);
+OMNIUI_STANDALONE_API void setCursorCapture(bool captured);
+
+// ---------------------------------------------------------------------------
+// Present timing, a diagnostic (OMNIUI_PRESENT_TIMING=1, see
+// VulkanBackend::takePresentTimings): the records (tag, submitted, completed)
+// finished since the previous call, and the tag of the next presents.
+// ---------------------------------------------------------------------------
+OMNIUI_STANDALONE_API std::vector<std::tuple<int64_t, double, double>> takePresentTimings();
+OMNIUI_STANDALONE_API void setPresentTimingTag(int64_t tag);
+
+// ---------------------------------------------------------------------------
 // Text input state
 //
 // Returns ImGui's `io.WantTextInput`: true while a text input (a StringField,
@@ -86,6 +153,23 @@ OMNIUI_STANDALONE_API bool isSoftwareCursorEnabled();
 // also run a global action.
 // ---------------------------------------------------------------------------
 OMNIUI_STANDALONE_API bool isTextInputActive();
+
+// Ends the keyboard edit of the text input that owns the keyboard, in the same
+// way as a mouse click outside the field: the field keeps the typed text, and
+// when it is drawn next it calls its end-edit callbacks as a commit, not as a
+// cancel. Returns false and changes nothing when no text input is in typing
+// mode (isTextInputActive() is false). A mouse drag of a FloatDrag or IntDrag
+// is not typing mode, also when the same field was edited as text before: the
+// drag continues.
+OMNIUI_STANDALONE_API bool endTextInput();
+
+// ---------------------------------------------------------------------------
+// Clipboard isolation
+//
+// Returns true when the current ImGui context uses the clipboard of this
+// process (headless platforms) and not the OS clipboard (GLFW windows).
+// ---------------------------------------------------------------------------
+OMNIUI_STANDALONE_API bool isClipboardProcessPrivate();
 
 // ---------------------------------------------------------------------------
 // Screenshot capture
@@ -231,6 +315,37 @@ using StreamNalCallback = void (*)(const uint8_t*, uint32_t, uint64_t);
 OMNIUI_STANDALONE_API void setStreamNalCallback(StreamNalCallback callback);
 
 // ---------------------------------------------------------------------------
+// Clear color of the headless Vulkan frame
+//
+// Each frame of the headless Vulkan backend (OMNIUI_HEADLESS=1, Vulkan) first
+// clears its offscreen RGBA8 image to this color. The pixels that no widget
+// draws keep it, in the headless frame export (copyHeadlessFrameToLinear) and
+// in screenshots. The default is the opaque {0.12, 0.13, 0.14, 1.0}.
+//
+// The pixels of that image are premultiplied by alpha: a draw of color C with
+// alpha A over pixel P gives C * A + P * (1 - A) in red, green and blue, and
+// A + P.alpha * (1 - A) in alpha. The clear color uses the same form: red,
+// green and blue must each be at most alpha, and all four values must be from
+// 0 to 1. {0, 0, 0, 0} gives a transparent background, so that a consumer
+// can composite the frame over another image with
+// out = frame.rgb + image.rgb * (1 - frame.alpha). The headless frame export
+// and the read-back keep these premultiplied pixels. A .png or .bmp screenshot
+// file holds straight color instead (each color value of a pixel that is not
+// opaque divided by its alpha), as the readers of these formats expect.
+//
+// setClearColor needs the headless Vulkan backend, so call it after init().
+// The color applies from the next frame that starts after the call and stays
+// until shutdown(). The call returns false, keeps the current color and
+// writes the cause to stderr and to `error` (when not null) when a value is
+// not valid, when init() did not run, or when the backend is a different one
+// (a window or headless EGL). getClearColor writes the current color and
+// returns false when there is no headless Vulkan backend.
+// ---------------------------------------------------------------------------
+OMNIUI_STANDALONE_API bool setClearColor(float red, float green, float blue, float alpha,
+                                         std::string* error = nullptr);
+OMNIUI_STANDALONE_API bool getClearColor(float* red, float* green, float* blue, float* alpha);
+
+// ---------------------------------------------------------------------------
 // Headless frame export — Vulkan offscreen image -> CUDA pitched-linear buffer
 //
 // Enables zero-host-bounce export of the headless Vulkan composite image to a
@@ -293,7 +408,8 @@ OMNIUI_STANDALONE_API void setHeadlessDrainFailureInjection(bool fail);
 /// frame because ``getHeadlessFrameExtent`` then reports the new size.
 OMNIUI_STANDALONE_API bool resizeHeadlessFrame(int width, int height);
 
-/// Return the pixel format of the exported frame. Always "rgba8" today.
+/// Return the pixel format of the exported frame. Always "rgba8" today: four
+/// bytes for each pixel, alpha premultiplied (see setClearColor).
 OMNIUI_STANDALONE_API const char* getHeadlessFrameFormat();
 
 /// Wait for the most recent Vulkan render to finish before the next CUDA

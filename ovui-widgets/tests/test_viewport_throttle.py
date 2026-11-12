@@ -20,6 +20,8 @@ that it routes through the new methods.
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+
 from ovui_widgets.app.frame_clock import FrameClock
 from ovui_widgets.common.testing.mock_renderer import MockRendererAdapter
 from ovui_widgets.viewport.viewport_widget import ViewportWidget
@@ -204,30 +206,28 @@ class TestUpdatePhysics:
         vp.update(0.016)
         vp.destroy()
 
-    def test_update_clamps_flight_dt(self):
-        """A multi-second tick must not propel the camera through the scene."""
-        renderer = MagicMock()
-        vp = _vp_with_fake_image(renderer, 800, 600)
-        # Force ``is_flying`` to return True and capture the dt that integrate
-        # actually receives.
-        captured = []
-
-        def _integrate(dt):
-            captured.append(dt)
-
-        type_fk = type(vp._flight_keyboard)
-        # Pretend flying is on without depending on key state plumbing.
-        original_property = type_fk.is_flying
-        type_fk.is_flying = property(lambda self: True)
-        try:
-            vp._flight_keyboard.integrate = _integrate  # type: ignore[assignment]
-            vp.update(5.0)  # huge stall
-        finally:
-            type_fk.is_flying = original_property
-
-        assert len(captured) == 1
-        # Clamped to ViewportWidget._UPDATE_DT_MAX (0.1s)
-        assert captured[0] == ViewportWidget._UPDATE_DT_MAX
+    def test_a_stalled_frame_does_not_throw_the_camera(self):
+        """However long a frame took, the next matrix flies at most 0.1 s further."""
+        vp = _make_vp()
+        camera, fly = vp._camera, vp._flight_keyboard
+        now = [0.0]
+        camera.clock = lambda: now[0]
+        camera.get_matrices(800, 600)
+        fly.notify_rmb_press()
+        fly.handle_key_event(ord("W"), 0, True)
+        for _ in range(300):  # 3 s: the heavy fly reaches its speed
+            now[0] += 0.01
+            camera.get_matrices(800, 600)
+        before = np.array(camera.state.target)
+        now[0] += 0.01
+        camera.get_matrices(800, 600)
+        speed = np.linalg.norm(np.array(camera.state.target) - before) / 0.01
+        before = np.array(camera.state.target)
+        now[0] += 5.0  # huge stall
+        camera.get_matrices(800, 600)
+        moved = np.linalg.norm(np.array(camera.state.target) - before)
+        assert speed > 0.0
+        assert abs(moved - speed * 0.1) <= 1e-3 * speed * 0.1
         vp.destroy()
 
     def test_update_runs_when_render_skips(self):
@@ -541,22 +541,47 @@ class TestLegacyOnFrameShim:
         renderer.render_frame.assert_called_once()
         vp.destroy()
 
-    def test_direct_render_stress_cannot_exceed_cap(self):
+    def test_direct_render_stress_cannot_exceed_cap(self, monkeypatch):
         """Repeated resize/resolution-style direct renders share one cadence
-        budget: a burst of events yields at most one render per period."""
+        budget: a burst of events yields at most one render per period.
+
+        The viewport reads the time from a clock that only the test moves,
+        0.1 ms for each event, so the 50 events stay in one period of the
+        120 FPS cap on any machine. With the real clock, a pause of the test
+        process (a garbage collection, a busy machine) could put two periods
+        in the burst.
+        """
+        import time as real_time
+
         from ovui_widgets.common.settings import (
             RATE_LIMIT_FPS_SETTING_KEY,
             Settings,
         )
+        from ovui_widgets.viewport import viewport_widget as viewport_module
+
+        class _TestClock:
+            """The ``time`` module of the viewport, with a ``perf_counter`` that the test moves."""
+
+            def __init__(self) -> None:
+                self.now = real_time.perf_counter()
+
+            def perf_counter(self) -> float:
+                return self.now
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_time, name)
 
         settings = Settings()
         settings.set(RATE_LIMIT_FPS_SETTING_KEY, 120.0)
         Settings.set_instance(settings)
         renderer = MagicMock()
         vp = _vp_with_fake_image(renderer, 800, 600)
+        clock = _TestClock()
+        monkeypatch.setattr(viewport_module, "time", clock)
         try:
             for _ in range(50):  # rapid event burst, far faster than any cap
                 vp._render_rate_limited()
+                clock.now += 0.0001
             assert renderer.render_frame.call_count == 1
         finally:
             vp.destroy()

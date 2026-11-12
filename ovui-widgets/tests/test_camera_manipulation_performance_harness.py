@@ -21,12 +21,9 @@ from ovui_widgets.common.testing.mock_renderer import MockRendererAdapter
 from ovui_widgets.common.undo import UndoManager
 from ovui_widgets.viewport.viewport_widget import ViewportWidget
 
-Gf = pytest.importorskip("pxr.Gf")
-Sdf = pytest.importorskip("pxr.Sdf")
-Usd = pytest.importorskip("pxr.Usd")
-UsdGeom = pytest.importorskip("pxr.UsdGeom")
-StageWidget = pytest.importorskip("ovui_widgets.stage.widget.stage_widget").StageWidget
-UsdStageAdapter = pytest.importorskip("ovui_data_adapters.openusd.stage_adapter").UsdStageAdapter
+from pxr import Gf, Sdf, Usd, UsdGeom
+from ovui_widgets.stage.widget.stage_widget import StageWidget
+from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
 
 
 @dataclass
@@ -1023,10 +1020,11 @@ def test_external_camera_focal_length_info_change_does_not_trigger_stage_widget_
 def test_non_camera_property_info_change_skips_stage_widget_recount(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A non-visibility property edit still rebuilds the hierarchy model but
-    # cannot change prim/hidden counts, so the footer must not walk the
-    # stage: counts refresh exactly once per count-affecting adapter event
-    # (visibility or topology), never per model rebuild.
+    # A non-visibility property edit (each edit of a slider drag) repaints
+    # only its row: it does not rebuild the hierarchy model, and it cannot
+    # change prim/hidden counts, so the footer must not walk the stage:
+    # counts refresh exactly once per count-affecting adapter event
+    # (visibility or topology), never per edit.
     hierarchy_spy = _HierarchyModelChangeSpy(monkeypatch)
     stage = _make_stage(extra_prim_count=8)
     adapter = _CountingUsdStageAdapter(stage)
@@ -1040,7 +1038,7 @@ def test_non_camera_property_info_change_skips_stage_widget_recount(
         adapter._drain_scheduled_flushes()
 
         assert adapter.notify.calls == 1
-        assert hierarchy_spy.metrics.calls == 1
+        assert hierarchy_spy.metrics.calls == 0
         assert widget.refresh_footer_counts.calls == 0
         assert widget.compute_stage_counts.calls == 0
     finally:

@@ -14,7 +14,10 @@ Type-name coverage:
 
 * ``matrix2d`` → :class:`MatrixAttributeRow` with ``n_dim=2`` (2×2, 4 cells)
 * ``matrix3d`` → :class:`MatrixAttributeRow` with ``n_dim=3`` (3×3, 9 cells)
-* ``matrix4d`` → :class:`MatrixAttributeRow` with ``n_dim=4`` (4×4, 16 cells)
+* ``matrix4d`` → :class:`MatrixAttributeRow` with ``n_dim=4`` (4×4, 16 cells);
+  a matrix transform operation (``xformOp:transform``) gets
+  :class:`MatrixTransformAttributeRow`: Translate, Rotate and Scale fields
+  above the 4×4 grid
 
 USD only ships double-precision matrix types (no ``matrix2f`` / ``matrix3f``
 / ``matrix4f``), so the three registrations above cover the complete
@@ -25,8 +28,12 @@ matrix type surface — unlike vec/colour which carry ``float``/``double``/
 from typing import Any
 
 from ovui_data_adapters.common import AttributeMetadata, PropertyAdapter
+from ovui_data_adapters.common.matrix_transform import is_transform_matrix_op
 
-from ovui_widgets.property.attribute_row import MatrixAttributeRow
+from ovui_widgets.property.attribute_row import (
+    MatrixAttributeRow,
+    MatrixTransformAttributeRow,
+)
 from ovui_widgets.property.builders.builder_table import WidgetBuilderTable
 
 
@@ -62,7 +69,16 @@ def build_matrix4d(
     adapter: PropertyAdapter,
     **kwargs: Any,
 ) -> MatrixAttributeRow:
-    """Build a 4×4 ``MatrixAttributeRow`` (16 ``ui.FloatDrag`` cells)."""
+    """Build a 4×4 ``MatrixAttributeRow`` (16 ``ui.FloatDrag`` cells).
+
+    A matrix transform operation (``xformOp:transform``) also gets
+    Translate, Rotate and Scale fields above the grid
+    (:class:`MatrixTransformAttributeRow`).
+    """
+    if is_transform_matrix_op(attr_name):
+        return MatrixTransformAttributeRow(
+            metadata, adapter, match=kwargs.get("match", ""),
+        )
     return MatrixAttributeRow(
         metadata, adapter, n_dim=4,
         match=kwargs.get("match", ""),

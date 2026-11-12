@@ -170,9 +170,42 @@ are disabled.
 
 ### Python Dependencies
 
-- **Python** >= 3.12
-- **pybind11** == 2.11.1 (installed automatically by pip, or `pip install pybind11==2.11.1`)
-- **setuptools** >= 68.0
+- **Python** 3.12, 3.13, 3.14 or 3.15 (CPython)
+- **pybind11** >= 2.13.6, < 3 (installed automatically by pip, or `pip install "pybind11>=2.13.6,<3"`). The 2.13 line is the first with Python 3.13 support. pybind11 3.x is not supported: it needs source changes. On Windows, the modules are built without the compiler version that pybind11 2.13.6 adds to the key of the shared type registry, so they share types with modules built with pybind11 2.11.1 (Kit's), as on Linux. The wheel builds require 2.13.6 or later, below 3, through `pyproject.toml`. The `ovui` CMake files still accept pybind11 2.11.1 or later for Kit-hosted builds
+- **setuptools** >= 84.0.0
+
+### Python versions
+
+This section describes the 0.3.1 native UI wheels. The published
+0.2.0 and 0.3.0 `ovui` wheels have only the `cp312` tag: they are for CPython
+3.12 only.
+
+The native `ovui` package ships one wheel per platform
+for all four Python versions. The wheel file name carries the combined tag, for
+example `ovui-<version>-cp312.cp313.cp314.cp315-cp312.cp313.cp314.cp315-manylinux_2_35_x86_64.whl`.
+The wheel holds one native module per version (`_ui.cpython-313-x86_64-linux-gnu.so`,
+`_ui.cp313-win_amd64.pyd`, and so on); Python imports the one that fits the
+running interpreter. The native libraries that do not depend on Python
+(`libovui`, the standalone library, the ImGui library, the CUDA runtime) are in
+the wheel once. The wheel is about one third larger than a single-version wheel.
+Free-threaded Python (`cp313t` and later) is not supported.
+
+Known dependency limits:
+
+- `usd-core==25.11`, the version of the `standalone` extra of
+  `ovui-data-adapters-openusd`, has wheels for Python 3.8 to 3.13 and none for
+  Python 3.14 or 3.15. On Python 3.14 and 3.15 the extra (and
+  `ovui-widgets-all`, which requests it) cannot be installed. usd-core 26.11
+  has Python 3.14 wheels, but the OpenUSD adapter is not validated with it,
+  and usd-core has no Python 3.15 wheel at all. On these versions, use the
+  OVStage provider, or supply a matching `pxr` from the environment and
+  install the plain `ovui-data-adapters-openusd` wheel.
+- `ovrtx`, `ovstage`, `ovstream`, `ovphysx` and `cuda-python` are `py3-none`
+  packages that this repository does not build. They are not tested here on
+  every version; Python 3.15 is the most likely to meet a problem, as is any
+  tool that has not yet published Python 3.15 support.
+- `numpy` publishes wheels for all four versions.
+- The WebAssembly build stays on its own static Python 3.12.
 
 ### Third-Party Dependencies
 
@@ -242,8 +275,8 @@ can detect it.
 
 For C++ contributors who want to invoke CMake directly -- useful for debugging the native layer or working on the bindings.
 
-The Kit-compatible native build uses Python 3.12 and exactly pybind11 2.11.1,
-matching the wheel workflows. Direct CMake invocation does not install the
+The native build uses pybind11 2.13.x for the wheel workflows, and the
+Python you build with (3.12 to 3.15). Direct CMake invocation does not install the
 build dependencies declared in `pyproject.toml`.
 
 ```bash
@@ -253,78 +286,64 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 cmake --build . --parallel $(nproc)
 ```
 
-### Native frame pacing build options
+### SVG images
 
-The standalone backend can build an optional native frame-pacing coordinator
-that borrows an ovrtx renderer and drives render and presentation independently
-of the UI tick. It has one gate:
+The standalone backend draws `.svg` files with its own SVG reader and painter
+(`standalone/src/StandaloneSvgDocument.h`); it uses no other library.
+`ui.Image` and `ui.ImageWithProvider` draw an `.svg` file at the content size
+of the widget, and images of the same file and size share one texture.
+`ui.MarkdownWidget` draws an `.svg` image at the size of the file (the width
+and height of its root `<svg>`), as it draws a PNG file. The CMake option
+`OMNIUI_ENABLE_SVG` builds this support and is ON by default.
 
-| Option | Default | Effect |
-|---|---|---|
-| `OMNIUI_OVRTX_INCLUDE_DIR` | auto-discovered | Build the coordinator when the public ovrtx headers expose the consumed ABI. Used by the standalone and OpenUSD render paths. |
+- Drawn: `<svg>`, `<g>`, `<use>`, `<symbol>`, `<defs>`, `<path>`, `<rect>`,
+  `<circle>`, `<ellipse>`, `<line>`, `<polyline>`, `<polygon>`; colors, linear
+  and radial gradients, fill rules, strokes with caps, joins, miter limit and
+  dashes, transforms, opacity, `clip-path`, presentation attributes, the
+  `style` attribute and `<style>` sheets (type, class, id and descendant
+  selectors).
+- Not drawn: `<text>`, `<image>`, `<foreignObject>`, `<pattern>` paint, masks,
+  filters and markers (also on the root `<svg>`), and a `transform` attribute
+  on an `<svg>` element (the root or a nested one). A file with such parts
+  draws its shapes and logs one warning that names the parts left out. A part
+  drawn differently from the file (a dash pattern too fine to draw dash by
+  dash, a path drawn up to an error in its data) logs one warning with the cause.
+- A file that is missing, empty, larger than 32 MiB, not well-formed XML (the
+  error gives the line, the column and the cause), without any shape, or over a
+  work limit of the reader or painter (for example entity text, shapes after
+  `<use>` references, style rules, gradient stops, line pieces, pixels or layer
+  memory; see [`docs/svg-images.md`](docs/svg-images.md)) draws nothing and
+  logs one error with the cause. An exception while a file is read or painted
+  (for example `std::bad_alloc`) is caught and logged the same way.
+- The test `standalone_svg_rasterizer_tests` compares the pixels of every file
+  in `tests/svg_corpus/` with the picture Google Chrome makes of it. The
+  results, side-by-side pictures and speed numbers are in
+  [`docs/svg-images.md`](docs/svg-images.md).
 
-The coordinator uses the public ovrtx C ABI and nothing else. `ovui` depends on
-no scene library: a scene provider lives in its own `ovui-data-adapters`
-package, which drives ovui through the generic renderer-borrow entry points
-(`omni.ui._ui._native_frame_pacing_*`) rather than putting provider code into
-ovui. A provider whose scene library ovui cannot borrow through those entry
-points renders on the ordinary synchronous path.
-
-### Visual Studio 2022 OVRTX application project
-
-Enable `OMNIUI_BUILD_OVRTX_UI_APP` to generate the `ovrtx_ui_app` startup project
-inside `ovui.sln`. This is an opt-in development build; library and wheel builds
-keep their existing behavior when the flag is off. It requires the local Kit
-development SDK/runtime, Python 3.12 with development headers and libraries,
-Visual Studio 2022 C++, CMake, Git, and network access for dependency downloads.
-The app build finds pinned pybind11 2.11.1 or fetches its sources automatically.
-
-```powershell
-$Repo = (Get-Location).Path
-$KitRoot = "<kit-checkout>"
-$Python312 = "$KitRoot/rendering/_build/target-deps/python/python.exe"
-cmake -S "$Repo\ovui" -B "$Repo\ovui\build\vs2022-dev" -G "Visual Studio 17 2022" -A x64 `
-  -DOMNIUI_BUILD_OVRTX_UI_APP=ON "-DPYTHON_EXECUTABLE=$Python312" `
-  "-DCMAKE_PREFIX_PATH=$KitRoot/rendering/ovrtx/public/tools/dev" `
-  "-DOMNIUI_OVRTX_INCLUDE_DIR=$KitRoot/rendering/ovrtx/public/include" `
-  -DOMNIUI_REQUIRE_VULKAN=ON -DOMNIUI_REQUIRE_CUDA=ON
-if ($LASTEXITCODE -eq 0) { cmake --build "$Repo\ovui\build\vs2022-dev" --target ovrtx_ui_app --config RelWithDebInfo --parallel }
+```bash
+cmake .. -DOMNIUI_ENABLE_SVG=OFF   # no SVG support: .svg images draw nothing and log one error that names the option
 ```
 
-Open `ovui/build/vs2022-dev/ovui.sln`, select `ovrtx_ui_app` as the startup
-project if Visual Studio retains an older selection, and use RelWithDebInfo/x64.
-Building this project builds `_ui`, `_standalone`, `_scene`, and their native dependencies.
-Its first build also creates `app/venv` inside the CMake build directory and
-installs the local widget, service and data-adapter distributions
-in editable mode using their existing package definitions. Pip resolves their
-Python dependencies, and the build verifies dependency consistency and the
-selected provider's early-renderer registration. CMake's in-place native `ovui` package gets
-its metadata from the existing setuptools configuration, without rebuilding it
-through pip or replacing it with a published wheel.
+### Native frame pacing
 
-CMake generates the project's debugger command, arguments, working directory,
-and environment. F5 launches `app/venv/Scripts/python.exe -m ovui_widgets.app`
-with the selected Kit sources/runtime and the freshly built native libraries.
-No manual `.vcxproj` edits, package installations, or pre-existing virtual
-environment are needed. Deleting the build directory removes the app environment;
-building the project again recreates it. Package-definition changes rerun setup,
-while ordinary Python edits are picked up by the editable installs.
+The standalone backend carries a native frame-pacing coordinator that drives
+render and presentation independently of the UI tick. It has no build option
+and no renderer dependency: ovui owns the image slots, the CUDA/Vulkan upload,
+the Vulkan presentation and its present worker. The render worker and every
+renderer call belong to the package that fills ovui's renderer slot; that
+worker drives ovui back through a host table ovui hands over for each session.
 
-`OMNIUI_OVRTX_UI_APP_RUNTIME_DIR` overrides the Kit runtime directory (default:
-the selected Kit checkout's `rendering/_build/windows-x86_64/release`).
-`OMNIUI_OVRTX_UI_APP_ARGUMENTS` adds scene or settings arguments to the debugger
-command. Existing `OMNIUI_OVRTX_*` include flags select the SDK sources.
-Missing required SDK paths fail configuration.
+An optional package supplies that table. It fills the slot before `ui.init`
+with `omni.ui._ui._set_native_frame_pacing_hooks(capsule)`, the same shape as
+`_set_native_timing_hooks`; `standalone/src/NativeFramePacingHooks.h` is its
+layout and ships with the ovui SDK. Without such a package the slot stays
+empty, `omni.ui.get_frame_pacing_status()` reports `supported = False` with the
+reason `hooks_unavailable`, and the viewport presents on the ordinary UI tick.
 
-ovui names no scene provider. `OMNIUI_OVRTX_UI_APP_PROVIDER` selects which
-`ovui-data-adapters` provider the generated environment installs and runs
-(default `openusd`, which needs nothing beyond the renderer SDK), and
-`OMNIUI_OVRTX_UI_APP_EXTRA_PROJECTS`, `OMNIUI_OVRTX_UI_APP_EXTRA_PYTHONPATH`
-and `OMNIUI_OVRTX_UI_APP_EXTRA_ENVIRONMENT` carry whatever else that provider
-needs. A provider's own configure recipe is documented with its adapter
-package. Kit itself remains
-an external, separately built dependency. Internal development options that are
-not part of a release are described in the source repository's `docs/` folder.
+`ovui` depends on no renderer and no scene library. A renderer package and a
+scene provider live in their own packages and drive ovui through the generic
+renderer-borrow entry points (`omni.ui._ui._native_frame_pacing_*`) rather than
+putting their code into ovui.
 
 The build produces three shared libraries:
 
@@ -821,10 +840,9 @@ ovui/
 ├── python/
 │   └── omni/
 │       └── ui/
-│           ├── __init__.py     Package root (Kit/standalone auto-detect)
+│           ├── __init__.py     Package root
 │           ├── standalone.py   run(), run_async(), next_frame(), init()
 │           ├── testing.py      mouse_click(), type_text(), capture_screenshot()
-│           ├── _compat.py      Python version compatibility shims
 │           ├── color_utils.py  Shade-aware color() helper
 │           ├── constant_utils.py  Shade-aware constant() helper
 │           ├── style_utils.py  Style dictionary utilities
@@ -870,7 +888,7 @@ This section tracks which files are shared between Kit (`~/dev/kit/kit/source/ex
 | Binding headers (Bind*.h) | 81 of 82 | 1 differs (BindGlyph.h) |
 | Python files | 7 of 8 | 1 differs (__init__.py) |
 
-### Files That Don't Match (5 files)
+### Files That Don't Match (4 files)
 
 | File | Reason |
 |------|--------|
@@ -878,7 +896,6 @@ This section tracks which files are shared between Kit (`~/dev/kit/kit/source/ex
 | `BindByteImageProvider.h` | Kit exposes carb::Format-dependent methods (set_bytes_data, set_raw_bytes_data). Standalone omits these. |
 | `BindImageProvider.h` | Kit exposes RpResource and carb::Format methods. Standalone omits these. |
 | `platform/Log.h` | Kit version routes OMNIUI_LOG_* to CARB_LOG_*. Standalone defaults to fprintf(stderr). |
-| `__init__.py` | Slight difference in _IN_KIT detection logic. |
 
 ### Architecture Rule
 

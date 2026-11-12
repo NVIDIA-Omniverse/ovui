@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" color="#00897b">
+  <rect x="2" y="2" width="14" height="14" fill="red"/>
+  <rect x="18" y="2" width="14" height="14" fill="cornflowerblue"/>
+  <rect x="34" y="2" width="14" height="14" fill="#f80"/>
+  <rect x="50" y="2" width="12" height="14" fill="#80f8"/>
+  <rect x="2" y="18" width="14" height="14" fill="rgb(255, 128, 0)"/>
+  <rect x="18" y="18" width="14" height="14" fill="rgba(0,0,255,0.5)"/>
+  <rect x="34" y="18" width="14" height="14" fill="rgb(50%, 25%, 75%)"/>
+  <rect x="50" y="18" width="12" height="14" fill="hsl(120, 60%, 40%)"/>
+  <rect x="2" y="34" width="14" height="14" fill="currentColor"/>
+  <rect x="18" y="34" width="14" height="14" fill="transparent" stroke="DarkSlateGray" stroke-width="2"/>
+  <rect x="34" y="34" width="14" height="14" fill="#336699CC"/>
+  <rect x="50" y="34" width="12" height="14" fill="hsla(300, 100%, 50%, 0.6)"/>
+  <rect x="2" y="50" width="14" height="12" fill="none" stroke="currentColor" stroke-width="2"/>
+  <rect x="18" y="50" width="14" height="12" fill="Gold"/>
+  <rect x="34" y="50" width="14" height="12" fill="rgb(0 0 0 / 40%)"/>
+  <rect x="50" y="50" width="12" height="12" style="fill: teal"/>
+</svg>

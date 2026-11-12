@@ -3,21 +3,11 @@
 
 """Tests for Step 35: PropertyWindow subscribes to stage changes and rebuilds
 when selected prim attributes change.
-
-All tests skip when pxr (OpenUSD) is not available.
 """
 
 from types import SimpleNamespace
 
-import pytest
-
-try:
-    from pxr import Gf, Usd, UsdGeom
-    HAS_USD = True
-except ImportError:
-    HAS_USD = False
-
-pytestmark = pytest.mark.skipif(not HAS_USD, reason="pxr (OpenUSD) not available")
+from pxr import Gf, Usd, UsdGeom
 
 from ovui_data_adapters.common import ChangeEvent, ChangeEventType
 from ovui_data_adapters.openusd import UsdPropertyAdapter

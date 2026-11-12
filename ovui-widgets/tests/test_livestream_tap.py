@@ -651,7 +651,7 @@ def test_legacy_port_back_compat_with_warning(monkeypatch, capsys):
 
 def _spy_swap_and_warmup(monkeypatch, events):
     """Replace the production swap kernel + warm_up with spies that
-    append events. Avoids a real NVRTC compile on CPU-only hosts and
+    append events. Avoids a real module load on CPU-only hosts and
     lets call-order assertions inspect the recorded sequence."""
     def _spy_swap(dev, w, h, pitch, stream=0):
         events.append(("swap", int(dev), int(w), int(h), int(pitch)))
@@ -842,10 +842,10 @@ def test_byte_order_swap_proven_via_d2h(monkeypatch):
     the first pixel's BGR is the source's RGB swapped (``BGR(out) ==
     swap(RGB(src))``). This is the no-ffmpeg byte-order proof Step
     1.6 specifies."""
-    from tests._cuda_helpers import TestCuda, has_gpu_with_swap_kernel
+    from tests._cuda_helpers import TestCuda, has_cuda_gpu
 
-    if not has_gpu_with_swap_kernel():
-        pytest.skip("CUDA runtime / NVRTC / GPU not available")
+    if not has_cuda_gpu():
+        pytest.skip("CUDA library (cudart) / GPU not available")
 
     cu = TestCuda()
     W, H = 8, 8
@@ -1401,11 +1401,11 @@ def test_tee_linear_to_ovstream_format_fix_off_skips_swap_and_sync(monkeypatch):
     assert any(e[0] == "stream_video" for e in events)
 
 
-def test_tee_linear_to_ovstream_swap_failure_falls_back_no_disable(monkeypatch):
-    """If the swap kernel itself raises, the tap disables only the
-    format fix (legacy R/B-swapped stream is better than dark stream)
-    — the overall tap stays alive and ``stream_video`` still runs. No
-    sync runs either: the kernel never queued any work."""
+def test_tee_linear_to_ovstream_swap_failure_disables_tap_and_sends_no_frame(monkeypatch):
+    """Issue 510: if the swap kernel raises, the frame is not sent (the
+    client would show red and blue exchanged). The livestream leg is
+    disabled with the cause in the ERROR status. No sync runs either:
+    the kernel never queued any work."""
     events = []
     ovstream, server = _install_mock_ovstream(monkeypatch, connected=True)
     server.stream_video.side_effect = lambda frame: events.append(
@@ -1416,21 +1416,83 @@ def test_tee_linear_to_ovstream_swap_failure_falls_back_no_disable(monkeypatch):
     monkeypatch.setattr(tap_mod, "_Cudart", lambda: cudart)
 
     def _failing_swap(dev, w, h, pitch, stream=0):
-        raise tap_mod._swap_kernel.CudaSwapError("nvrtc broken")
+        raise tap_mod._swap_kernel.CudaSwapError("cuLaunchKernel rc=700")
 
     monkeypatch.setattr(tap_mod._swap_kernel, "swap_rb_in_place", _failing_swap)
 
     with patch.dict(os.environ, {tap_mod._ENABLED_ENV_VAR: "1"}):
         tap = tap_mod.LivestreamTap.maybe_create()
 
-    pushed = tap.tee_linear_to_ovstream(0xCAFEBABE, 1920, 1080, 7936)
-    assert pushed is True
-    assert tap._swap_disabled is True
-    assert tap._disabled is False  # tap as a whole stays live
-    assert tap.status()[0] != tap_mod._STATE_ERROR
-    # No sync because the swap didn't queue any work.
-    assert all(e[0] != "stream_sync" for e in events)
-    assert any(e[0] == "stream_video" for e in events)
+    assert tap.tee_linear_to_ovstream(0xCAFEBABE, 1920, 1080, 7936) is False
+    assert tap.tee_linear_to_ovstream(0xCAFEBABE, 1920, 1080, 7936) is False
+    assert tap._disabled is True
+    state, _clients, error = tap.status()
+    assert state == tap_mod._STATE_ERROR
+    assert "R/B swap kernel failed" in error and "cuLaunchKernel rc=700" in error
+    assert all(e[0] not in ("stream_video", "stream_sync") for e in events), events
+
+
+def test_tee_to_ovstream_swap_failure_sends_no_frame(monkeypatch):
+    """Issue 510, windowed path: a frame whose R/B swap failed is not
+    sent, and the livestream leg stays disabled with an ERROR status."""
+    events = []
+    ovstream, server = _install_mock_ovstream(monkeypatch, connected=True)
+    server.stream_video.side_effect = lambda frame: events.append(
+        ("stream_video", frame.buffer)
+    )
+    cudart = _make_cudart_mock(events, ptrs=iter([0xAA, 0xBB]))
+    monkeypatch.setattr(tap_mod, "_Cudart", lambda: cudart)
+
+    def _failing_swap(dev, w, h, pitch, stream=0):
+        raise tap_mod._swap_kernel.CudaSwapError("cuLaunchKernel rc=700")
+
+    monkeypatch.setattr(tap_mod._swap_kernel, "swap_rb_in_place", _failing_swap)
+
+    with patch.dict(os.environ, _TEST_ENV, clear=True):
+        tap = tap_mod.LivestreamTap.maybe_create()
+
+    assert tap.tee_to_ovstream(_mapping(4, 2), 4, 2) is False
+    assert tap.tee_to_ovstream(_mapping(4, 2), 4, 2) is False
+    state, _clients, error = tap.status()
+    assert state == tap_mod._STATE_ERROR
+    assert "R/B swap kernel failed" in error
+    assert all(e[0] != "stream_video" for e in events), events
+    # The second frame took the disabled fast path: one copy only.
+    assert [e[0] for e in events].count("d2d") == 1
+
+
+def test_start_fails_when_the_swap_kernel_cannot_load(monkeypatch, capsys):
+    """Issue 510: when the R/B swap kernel cannot load (the report had
+    ``cuModuleLoadData rc=222``), ``start`` fails with the cause, no
+    server starts, the ring is freed and later frames are not sent,
+    instead of a stream with red and blue exchanged."""
+    events = []
+    ovstream, server = _install_mock_ovstream(monkeypatch, connected=True)
+    server.stream_video.side_effect = lambda frame: events.append(
+        ("stream_video", frame.buffer)
+    )
+    cudart = _make_cudart_mock(events, ptrs=iter([0xAA, 0xBB]))
+    monkeypatch.setattr(tap_mod, "_Cudart", lambda: cudart)
+
+    def _failing_warm_up():
+        raise tap_mod._swap_kernel.CudaSwapError("cuModuleLoadData rc=222")
+
+    monkeypatch.setattr(tap_mod._swap_kernel, "warm_up", _failing_warm_up)
+
+    with patch.dict(os.environ, _TEST_ENV, clear=True):
+        tap = tap_mod.LivestreamTap.maybe_create()
+    with pytest.raises(RuntimeError, match="R/B color correction is not available") as raised:
+        tap.start(4, 2)
+
+    assert "cuModuleLoadData rc=222" in str(raised.value)
+    server.start.assert_not_called()
+    assert [e[1] for e in events if e[0] == "free"] == [0xAA, 0xBB]
+    state, _clients, error = tap.status()
+    assert state == tap_mod._STATE_ERROR
+    assert "cuModuleLoadData rc=222" in error
+    assert "R/B color correction is not available" in capsys.readouterr().err
+    assert tap.tee_to_ovstream(_mapping(4, 2), 4, 2) is False
+    assert all(e[0] not in ("d2d", "stream_video") for e in events), events
 
 
 def test_tee_linear_to_ovstream_sync_failure_disables_tap(monkeypatch):

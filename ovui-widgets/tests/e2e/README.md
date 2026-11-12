@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Wheel-install end-to-end golden test
 
-Two full integration tests for the USD Viewer. They reproduce exactly what a
+Full integration tests for the USD Viewer. They reproduce exactly what a
 user does and what unit tests cannot cover (for example, the Windows
 `imgui.dll` collision slipped through unit tests):
 
@@ -15,6 +15,32 @@ user does and what unit tests cannot cover (for example, the Windows
 - `test_wheel_app_window_golden_e2e.py` — the **regular** app as a user starts
   it (`python -m ovui_widgets.app scene.usda`, a real window), once per data
   provider. It checks the whole window.
+
+- `test_wheel_app_camera_pan_golden_e2e.py` — the **regular** app on an empty
+  stage, once per data provider. It creates a cube, pans the camera a little
+  and compares the whole window.
+
+- `test_wheel_app_camera_zoom_golden_e2e.py` — the same start, once per data
+  provider. It creates a cube, zooms the camera out with the mouse wheel and
+  compares the whole window.
+
+- `test_wheel_app_light_pick_e2e.py` — the **regular** app, once per data
+  provider, on a scene with a dome light and a distant light at the origin.
+  With no light selected, clicks on the cube at the origin and on
+  a small cube near it must select those cubes. After the sphere light is
+  selected in the Stage Browser, a click on a drawn pixel of its gizmo must be
+  a viewport pick that keeps the light. After each step it compares the whole
+  window with the golden of that step (see "Light pick test").
+
+- `test_wheel_app_livestream_e2e.py` — the **regular** and the **headless**
+  app stream and record a red/green/blue scene; real stream clients decode
+  the frames, which must keep red and blue in their places. See
+  "Livestream test".
+
+- `test_wheel_app_memory_check_e2e.py` — the **regular** app, once per data
+  provider, with the cube scene and with an empty scene. It checks
+  the memory check in the app log and in `ovui-inspect health`; see "Memory
+  check test".
 
 The headless jobs also run `test_wheel_imgui_load_order_e2e.py`: a script
 that constructs `ovrtx.Renderer()` and imports `omni.ui`, in both orders, in a
@@ -110,6 +136,237 @@ still works: Delete with the cube selected in the Stage Browser removes it,
 Ctrl+Z restores it, Backspace with the cube selected in the viewport removes
 it. Every step is saved as a numbered PNG in the test directory.
 
+## Property field keys test
+
+`test_wheel_app_property_field_keys_e2e.py` runs in the openusd window jobs.
+It has no golden and takes no screenshot. It opens `simple_scene.usda`, clicks
+the cube in the viewport, and then, for the text fields Display Color and
+Extent, the Purpose dropdown and the Double Sided checkbox, with Backspace and
+with Delete: clicks the field and presses the key. After every click and key
+press `/World/Cube` must exist in the app state. Escape closes the dropdown
+list. Then it checks that intentional deletion still works after the Property
+Inspector had the focus: Delete with the cube selected in the Stage Browser
+removes it, Ctrl+Z restores it, Backspace with the cube selected in the
+viewport removes it. The test skips only on a machine without an
+ovrtx-capable NVIDIA GPU. On Linux with such a GPU and no `DISPLAY`, it fails
+and names the missing display.
+
+## Path bar keys test
+
+`test_wheel_app_path_bar_keys_e2e.py` runs in the openusd window jobs. It has
+no golden and takes no screenshot. A real key gives a key event and a
+character, so the test sends both for each typed letter (`press`, then
+`type`). After each action it reads the camera orbit state
+(`viewport.camera`), the viewport tool and the path bar (`content_ui`) from
+the app state.
+
+1. Click the cube in the viewport and zoom out with the mouse wheel.
+2. Double-click the Content Browser path bar and type `f` and `h`. The camera
+   must not change; the path field must hold `fh`. Press Escape.
+3. Single-click the path bar outside the breadcrumbs. The path field must
+   edit. Type the path of a test folder; the letters of its last part,
+   `frame_home_view`, are keys. After each of F, H, W, E and R the camera and
+   the tool must not change. The folder suggestions must list
+   `frame_home_view/`, and Enter must take the Content Browser to the folder.
+4. Single-click a folder name that the narrow bar shows, then another one.
+   Each click must take the Content Browser to that folder and keep the folder
+   names: the path field must not open.
+5. Type the test folder path with a slash at the end, press Down until
+   `other_folder/` is highlighted and press Enter: the Content Browser must go
+   to `other_folder`. Click the path bar, press Tab, type the test folder path
+   and `fr`, then click the suggestion `frame_home_view/`: the Content Browser
+   must go to that folder.
+   The camera must not change.
+6. Click the cube in the viewport, press F (the camera must change) and H (the
+   camera must go back to the view the scene opened with).
+7. Drag the Content tab out of the dock, so that the Content Browser floats.
+   Single-click its path bar outside the breadcrumbs and type `f`: the camera
+   and the tool must not change, and the field must hold `f`. Then type the
+   test folder path: the field must hold all the typed text.
+
+The test compares paths as the platform does: on Windows a path has no case,
+and the Content Browser shows a typed `C:/...` as `c:/...`.
+
+## Property Inspector focus Delete/Backspace test
+
+`test_wheel_app_property_panel_keys_e2e.py` runs in the window jobs, once per
+provider. It has no golden and takes no screenshot. It clicks the cube in the
+viewport, clicks empty Property Inspector space below the last row and
+presses Delete, then Backspace. Each relationship field (Proxy Prim with the
+openusd provider, Material Binding with ovstage) must be disabled; the test
+clicks it and presses Backspace, then clicks it again and presses Delete.
+After every key `/World/Cube` must exist and the undo stack must not grow.
+Then it checks that intentional deletion still works: Delete with the cube
+selected in the Stage Browser removes it and adds one undo step labelled
+`Delete`, Ctrl+Z restores it, Backspace with the cube selected in the
+viewport removes it.
+
+## Camera pan test
+
+`test_wheel_app_camera_pan_golden_e2e.py` runs in the window jobs, once per
+provider. It starts the app on an empty stage (`World` only), at 1000x720.
+All input is real mouse input through the inspector.
+
+1. Close the Content browser with the mouse, as in the windowed test.
+2. Create a cube: click *Create*, hover *Shape*, click *Cube*. The test
+   checks that `/World/Cube` is selected and shown in the viewport.
+3. Park the cursor and wait for 3 identical frames (`4_before_pan.png`).
+4. Pan the camera: drag with the **middle mouse button** in the viewport
+   centre, 80 px right and 40 px down, in 20 move steps.
+5. Park the cursor and wait for 3 identical frames (`5_after_pan.png`).
+6. Check that the cube's move gizmo (drawn at the cube centre, read from the
+   pixels) moved on screen by the drag distance (within 12 px) and that the
+   render changed (MEAN_ERROR >= 1.0 against the frame
+   before the pan). A tumble or a zoom does not move the cube by the drag
+   distance, so they fail this check.
+7. Assert the zero-copy GPU path is still on, then compare with the golden
+   (`golden/camera_pan_<provider>.png`) with the same two-region compare as
+   the windowed test.
+
+## Camera zoom test
+
+`test_wheel_app_camera_zoom_golden_e2e.py` runs in the window jobs, once per
+provider. It starts like the camera pan test: empty stage, 1000x720, Content
+browser closed with the mouse, cube made with *Create*, *Shape*, *Cube*.
+
+1. Park the cursor and wait for 3 identical frames (`4_before_zoom.png`).
+2. Zoom out: scroll the **mouse wheel** down by 10 over the viewport centre.
+   (The ovstage provider frames the cube so close that zoom in would clip it.)
+3. Park the cursor and wait for 3 identical frames (`5_after_zoom.png`).
+4. Check that the light grey cube area is at most 0.85 times the area before
+   (a zoom out gives about 0.55) and that the render changed
+   (MEAN_ERROR >= 1.0 against the frame before the zoom).
+5. Assert the zero-copy GPU path is still on, then compare with the golden
+   (`golden/camera_zoom_<provider>.png`) with the same two-region compare as
+   the windowed test.
+
+## Light pick test
+
+`test_wheel_app_light_pick_e2e.py` runs in the window jobs, once per
+provider. The scene has a dome light and a distant light at the origin, a cube
+at the origin, a small cube at (0.6, 1.4, 0.6), and a sphere light (`Lamp`)
+above a side cube. Each test starts its own app at 1000x720 and closes the
+Content browser with the mouse, as the windowed test does. The frames before
+that show the Content browser, which lists the home folder of the machine, so
+they have no golden (their names start with `_`).
+
+After each step the test parks the cursor in the bottom-right corner, waits
+for 3 identical frames (FPS value masked) and compares the window with the
+golden of the step: `golden/light_pick_<step>_<provider>.png`, with the same
+two-region compare as the windowed test. Steps that must look the same use
+one golden. Each click waits until the renderer pick of that click is done,
+so a click that must change nothing cannot pass before its pick ends.
+
+The `small_cube`, `lamp_selected` and `lamp_gizmo_click` steps have one golden
+per platform, `golden/light_pick_<step>_<provider>_<platform>.png`
+(`linux_x86_64`, `windows_amd64`, `linux_aarch64`). In these steps the window is
+not the same on all platforms, so one golden cannot pass everywhere. Measured
+with the images of a `mode: generate` run of this test on all platforms (run
+41016982725; half size, against the Linux x86_64 golden):
+
+- `lamp_selected`, `lamp_gizmo_click` on Windows: the light gizmo lines are
+  thinner (default SceneView) than on Linux (OpenGL). Render changed pixels:
+  48 (OpenUSD) and 59 (OVStage), limit 40.
+- `lamp_selected`, `lamp_gizmo_click` on Linux ARM64 with OpenUSD: the OpenUSD
+  of conda-forge lists two more `Mode` rows for the light in the Property
+  Inspector. Strict changed pixels: 4419, limit 10.
+- `small_cube` on Windows with OpenUSD: the move gizmo of the small cube
+  touches the right edge of the viewport, and Windows draws a handle 2 px past
+  that edge. Strict changed pixels: 16 (one column), limit 10.
+
+The other steps (`start`, `origin_cube`, `cleared`) differ by at most 14 render
+pixels (mean 0.106) and 0 strict pixels between the platforms. On each platform,
+the images of two Python versions are the same (0 changed pixels). The
+`lamp_selected` and `lamp_gizmo_click` steps also differ from each other in the
+Layers panel: after a viewport pick it shows the spec of the selected prim.
+
+| Test | Step | Expected selection | Golden step |
+|---|---|---|---|
+| both | start, Content browser closed | nothing | `start` |
+| clicks near the origin | click empty background | nothing | `start` |
+| clicks near the origin | click the cube at the origin | `/World/OriginCube` | `origin_cube` |
+| clicks near the origin | click empty background | nothing | `cleared` |
+| clicks near the origin | click the small cube | `/World/SmallCube` | `small_cube` |
+| drawn light gizmo | open the rows above `Lamp` with their chevrons, click the `Lamp` row | `/World/Lamp`, from the Stage Browser | `lamp_selected` |
+| drawn light gizmo | click a drawn pixel of the Lamp gizmo, at least 12 px from anything else drawn | `/World/Lamp`, from the viewport | `lamp_gizmo_click` |
+
+Each compare writes its golden-size capture and the diffs in a
+`<step>_<name>_compare` folder next to the capture.
+
+## Livestream test
+
+`test_wheel_app_livestream_e2e.py` runs in the openusd window jobs on Python
+3.12, in its own step. It has no golden. It opens
+`tests/data/livestream_red_green_blue.usda` (a red cube left, a green cube
+middle, a blue cube right) and checks frames that real stream clients decode:
+
+1. Windowed app, viewport at a fixed 1000x720 (the viewport Resolution
+   setting): `stream_start` (inspector media command) with `webrtc`, `native`
+   and `rtsp`. The app log at the start must have no R/B line, the status no
+   error, and the decoded frame red left of blue. The native client is
+   `ovstream.Client` (NATIVE); the RTSP client is ffmpeg (from
+   `imageio-ffmpeg`); the WebRTC client is the ovstream browser client
+   (`examples/webrtc_client` of the ovstream release) in Google Chrome or
+   Microsoft Edge (`OVUI_E2E_REQUIRE_WEBRTC_DECODE=1` makes a missing browser
+   a failure). The Linux runners have no browser that decodes H.264, so there
+   the WebRTC start is checked but not decoded. After streaming the viewport
+   must still be on the zero-copy GPU ingest path.
+2. Headless app: an MP4 recording (`recording_start`/`recording_stop`; the
+   last frame is decoded), then `stream_start` with `source: application`
+   (the composed window) and the native and RTSP clients. Every decoded frame
+   must have red left of blue in the viewport area. This needs the
+   CUDA-Vulkan frame export; on a partitioned (MIG) GPU, which cannot export,
+   this test skips with the reason.
+
+Every protocol of a test must start: a failed `stream_start` fails the test
+with its cause, after the other protocols are checked. The WebRTC and native
+servers of StreamSDK need a Direct3D device on Windows, which the session of
+a Windows service (session 0) cannot give
+(`NVST_DISCONN_SERVER_VIDEO_ADAPTER_INITIALIZE_D3D_FAILED`). Run the Windows test from the logged-in user's interactive console
+session, where the required graphics device is available. The decoded
+frames are saved as PNGs in the test directory.
+
+The test skips only on a computer without the hardware: no NVIDIA GPU that
+ovrtx can use, or on Linux no X display (`OVUI_E2E_REQUIRE_RENDER=1` makes
+this a failure too). When the hardware is there, a missing `ovstream` or
+`imageio-ffmpeg` fails the test with the install command.
+
+Run `ovui-data-adapters/tests/test_swap_kernel.py` separately against the
+installed adapters to validate the R/B swap kernels. These tests launch
+the R/B swap kernels on the GPU and compare the result with NumPy. They need
+only the NVIDIA driver (libcuda or nvcuda.dll), not a CUDA toolkit. They skip
+on a computer without a CUDA GPU, such as the hosted wheelhouse jobs; on the
+GPU test machine, require these tests to execute successfully.
+
+## Memory check test
+
+`test_wheel_app_memory_check_e2e.py` runs in all window jobs, with both data
+providers. It has no golden and takes no screenshot. It starts the app with
+`OVUI_MIN_GPU_MEMORY_GIB=100000`, a GPU minimum that no GPU has, so that each
+memory check of a scene with prims gives a warning on every computer:
+
+- `simple_scene.usda`: each warning of the report of the check
+  (`render_diagnostics`, `resources.warnings`) is in the app log exactly one
+  time, and the log has no other memory warning (the renderer does not check
+  the memory when it starts; the scene load checks it once). `ovui-inspect
+  health` shows the same warnings. Exactly one of them is the GPU warning, with
+  the minimum that the GPU reading of the app (`gpu_memory`) calls for: the GPU
+  minimum on a discrete GPU; the GPU minimum plus the host minimum on an
+  integrated GPU with unified memory (DGX Spark GB10); the GPU minimum that
+  cannot be checked when the GPU memory is unknown.
+- An empty scene (`#usda 1.0` only): no memory warning in the log, no minimum
+  in the report of the check (`resources.scene_empty`), and no warning in
+  `health`.
+
+The CI runners have discrete GPUs. The integrated-GPU case is tested only where
+the GPU reading of the app is `unified`.
+
+The test skips only when `nvidia-smi -L` lists no NVIDIA GPU, an
+`ovrtx.Renderer()` cannot be made, and `OVUI_E2E_REQUIRE_RENDER` is not 1, as
+the other e2e tests do. The CI jobs set `OVUI_E2E_REQUIRE_RENDER=1`, so there it
+fails instead. On Linux with a working renderer and no `DISPLAY`, it fails and
+names the missing display.
+
 ## Providers and runtimes
 
 The window test runs once per data provider, each from its own clean install:
@@ -121,9 +378,8 @@ The window test runs once per data provider, each from its own clean install:
 
 The headless test uses the `openusd` install. On Linux the window needs an
 X display, which may be supplied by Xvfb; the NVIDIA Vulkan driver must still
-render it on the GPU. The checked-in reference captures used matched runtimes
-`ovrtx==0.5.1.385782` and `ovstage==0.2.1.385922`. Use these versions when
-comparing the references, and investigate differences when changing runtimes.
+render on a compatible GPU. Install compatible `ovrtx` and, for native
+OVStage checks, `ovstage` runtimes in the test environment.
 
 ## Product defects this test found (fixed)
 
@@ -146,6 +402,9 @@ cannot render on software Vulkan (Lavapipe). The gate is honest:
 - No NVIDIA GPU at all → **skip**, with the full reason (an environment limit).
 - A GPU is present but the renderer fails to init → **fail** (the real break
   this test exists to catch, e.g. the Windows imgui.dll collision).
+- The renderer works but, on Linux, `DISPLAY` is not set (the camera pan and
+  zoom tests) → **fail** with a setup message, with or without
+  `OVUI_E2E_REQUIRE_RENDER`: the windowed app needs an X display.
 - `OVUI_E2E_REQUIRE_RENDER=1` (set for a required GPU run) → any non-run is a
   **failure**, so a required run cannot pass by skipping the test.
 
@@ -163,12 +422,12 @@ checks (for example, Xvfb); software Vulkan alone is insufficient.
 Create and activate a fresh Python 3.12 virtual environment for each provider.
 Install exactly one compatible wheel for each product distribution from the
 compiled wheelhouse using `pip install --no-index --no-deps <wheel files>`.
-Keep every product wheel at version 0.3.0. For the native OVStage environment,
+Keep every product wheel at version 0.3.1. For the native OVStage environment,
 omit both the OpenUSD adapter and `ovui-widgets-all` (which depends on the
 OpenUSD adapter). Do not install `usd-core` or another `pxr` provider.
 
 Install third-party dependencies from public indexes (`pypi.org` and
-`pypi.nvidia.com`), including the matched renderer/runtime versions above,
+`pypi.nvidia.com`), including compatible renderer/runtime versions,
 `numpy`, `pydantic`, `platformdirs`, `Pillow`, `pytest`, `fastapi`, and `uvicorn`.
 The OpenUSD environment also needs `usd-core`, or compatible OpenUSD Python
 bindings supplied separately on a platform without a matching wheel. Run
@@ -198,15 +457,19 @@ artifacts (screenshots, app logs, and provenance) for any failing comparison.
 
 ## Goldens
 
-**One golden per test for all platforms**, stored at **half size (500x360)**
-in `golden/`: `app_window_openusd.png`, `app_window_ovstage.png`,
-`headless_viewport_openusd.png`. The 1000x720 capture is reduced by a 2x2 box
-average (`Image.reduce(2)`) before it is written or compared. The checked-in references
-were generated on Linux x86_64 with an optional Linux gizmo backend that is
-not included in the public package set. Historical Windows comparisons used
-ovui's default SceneView and passed against these same images. The public
-package set uses the default SceneView on every platform; the historical
-results do not prove that the public Linux configuration will match.
+**One golden per test for all platforms** (except three steps of the light pick
+test, see "Light pick test"), stored at **half size (500x360)** in `golden/`: `app_window_openusd.png`, `app_window_ovstage.png`,
+`headless_viewport_openusd.png`, `camera_pan_openusd.png`,
+`camera_pan_ovstage.png`, `camera_zoom_openusd.png`, `camera_zoom_ovstage.png`
+and, for the light pick test, `light_pick_<step>_<provider>.png` (steps
+`start`, `origin_cube` and `cleared`) and
+`light_pick_<step>_<provider>_<platform>.png` (steps `small_cube`,
+`lamp_selected` and `lamp_gizmo_click`, see "Light pick test"). The 1000x720 capture is reduced by a 2x2 box
+average (`Image.reduce(2)`) before it is written or compared. The golden is
+made on Linux x86_64; a per-platform golden is made on its own platform.
+Some historical Linux references used an optional gizmo backend that is not
+included in this public source tree. A comparison against those references
+may reveal backend differences; investigate them without weakening the checks.
 
 The reference images and comparison tolerances are retained unchanged. A
 failure must be investigated as a possible product, runtime, or backend

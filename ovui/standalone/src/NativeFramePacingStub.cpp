@@ -30,7 +30,9 @@ uint64_t startNativeFramePacing(uintptr_t, const char*, uint32_t, uint32_t, uint
 bool publishNativeFramePacingState(uint64_t, uint32_t, uint32_t, const std::array<double, 16>&,
                                    const std::array<double, 3>&, double) { return false; }
 bool pauseNativeFramePacingRender(uint64_t) { return false; }
-bool resumeNativeFramePacingRender(uint64_t) { return false; }
+bool resumeNativeFramePacingRender(uint64_t, bool) { return false; }
+bool setNativeFramePacingRenderPolicy(uint64_t, const char*, uint32_t) { return false; }
+bool requestNativeFramePacingRender(uint64_t) { return false; }
 bool stopNativeFramePacing(uint64_t) { return false; }
 NativeFramePacingStats getNativeFramePacingStats()
 {

@@ -1,40 +1,41 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for ``ovui_data_adapters.openusd._swap_kernel`` — issue #34 Step 1.5.
+"""Tests for ``ovui_data_adapters.openusd._swap_kernel`` — the regression Step 1.5.
 
-The kernel runs on the GPU; tests are skipped automatically when no
-CUDA device or runtime is available. On the dev VM (driver 570.158.01,
-CUDA 12.6, NVIDIA L40) both tests pass.
+The kernel runs on the GPU. The kernels need only the NVIDIA driver (issue
+510), so the tests use only the driver too: its CUDA library (libcuda or
+nvcuda.dll) gives the device memory. They run on each computer with an
+NVIDIA GPU and driver, also without a CUDA toolkit, and skip only when
+that library or a CUDA GPU is missing. A kernel that cannot load on a GPU
+host fails the tests.
 """
 
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import os
 
 import numpy as np
 import pytest
 from ovui_data_adapters.openusd import _swap_kernel
 
 # ---------------------------------------------------------------------------
-# Tiny CUDA Runtime API helper for the tests. The production tap's
+# Tiny CUDA Driver API helper for the tests. The production tap's
 # `_Cudart` class only knows D2H/D2D/malloc; tests need H2D too. We keep
 # this thin wrapper test-local so the production module stays focused.
+# It uses the CUDA library of the driver, like the kernel, and the primary
+# context of device 0, which the kernel uses when it finds it current.
 # ---------------------------------------------------------------------------
-
-_CUDA_MEMCPY_HTOD = 1
-_CUDA_MEMCPY_DTOH = 2
 
 
 class _TestCuda:
     def __init__(self) -> None:
-        candidates = [
-            ctypes.util.find_library("cudart"),
-            "libcudart.so",
-            "libcudart.so.12",
-            "libcudart.so.1",
-        ]
+        if os.name == "nt":
+            candidates = ["nvcuda.dll"]
+        else:
+            candidates = [ctypes.util.find_library("cuda"), "libcuda.so.1", "libcuda.so"]
         last_exc = None
         for c in candidates:
             if not c:
@@ -45,73 +46,82 @@ class _TestCuda:
             except OSError as exc:
                 last_exc = exc
         else:
-            raise OSError(f"libcudart not found: {last_exc!r}")
+            raise OSError(f"the CUDA driver library (libcuda / nvcuda.dll) is not found: {last_exc!r}")
 
         L = self._lib
-        L.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
-        L.cudaMalloc.restype = ctypes.c_int
-        L.cudaFree.argtypes = [ctypes.c_void_p]
-        L.cudaFree.restype = ctypes.c_int
-        L.cudaMemcpy.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
-        ]
-        L.cudaMemcpy.restype = ctypes.c_int
-        L.cudaDeviceSynchronize.argtypes = []
-        L.cudaDeviceSynchronize.restype = ctypes.c_int
+        L.cuInit.argtypes = [ctypes.c_uint]
+        L.cuInit.restype = ctypes.c_int
+        L.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        L.cuDeviceGet.restype = ctypes.c_int
+        L.cuDevicePrimaryCtxRetain.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+        L.cuDevicePrimaryCtxRetain.restype = ctypes.c_int
+        L.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
+        L.cuCtxSetCurrent.restype = ctypes.c_int
+        L.cuMemAlloc_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+        L.cuMemAlloc_v2.restype = ctypes.c_int
+        L.cuMemFree_v2.argtypes = [ctypes.c_uint64]
+        L.cuMemFree_v2.restype = ctypes.c_int
+        L.cuMemcpyHtoD_v2.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
+        L.cuMemcpyHtoD_v2.restype = ctypes.c_int
+        L.cuMemcpyDtoH_v2.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t]
+        L.cuMemcpyDtoH_v2.restype = ctypes.c_int
+        L.cuCtxSynchronize.argtypes = []
+        L.cuCtxSynchronize.restype = ctypes.c_int
+
+        self._check(L.cuInit(0), "cuInit")
+        device = ctypes.c_int(0)
+        self._check(L.cuDeviceGet(ctypes.byref(device), 0), "cuDeviceGet")
+        ctx = ctypes.c_void_p(0)
+        self._check(L.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), device.value),
+                    "cuDevicePrimaryCtxRetain")
+        self._check(L.cuCtxSetCurrent(ctx), "cuCtxSetCurrent")
+
+    @staticmethod
+    def _check(rc: int, what: str) -> None:
+        if rc != 0:
+            raise RuntimeError(f"{what} rc={rc}")
 
     def malloc(self, nbytes: int) -> int:
-        ptr = ctypes.c_void_p()
-        rc = self._lib.cudaMalloc(ctypes.byref(ptr), nbytes)
-        if rc != 0:
-            raise RuntimeError(f"cudaMalloc({nbytes}) rc={rc}")
+        ptr = ctypes.c_uint64(0)
+        self._check(self._lib.cuMemAlloc_v2(ctypes.byref(ptr), nbytes), f"cuMemAlloc({nbytes})")
         return int(ptr.value)
 
     def free(self, dev: int) -> None:
         if dev:
-            self._lib.cudaFree(ctypes.c_void_p(dev))
+            self._lib.cuMemFree_v2(dev)
 
     def h2d(self, dev: int, host: np.ndarray) -> None:
-        rc = self._lib.cudaMemcpy(
-            ctypes.c_void_p(dev),
-            host.ctypes.data_as(ctypes.c_void_p),
-            host.nbytes,
-            _CUDA_MEMCPY_HTOD,
+        self._check(
+            self._lib.cuMemcpyHtoD_v2(dev, host.ctypes.data_as(ctypes.c_void_p), host.nbytes),
+            "cuMemcpyHtoD",
         )
-        if rc != 0:
-            raise RuntimeError(f"cudaMemcpy H2D rc={rc}")
 
     def d2h(self, host: np.ndarray, dev: int) -> None:
-        rc = self._lib.cudaMemcpy(
-            host.ctypes.data_as(ctypes.c_void_p),
-            ctypes.c_void_p(dev),
-            host.nbytes,
-            _CUDA_MEMCPY_DTOH,
+        self._check(
+            self._lib.cuMemcpyDtoH_v2(host.ctypes.data_as(ctypes.c_void_p), dev, host.nbytes),
+            "cuMemcpyDtoH",
         )
-        if rc != 0:
-            raise RuntimeError(f"cudaMemcpy D2H rc={rc}")
 
     def sync(self) -> None:
-        rc = self._lib.cudaDeviceSynchronize()
-        if rc != 0:
-            raise RuntimeError(f"cudaDeviceSynchronize rc={rc}")
+        self._check(self._lib.cuCtxSynchronize(), "cuCtxSynchronize")
 
 
-def _has_gpu() -> bool:
+def _cuda_gpu() -> tuple[bool, str]:
+    """Whether the CUDA driver library and a CUDA GPU are present, and the cause if not."""
     try:
         cu = _TestCuda()
         ptr = cu.malloc(16)
         cu.free(ptr)
-        # Probe NVRTC + driver too — if any of these fail we should
-        # skip rather than fail (the kernel can't run anyway).
-        _swap_kernel.warm_up()
-        return True
-    except Exception:
-        return False
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
 
+
+_CUDA_GPU, _NO_CUDA_GPU_CAUSE = _cuda_gpu()
 
 pytestmark = pytest.mark.skipif(
-    not _has_gpu(),
-    reason="CUDA runtime / NVRTC / GPU not available — _swap_kernel needs all three",
+    not _CUDA_GPU,
+    reason=f"no CUDA GPU with an NVIDIA driver (libcuda / nvcuda.dll): {_NO_CUDA_GPU_CAUSE}",
 )
 
 
@@ -233,3 +243,48 @@ def test_copy_swap_rb_writes_bgra_and_leaves_the_source(width, height):
 
     assert np.array_equal(out, expected)
     assert np.array_equal(back, rgba)
+
+
+def test_kernels_load_and_run_without_nvrtc(monkeypatch):
+    """Issue 510: the kernels must not need NVRTC. The reported failures
+    came from the NVRTC found on the computer: its builtins DLL was not
+    on the Windows DLL search path (``nvrtcCompileProgram rc=7``), and a
+    Linux toolkit newer than the driver made PTX that the driver rejects
+    (``cuModuleLoadData rc=222``). With every NVRTC library unloadable,
+    a fresh load of the kernels must still give the exact R/B swap."""
+    real_cdll = ctypes.CDLL
+
+    def _cdll_without_nvrtc(name, *args, **kwargs):
+        if name and "nvrtc" in str(name).lower():
+            raise OSError(f"{name}: NVRTC is not usable on this computer")
+        return real_cdll(name, *args, **kwargs)
+
+    monkeypatch.setattr(_swap_kernel.ctypes, "CDLL", _cdll_without_nvrtc)
+    # Load the module again in this process instead of reusing the cached one.
+    monkeypatch.setattr(_swap_kernel, "_cached", {})
+
+    width, height = 37, 5
+    rng = np.random.default_rng(510)
+    rgba = rng.integers(0, 256, size=(height, width, 4), dtype=np.uint8)
+    expected = rgba.copy()
+    expected[..., [0, 2]] = expected[..., [2, 0]]
+
+    cu = _TestCuda()
+    src = cu.malloc(rgba.nbytes)
+    dst = cu.malloc(rgba.nbytes)
+    try:
+        _swap_kernel.warm_up()
+        cu.h2d(src, rgba)
+        _swap_kernel.copy_swap_rb(src, width * 4, dst, width * 4, width, height)
+        _swap_kernel.swap_rb_in_place(src, width, height, pitch=width * 4)
+        cu.sync()
+        copied = np.empty_like(rgba)
+        cu.d2h(copied, dst)
+        in_place = np.empty_like(rgba)
+        cu.d2h(in_place, src)
+    finally:
+        cu.free(src)
+        cu.free(dst)
+
+    assert np.array_equal(copied, expected)
+    assert np.array_equal(in_place, expected)

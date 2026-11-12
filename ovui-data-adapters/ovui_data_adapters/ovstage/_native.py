@@ -6,11 +6,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import math
 import re
 import struct
 from importlib import import_module
 from typing import Any, Iterable
+
+from ovui_data_adapters.ovstage._handles import (
+    handle_number,
+    native_prim_path,
+    native_token,
+    read_groups,
+    release_read_group,
+)
 
 
 _TOKEN_PLACEHOLDER_RE = re.compile(r"^<token ([0-9]+)>$")
@@ -29,6 +38,45 @@ _MATRIX_FABRIC_COLUMNS = {
     "localMatrix": "omni:fabric:localMatrix",
     "worldMatrix": "omni:fabric:worldMatrix",
 }
+
+
+def element_lanes(tensor: Any) -> int:
+    """Return how many components one element of an ovstage tensor holds.
+
+    ovstage can describe a vector element with DLPack lanes (shape ``(rows,)``
+    with lanes 3) or with trailing dimensions (shape ``(rows, 3)`` with lanes
+    1). Both mean the same element: its components are the lanes times every
+    dimension after the first.
+    """
+
+    lanes = max(int(tensor.dtype.lanes), 1)
+    shape = tuple(int(value) for value in (getattr(tensor, "shape_tuple", ()) or ()))
+    return lanes * math.prod(shape[1:]) if len(shape) > 1 else lanes
+
+
+def path_strings(paths: Any, path_list: Any) -> list[str]:
+    """Return the path strings of a native path list.
+
+    ``PathDictionary.get_path_strings`` resolves each name of each path
+    through the dictionary on its own. Paths in one list share most of their
+    ancestors, so a small cache of resolved names removes most of those calls.
+    A newer ovstage gives each name as a token that shows memory that ovstage
+    frees after the call, so the cache keeps the number of the token, not the
+    token.
+    """
+
+    resolve = getattr(paths, "token_to_string", None)
+    try:
+        resolve_number = functools.lru_cache(maxsize=256)(
+            lambda number: resolve(native_token(paths, number))
+        )
+        paths.token_to_string = lambda token: resolve_number(handle_number(token))
+    except (AttributeError, TypeError):
+        return paths.get_path_strings(path_list)
+    try:
+        return paths.get_path_strings(path_list)
+    finally:
+        del paths.token_to_string
 
 
 @dataclass(frozen=True)
@@ -74,14 +122,14 @@ def read_paths_attribute_records(
                 query.wait()
                 result = query.result()
                 discovered = frozenset(
-                    str(paths.token_to_string(int(token)))
+                    str(paths.token_to_string(native_token(paths, token)))
                     for token in getattr(result, "attributes", ())
                 )
                 names = tuple(name for name in requested if name in discovered)
                 if not names:
                     return {}
                 tokens = {name: paths.intern_token(name) for name in names}
-                token_names = {int(token): name for name, token in tokens.items()}
+                token_names = {handle_number(token): name for name, token in tokens.items()}
                 ordinal_range = ovstage.OrdinalRange.latest(int(stage.current_ordinal))
                 with stage.read_attributes(
                     query,
@@ -89,7 +137,7 @@ def read_paths_attribute_records(
                     ordinal_range,
                 ) as read:
                     read.wait()
-                    for group in read.groups():
+                    for group in read_groups(read.groups()):
                         try:
                             name = token_names.get(
                                 int(getattr(group, "attribute", 0) or 0)
@@ -104,7 +152,7 @@ def read_paths_attribute_records(
                             ).items():
                                 copied.setdefault(path, {})[name] = record
                         finally:
-                            stage.release_group(group)
+                            release_read_group(stage, group)
         finally:
             paths.destroy_path_list(path_list)
     return copied
@@ -145,7 +193,7 @@ def read_path_attribute_records(
                 query.wait()
                 result = query.result()
                 discovered = tuple(
-                    str(paths.token_to_string(int(token)))
+                    str(paths.token_to_string(native_token(paths, token)))
                     for token in getattr(result, "attributes", ())
                 )
                 names = (
@@ -156,7 +204,7 @@ def read_path_attribute_records(
                 if not names:
                     return {}
                 tokens = {name: paths.intern_token(name) for name in names}
-                token_names = {int(token): name for name, token in tokens.items()}
+                token_names = {handle_number(token): name for name, token in tokens.items()}
                 ordinal_range = ovstage.OrdinalRange.latest(int(stage.current_ordinal))
                 with stage.read_attributes(
                     query,
@@ -164,7 +212,7 @@ def read_path_attribute_records(
                     ordinal_range,
                 ) as read:
                     read.wait()
-                    for group in read.groups():
+                    for group in read_groups(read.groups()):
                         try:
                             name = token_names.get(
                                 int(getattr(group, "attribute", 0) or 0)
@@ -180,7 +228,7 @@ def read_path_attribute_records(
                             if record is not None:
                                 records[name] = record
                         finally:
-                            stage.release_group(group)
+                            release_read_group(stage, group)
         finally:
             paths.destroy_path_list(path_list)
     return records
@@ -212,7 +260,7 @@ def _copy_path_attribute_group_rows(
 
     try:
         group_paths = tuple(
-            str(path) for path in paths.get_path_strings(group.prim_list)
+            str(path) for path in path_strings(paths, group.prim_list)
         )
         raw = getattr(group, "raw", None)
         semantic = int(getattr(raw, "semantic", 0) or 0)
@@ -234,11 +282,12 @@ def _copy_path_attribute_group_rows(
                 if data_index < 0 or data_index >= tensor_count:
                     continue
                 tensor_index = data_index
-                dtype_obj = group.tensor(tensor_index).dtype
+                tensor = group.tensor(tensor_index)
+                dtype_obj = tensor.dtype
                 dtype = (
                     int(dtype_obj.code),
                     int(dtype_obj.bits),
-                    int(dtype_obj.lanes),
+                    element_lanes(tensor),
                 )
                 array = group.array(tensor_index).reshape(-1)
                 raw_values = array.tolist()
@@ -251,23 +300,18 @@ def _copy_path_attribute_group_rows(
                 dtype = (
                     int(dtype_obj.code),
                     int(dtype_obj.bits),
-                    int(dtype_obj.lanes),
+                    element_lanes(tensor),
                 )
                 array = group.array(0).reshape(-1)
                 shape = tuple(
                     int(value)
                     for value in (getattr(tensor, "shape_tuple", ()) or ())
                 )
-                lanes = int(dtype[2])
+                width = int(dtype[2])
                 row_count = (
                     int(shape[0])
                     if shape
-                    else int(array.size) // max(lanes, 1)
-                )
-                width = (
-                    math.prod(shape[1:]) * lanes
-                    if shape
-                    else lanes
+                    else int(array.size) // max(width, 1)
                 )
                 if width <= 0 or data_index < 0 or data_index >= row_count:
                     continue
@@ -286,7 +330,7 @@ def _copy_path_attribute_group_rows(
             # token id with semantic NONE.  Preserve the public logical type
             # value rather than leaking a stage-owned dictionary id.
             if name == "usd-prim-type" and isinstance(value, int):
-                value = str(paths.token_to_string(value))
+                value = str(paths.token_to_string(native_token(paths, value)))
         except Exception:
             continue
         copied[path] = NativePathAttributeRecord(
@@ -324,9 +368,9 @@ def _decode_path_attribute_values(
             return decoded_strings
         return decoded_strings[0] if decoded_strings else ""
     if semantic == _TOKEN_ID_SEMANTIC:
-        decoded = tuple(paths.token_to_string(int(value)) for value in values)
+        decoded = tuple(paths.token_to_string(native_token(paths, value)) for value in values)
     elif semantic == _RELATIONSHIP_PATH_ID_SEMANTIC:
-        decoded = tuple(paths.path_to_string(int(value)) for value in values)
+        decoded = tuple(paths.path_to_string(native_prim_path(paths, value)) for value in values)
     elif code == _DLPACK_BOOL:
         decoded = tuple(bool(value) for value in values)
     elif code in (0, _DLPACK_UINT):
@@ -380,6 +424,16 @@ def read_token_attribute(stage: Any, path: str, attr_name: str) -> str | None:
     return None
 
 
+def _populated_stage_metadata(
+    stage: Any,
+    name: str,
+) -> NativePathAttributeRecord | None:
+    """Return one stage metadata record that population read with the scene."""
+
+    metadata = getattr(stage, "_ovui_stage_metadata", None)
+    return metadata.get(name) if isinstance(metadata, dict) else None
+
+
 def read_population_up_axis(stage: Any) -> str | None:
     """Copy the populated stage up-axis through OVStage's public query API.
 
@@ -387,8 +441,13 @@ def read_population_up_axis(stage: Any) -> str | None:
     stage-info prim.  The prim is intentionally absent from the user hierarchy,
     so this narrow native read bypasses the user-facing compatibility cache
     while retaining the query/read/group ownership required by OVStage.
+    ovstage 0.2 publishes it as stage metadata instead.
     """
 
+    record = _populated_stage_metadata(stage, "usd-metadata:upAxis")
+    if record is not None:
+        axis = str(record.value).upper()
+        return axis if axis in {"Y", "Z"} else None
     ovstage = import_module("ovstage")
     with ovstage.PathDictionary(stage) as paths:
         token = paths.intern_token("upAxis")
@@ -397,25 +456,30 @@ def read_population_up_axis(stage: Any) -> str | None:
             ordinal_range = ovstage.OrdinalRange.latest(int(stage.current_ordinal))
             with stage.read_attributes(query, [token], ordinal_range) as read:
                 read.wait()
-                for group in read.groups():
+                for group in read_groups(read.groups()):
                     try:
                         result = _copy_up_axis_group(paths, group, token)
                     finally:
-                        stage.release_group(group)
+                        release_read_group(stage, group)
                     if result is not None:
                         return result
     return None
 
 
 def read_population_meters_per_unit(stage: Any) -> float | None:
-    """Copy populated ``metersPerUnit`` from OVStage's reserved stage info."""
+    """Copy populated ``metersPerUnit`` from OVStage's stage metadata.
 
-    records = read_path_attribute_records(
+    ovstage 0.2 publishes it as stage metadata; ovstage 0.1 published it on
+    its reserved stage-info prim.
+    """
+
+    record = _populated_stage_metadata(
+        stage, "usd-metadata:metersPerUnit"
+    ) or read_path_attribute_records(
         stage,
         _POPULATION_STAGE_INFO_PATH,
         ("metersPerUnit",),
-    )
-    record = records.get("metersPerUnit")
+    ).get("metersPerUnit")
     if record is None:
         return None
     try:
@@ -471,11 +535,11 @@ def read_matrix_attribute(
                         query, [token], ordinal_range
                     ) as read:
                         read.wait()
-                        for group in read.groups():
+                        for group in read_groups(read.groups()):
                             try:
                                 values = _copy_matrix_group(group, token)
                             finally:
-                                stage.release_group(group)
+                                release_read_group(stage, group)
                             if values is not None:
                                 return values
             finally:
@@ -538,7 +602,7 @@ def _is_matrix_info(info: Any) -> bool:
 def _copy_matrix_group(group: Any, token: int) -> tuple[float, ...] | None:
     """Copy one validated 16-lane float MATRIX row from a read group."""
 
-    if int(getattr(group, "attribute", 0) or 0) != int(token):
+    if int(getattr(group, "attribute", 0) or 0) != handle_number(token):
         return None
     raw = getattr(group, "raw", None)
     if bool(getattr(group, "is_array", False)) or bool(
@@ -550,11 +614,12 @@ def _copy_matrix_group(group: Any, token: int) -> tuple[float, ...] | None:
     if int(getattr(group, "tensor_count", 0) or 0) != 1:
         return None
     try:
-        dtype = group.tensor(0).dtype
+        tensor = group.tensor(0)
+        dtype = tensor.dtype
         if (
             int(dtype.code) != _DLPACK_FLOAT
             or int(dtype.bits) not in {32, 64}
-            or int(dtype.lanes) != 16
+            or element_lanes(tensor) != 16
         ):
             return None
         prim_count = int(group.prim_count)
@@ -574,7 +639,7 @@ def _copy_matrix_group(group: Any, token: int) -> tuple[float, ...] | None:
 
 
 def resolve_token_id(stage: Any, token_id: int) -> str:
-    token = int(token_id)
+    token = handle_number(token_id)
     if token <= 0:
         return ""
 
@@ -600,7 +665,7 @@ def resolve_token_id(stage: Any, token_id: int) -> str:
     try:
         ovstage = import_module("ovstage")
         dictionary = ovstage.PathDictionary(stage)
-        resolved = str(dictionary.token_to_string(token))
+        resolved = str(dictionary.token_to_string(native_token(dictionary, token)))
     except Exception:
         resolved = ""
     finally:
@@ -626,22 +691,23 @@ def resolve_token_id(stage: Any, token_id: int) -> str:
 
 
 def _copy_up_axis_group(paths: Any, group: Any, token: int) -> str | None:
-    if int(getattr(group, "attribute", 0) or 0) != int(token):
+    if int(getattr(group, "attribute", 0) or 0) != handle_number(token):
         return None
     if bool(getattr(group, "is_array", False)):
         return None
     if int(getattr(group, "tensor_count", 0) or 0) != 1:
         return None
     try:
-        dtype = group.tensor(0).dtype
+        tensor = group.tensor(0)
+        dtype = tensor.dtype
         if (
             int(dtype.code),
             int(dtype.bits),
-            int(dtype.lanes),
+            element_lanes(tensor),
         ) != (_DLPACK_UINT, 64, 1):
             return None
         group_paths = tuple(
-            str(path) for path in paths.get_path_strings(group.prim_list)
+            str(path) for path in path_strings(paths, group.prim_list)
         )
         values = group.array(0).reshape(-1).tolist()
         prim_count = int(group.prim_count)
@@ -661,7 +727,7 @@ def _copy_up_axis_group(paths: Any, group: Any, token: int) -> str | None:
         if path != _POPULATION_STAGE_INFO_PATH:
             continue
         try:
-            axis = str(paths.token_to_string(token_id)).upper()
+            axis = str(paths.token_to_string(native_token(paths, token_id))).upper()
         except Exception:
             return None
         return axis if axis in {"Y", "Z"} else None

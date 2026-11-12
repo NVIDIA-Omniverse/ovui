@@ -15,13 +15,16 @@ namespace
 std::atomic<const NativeTimingHooks*> g_nativeTimingHooks{ nullptr };
 } // namespace
 
-void setNativeTimingHooks(const NativeTimingHooks* hooks)
+bool setNativeTimingHooks(const NativeTimingHooks* hooks)
 {
+    bool accepted = true;
     if (hooks && (hooks->structSize < sizeof(NativeTimingHooks) || hooks->version != kNativeTimingHooksVersion))
     {
         hooks = nullptr;
+        accepted = false;
     }
     g_nativeTimingHooks.store(hooks, std::memory_order_release);
+    return accepted;
 }
 
 const NativeTimingHooks* getNativeTimingHooks()

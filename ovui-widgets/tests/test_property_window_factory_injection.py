@@ -137,9 +137,6 @@ def test_create_adapter_for_paths_swallows_factory_exception():
 # ---------------------------------------------------------------------------
 
 
-pytest.importorskip("pxr")
-
-
 def _build_in_memory_stage():
     """Tiny stage with one Cube — enough for the property factory to
     resolve a real prim path on construction.

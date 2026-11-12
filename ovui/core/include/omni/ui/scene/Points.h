@@ -63,7 +63,9 @@ public:
     /**
      * @brief List with positions of the points
      */
-    OMNIUI_PROPERTY(std::vector<Vector3>, positions, READ, getPositions, WRITE, setPositions, NOTIFY, _setPositionsChangedFn);
+    OMNIUI_PROPERTY(std::vector<Vector3>, positions, READ, getPositions, NOTIFY, _setPositionsChangedFn);
+    OMNIUI_SCENE_API
+    virtual void setPositions(std::vector<Vector3> const& value);
 
     /**
      * @brief List of colors of the points
@@ -101,6 +103,9 @@ protected:
 
     OMNIUI_SCENE_API
     void _drawContent(const Matrix44& projection, const Matrix44& view) override;
+
+    bool _getFollowReport(Vector3& moved) const override;
+    void _captureBaseline() const override;
 
     void _dirtyCache();
 

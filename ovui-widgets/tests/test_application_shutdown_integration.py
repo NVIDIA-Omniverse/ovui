@@ -4,7 +4,7 @@
 """Integration tests that exercise the REAL ``Application.shutdown()``
 path against the dialog-list cleanup machinery.
 
-Issue #35, Step 4 + Step 4b. End-to-end coverage for the dialog
+Regression, Step 4 + Step 4b. End-to-end coverage for the dialog
 teardown chain:
 
     Application.shutdown()

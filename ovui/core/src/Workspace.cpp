@@ -52,6 +52,9 @@ static std::function<void(const std::shared_ptr<WindowHandle>& window)> g_newWin
 // Callback for window visiblity change
 static std::vector<std::function<void(const std::string& title, bool visible)>> g_windowVisiblityChangedCallbackFn;
 
+// Callback fired the first time the user clicks inside a Window. Used by the Python
+// extension-usage telemetry hook in omni.ui.
+static std::function<void(const std::string& title, const std::string& ownerModule)> g_windowFirstInteractionCallbackFn;
 static bool g_acceptWorkspaceCallbacks = true;
 
 void detail::beginWorkspaceCallbackLifetime()
@@ -67,9 +70,11 @@ void detail::endWorkspaceCallbackLifetime()
     // reenter Workspace to remove or register callbacks during teardown.
     decltype(g_showWindowFns) retiredShowWindowFns;
     decltype(g_newWindowCallbackFn) retiredNewWindowCallbackFn;
+    decltype(g_windowFirstInteractionCallbackFn) retiredFirstInteractionCallbackFn;
     decltype(g_windowVisiblityChangedCallbackFn) retiredVisibilityCallbacks;
     retiredShowWindowFns.swap(g_showWindowFns);
     retiredNewWindowCallbackFn.swap(g_newWindowCallbackFn);
+    retiredFirstInteractionCallbackFn.swap(g_windowFirstInteractionCallbackFn);
     retiredVisibilityCallbacks.swap(g_windowVisiblityChangedCallbackFn);
 }
 
@@ -763,6 +768,26 @@ void Workspace::onWindowVisibilityChanged(const std::string& title, bool visible
         {
             callback(title, visible);
         }
+    }
+}
+
+void Workspace::setWindowFirstInteractionCallback(
+    std::function<void(const std::string& title, const std::string& ownerModule)> callbackFn)
+{
+    if (!g_acceptWorkspaceCallbacks)
+        return;
+
+    g_windowFirstInteractionCallbackFn = std::move(callbackFn);
+}
+
+void Workspace::onWindowFirstInteraction(const std::string& title, const std::string& ownerModule)
+{
+    // Call a copy: the callback can unregister or replace itself, which must not destroy it (and its captures)
+    // while it runs. The change takes effect for the next interaction.
+    auto callbackFn = g_windowFirstInteractionCallbackFn;
+    if (callbackFn)
+    {
+        callbackFn(title, ownerModule);
     }
 }
 

@@ -24,8 +24,8 @@ the viewport behavior writes the decay as::
 
 Choosing ``(1 - damping) == 1/e`` (i.e. ``damping ≈ 0.632``) reduces the
 formula to the pure exponential decay ``velocity *= exp(-dt / tc)``. With
-``tc == 0.15 s`` this yields ``exp(-2) ≈ 0.135`` remaining after 300 ms
-— about 86% decay, matching the plan's "~85% decay over 300ms" target.
+``tc == 0.2 s`` this yields ``exp(-1.5) ≈ 0.22`` remaining after 300 ms
+— a heavier coast than the plan's "~85% decay over 300ms".
 We use the exponential form directly to avoid carrying around the
 implicit damping coefficient.
 
@@ -38,12 +38,16 @@ import math
 import time
 from typing import Callable, Optional, Tuple
 
+import numpy as np
+
 from ovui_widgets.viewport.camera_controller import CameraController
 from ovui_widgets.viewport.camera_manipulator import CameraManipulatorModel
 
-# Default time constant in seconds. Matches the camera navigation behavior
-# §18 and the viewport behavior (`tumble_inertia_time_constant = 0.15`).
-DEFAULT_TIME_CONSTANT = 0.15
+# Default time constant in seconds (look and tumble).
+DEFAULT_TIME_CONSTANT = 0.2
+
+# The release velocity is fitted to the motion of the last FIT_WINDOW seconds.
+FIT_WINDOW = 0.05
 
 # Velocity magnitude (rad/sec) below which inertia is considered finished.
 # The plan writes ``min_speed = 0.001``. At 60 fps that corresponds to a
@@ -52,8 +56,6 @@ DEFAULT_MIN_SPEED = 0.001
 
 # dt clamp for ``tick()`` — guards against large frame stalls (first-frame
 # shader compile, GC pauses) snapping the camera through a full rotation.
-# the viewport behavior calls for clamping dt into [0.001, 0.1] seconds.
-DT_CLAMP_MIN = 0.001
 DT_CLAMP_MAX = 0.1
 
 # Age of the last non-zero gesture delta beyond which we do not hand off
@@ -100,6 +102,7 @@ class TumbleInertia:
         self._vy = 0.0
         self._vx = 0.0
         self._active = False
+        self._apply: Callable[[float, float], None] = camera.orbit
 
     # -- configuration ----------------------------------------------------
 
@@ -140,8 +143,16 @@ class TumbleInertia:
 
     # -- state transitions -----------------------------------------------
 
-    def start(self, rotate_y_velocity: float, rotate_x_velocity: float) -> bool:
+    def start(
+        self,
+        rotate_y_velocity: float,
+        rotate_x_velocity: float,
+        apply: Optional[Callable[[float, float], None]] = None,
+    ) -> bool:
         """Hand off a velocity vector. Returns True if inertia armed.
+
+        ``apply(rotate_y, rotate_x)`` moves the camera each tick (the
+        releasing gesture's own step; :meth:`CameraController.orbit` by default).
 
         A no-op (returns False) when:
 
@@ -159,6 +170,7 @@ class TumbleInertia:
             return False
         self._vy = float(rotate_y_velocity)
         self._vx = float(rotate_x_velocity)
+        self._apply = apply or self._camera.orbit
         self._active = True
         return True
 
@@ -188,8 +200,8 @@ class TumbleInertia:
         if tc <= 0.0:
             self.stop()
             return False
-        dt_clamped = max(DT_CLAMP_MIN, min(DT_CLAMP_MAX, float(dt)))
-        self._camera.orbit(self._vy * dt_clamped, self._vx * dt_clamped)
+        dt_clamped = min(DT_CLAMP_MAX, float(dt))
+        self._apply(self._vy * dt_clamped, self._vx * dt_clamped)
         decay = math.exp(-dt_clamped / tc)
         self._vy *= decay
         self._vx *= decay
@@ -199,19 +211,15 @@ class TumbleInertia:
 
 
 class AngularVelocityTracker:
-    """Records the most recent non-zero angular delta and its timestamp.
+    """The release velocity of a drag, fitted to its last motion.
 
-    Used by :class:`TumbleGesture` to measure tail velocity for inertia
-    handoff. Kept as its own class so the gesture doesn't grow five more
-    instance attributes and the behaviour is independently testable.
-
-    The tracker ignores zero-delta frames: if the user holds the mouse
-    still before releasing, the last *motion* is the last non-zero
-    change, not the release. That matches
-    the camera navigation behavior "last non-zero delta".
-
-    An injected clock must resolve well below the 1-8 ms spacing of mouse
-    move events; :meth:`record` divides by that interval.
+    The velocity is the least-squares slope of the turned angle over the
+    last :data:`FIT_WINDOW` seconds, or over the newer half of that window
+    when that is slower, so a hand that slows down before the release does
+    not throw the camera. When no motion came in for two report intervals
+    before the release, a still sample at the release is added: a hand that
+    stopped does not coast. Nothing coasts when the last motion is older than
+    ``max_handoff_age``.
     """
 
     def __init__(
@@ -221,45 +229,39 @@ class AngularVelocityTracker:
     ) -> None:
         self._clock = clock
         self._max_handoff_age = float(max_handoff_age)
-        self._last_change_time: Optional[float] = None
-        self._last_velocity: Tuple[float, float] = (0.0, 0.0)
+        self._samples: list = []  # (time, total rotate_y, total rotate_x)
 
     def reset(self) -> None:
-        self._last_change_time = None
-        self._last_velocity = (0.0, 0.0)
+        self._samples = []
 
-    def record(self, rotate_y: float, rotate_x: float) -> None:
-        """Record a frame delta. Zero deltas are stored as timestamps only
-        so the "stopped before release" check in :meth:`pop_handoff`
-        still sees a fresh timestamp without a non-zero velocity.
-        """
-        now = self._clock()
-        if rotate_y == 0.0 and rotate_x == 0.0:
-            # No motion this frame — zero out the recorded velocity so
-            # a static hold → release produces no inertia, but keep a
-            # fresh timestamp so age gating works predictably.
-            self._last_velocity = (0.0, 0.0)
-            self._last_change_time = now
-            return
-        prev = self._last_change_time
-        if prev is not None:
-            dt = now - prev
-            if dt > 1e-6:
-                self._last_velocity = (rotate_y / dt, rotate_x / dt)
-        self._last_change_time = now
+    def record(self, rotate_y: float, rotate_x: float, now: Optional[float] = None) -> None:
+        """Record the angles of one input step, made at ``now`` (the clock's time by default)."""
+        now = self._clock() if now is None else float(now)
+        total_y, total_x = self._samples[-1][1:] if self._samples else (0.0, 0.0)
+        self._samples.append((now, total_y + rotate_y, total_x + rotate_x))
+        while len(self._samples) > 2 and self._samples[0][0] < now - FIT_WINDOW:
+            del self._samples[0]
 
-    def pop_handoff(self) -> Tuple[float, float]:
-        """Return the velocity to hand off, then reset.
-
-        Returns ``(0.0, 0.0)`` when the last non-zero change is stale or
-        never recorded — ``TumbleInertia.start`` treats that as "do
-        nothing" per its own threshold check.
-        """
-        vy, vx = self._last_velocity
-        last_t = self._last_change_time
-        self.reset()
-        if last_t is None:
+    def pop_handoff(self, now: Optional[float] = None) -> Tuple[float, float]:
+        """Return the release velocity ``(rotate_y, rotate_x)`` per second, then reset."""
+        now = self._clock() if now is None else float(now)
+        samples, self._samples = self._samples, []
+        if len(samples) < 2 or now - samples[-1][0] > self._max_handoff_age:
             return (0.0, 0.0)
-        if self._clock() - last_t > self._max_handoff_age:
-            return (0.0, 0.0)
-        return (vy, vx)
+        interval = (samples[-1][0] - samples[0][0]) / (len(samples) - 1)
+        if now - samples[-1][0] > 2.0 * interval:
+            samples.append((now, *samples[-1][1:]))
+        samples = [sample for sample in samples if sample[0] >= samples[-1][0] - FIT_WINDOW]
+        newer = [sample for sample in samples if sample[0] >= samples[-1][0] - FIT_WINDOW / 2.0]
+        fits = [_slope(samples)] + ([_slope(newer)] if len(newer) >= 2 else [])
+        return min(fits, key=lambda velocity: math.hypot(*velocity))
+
+
+def _slope(samples: list) -> Tuple[float, float]:
+    """Least-squares slope of both angles over time."""
+    t = np.array([sample[0] for sample in samples])
+    t -= t.mean()
+    denominator = float(np.dot(t, t))
+    if denominator <= 0.0:
+        return (0.0, 0.0)
+    return tuple(float(np.dot(t, [sample[i] for sample in samples])) / denominator for i in (1, 2))

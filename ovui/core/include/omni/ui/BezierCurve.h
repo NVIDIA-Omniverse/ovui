@@ -147,9 +147,6 @@ private:
     void _evaluateTangents(
         float width, float height, float& startWidth, float& startHeight, float& endWidth, float& endHeight) const;
 
-    // void _calculteNormalPoints(
-    //     const ImVec2& p1, const ImVec2& p2, float dist, int id, int size, std::vector<ImVec2>& points);
-
     // Don't use m_mouseHoveredFn and m_isHovered to prevent the bbox logic of Widget.
     std::function<void(bool)> m_mouseHoveredLineFn;
     bool m_isHoveredLine = false;

@@ -10,8 +10,9 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from ovui_data_adapters.ovstage._handles import handle_number, native_token, read_groups, release_read_group
 from ovui_data_adapters.common import Command
-from ovui_data_adapters.ovstage._native import read_token_attribute
+from ovui_data_adapters.ovstage._native import read_token_attribute, element_lanes
 from ovui_data_adapters.ovstage._stage_write import (
     wait_operation,
     write_fixed_attribute,
@@ -498,10 +499,7 @@ def capture_native_subtrees(
                 query.wait()
                 with stage.read_attributes(query, [token], ordinal_range) as read:
                     read.wait()
-                    while True:
-                        group = stage.fetch_read_next(read)
-                        if group is None:
-                            break
+                    for group in read_groups(iter(lambda: stage.fetch_read_next(read), None)):
                         try:
                             _copy_group_attributes(
                                 stage,
@@ -512,7 +510,7 @@ def capture_native_subtrees(
                                 prim_attributes,
                             )
                         finally:
-                            stage.release_group(group)
+                            release_read_group(stage, group)
         for path in paths:
             attribute = prim_attributes[path].get(_TYPE_ATTRIBUTE)
             if attribute is None or not attribute.tensors:
@@ -520,7 +518,7 @@ def capture_native_subtrees(
             values = attribute.tensors[0].values.reshape(-1)
             if values.size:
                 prim_types[path] = str(
-                    dictionary.token_to_string(int(values[0]))
+                    dictionary.token_to_string(native_token(dictionary, values[0]))
                 )
 
     prims = tuple(
@@ -556,7 +554,7 @@ def create_native_prims(
     paths = tuple(path for path, _type_name in rows)
     with ovstage.PathDictionary(stage) as dictionary:
         type_ids = np.asarray(
-            [dictionary.intern_token(type_name) for _path, type_name in rows],
+            [handle_number(dictionary.intern_token(type_name)) for _path, type_name in rows],
             dtype=np.uint64,
         )
         type_tensor = ovstage.make_dltensor(type_ids)
@@ -675,7 +673,7 @@ def _discover_attribute_names(stage: Any, dictionary: Any) -> list[str]:
         query.wait()
         return list(
             dict.fromkeys(
-                str(dictionary.token_to_string(int(token)))
+                str(dictionary.token_to_string(native_token(dictionary, token)))
                 for token in query.result().attributes
             )
         )
@@ -742,8 +740,10 @@ def _copy_whole_tensor(group: Any, tensor_index: int) -> NativeTensorSnapshot:
         values=values,
         code=int(tensor.dtype.code),
         bits=int(tensor.dtype.bits),
-        lanes=int(tensor.dtype.lanes),
-        shape=tuple(int(value) for value in tensor.shape_tuple),
+        lanes=element_lanes(tensor),
+        # Components live in ``lanes``; keep only the row dimension (some
+        # tensors report components in trailing shape dimensions instead).
+        shape=tuple(int(value) for value in tensor.shape_tuple)[:1],
     )
 
 
@@ -762,7 +762,7 @@ def _copy_fixed_tensor_row(
     start = int(data_index) * width
     values = np.ascontiguousarray(flat[start:start + width]).copy()
     values.setflags(write=False)
-    lanes = int(tensor.dtype.lanes)
+    lanes = element_lanes(tensor)
     if lanes <= 0 or width % lanes:
         raise RuntimeError("native fixed-width tensor has inconsistent lanes")
     logical_width = max(1, width // lanes)

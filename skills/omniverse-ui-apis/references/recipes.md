@@ -346,7 +346,7 @@ tree.set_selection_changed_fn(on_tree_selection)
 
 Add expansion persistence if external model rebuilds are possible. Snapshot `tree.is_expanded(item)` into `model.expanded_paths` before `_item_changed(None)`, then resolve and `tree.set_expanded(item, True, False)` after the next frame.
 
-## Recipe: Viewport-Like Panel Shell With ovrtx
+## Recipe: Viewport-Like Panel Shell
 
 Goal: build enough of a viewport shell to validate layout, image embedding, toolbar, HUD, and renderer loop without importing `ViewportWidget`.
 
@@ -448,80 +448,13 @@ class AtomicViewportPanel:
             self.window = None
 ```
 
-ovrtx direct renderer path (sketch):
-
-```python
-import os
-os.environ.setdefault("OVRTX_SKIP_USD_CHECK", "1")  # required before import
-# In local shells with user-site usd-core installed, launch with:
-# PYTHONNOUSERSITE=1 PYTHONPATH="${OVRTX_ROOT}/python:${OVUI_REPO}/ovui/python:..."
-
-import numpy as np
-import ovrtx
-from ovrtx import Device
-
-_SESSION_ROOT = "/MyPrototypeSession"
-_RENDER_PRODUCT_PATH = f"{_SESSION_ROOT}/Render/Viewport"
-
-SESSION_USDA = """#usda 1.0
-(
-    defaultPrim = "MyPrototypeSession"
-    upAxis = "Y"
-)
-
-def Scope "MyPrototypeSession"
-{
-    def Scope "Cameras"
-    {
-        def Camera "Main"
-        {
-            float focalLength = 18
-            float horizontalAperture = 20.955
-            float verticalAperture = 15.2908
-            float2 clippingRange = (0.01, 10000)
-            token projection = "perspective"
-            matrix4d xformOp:transform = ( (1,0,0,0), (0,1,0,0), (0,0,1,0), (0,0,0,1) )
-            uniform token[] xformOpOrder = ["xformOp:transform"]
-        }
-    }
-    def Scope "Render"
-    {
-        def RenderProduct "Viewport"
-        {
-            rel camera = </MyPrototypeSession/Cameras/Main>
-            rel orderedVars = </MyPrototypeSession/Render/Vars/LdrColor>
-            uniform int2 resolution = (1280, 720)
-        }
-        def Scope "Vars"
-        {
-            def RenderVar "LdrColor"
-            {
-                uniform string sourceName = "LdrColor"
-            }
-        }
-    }
-}
-"""
-
-renderer = ovrtx.Renderer()
-renderer.add_usd("/path/to/scene.usda")
-renderer.add_usd_layer(SESSION_USDA, path_prefix=_SESSION_ROOT)
-
-dt = max(1.0 / 300.0, min(0.1, 1.0 / 60.0))
-products = renderer.step({_RENDER_PRODUCT_PATH}, delta_time=dt)
-product = products[_RENDER_PRODUCT_PATH]
-rv = product.frames[0].render_vars["LdrColor"]
-with rv.map(device=Device.CPU) as mapping:
-    frame = np.array(mapping.tensor.numpy(), copy=True)  # copy before context exits
-```
-
-`frame` is `(H, W, 4)` uint8 RGBA — feed it straight into `ImageBridge.update(frame)`.
-
-If the agent needs more than this — pick rays, selection highlight, GPU zero-copy, or session-layer reinjection on resize — stop and ask the skill maintainer to authorize the high-level adapter or extend this skill.
+For the renderer behind `render_frame`, follow `references/renderer-direct.md` in the `omniverse-ui-widgets` skill.
 
 ## Recipe: Property-Inspector Row Patterns From Atomic Widgets
 
 Goal: build a Property Inspector-like panel from atomic widgets without importing any `PropertyWidget` subclass. Sections are collapsible groups; each row is a label-on-the-left + control-on-the-right pair.
+
+The spacing, the alignment and the options of the rows come from `references/layout-presets.md`. Copy its constants (`LAYOUT_*`) into your module.
 
 ```python
 import omni.ui as ui
@@ -546,17 +479,23 @@ class AtomicPropertySection:
             style_type_name_override="Property.GroupFrame",
         )
         with self._frame:
-            with ui.VStack(spacing=2):
-                for label, build_control in self._rows:
-                    self._build_row(label, build_control)
+            with ui.VStack(spacing=0, height=0):
+                ui.Spacer(height=LAYOUT_HEADER_GAP)
+                with ui.VStack(spacing=LAYOUT_TIGHT_SPACING, height=0):
+                    for label, build_control in self._rows:
+                        self._build_row(label, build_control)
 
     def _build_row(self, label, build_control):
-        with ui.HStack(height=ui.Pixel(20), spacing=6):
-            ui.Spacer(width=ui.Pixel(8))
-            ui.Label(label, width=ui.Pixel(120), alignment=ui.Alignment.LEFT_CENTER)
+        with ui.HStack(height=LAYOUT_ROW_HEIGHT, spacing=LAYOUT_LABEL_GAP):
+            ui.Label(
+                label,
+                width=LAYOUT_LABEL_WIDTH,
+                alignment=ui.Alignment.LEFT_CENTER,
+                elided_text=True,
+                tooltip=label,
+            )
             with ui.HStack():
                 build_control()
-            ui.Spacer(width=ui.Pixel(8))
 
 
 # Example controls — each one is a callable that builds a single control in place.
@@ -583,17 +522,21 @@ def vec3_row(x_model, y_model, z_model):
         # Use MultiFloatDragField when the three values should share a single
         # AbstractItemModel. For independent value models, lay out three
         # FloatDrag widgets in an HStack with Fraction widths.
-        with ui.HStack(spacing=4):
-            ui.FloatDrag(model=x_model, width=ui.Fraction(1))
-            ui.FloatDrag(model=y_model, width=ui.Fraction(1))
-            ui.FloatDrag(model=z_model, width=ui.Fraction(1))
+        with ui.HStack(spacing=LAYOUT_TIGHT_SPACING):
+            ui.FloatDrag(model=x_model, step=0.01, width=ui.Fraction(1))
+            ui.FloatDrag(model=y_model, step=0.01, width=ui.Fraction(1))
+            ui.FloatDrag(model=z_model, step=0.01, width=ui.Fraction(1))
     return build
 
 
 def bool_row(model):
     def build():
-        with ui.HStack():
-            ui.CheckBox(model=model, width=ui.Pixel(16))
+        # A check box of fixed size, centered in the row (see the form row preset).
+        with ui.HStack(spacing=0):
+            with ui.VStack(width=LAYOUT_CHECK_BOX_SIZE, spacing=0):
+                ui.Spacer()
+                ui.CheckBox(model=model, width=LAYOUT_CHECK_BOX_SIZE, height=LAYOUT_CHECK_BOX_SIZE)
+                ui.Spacer()
             ui.Spacer()
     return build
 
@@ -609,7 +552,7 @@ def color_row(r_model, g_model, b_model, a_model=None):
 
 # Assembly inside a docked property window:
 
-with ui.VStack(spacing=4):
+with ui.VStack(spacing=LAYOUT_SPACING):
     AtomicPropertySection("Transform", [
         ("Translate", vec3_row(tx, ty, tz)),
         ("Rotate",    vec3_row(rx, ry, rz)),

@@ -415,6 +415,16 @@ class BrowserBar:
             self._path_field.set_path(path)
         self._update_nav_buttons()
 
+    def handle_path_key(self, key: int, modifiers: int) -> bool:
+        """Send a key press of the window to the :class:`PathField`.
+
+        See :meth:`PathField.handle_window_key`. Returns ``True`` when
+        the path field used the key.
+        """
+        if self._path_field is None:
+            return False
+        return self._path_field.handle_window_key(key, modifiers)
+
     def go_back(self) -> None:
         """Step the history cursor back and echo the target URL.
 
@@ -492,7 +502,7 @@ class BrowserBar:
         self._begin_edit_handler = None
 
 
-# ── Issue #35 Step 3: register the module-scope provider cache so
+# ── register the module-scope provider cache so
 # Application.shutdown() drops every ui.RasterImageProvider it holds
 # before omni.ui.shutdown() runs.
 from ovui_widgets.common.icon_caches import register_dict as _register_dict_for_shutdown

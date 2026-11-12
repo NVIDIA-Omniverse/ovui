@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Ty
 # constructed namespace. The private path is what ``_undo_manager`` uses too.
 from ovui_data_adapters.common._bound_camera_pose import BoundCameraPose
 from ovui_data_adapters.common._subscription import SubscriptionProtocol
+from ovui_data_adapters.common.matrix_transform import with_matrix_part
 from ovui_data_adapters.common.point_cloud import (
     PointCloudFrame,
     PointCloudOutputCatalog,
@@ -534,6 +535,15 @@ class UnresolvedDeliveryDebtError(RuntimeError):
     """
 
 
+class RendererStageMismatchError(RuntimeError):
+    """The installed renderer library and stage library do not match.
+
+    Raised by a renderer adapter when the renderer refuses to attach the
+    stage because the two libraries were not built to work together. The
+    message tells the user the cause and what to install.
+    """
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Abstract Base Classes — StageAdapter and related adapters
 # ──────────────────────────────────────────────────────────────────────────────
@@ -613,10 +623,29 @@ class StageAdapter(ABC):
     # ── Visibility ──
 
     @abstractmethod
-    def compute_visibility(self, item: AdapterItem) -> VisibilityState: ...
+    def compute_visibility(self, item: AdapterItem) -> VisibilityState:
+        """Return the visibility of ``item``.
+
+        ``INVISIBLE`` when ``item`` itself is hidden, also under a hidden
+        ancestor. ``INHERITED_INVISIBLE`` when only a hidden ancestor hides
+        it. The Stage eye shows the closed eye for ``INVISIBLE`` only, and a
+        click on that eye shows ``item`` (:meth:`set_own_visibility`).
+        """
 
     @abstractmethod
     def set_visibility(self, item: AdapterItem, visible: bool) -> None: ...
+
+    def set_own_visibility(self, item: AdapterItem, visible: bool) -> None:
+        """Author visibility on ``item`` only; the Stage eye uses this.
+
+        Hiding authors ``invisible`` on ``item``. Showing authors ``inherited``
+        on ``item`` and never writes its ancestors or their other children, so
+        an item under a hidden ancestor stays hidden through that ancestor.
+        The default calls :meth:`set_visibility`, which is correct when that
+        method writes only ``item``. An adapter whose ``set_visibility`` also
+        writes other items must override this method.
+        """
+        self.set_visibility(item, visible)
 
     @abstractmethod
     def can_edit_visibility(self, item: AdapterItem) -> bool: ...
@@ -628,7 +657,16 @@ class StageAdapter(ABC):
 
     @abstractmethod
     def rename(self, item: AdapterItem, new_name: str) -> str:
-        """Rename item. Returns the actual name used (may differ on collision)."""
+        """Rename item. Returns the actual name used.
+
+        The name can differ from ``new_name``, for example when ``new_name``
+        is not a valid name and the adapter makes a valid one from it. The
+        Stage Browser then tells the user which name it used.
+
+        When the rename cannot be done, for example because another prim
+        already has the name, it raises ``ValueError`` and changes nothing.
+        The Stage Browser then shows the error.
+        """
 
     @abstractmethod
     def normalize_name(self, name: str) -> str:
@@ -638,6 +676,20 @@ class StageAdapter(ABC):
 
     @abstractmethod
     def can_reparent(self, items: List[AdapterItem], new_parent: AdapterItem) -> bool: ...
+
+    def get_reparent_refusal_reason(
+        self, items: List[AdapterItem], new_parent: AdapterItem
+    ) -> str:
+        """Return why :meth:`can_reparent` refuses to move ``items`` into ``new_parent``.
+
+        The Stage Browser shows this text when the user drops ``items`` on
+        ``new_parent``. Return text only for a refusal that the tree does not
+        explain, for example a target whose children the scene does not show.
+        Return an empty string when the move is allowed or needs no message,
+        for example a move into itself. The default returns an empty string.
+        """
+        del items, new_parent
+        return ""
 
     @abstractmethod
     def reparent(
@@ -834,8 +886,15 @@ class TransformAdapter(ABC):
         """Returns 4×4 world-space matrix."""
 
     @abstractmethod
-    def set_local_transform(self, path: str, matrix: List[List[float]]) -> None:
-        """Set local transform. Does NOT push to undo — caller manages group."""
+    def set_local_transform(self, path: str, matrix: List[List[float]]) -> Optional[str]:
+        """Set local transform. Does NOT push to undo — caller manages group.
+
+        Return ``None``, or a note that names the object and the cause when
+        the adapter must store the transform in another form than the one
+        the object had (for example one matrix in place of its translate,
+        rotate and scale operations). The object still gets the exact
+        matrix; the caller reports the note.
+        """
 
     def capture_local_transform_state(self, path: str) -> Any:
         """Capture adapter-native authored state for an exact history restore.
@@ -924,6 +983,56 @@ class PropertyAdapter(ABC):
 
     @abstractmethod
     def set_value(self, attr_name: str, value: Any) -> None: ...
+
+    def set_component_value(self, attr_name: str, index: int, value: Any) -> None:
+        """Set channel ``index`` of a vector attribute to ``value``.
+
+        Each selected object keeps its own values in the other channels,
+        so a channel that shows "Mixed" stays mixed. The default reads the
+        shown vector with :meth:`get_value`, replaces the channel and
+        writes the vector with :meth:`set_value`. That is correct only when
+        the objects have the same values in the other channels, for
+        example for one object. An adapter that edits more than one object
+        overrides this method.
+        """
+        current = self.get_value(attr_name)
+        if current is None:
+            raise ValueError(
+                f"{type(self).__name__}.set_component_value: {attr_name!r} "
+                f"has no shown value to change channel {index} of"
+            )
+        components = list(current)
+        components[index] = value
+        self.set_value(attr_name, tuple(components))
+
+    def set_matrix_part_value(
+        self, attr_name: str, part: str, index: int, value: float
+    ) -> None:
+        """Set channel ``index`` of the Translate, Rotate or Scale part of a
+        4x4 transform matrix attribute to ``value``.
+
+        ``part`` is ``"translate"``, ``"rotate"`` or ``"scale"``; see
+        :mod:`ovui_data_adapters.common.matrix_transform`. Each selected
+        object keeps its own matrix in the other parts and channels. In an
+        edit, the change applies to the matrix of each object at the start
+        of the edit, so each value of a drag gives one exact result. When the
+        matrix of one object cannot give the part (Rotate and Scale of a
+        matrix with a value that is not a finite number),
+        ``MatrixPartError`` is raised and no object changes.
+
+        The default reads the shown matrix with :meth:`get_value` and
+        writes the new matrix with :meth:`set_value`. That is correct only
+        when the objects have the same matrix, for example for one object,
+        and the adapter keeps no edit state. An adapter that edits more
+        than one object overrides this method.
+        """
+        current = self.get_value(attr_name)
+        if current is None:
+            raise ValueError(
+                f"{type(self).__name__}.set_matrix_part_value: {attr_name!r} "
+                f"has no shown matrix to change the {part} part of"
+            )
+        self.set_value(attr_name, with_matrix_part(current, part, index, value))
 
     @abstractmethod
     def end_edit(self, attr_name: str) -> None: ...
@@ -1037,6 +1146,57 @@ class RendererAdapter(ABC):
         implementation is an explicit no-op so existing renderer adapters
         remain source-compatible. Passing ``None`` asks supporting renderers
         to restore their fallback render product.
+        """
+        return False
+
+    def set_render_policy(self, policy: str, settle_frames: int) -> None:
+        """When :meth:`render_frame` steps the renderer for a still picture.
+
+        ``"continuous"`` steps it on every call. With ``"on_change"`` an
+        adapter may return the picture of its last step again (the same
+        array object), with no renderer step, after ``settle_frames`` more
+        steps have followed the last change and while no work waits for a
+        step. A renderer keeps memory on every step, so a still viewer that
+        steps again grows without end. The base renderer keeps
+        stepping on every call.
+        """
+        return None
+
+    def last_frame_unchanged(self) -> bool:
+        """Whether the last :meth:`render_frame` returned the picture of the call before it again.
+
+        ``True`` only for a call with no renderer step that returned the same
+        object as before (see :meth:`set_render_policy`): a viewport then keeps
+        the picture on screen without a new upload. The default ``False``
+        shows every returned image, also an array that the adapter fills again
+        with a new picture.
+        """
+        return False
+
+    def request_render(self) -> None:
+        """Step again, then the settle frames, for a change the camera does not show."""
+        return None
+
+    def stage_change_keeps_picture(self, event: Any) -> bool:
+        """Whether the stage change ``event`` cannot change the rendered picture.
+
+        A viewport asks this before it hands ``event`` to the renderer, and
+        does not ask for a render when the answer is ``True``: the renderer
+        keeps memory on every step, so a render of a picture that
+        cannot change only adds memory. The default ``False`` renders after
+        every stage change.
+        """
+        return False
+
+    def scene_update_pending(self) -> bool:
+        """Whether the renderer still builds the scene again after a stage edit.
+
+        While this is ``True``, :meth:`render_frame` returns no new picture
+        and the viewport keeps its last picture, from before the edit (an
+        adapter whose native frame pacing session presents the viewport keeps
+        that session presenting it); a viewport shows the user that it is
+        busy. The default ``False``: the picture of each :meth:`render_frame`
+        is current.
         """
         return False
 
@@ -1215,8 +1375,13 @@ class RendererAdapter(ABC):
         """Rectangle selection pick. callback receives list of prim paths in rect."""
 
     @abstractmethod
-    def set_selection_highlight(self, paths: List[str]) -> None:
-        """Update renderer highlight overlay. Empty list clears all highlights."""
+    def set_selection_highlight(self, paths: List[str]) -> Optional[bool]:
+        """Update renderer highlight overlay. Empty list clears all highlights.
+
+        May return ``False`` when the overlay cannot change (nothing was
+        highlighted before and nothing is highlighted now); a viewport then
+        does not ask for a render. Any other value means that it may change.
+        """
 
     @abstractmethod
     def shutdown(self) -> None:
@@ -1237,7 +1402,7 @@ class SelectionAdapter(ABC):
 # LayerStackAdapter family.
 #
 # Layer-stack types consumed by the Layers window. Moved here from
-# ``ovui_widgets.layers.adapter`` per issue #38 so the full adapter family lives in
+# ``ovui_widgets.layers.adapter`` during the adapter migration so the full adapter family lives in
 # one canonical location alongside ``StageAdapter`` / ``TransformAdapter`` /
 # ``PropertyAdapter`` / ``RendererAdapter`` / ``SelectionAdapter``.
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1360,6 +1525,26 @@ class LayerSnapshot:
 
 
 @dataclass(frozen=True)
+class SublayerEntry:
+    """One entry of a parent's sublayer list, as the parent layer stores it.
+
+    Produced by :meth:`LayerStackAdapter.get_sublayer_entry` and put back by
+    :meth:`LayerStackAdapter.insert_sublayer_entry`, so that the undo of a
+    remove gives back the same entry and not only the same layer.
+
+    - ``path`` — the sublayer path as the parent writes it (it can be
+      relative to the parent).
+    - ``offset`` / ``scale`` — the time offset and the time scale of the
+      entry. The layer's time ``t`` shows at stage time
+      ``t * scale + offset``.
+    """
+
+    path: str
+    offset: float = 0.0
+    scale: float = 1.0
+
+
+@dataclass(frozen=True)
 class PrimSpecDescriptor:
     """Plain-data description of a single prim spec on a layer.
 
@@ -1426,6 +1611,21 @@ class LayerStackAdapter(ABC):
         (useful for Save-All, which cannot save anonymous layers without
         first assigning a path).
         """
+
+    def get_scene_file_identifiers(self) -> List[str]:
+        """Return the identifiers of every file that the open scene uses.
+
+        Save-All refuses to write an anonymous layer over one of these
+        files, because the write replaces content that the scene uses.
+        An adapter that knows more than its layer stack (for example the
+        files of references and payloads) overrides this method. The
+        default returns the file layers of the layer stack, with the
+        session layer.
+        """
+        return self.get_layer_stack_identifiers(
+            include_session=True,
+            include_anonymous=False,
+        )
 
     # ── Display ──────────────────────────────────────────────────────
 
@@ -1567,6 +1767,46 @@ class LayerStackAdapter(ABC):
         :class:`IndexError` on out-of-range positions.
         """
 
+    def get_sublayer_entry(self, parent_id: str, position: int) -> SublayerEntry:
+        """Return the sublayer entry at ``position`` of ``parent_id``.
+
+        Read it before :meth:`remove_sublayer`; :meth:`insert_sublayer_entry`
+        puts the same entry back. The default is for an adapter without
+        time offsets: the identifier, with offset 0 and scale 1. Raises
+        :class:`KeyError` for an unknown parent and :class:`IndexError` on
+        out-of-range positions.
+        """
+        parent = self.find_layer(parent_id)
+        if parent is None:
+            raise KeyError(f"unknown parent layer {parent_id!r}")
+        children = self.get_sublayer_identifiers(parent)
+        if position < 0 or position >= len(children):
+            raise IndexError(
+                f"sublayer position {position} out of range for {parent_id!r}"
+            )
+        return SublayerEntry(path=children[position])
+
+    def insert_sublayer_entry(
+        self,
+        parent_id: str,
+        position: int,
+        entry: SublayerEntry,
+    ) -> None:
+        """Insert ``entry`` into ``parent_id`` at ``position``.
+
+        The parent gets the same path text and the same time offset and
+        scale. ``position`` follows :meth:`insert_sublayer`. The default
+        is for an adapter without time offsets: it inserts ``entry.path``
+        and raises :class:`NotImplementedError` for an entry with a time
+        offset or scale, so that the offset is never lost without a report.
+        """
+        if (entry.offset, entry.scale) != (0.0, 1.0):
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot insert a sublayer with a time "
+                f"offset or scale ({entry.path!r})"
+            )
+        self.insert_sublayer(parent_id, position, entry.path)
+
     @abstractmethod
     def move_sublayer(
         self,
@@ -1580,8 +1820,9 @@ class LayerStackAdapter(ABC):
 
         When ``remove_source=True`` the sublayer is unlinked from the
         source parent; when ``False`` both parents reference the same
-        child (valid USD composition). Emits ``SUBLAYERS_CHANGED`` for
-        every parent touched.
+        child (valid USD composition). The moved entry keeps its time
+        offset and scale. Emits ``SUBLAYERS_CHANGED`` for every parent
+        touched.
         """
 
     @abstractmethod
@@ -1677,7 +1918,7 @@ class LayerStackAdapter(ABC):
     # :class:`~ovui_widgets.layers.commands.FlattenSublayersCommand` use the
     # snapshot/restore pair to round-trip a destructive merge across
     # undo. ``transfer_layer_content`` is the atomic merge primitive
-    # — it copies every root prim spec from ``src`` into ``dst`` in
+    # — it merges every root prim spec from ``src`` into ``dst`` in
     # strength order so the destination ends up with the union of
     # both layers' opinions.
 
@@ -1716,16 +1957,35 @@ class LayerStackAdapter(ABC):
 
     @abstractmethod
     def transfer_layer_content(
-        self, src_identifier: str, dst_identifier: str
+        self,
+        src_identifier: str,
+        dst_identifier: str,
+        *,
+        dst_is_stronger: bool = False,
     ) -> None:
-        """Copy every root prim spec from ``src`` into ``dst``.
+        """Merge every root prim spec from ``src`` into ``dst``.
 
         Used as the merge primitive for
-        :class:`~ovui_widgets.layers.commands.MergeDownCommand`: after calling
-        this, ``dst`` holds the union of its own opinions and the
-        source's opinions (source wins on overlapping specs — matches
-        USD's stronger-over-weaker composition rule for a merge from
-        a strictly-stronger source). Neither layer is removed.
+        :class:`~ovui_widgets.layers.commands.MergeDownCommand` and
+        :class:`~ovui_widgets.layers.commands.FlattenSublayersCommand`:
+        after calling this, ``dst`` holds the union of its own opinions
+        and the source's opinions, prim by prim and child by child. A
+        prim spec that both layers have (for example a shared ``/World``)
+        keeps the children and the opinions of both layers.
+
+        Where both layers have an opinion, the stronger layer wins, as in
+        USD composition, and the prims keep the order that composition
+        gives them. By default the source is the stronger layer
+        (Merge Down from a strictly-stronger source). Set
+        ``dst_is_stronger`` when the destination is stronger (Flatten of
+        a sublayer into its parent). Neither layer is removed.
+
+        An implementation that takes only the two identifiers (the form
+        before ``dst_is_stronger``) still works: Flatten then merges the
+        sublayers weakest-first with the source stronger, as before.
+        Flatten passes ``dst_is_stronger`` only to a method whose
+        signature names it; a method whose signature cannot be read,
+        such as a native function, gets the two identifiers.
 
         Raises :class:`KeyError` when either identifier is unknown.
         """
@@ -1751,7 +2011,9 @@ class LayerStackAdapter(ABC):
         sublayer entry.
 
         Returns the new layer's identifier on success, or ``None`` on
-        failure. When ``replace_in_parent=True`` every parent that
+        failure. A write error can raise :class:`OSError` with a message
+        that names the cause; ``SaveLayerAsCommand`` reports that message.
+        When ``replace_in_parent=True`` every parent that
         references the old identifier is rewritten to point at the new
         one. Emits ``SUBLAYERS_CHANGED`` for each such parent.
         """

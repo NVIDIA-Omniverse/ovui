@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <style>
+    /* class, id, type and descendant selectors */
+    .red { fill: #e53935; }
+    .blue { fill: #1e88e5; stroke: #0d47a1; stroke-width: 2; }
+    #green { fill: #43a047; }
+    circle { fill: #8e24aa; }
+    g.box rect { fill: #fb8c00; }
+    .outline, .thin { fill: none; stroke: #212121; }
+    .thin { stroke-width: 0.75 }
+  </style>
+  <rect class="red" x="4" y="4" width="16" height="16"/>
+  <rect class="blue" x="24" y="4" width="16" height="16"/>
+  <rect id="green" x="44" y="4" width="16" height="16" fill="#000"/>
+  <circle cx="12" cy="32" r="7"/>
+  <circle cx="32" cy="32" r="7" style="fill:#00897b"/>
+  <circle cx="52" cy="32" r="7" class="red" fill="#fdd835"/>
+  <g class="box"><rect x="4" y="44" width="16" height="16"/></g>
+  <rect class="outline" x="24" y="44" width="16" height="16" stroke-width="2"/>
+  <rect class="outline thin" x="44" y="44" width="16" height="16"/>
+</svg>

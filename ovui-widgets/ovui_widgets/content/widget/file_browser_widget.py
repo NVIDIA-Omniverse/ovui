@@ -1581,6 +1581,16 @@ class FileBrowserWidget:
         if self._bookmark_button is not None:
             self._bookmark_button.set_current_url(normalized)
 
+    def handle_path_bar_key(self, key: int, modifiers: int) -> bool:
+        """Send a key press of the window to the path bar.
+
+        See :meth:`PathField.handle_window_key`. Returns ``True`` when
+        the path bar used the key.
+        """
+        if self._browser_bar is None:
+            return False
+        return self._browser_bar.handle_path_key(key, modifiers)
+
     # ── BrowserBar apply-path / begin-edit / nav (Step 20) ───────────────────
 
     def _on_apply_path(self, url: str) -> None:

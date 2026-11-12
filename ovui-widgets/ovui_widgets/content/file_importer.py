@@ -300,7 +300,7 @@ class FileImporterHelper:
             return None
 
 
-# ── Issue #35 Step 3: register the helper's reset_singleton classmethod
+# ── register the helper's reset_singleton classmethod
 # so Application.shutdown() drops the live FilePickerDialog (and its
 # ui.Window) before omni.ui.shutdown() runs. register_classmethod uses
 # a stable string key `f"clsmethod:{module}.{qualname}.reset_singleton"`

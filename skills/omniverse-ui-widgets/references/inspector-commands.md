@@ -28,7 +28,7 @@ does not enable Inspector automatically in applications that treat it as optiona
 | `camera_set` | Bind an existing authored camera |
 | `viewport_frame` | Frame explicit paths or selection; empty selection frames the scene |
 | `viewport_tool` | Stock selection/move/rotate/scale mode |
-| `viewport_pick` | GPU pick from current full-application pixels and apply selection mode |
+| `viewport_pick` | GPU pick from current full-application pixels, then `surface.resolve_pick_path(x, y, path)` (a click on the drawn gizmo of the selected UsdLux light selects that light), and apply selection mode |
 
 Provide surface and selection accessors rather than a new scene model:
 
@@ -44,11 +44,18 @@ def get_inspector_commands(self):
 
 The standard USD Viewer already does this. Hosts that maintain render products
 can provide `camera_setter(path, view_id)` to keep surface and product bindings
-in agreement. Typed picking rejects pixels outside the viewport or in its
+in agreement. When the viewport itself goes back to its own render product (H,
+or Camera > Perspective or Ortho, while a USD camera is bound) and the shown
+render product changes, it calls the callbacks of
+`ViewportSurface.subscribe_render_product_change(callback)`; see
+[source-map.md](source-map.md).
+Typed picking rejects pixels outside the viewport or in its
 letterbox and cancels abandoned renderer requests. It does not guarantee that a
 historical screenshot is still current; recapture after scene/camera/layout changes.
 
 The public `ViewportSurface.apply_pick_selection`, `map_pick_to_render_ndc`,
+`resolve_pick_path` (a host that picks from its own renderer answer calls it
+before `apply_pick_selection`, so a light gizmo click selects the light),
 `handle_navigation_key` and `set_transform_manipulator_visible` seams reuse the
 existing selection, aspect-fit mapping, navigation and gizmo stack for hosts that
 ground a capture or forward native input without a window.

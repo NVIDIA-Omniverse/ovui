@@ -179,15 +179,17 @@ public:
 
     virtual void removeWindowSetCallback(WindowSet* windowSet, IWindowCallback* windowCallback) = 0;
 
-    void removeAppWindowCallback(omni::ui::AppWindowHandle appWindow, IWindowCallback* windowCallback)
+    /** Remove the callback from its owning set; appWindow is retained for source compatibility and ignored. */
+    void removeAppWindowCallback(omni::ui::AppWindowHandle /*appWindow*/, IWindowCallback* windowCallback)
     {
-        WindowSet* windowSet = this->getWindowSetByAppWindow(appWindow);
-        if (!windowSet)
-        {
-            OMNIUI_LOG_WARN("removeAppWindowCallback: No window set attached to supplied app window!");
+        if (!windowCallback)
             return;
-        }
-        this->removeWindowSetCallback(windowSet, windowCallback);
+
+        // A detached window no longer has a lookup association. The callback's
+        // owner still identifies its retiring set; destruction clears that owner.
+        WindowSet* windowSet = windowCallback->getWindowSet();
+        if (windowSet)
+            this->removeWindowSetCallback(windowSet, windowCallback);
     }
 
     void moveCallbackToAppWindow(IWindowCallback* windowCallback, omni::ui::AppWindowHandle newAppWindow)

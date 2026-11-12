@@ -647,7 +647,7 @@ class TestRenderWithoutStage:
 
 
 class TestCameraIntrinsicsPushedToOvrtx:
-    """Issue #22 regression: per-frame ``write_attribute`` for camera
+    """Regression regression: per-frame ``write_attribute`` for camera
     intrinsics must reach ovrtx, so the rendered image's effective
     camera matches the projection used by the ``omni.ui.scene`` overlay.
     """

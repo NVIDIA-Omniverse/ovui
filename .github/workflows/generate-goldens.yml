@@ -154,11 +154,15 @@ jobs:
         run: |
           set -o pipefail
           ulimit -c 0
+          # This EGL build has no Vulkan backend. test_standalone_resize_present.py
+          # checks the Vulkan swapchain and fails without it, as in the B3 job.
           if [ -n "${GH_FILTER}" ]; then
             pytest tests/ --forked -m "not requires_cuda" \
+              --ignore=tests/test_standalone_resize_present.py \
               -k "${GH_FILTER}" -q --color=yes
           else
             pytest tests/ --forked -m "not requires_cuda" \
+              --ignore=tests/test_standalone_resize_present.py \
               -q --color=yes
           fi
 

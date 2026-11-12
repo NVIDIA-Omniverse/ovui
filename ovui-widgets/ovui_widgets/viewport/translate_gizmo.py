@@ -177,8 +177,9 @@ def _constrain_delta(
 def _axis_delta_matrix(dx: float, dy: float, dz: float) -> List[List[float]]:
     """Return a 4×4 row-major translation matrix: ``initial × delta → initial + d``.
 
-    ``PrimTransformModel.on_drag_moved`` multiplies this matrix from the right
-    with each prim's initial local transform, so the translation component
+    The translation ``d`` is along the world axes. ``PrimTransformModel.on_drag_moved``
+    turns it into the space of each prim's parent and multiplies the result from
+    the right with the prim's initial local transform, so the translation component
     lives in row 3, columns 0..2 (row-major convention used throughout
     ``ovgear``).
     """
@@ -262,13 +263,16 @@ class PrimTranslateChangedGesture(TransformGestureBase):
       :meth:`PrimTransformModel.on_drag_start` which opens an undo group
       via the stage adapter (``stage.begin_undo_group("Move Prims")`` →
       ``UndoManager.begin_group``). The frame's accumulated delta resets to
-      zero.
-    * ``on_changed``: read ``sender.gesture_payload.moved`` (world-space
-      incremental delta along the line since the previous intersect), project
-      onto the stored axis to kill off-axis noise, add it to the running
-      accumulated delta, and call
-      :meth:`PrimTransformModel.on_drag_moved` with the resulting 4×4
-      translation matrix. No undo entry is pushed during the drag.
+      zero, and the closest point of the press (``line_closest_point`` of the
+      payload that ``on_began`` got) is the baseline of the drag.
+    * ``on_changed``: read ``sender.gesture_payload.line_closest_point`` (the
+      absolute world-space closest point on the shaft), take its distance from
+      the baseline, project it onto the stored axis to kill off-axis noise, and
+      call :meth:`PrimTransformModel.on_drag_moved` with the resulting 4×4
+      translation matrix, inside ``with self.following()``: the writes of the
+      model and of the gizmo are the follow of the pointer, not a change that the
+      gesture reports again. A payload that has only ``moved`` (tests) is
+      accumulated instead. No undo entry is pushed during the drag.
     * ``on_ended``: call :meth:`PrimTransformModel.on_drag_ended`, which
       pushes one :class:`BatchTransformCommand` per affected prim into the
       existing undo group and closes the group (via the stage adapter). A
@@ -425,10 +429,11 @@ class PrimTranslateChangedGesture(TransformGestureBase):
             self._active = False
             return
         self._accumulated = [0.0, 0.0, 0.0]
-        # Reset the drag-start baseline; the first ``_on_changed`` will
-        # capture the current closest-point, so total displacement starts
-        # at zero.
-        self._drag_start_point = None
+        # The drag-start baseline is the closest point of the press itself: the
+        # payload that ``on_began`` got. The first ``_on_changed`` already carries
+        # pointer movement, so a baseline taken there would lose it. A caller
+        # without a payload (the streamed bridge) sets the baseline itself.
+        self._drag_start_point = self._closest_point(self._payload_of(sender))
         try:
             self._model.on_drag_start()
         except Exception:
@@ -439,54 +444,51 @@ class PrimTranslateChangedGesture(TransformGestureBase):
             return
         self._active = True
 
+    def _payload_of(self, sender: Any = None) -> Any:
+        """The gesture payload of the shape that owns the gesture, or ``None``.
+
+        When the subclassed ``on_changed`` method override fires, the event dispatcher exposes the shape as
+        ``self.sender``; the legacy ``set_on_*_fn`` callback path passed it as a positional argument, so both are accepted.
+        """
+        shape = sender if sender is not None else getattr(self, "sender", None)
+        payload = getattr(shape, "gesture_payload", None) if shape is not None else None
+        if payload is None:
+            payload = getattr(self, "gesture_payload", None)
+        return payload
+
+    @staticmethod
+    def _closest_point(payload: Any) -> Optional[Tuple[float, float, float]]:
+        """The absolute world-space closest point of a payload, or ``None`` if it has none."""
+        closest = getattr(payload, "line_closest_point", None)
+        if closest is None:
+            closest = getattr(payload, "ray_closest_point", None)
+        if closest is None:
+            return None
+        if hasattr(closest, "x"):
+            return float(closest.x), float(closest.y), float(closest.z)
+        return float(closest[0]), float(closest[1]), float(closest[2])
+
     def _on_changed(self, sender: Any = None) -> None:
         if self._generation is not None and not self._generation.effective:
             return
         if not self._active:
             return
-        # Resolve the shape that owns the gesture payload. When the
-        # subclassed ``on_changed`` method override fires, the event
-        # dispatcher exposes the shape as ``self.sender``; the legacy
-        # ``set_on_*_fn`` callback path passed it as a positional arg,
-        # so we accept both for backward compat with existing tests.
-        shape = sender if sender is not None else getattr(self, "sender", None)
-        payload = getattr(shape, "gesture_payload", None) if shape is not None else None
-        if payload is None:
-            payload = getattr(self, "gesture_payload", None)
+        payload = self._payload_of(sender)
         if payload is None:
             return
         # ``LineGesturePayload`` exposes two 3-vectors of interest:
-        # ``line_closest_point`` (absolute world-space closest point on
-        # the shaft to the current mouse ray) and ``moved`` (per-frame
-        # delta of that closest point). The absolute-point path is
-        # preferred because ``moved`` oscillates on real mouse drags —
-        # ``omni.ui_scene`` fires ``on_changed`` twice per mouse_drag
-        # step (once for the moved mouse, once for the re-pressed
-        # button state) and the two events alternate between the
-        # current closest point and the drag-start point, so
-        # accumulating ``moved`` cancels out. Tests that synthesise a
-        # payload with only ``moved`` fall back to the accumulation
-        # path, which is correct because the test harness never fires
-        # a "snap back to baseline" event.
-        closest = getattr(payload, "line_closest_point", None)
-        if closest is None:
-            closest = getattr(payload, "ray_closest_point", None)
+        # ``line_closest_point`` (absolute world-space closest point on the
+        # shaft to the current mouse ray) and ``moved`` (the change of that
+        # point since the previous call). The absolute point is used: the
+        # displacement from the drag start is ``closest - baseline`` however
+        # many calls there were. Tests that synthesise a payload with only
+        # ``moved`` fall back to the accumulation path.
+        closest = self._closest_point(payload)
         if closest is not None:
-            if hasattr(closest, "x"):
-                cx, cy, cz = float(closest.x), float(closest.y), float(closest.z)
-            else:
-                cx, cy, cz = float(closest[0]), float(closest[1]), float(closest[2])
+            cx, cy, cz = closest
             if self._drag_start_point is None:
+                # No payload at the start of the drag: this one is the baseline.
                 self._drag_start_point = (cx, cy, cz)
-                return
-            if (
-                abs(cx - self._drag_start_point[0]) < 1e-6
-                and abs(cy - self._drag_start_point[1]) < 1e-6
-                and abs(cz - self._drag_start_point[2]) < 1e-6
-            ):
-                # "Snap back to baseline" — a stale payload between real
-                # mouse moves. Preserve the last good accumulator so the
-                # USD write doesn't revert mid-drag.
                 return
             dx = cx - self._drag_start_point[0]
             dy = cy - self._drag_start_point[1]
@@ -514,7 +516,11 @@ class PrimTranslateChangedGesture(TransformGestureBase):
             self._accumulated[0], self._accumulated[1], self._accumulated[2],
         )
         try:
-            self._model.on_drag_moved(delta)
+            # The model writes the live transform and the gizmo moves with the prim in the same call (see
+            # ``PrimTransformModel.add_live_listener``): those writes are the follow of the movement that this call reports,
+            # so the next frame, with the same pointer, is not a second call for it.
+            with self.following():
+                self._model.on_drag_moved(delta)
         except Exception:
             # A bad adapter must not crash the drag. Subsequent frames will
             # retry; on_ended will still close the undo group cleanly.

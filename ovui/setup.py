@@ -75,14 +75,77 @@ def _read_commit_sha() -> str:
     return "unknown"
 
 
-def _qualified_version(base_version: str, commit: str) -> str:
-    """Return the wheel's PEP 440 version — always the plain base version.
+def _build_config() -> str:
+    """Return the native build configuration: ``release`` or ``debug``.
 
-    Public package indexes (PyPI, NVIDIA Kitmaker) reject PEP 440
-    local-version identifiers (``+local``), so wheels never carry a
-    ``+g<hash>`` suffix. The full commit SHA is still recorded in
-    ``_build_info.py`` (via the separate ``__commit__`` field) for
-    provenance.
+    ``OVUI_BUILD_CONFIG=debug`` builds the native code without optimization,
+    with assertions and with full debug symbols. It keeps the CMake Release
+    configuration folder. On Windows it uses the MSVC debug C runtime
+    (``/MDd``, which defines ``_DEBUG``), as a Windows debug build of a host
+    application does. Such a wheel loads only where the Visual Studio debug
+    runtime is installed, and only in a host whose native modules are debug
+    builds too.
+    """
+    value = os.environ.get("OVUI_BUILD_CONFIG", "").strip().lower() or "release"
+    if value not in ("release", "debug"):
+        raise RuntimeError(f"OVUI_BUILD_CONFIG must be 'release' or 'debug', not {value!r}")
+    return value
+
+
+def _debug_cmake_args() -> list:
+    """CMake arguments that turn the Release configuration into a debug build."""
+    # pybind11 strips its Release modules and links them with LTO. A debug
+    # build keeps the symbols: no LTO, and a strip command that changes nothing.
+    no_extras = ["-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF"]
+    if not IS_WINDOWS:
+        no_strip = shutil.which("true")
+        if not no_strip:
+            raise RuntimeError("a debug build needs the 'true' command to keep the debug symbols")
+        no_extras.append(f"-DCMAKE_STRIP={no_strip}")
+    if IS_WINDOWS:
+        # The MSVC debug DLL runtime. /MDd defines _DEBUG, so the STL debug layout
+        # and pybind11's "_debug" registry key match the native modules of a
+        # Windows debug host. CMAKE_MSVC_RUNTIME_LIBRARY covers the targets with
+        # policy CMP0091 NEW; the flags cover bundled projects that still set the
+        # runtime through the flags. /Z7 keeps the debug data in the objects, so
+        # parallel compiles do not share one PDB file; the linker writes one PDB
+        # for each binary.
+        compile_flags = "/MDd /Z7 /Od /Ob0 /D_DEBUG"
+        link_flags = "/DEBUG /INCREMENTAL:NO"
+        return no_extras + ["-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDebugDLL"] + [
+            f"-DCMAKE_{lang}_FLAGS_RELEASE={compile_flags}" for lang in ("C", "CXX")
+        ] + [f"-DCMAKE_{kind}_LINKER_FLAGS_RELEASE={link_flags}" for kind in ("SHARED", "MODULE", "EXE")]
+    return no_extras + [f"-DCMAKE_{lang}_FLAGS_RELEASE=-O0 -g" for lang in ("C", "CXX")]
+
+
+def _copy_debug_symbols(build_dir: Path, package_root: Path) -> None:
+    """Put the PDB file of each shared library (DLL) of the package next to it.
+
+    The DLLs hold the native code of all interpreters, so their PDB files are
+    the same set in each per-interpreter wheel. The PDB files of the
+    interpreter-specific modules (.pyd) are not shipped.
+    """
+    symbols = {}
+    for pdb in build_dir.rglob("*.pdb"):
+        symbols.setdefault(pdb.stem.lower(), pdb)
+    for binary in sorted(package_root.rglob("*.dll")):
+        pdb = symbols.get(binary.stem.lower())
+        if pdb is not None:
+            shutil.copy2(str(pdb), str(binary.with_suffix(".pdb")))
+            print(f"  copied debug symbols {pdb.name} -> {binary.with_suffix('.pdb')}")
+
+
+def _qualified_version(base_version: str, commit: str) -> str:
+    """Return the wheel's PEP 440 version.
+
+    A release build has the plain base version. Public package indexes (PyPI,
+    NVIDIA Kitmaker) reject PEP 440 local-version identifiers (``+local``), so
+    release wheels never carry a ``+g<hash>`` suffix. The full commit SHA is
+    still recorded in ``_build_info.py`` (via the separate ``__commit__``
+    field) for provenance.
+
+    A debug build has the same version. The release process gives a debug
+    wheel its own distribution name, so it never replaces the release wheel.
     """
     del commit  # unused; kept in signature for call-site stability
     return base_version
@@ -101,6 +164,7 @@ def _write_build_info(version: str, commit: str) -> None:
     )
 
 
+_BUILD_CONFIG = _build_config()
 _PROJECT_VERSION = _read_project_version()
 _PROJECT_COMMIT = _read_commit_sha()
 _QUALIFIED_VERSION = _qualified_version(_PROJECT_VERSION, _PROJECT_COMMIT)
@@ -293,7 +357,9 @@ class CMakeBuild(build_ext):
     def build_extension(self, ext: Extension) -> None:
         # Directories
         source_dir = Path(__file__).resolve().parent
-        build_dir = source_dir / "build" / "pip"
+        # A debug build has its own build folder: its CMake cache holds the debug
+        # flags, and a later release build must not reuse them.
+        build_dir = source_dir / "build" / ("pip-debug" if _BUILD_CONFIG == "debug" else "pip")
         build_dir.mkdir(parents=True, exist_ok=True)
 
         # Where setuptools wants the final package tree
@@ -307,6 +373,8 @@ class CMakeBuild(build_ext):
             f"-DPYTHON_EXECUTABLE={sys.executable}",
         ]
         cmake_args.extend(_windows_fetchcontent_source_args(source_dir, build_dir))
+        if _BUILD_CONFIG == "debug":
+            cmake_args.extend(_debug_cmake_args())
 
         # Forward Vulkan hints from environment if available
         vulkan_include = os.environ.get("Vulkan_INCLUDE_DIR", "")
@@ -392,7 +460,7 @@ class CMakeBuild(build_ext):
             print(f"  copied {core_src.name} -> {pkg_dir / core_lib}")
 
         # OVUI and its native consumers share one ImGui library.
-        imgui_lib = "ovui_imgui.dll" if IS_WINDOWS else ("libimgui.dylib" if IS_MACOS else "libimgui.so")
+        imgui_lib = "ovui_imgui.dll" if IS_WINDOWS else ("libovui_imgui.dylib" if IS_MACOS else "libovui_imgui.so")
         imgui_src = _find_artifact(build_dir, "third_party", imgui_lib)
         if not imgui_src:
             raise RuntimeError("the build did not produce the shared ImGui library")
@@ -590,16 +658,20 @@ class CMakeBuild(build_ext):
                 shutil.copy2(str(py_file), str(target))
                 print(f"  copied scene {py_file.name}")
 
+        if IS_WINDOWS:
+            # setuptools keeps its package folder between builds, so a release
+            # build removes the PDB files that an earlier debug build put there.
+            for stale in pkg_dir.parent.rglob("*.pdb"):
+                stale.unlink()
+            if _BUILD_CONFIG == "debug":
+                _copy_debug_symbols(build_dir, pkg_dir.parent)
+
 
 class BuildPyWithAgentSkills(build_py):
     """Bundle repo-owned Agent Skills without moving their source trees."""
 
     def run(self) -> None:
         super().run()
-        # The .pth and its module sit at the wheel root, so site imports
-        # them at startup (see python/_ovui_imgui_preload.py).
-        for name in ("ovui_imgui_preload.pth", "_ovui_imgui_preload.py"):
-            shutil.copy2(Path(__file__).resolve().parent / "python" / name, Path(self.build_lib) / name)
         source_root = REPO_ROOT / "skills"
         target_root = Path(self.build_lib) / "ovui_agent_skills" / "skills"
         if target_root.exists():

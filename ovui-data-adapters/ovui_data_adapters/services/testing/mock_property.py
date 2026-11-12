@@ -9,9 +9,11 @@ an in-memory attribute dict.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ovui_data_adapters.common import AttributeMetadata, PropertyAdapter
+from ovui_data_adapters.common.matrix_transform import with_matrix_part
 
 
 def _is_vector_value(v: Any) -> bool:
@@ -137,6 +139,67 @@ class MockPropertyAdapter(PropertyAdapter):
             if path not in self._per_path_values:
                 self._per_path_values[path] = {}
             self._per_path_values[path][attr_name] = value
+
+    def set_component_value(self, attr_name: str, index: int, value: Any) -> None:
+        """Write one channel to each selected path; the other channels stay.
+
+        A path with no stored value starts with zero in each channel, as a
+        vector row does when it has no value. The type name of the
+        attribute gives the channel count (``float3`` has 3).
+        """
+
+        def with_component(current: Any) -> Tuple[Any, ...]:
+            if current is None:
+                # The zero of the typed value: 0.0 for a float, 0 for an int.
+                components = [type(value)()] * self._channel_count(attr_name)
+            else:
+                components = list(current)
+            components[index] = value
+            return tuple(components)
+
+        if not self._paths:
+            self._values[attr_name] = with_component(self._values.get(attr_name))
+            return
+        for path in self._paths:
+            path_values = self._per_path_values.setdefault(path, {})
+            current = path_values.get(attr_name, self._values.get(attr_name))
+            path_values[attr_name] = with_component(current)
+
+    def set_matrix_part_value(
+        self, attr_name: str, part: str, index: int, value: float
+    ) -> None:
+        """Set one channel of the Translate, Rotate or Scale part of a 4x4
+        matrix on each selected path; each path keeps its other values.
+
+        The mock keeps no edit state: the change applies to the stored
+        matrix of each path. When the matrix of one path cannot give the
+        part, ``MatrixPartError`` is raised and no path changes.
+        """
+        if not self._paths:
+            self._values[attr_name] = with_matrix_part(
+                self._values[attr_name], part, index, value
+            )
+            return
+        new_values = [
+            with_matrix_part(
+                self._per_path_values.get(path, {}).get(attr_name, self._values.get(attr_name)),
+                part, index, value,
+            )
+            for path in self._paths
+        ]
+        for path, new_value in zip(self._paths, new_values):
+            self._per_path_values.setdefault(path, {})[attr_name] = new_value
+
+    def _channel_count(self, attr_name: str) -> int:
+        meta = self._attributes.get(attr_name)
+        type_name = meta.type_name if meta is not None else ""
+        digit = re.search(r"\d", type_name)
+        if digit is not None:
+            return int(digit.group())
+        raise ValueError(
+            f"MockPropertyAdapter.set_component_value: {attr_name!r} has no "
+            f"stored value, and its type name {type_name!r} gives no channel count"
+        )
 
     def end_edit(self, attr_name: str) -> None:
         self._edits.append(("end", attr_name))

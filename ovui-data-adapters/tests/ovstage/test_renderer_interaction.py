@@ -1103,6 +1103,162 @@ def test_replacement_generation_recovers_failed_clear_exactly_once(
         session2.shutdown_scene()
 
 
+def test_first_step_puts_the_runtime_outline_anchor_in_the_hidden_group(
+    ovstage_static_scene_path: pathlib.Path,
+    ovstage_runtime: Any,
+) -> None:
+    """The runtime layer's mesh with no area goes into the hidden group after the first step.
+
+    ovrtx draws new outlines on an image that it no longer refines only
+    while a prim that is not hidden is in an outline group. The renderer gets
+    the attached prims at its first step and drops membership written before
+    it. With the anchor in place, the first selection needs no reset.
+    """
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(ovstage_static_scene_path))
+    adapter = OvstageRendererAdapter(scene)
+    renderer = adapter._renderer
+    native_group_setter = renderer.set_selection_outline_group_strings
+    native_reset = renderer.reset
+    writes: list[tuple[list[str], int]] = []
+    resets: list[int] = []
+
+    def record_outline_write(paths: list[str], group_id: int) -> None:
+        native_group_setter(paths, group_id)
+        writes.append((list(paths), int(group_id)))
+
+    def record_reset() -> None:
+        resets.append(1)
+        native_reset()
+
+    renderer.set_selection_outline_group_strings = record_outline_write
+    renderer.reset = record_reset
+    try:
+        adapter.load_stage(scene)
+        assert writes == []
+
+        adapter.render_frame(64, 32, None, None)
+        anchor = f"{adapter.runtime_root_path}/Render/OutlineAnchor"
+        assert writes == [([anchor], 2)]
+        adapter.render_frame(64, 32, None, None)
+        assert writes == [([anchor], 2)]
+        resets.clear()  # The first frame's resolution change resets, as on main.
+
+        adapter.set_selection_highlight([_PICKED_PATH])
+
+        assert writes == [([anchor], 2), ([_PICKED_PATH], 1)]
+        assert resets == []
+    finally:
+        adapter.shutdown()
+        session.shutdown_scene()
+
+
+@pytest.mark.parametrize("failures", [1, 3])
+def test_failed_runtime_outline_anchor_write_is_reported_and_tried_again(
+    ovstage_static_scene_path: pathlib.Path,
+    ovstage_runtime: Any,
+    capsys: pytest.CaptureFixture[str],
+    failures: int,
+) -> None:
+    """A failed anchor write is reported with its cause and tried at the next step.
+
+    After three failed steps the adapter stops trying for this scene and says
+    so; the first selection then resets the renderer, as on main.
+    """
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(ovstage_static_scene_path))
+    adapter = OvstageRendererAdapter(scene)
+    renderer = adapter._renderer
+    native_group_setter = renderer.set_selection_outline_group_strings
+    writes: list[tuple[list[str], int]] = []
+    remaining = [failures]
+
+    def flaky_outline_write(paths: list[str], group_id: int) -> None:
+        if remaining[0]:
+            remaining[0] -= 1
+            raise RuntimeError("injected anchor failure")
+        native_group_setter(paths, group_id)
+        writes.append((list(paths), int(group_id)))
+
+    renderer.set_selection_outline_group_strings = flaky_outline_write
+    try:
+        adapter.load_stage(scene)
+        capsys.readouterr()
+        anchor = f"{adapter.runtime_root_path}/Render/OutlineAnchor"
+
+        adapter.render_frame(64, 32, None, None)
+
+        err = capsys.readouterr().err
+        assert f"selection outline anchor write failed (attempt 1 of 3, {anchor})" in err
+        assert "RuntimeError: injected anchor failure" in err
+        assert adapter._selection_outline_anchor_applied is False
+
+        adapter.render_frame(64, 32, None, None)
+        adapter.render_frame(64, 32, None, None)
+        adapter.render_frame(64, 32, None, None)
+
+        err = capsys.readouterr().err
+        if failures == 1:
+            assert err.count("selection outline anchor write failed") == 0
+            assert writes == [([anchor], 2)]
+            assert adapter._selection_outline_anchor_applied is True
+            assert adapter._selection_outline_pass_needs_reset is False
+        else:
+            assert "attempt 3 of 3" in err
+            assert "no more attempts for this scene" in err
+            assert writes == []
+            assert adapter._selection_outline_anchor_applied is False
+            assert adapter._selection_outline_pass_needs_reset is True
+    finally:
+        adapter.shutdown()
+        session.shutdown_scene()
+
+
+def test_failed_outline_style_setup_keeps_no_step_outputs_alive(
+    ovstage_static_scene_path: pathlib.Path,
+    ovstage_runtime: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The saved cause of a failed style setup does not keep step outputs alive.
+
+    An exception keeps its traceback, and with it the frames of
+    ``render_frame`` and their step outputs. After the retry succeeds and the
+    retained output is released, no step output may stay alive.
+    """
+    import gc
+
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(ovstage_static_scene_path))
+    adapter = OvstageRendererAdapter(scene)
+    renderer = adapter._renderer
+    native_styles = renderer.set_selection_group_styles
+    failed = [False]
+
+    def flaky_styles(styles: Any) -> None:
+        if not failed[0]:
+            failed[0] = True
+            raise RuntimeError("injected style failure")
+        native_styles(styles)
+
+    renderer.set_selection_group_styles = flaky_styles
+    try:
+        adapter.load_stage(scene)
+        adapter._selection_outline_styles_configured = False
+        adapter.render_frame(64, 32, None, None)
+        assert "injected style failure" in capsys.readouterr().err
+        adapter.render_frame(64, 32, None, None)
+        assert adapter._selection_outline_anchor_applied is True
+
+        adapter._release_retained_output()
+        gc.collect()
+
+        alive = [o for o in gc.get_objects() if type(o).__name__ == "RenderProductSetOutputs"]
+        assert alive == []
+    finally:
+        adapter.shutdown()
+        session.shutdown_scene()
+
+
 class _RecordedBatch:
     def __init__(self, stage: Any, paths: list[str]) -> None:
         self.stage = stage

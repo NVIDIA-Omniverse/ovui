@@ -25,7 +25,20 @@ Use these contracts when connecting ovui-widgets to OpenUSD, mock data, or a
 project-specific backend.
 """}
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
 dependencies = ["numpy>=1.20"]
+
+[project.entry-points."ovui.inspector_commands"]
+render_diagnostics = "ovui_data_adapters.common.render_diagnostics_service:inspector_commands"
+
+[project.entry-points."ovui.inspector_status"]
+render_diagnostics = "ovui_data_adapters.common.render_diagnostics_service:inspector_status"
 
 [tool.setuptools.packages.find]
 namespaces = true

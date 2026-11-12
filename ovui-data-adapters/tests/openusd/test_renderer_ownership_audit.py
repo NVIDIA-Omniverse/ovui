@@ -124,6 +124,7 @@ MUTATING_CALLS = {
     "add_usd",
     "add_usd_layer",
     "add_usd_reference_from_string",
+    "clone_usd",
     "open_usd",
     "open_usd_from_string",
     "open_usd_from_file",
@@ -161,6 +162,22 @@ BOUNDARY_FUNCTIONS = {
     # One-shot selection-outline activation: releases the retained output,
     # then resets the renderer once outline membership exists.
     "_ensure_selection_outline_pass_active",
+    # The same activation once the scene's first frames are shown: the
+    # worker pauses, the retained output is released, the renderer resets.
+    "_start_selection_outline_pass",
+    # The restart that applies session RenderProduct settings: releases the
+    # retained output, then resets and recomposes the session layer.
+    "_restart_for_render_settings",
+    # The live material check: releases the retained output, adds the check
+    # layer to the renderer, copies geometry prims, steps its products, removes the layer.
+    "verify_materials_live",
+    # Created prims without a root reopen: releases the retained output,
+    # removes the earlier created-prim references, adds one for each prim.
+    "_install_live_prim_references",
+    # A settled viewport size: releases the retained output, writes the
+    # resolution of the owned render product, then resets the renderer (or
+    # recomposes the session layer when the write or the reset fails).
+    "_apply_owned_render_product_resolution",
 }
 
 # Calls to these (on self) count as mutations for path ordering: they either
@@ -177,6 +194,7 @@ STRICT_GUARD_FUNCTIONS = {
     "set_active_render_product_path",
     "_reload_live_root_snapshot",
     "_sync_ovrtx_root_snapshot_overlay_from_stage",
+    "_install_live_prim_references",
 }
 
 RELEASE_CALL = "_release_retained_output"

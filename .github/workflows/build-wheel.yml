@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Wheel build — produces native binary wheels for ovui.
+# Wheel build â€” produces native binary wheels for ovui.
 #
 # The Linux wheels are built against the headless Vulkan + Lavapipe toolchain
 # (the same recipe B1 uses) plus CUDA 12.8 development components. A CUDA
@@ -28,8 +28,8 @@
 # the package DLL directories at import time.
 #
 # Triggers:
-#   * workflow_dispatch — build on demand; optionally attach to an existing release_tag
-#   * release: [published] — build and attach all wheels to the published release
+#   * workflow_dispatch â€” build on demand; optionally attach to an existing release_tag
+#   * release: [published] â€” build and attach all wheels to the published release
 #
 # Outputs:
 #   * Workflow artifacts for Linux x64, Linux ARM64, manylinux x64,
@@ -57,6 +57,9 @@ on:
 permissions:
   contents: read
 
+env:
+  COMBINED_TAG: cp312.cp313.cp314.cp315-cp312.cp313.cp314.cp315
+
 concurrency:
   group: build-wheel-${{ github.ref }}
   cancel-in-progress: false
@@ -80,7 +83,7 @@ jobs:
           echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
 
   build-wheel-linux:
-    name: Build wheel (${{ matrix.label }}, Vulkan + CUDA)
+    name: Build wheel (${{ matrix.label }}, Python ${{ matrix.python }}, Vulkan + CUDA)
     needs: resolve-source
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -88,14 +91,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        target: [linux-x64, linux-arm64]
+        python: ["3.12", "3.13", "3.14", "3.15"]
         include:
-          - label: Linux x64
+          - target: linux-x64
+            label: Linux x64
             runner: ubuntu-22.04
             artifact: ovui-wheel-linux-x64
             linux_tag: linux_x86_64
             manylinux_tag: manylinux_2_35_x86_64
             cuda_repo_arch: x86_64
-          - label: Linux ARM64
+          - target: linux-arm64
+            label: Linux ARM64
             # Cross-compiled on x86_64 with the host CUDA toolkit plus its
             # sbsa cross runtime.
             runner: ubuntu-22.04
@@ -138,7 +145,7 @@ jobs:
           set -euo pipefail
           keyring="$RUNNER_TEMP/cuda-keyring_1.1-1_all.deb"
           curl -fsSL \
-            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${{ matrix.cuda_repo_arch }}/cuda-keyring_1.1-1_all.deb" \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb" \
             -o "$keyring"
           sudo dpkg -i "$keyring"
           sudo apt-get update -qq
@@ -172,18 +179,16 @@ jobs:
           echo "LD_LIBRARY_PATH=$stub_dir:$(dirname "$cuda_runtime")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           "$CUDAToolkit_ROOT/bin/nvcc" --version
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
 
       - name: Upgrade pip toolchain
         run: |
           python -m pip install --upgrade pip wheel setuptools build
-          # Pinned: native frame pacing only starts with an ovrtx runtime of the
-          # same major.minor as these headers, so a new ovrtx release must not
-          # change a release build silently.
-          python -m pip install --no-deps ovrtx==0.5.0.377615
+          echo "PYTAG=cp$(python -c 'import sys; print(f"{sys.version_info[0]}{sys.version_info[1]}")')" >> "$GITHUB_ENV"
 
       - name: Set up Linux ARM64 cross-compilation
         if: matrix.cross_compile
@@ -191,26 +196,25 @@ jobs:
 
       - name: Build wheel
         run: |
-          ovrtx_include="$(python -c "from importlib.util import find_spec; from pathlib import Path; print(Path(find_spec('ovrtx').origin).parent / 'include')")"
           # The OVUI_CROSS_* variables are set only by the cross-compilation step.
-          # Only ovrtx headers are offered. ovui depends on no scene library;
-          # a scene provider lives in its own ovui-data-adapters package.
-          OVRTX_INCLUDE_DIR="$ovrtx_include" \
+          # No product headers are offered: ovui depends on no renderer and no
+          # scene library. Both live in their own packages.
           OMNIUI_CMAKE_ARGS="$OMNIUI_CMAKE_ARGS ${OVUI_CROSS_CMAKE_ARGS:-}" \
             "${OVUI_CROSS_PYTHON:-python}" -m pip wheel . --no-deps ${OVUI_CROSS_PYTHON:+--no-build-isolation} -w dist/ -v
 
-      - name: Retag wheel for manylinux
+      - name: Assert the wheel carries no ovrtx ABI
+        run: python ../.github/scripts/assert_no_ovrtx_abi.py dist/ovui-*.whl
+
+      - name: Check the wheel is for this interpreter only
         run: |
           shopt -s nullglob
-          src_wheels=(dist/ovui-*-cp312-cp312-${{ matrix.linux_tag }}.whl)
+          src_wheels=(dist/ovui-*-${PYTAG}-${PYTAG}-${{ matrix.linux_tag }}.whl)
           if [ "${#src_wheels[@]}" -ne 1 ]; then
-            echo "Expected exactly one ${{ matrix.linux_tag }} wheel in dist/, found ${#src_wheels[@]}"
+            echo "Expected exactly one ${PYTAG} ${{ matrix.linux_tag }} wheel in dist/, found ${#src_wheels[@]}"
             printf '  %s\n' "${src_wheels[@]}"
             exit 1
           fi
-          python -m wheel tags --platform-tag ${{ matrix.manylinux_tag }} "${src_wheels[0]}"
-          echo "dist/ after retag:"
-          ls -la dist/
+          python ../.github/scripts/combined_wheel.py modules "${src_wheels[0]}" --python-tag "$PYTAG"
 
       - name: Show wheel contents
         run: |
@@ -220,14 +224,7 @@ jobs:
             python -m zipfile -l "$whl"
           done
 
-      - name: Note ARM64 runtime checks not run
-        if: matrix.cross_compile
-        run: |
-          msg="${{ matrix.label }} wheels are cross-compiled on x86_64. The install/import smoke test runs ARM64 code and is skipped; the wheels have not been executed in this job."
-          echo "::notice title=ARM64 runtime checks skipped::$msg"
-          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Smoke test — verify filename, install wheel, import omni.ui
+      - name: Smoke test â€” verify filename, install wheel, import omni.ui
         if: ${{ !matrix.cross_compile }}
         env:
           OMNIUI_HEADLESS: "1"
@@ -262,21 +259,26 @@ jobs:
           version = getattr(omni.ui, "__version__", None)
           commit = getattr(omni.ui, "__commit__", None)
           expected = os.environ["EXPECTED_COMMIT_SHA"]
-          print(f"omni.ui ok — version={version!r} commit={commit!r}")
+          print(f"omni.ui ok â€” version={version!r} commit={commit!r}")
           print("omni.ui_scene ok")
           assert version, "omni.ui.__version__ is empty"
-          print(f"  version={version!r} — OK")
+          print(f"  version={version!r} â€” OK")
           assert commit == expected, (
               f"omni.ui.__commit__ {commit!r} does not match GITHUB_SHA {expected!r}"
           )
+          # ovui holds no renderer call. The renderer table of native frame
+          # pacing comes from a separate package, which this wheel does not
+          # carry, so the viewport presents on the ordinary UI tick and the
+          # status says exactly that.
           frame_pacing = omni.ui.get_frame_pacing_status()
-          assert frame_pacing["supported"], frame_pacing
+          assert frame_pacing["supported"] is False, frame_pacing
+          assert frame_pacing["status_reason"] == "hooks_unavailable", frame_pacing
           PY
           /tmp/wheel-venv/bin/python ../.github/scripts/validate_packaged_skills.py \
             --expected omniverse-ui-apis omniverse-ui-inspector
 
       - name: Build pure-Python project wheels
-        if: matrix.linux_tag == 'linux_x86_64'
+        if: matrix.linux_tag == 'linux_x86_64' && matrix.python == '3.12'
         run: |
           set -euo pipefail
           projects=(
@@ -298,7 +300,7 @@ jobs:
           done
 
       - name: Validate skills in release wheels
-        if: matrix.linux_tag == 'linux_x86_64'
+        if: matrix.linux_tag == 'linux_x86_64' && matrix.python == '3.12'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -313,15 +315,245 @@ jobs:
       - name: Upload wheel as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: native-${{ matrix.target }}-py${{ matrix.python }}
           path: ovui/dist/*.whl
           if-no-files-found: error
 
+  combine-wheel-linux:
+    name: Combine wheels (${{ matrix.label }})
+    needs: [resolve-source, build-wheel-linux]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            label: Linux x64
+            artifact: ovui-wheel-linux-x64
+            linux_tag: linux_x86_64
+            manylinux_tag: manylinux_2_35_x86_64
+          - target: linux-arm64
+            label: Linux ARM64
+            artifact: ovui-wheel-linux-arm64
+            linux_tag: linux_aarch64
+            manylinux_tag: manylinux_2_35_aarch64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download the four interpreter wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-${{ matrix.target }}-py*
+          path: parts
+
+      - name: Prove the combine and check scripts
+        run: python .github/scripts/combined_wheel.py selftest
+
+      - name: Combine the ovui wheels
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ls -R parts
+          native=(parts/native-${{ matrix.target }}-py*/ovui-*-cp3*-cp3*-${{ matrix.linux_tag }}.whl)
+          python .github/scripts/combined_wheel.py combine "${native[@]}" \
+            --out-dir out --also-platform ${{ matrix.manylinux_tag }}
+          # The pure-Python wheels are built once, by the first interpreter.
+          pure=(parts/native-${{ matrix.target }}-py3.12/*-py3-none-any.whl)
+          if [ "${#pure[@]}" -gt 0 ]; then cp "${pure[@]}" out/; fi
+          ls -la out/
+
+      - name: Check the combined wheels
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for tag in ${{ matrix.linux_tag }} ${{ matrix.manylinux_tag }}; do
+            matches=(out/ovui-*-${COMBINED_TAG}-${tag}.whl)
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "Expected exactly one ovui wheel named *-${COMBINED_TAG}-${tag}.whl, found ${#matches[@]}"
+              printf '  %s\n' "${matches[@]}"
+              exit 1
+            fi
+            python .github/scripts/combined_wheel.py check "${matches[0]}"
+          done
+          python .github/scripts/assert_no_ovrtx_abi.py out/ovui-*.whl
+
+      - name: Show wheel contents
+        run: |
+          for whl in out/ovui-*.whl; do
+            echo "=== $whl ==="
+            python -m zipfile -l "$whl"
+          done
+
+      - name: Note ARM64 runtime checks not run
+        if: matrix.target == 'linux-arm64'
+        run: |
+          msg="${{ matrix.label }} wheels are cross-compiled on x86_64. The install/import test runs ARM64 code and is skipped; the wheels have not been executed in this job."
+          echo "::notice title=ARM64 runtime checks skipped::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/*.whl
+          if-no-files-found: error
+
+  test-wheel-linux:
+    name: Test the combined wheel (Linux x64, Python ${{ matrix.python }})
+    needs: [resolve-source, combine-wheel-linux]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14", "3.15"]
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CUDAToolkit_ROOT: /usr/local/cuda-12.8
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Resolve checked-out commit
+        run: echo "EXPECTED_COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install Vulkan, CUDA, and static dependency build prerequisites
+        # Do not install libglfw3-dev, libfreetype-dev, or libfontconfig1-dev:
+        # wheel builds force the pinned static FetchContent targets instead.
+        # GLFW's source build still needs the Wayland and X11 headers below.
+        run: |
+          set -euo pipefail
+          keyring="$RUNNER_TEMP/cuda-keyring_1.1-1_all.deb"
+          curl -fsSL \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb" \
+            -o "$keyring"
+          sudo dpkg -i "$keyring"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-8 \
+            libvulkan-dev \
+            mesa-vulkan-drivers \
+            libgl-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libxkbcommon-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3-dev
+
+          test -x "$CUDAToolkit_ROOT/bin/nvcc"
+          test -f "$CUDAToolkit_ROOT/include/cuda_runtime.h"
+          cuda_stub="$(find "$CUDAToolkit_ROOT" -path '*/stubs/libcuda.so' -print -quit)"
+          cuda_runtime="$(find "$CUDAToolkit_ROOT" -name 'libcudart.so.12' -print -quit)"
+          test -n "$cuda_stub"
+          test -n "$cuda_runtime"
+          stub_dir="$RUNNER_TEMP/cuda-driver-stub"
+          mkdir -p "$stub_dir"
+          ln -s "$cuda_stub" "$stub_dir/libcuda.so.1"
+          echo "LD_LIBRARY_PATH=$stub_dir:$(dirname "$cuda_runtime")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          "$CUDAToolkit_ROOT/bin/nvcc" --version
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+
+      - name: Download the combined wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: ovui-wheel-linux-x64
+          path: dist
+
+      - name: Install the combined wheel and import it
+        env:
+          OMNIUI_HEADLESS: "1"
+          OMNIUI_BACKEND: "vulkan"
+          OMNIUI_LAVAPIPE: "1"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ls -la dist/
+          pyver="$(python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
+          # Both Linux names of the one wheel must install on this interpreter.
+          for tag in linux_x86_64 manylinux_2_35_x86_64; do
+            wheels=(dist/ovui-*-${COMBINED_TAG}-${tag}.whl)
+            if [ "${#wheels[@]}" -ne 1 ]; then
+              echo "Expected exactly one ovui wheel for ${tag}, found ${#wheels[@]}"; exit 1
+            fi
+            python -m venv "/tmp/wheel-venv-$tag"
+            "/tmp/wheel-venv-$tag/bin/pip" install --upgrade pip
+            "/tmp/wheel-venv-$tag/bin/pip" install "${wheels[0]}"
+            # Import with only the driver stub on the search path. The builder's
+            # CUDA Toolkit runtime directory is deliberately dropped: a wheel that
+            # needs it would install cleanly here and then fail on a machine that
+            # has the NVIDIA driver but no Toolkit.
+            LD_LIBRARY_PATH="$RUNNER_TEMP/cuda-driver-stub" \
+            PYVER="$pyver" \
+            "/tmp/wheel-venv-$tag/bin/python" - <<'PY'
+          import os
+          import sys
+          import omni.ui
+          import omni.ui_scene
+          from omni.ui import _standalone, _ui
+          from omni.ui_scene import _scene
+          want = "cpython-%d%d" % sys.version_info[:2]
+          for module in (_ui, _standalone, _scene):
+              assert want in os.path.basename(module.__file__), module.__file__
+              print("loaded", module.__file__)
+          version = getattr(omni.ui, "__version__", None)
+          commit = getattr(omni.ui, "__commit__", None)
+          expected = os.environ["EXPECTED_COMMIT_SHA"]
+          print(f"omni.ui ok â€” python={os.environ['PYVER']} version={version!r} commit={commit!r}")
+          assert version, "omni.ui.__version__ is empty"
+          assert commit == expected, (
+              f"omni.ui.__commit__ {commit!r} does not match {expected!r}"
+          )
+          frame_pacing = omni.ui.get_frame_pacing_status()
+          assert frame_pacing["supported"] is False, frame_pacing
+          assert frame_pacing["status_reason"] == "hooks_unavailable", frame_pacing
+          PY
+          done
+          "/tmp/wheel-venv-linux_x86_64/bin/python" .github/scripts/validate_packaged_skills.py \
+            --expected omniverse-ui-apis omniverse-ui-inspector
+
+      - name: Install the pure-Python wheels beside it and validate skills
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          venv=/tmp/wheel-venv-manylinux_2_35_x86_64
+          pure=(dist/*-py3-none-any.whl)
+          if [ "${#pure[@]}" -eq 0 ]; then echo "no pure-Python wheels in dist/"; exit 1; fi
+          "$venv/bin/pip" install --no-deps "${pure[@]}"
+          "$venv/bin/python" .github/scripts/validate_packaged_skills.py
+
   build-wheel-windows:
-    name: Build wheel (Windows x64, Vulkan + CUDA)
+    name: Build wheel (Windows x64, Python ${{ matrix.python }}, Vulkan + CUDA)
     needs: resolve-source
     runs-on: windows-2022
     timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14", "3.15"]
 
     env:
       CMAKE_GENERATOR: Visual Studio 17 2022
@@ -350,11 +582,18 @@ jobs:
           "OVUI_BUILD_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "EXPECTED_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Set up Python 3.12
+      - name: Select the MSVC 14.38 toolset (the toolset Kit ships)
+        shell: pwsh
+        run: |
+          & ..\.github\scripts\select_msvc_toolset.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           architecture: "x64"
+          allow-prereleases: true
 
       - name: Install CUDA 12.8 compiler and runtime
         shell: pwsh
@@ -426,20 +665,35 @@ jobs:
       - name: Upgrade pip toolchain
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip wheel setuptools build cmake pybind11==2.11.1
+          python -m pip install --upgrade pip wheel setuptools build cmake "pybind11>=2.13.6,<3"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # Pinned for the same reason as the Linux job.
-          python -m pip install --no-deps ovrtx==0.5.0.377615
 
       - name: Build wheel
         shell: pwsh
         run: |
-          $ovrtxInclude = python -c "from importlib.util import find_spec; from pathlib import Path; print(Path(find_spec('ovrtx').origin).parent / 'include')"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:OVRTX_INCLUDE_DIR = $ovrtxInclude.Trim()
-          # Only ovrtx headers are offered. ovui depends on no scene library;
-          # a scene provider lives in its own ovui-data-adapters package.
+          # No product headers are offered: ovui depends on no renderer and no
+          # scene library. Both live in their own packages.
           python -m pip wheel . --no-deps -w dist/ -v
+
+      - name: Assert the wheel carries no ovrtx ABI
+        shell: pwsh
+        run: |
+          # @(...) keeps this an array. A single match unrolls to a bare
+          # string, and splatting a string splats it one character per
+          # argument, so the guard was handed 'D', ':', '\', ... instead
+          # of the wheel path.
+          $wheels = @(Get-ChildItem dist/ovui-*.whl | ForEach-Object { $_.FullName })
+          python ../.github/scripts/assert_no_ovrtx_abi.py @wheels
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check the wheel is for this interpreter only
+        shell: pwsh
+        run: |
+          $tag = python -c "import sys; print('cp%d%d' % sys.version_info[:2])"
+          $wheels = @(Get-ChildItem "dist/ovui-*-$tag-$tag-win_amd64.whl" | ForEach-Object { $_.FullName })
+          if ($wheels.Count -ne 1) { throw "Expected exactly one $tag win_amd64 wheel in dist/, found $($wheels.Count)" }
+          python ../.github/scripts/combined_wheel.py modules $wheels[0] --python-tag $tag
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Show wheel contents
         shell: pwsh
@@ -450,7 +704,7 @@ jobs:
             python -m zipfile -l $wheel.FullName
           }
 
-      - name: Smoke test — verify filename, install wheel, import omni.ui
+      - name: Smoke test â€” verify filename, install wheel, import omni.ui
         shell: pwsh
         run: |
           $wheels = Get-ChildItem dist/*.whl
@@ -470,7 +724,7 @@ jobs:
           # wheel must carry the runtime the backend needs. Both the search
           # path and the CUDA root variables have to go, because the package
           # adds $CUDA_PATH\bin back as a fallback when it finds no packaged
-          # runtime — which would hide exactly the omission this checks for.
+          # runtime â€” which would hide exactly the omission this checks for.
           # The NVIDIA driver and the Vulkan loader stay: they are separate
           # host prerequisites.
           $cudaBin = @((Join-Path $env:CUDA_PATH 'bin'), (Join-Path $env:CUDA_PATH 'bin\x64'))
@@ -491,8 +745,13 @@ jobs:
           assert version, "omni.ui.__version__ is empty"
           print(f"  version={version!r} - OK")
           assert commit == expected, f"omni.ui.__commit__ {commit!r} does not match GITHUB_SHA {expected!r}"
+          # ovui holds no renderer call. The renderer table of native frame
+          # pacing comes from a separate package, which this wheel does not
+          # carry, so the viewport presents on the ordinary UI tick and the
+          # status says exactly that.
           frame_pacing = omni.ui.get_frame_pacing_status()
-          assert frame_pacing["supported"], frame_pacing
+          assert frame_pacing["supported"] is False, frame_pacing
+          assert frame_pacing["status_reason"] == "hooks_unavailable", frame_pacing
           '@
           $scriptPath = Join-Path $env:RUNNER_TEMP "wheel_smoke.py"
           Set-Content -Path $scriptPath -Value $checkScript -Encoding utf8
@@ -504,19 +763,178 @@ jobs:
       - name: Upload wheel as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ovui-wheel-windows-x64
+          name: native-windows-x64-py${{ matrix.python }}
           path: ovui/dist/*.whl
           if-no-files-found: error
 
-  # Install exact-version siblings together from this run's wheel set.
-  # Linux ARM64 wheels are cross-compiled and reported as unexecuted here.
+  combine-wheel-windows:
+    name: Combine wheels (Windows x64)
+    needs: [resolve-source, build-wheel-windows]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download the four interpreter wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-windows-x64-py*
+          path: parts
+
+      - name: Combine and check
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          python .github/scripts/combined_wheel.py selftest
+          native=(parts/native-windows-x64-py*/ovui-*-cp3*-cp3*-win_amd64.whl)
+          python .github/scripts/combined_wheel.py combine "${native[@]}" --out-dir out
+          matches=(out/ovui-*-${COMBINED_TAG}-win_amd64.whl)
+          if [ "${#matches[@]}" -ne 1 ]; then
+            echo "Expected exactly one combined Windows wheel, found ${#matches[@]}"
+            exit 1
+          fi
+          python .github/scripts/combined_wheel.py check "${matches[0]}"
+          python .github/scripts/assert_no_ovrtx_abi.py "${matches[0]}"
+          python -m zipfile -l "${matches[0]}"
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ovui-wheel-windows-x64
+          path: out/*.whl
+          if-no-files-found: error
+
+  test-wheel-windows:
+    name: Test the combined wheel (Windows x64, Python ${{ matrix.python }})
+    needs: [resolve-source, combine-wheel-windows]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Resolve checked-out commit
+        shell: pwsh
+        run: |
+          $sha = git rev-parse HEAD
+          "EXPECTED_COMMIT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: "x64"
+          allow-prereleases: true
+
+      - name: Install the Vulkan loader
+        shell: pwsh
+        run: |
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe"
+          & $vcpkg install vulkan-loader:x64-windows
+          $installed = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed\x64-windows"
+          $loaderDll = @(Get-Item (Join-Path $installed "bin\vulkan-1.dll"), (Join-Path $installed "debug\bin\vulkan-1.dll") -ErrorAction SilentlyContinue)[0]
+          if (-not $loaderDll) { throw "Expected Vulkan loader DLL was not found under $installed" }
+          "Vulkan_DLL_DIR=$($loaderDll.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $loaderDll.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Download the combined wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ovui-wheel-windows-x64
+          path: dist
+
+      - name: Install the combined wheel and import it
+        shell: pwsh
+        run: |
+          $wheels = @(Get-ChildItem "dist/ovui-*-$env:COMBINED_TAG-win_amd64.whl")
+          if ($wheels.Count -ne 1) { throw "Expected exactly one combined ovui wheel, found $($wheels.Count)" }
+          python -m venv "$env:RUNNER_TEMP\wheel-venv"
+          $python = "$env:RUNNER_TEMP\wheel-venv\Scripts\python.exe"
+          & $python -m pip install --upgrade pip
+          & $python -m pip install $wheels[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $checkScript = @'
+          import os
+          import sys
+          p = os.environ.get("Vulkan_DLL_DIR")
+          if p and hasattr(os, "add_dll_directory"):
+              os.add_dll_directory(p)
+          import omni.ui
+          import omni.ui_scene
+          from omni.ui import _standalone, _ui
+          from omni.ui_scene import _scene
+          want = "cp%d%d-win_amd64" % sys.version_info[:2]
+          for module in (_ui, _standalone, _scene):
+              assert want in os.path.basename(module.__file__), module.__file__
+              print("loaded", module.__file__)
+          version = getattr(omni.ui, "__version__", None)
+          commit = getattr(omni.ui, "__commit__", None)
+          expected = os.environ["EXPECTED_COMMIT_SHA"]
+          print(f"omni.ui ok - python={sys.version_info[:2]} version={version!r} commit={commit!r}")
+          assert version, "omni.ui.__version__ is empty"
+          assert commit == expected, f"omni.ui.__commit__ {commit!r} does not match {expected!r}"
+          frame_pacing = omni.ui.get_frame_pacing_status()
+          assert frame_pacing["supported"] is False, frame_pacing
+          assert frame_pacing["status_reason"] == "hooks_unavailable", frame_pacing
+          # Kit's Windows modules (pybind11 2.11.1) share types only through the pybind11 type registry whose key has
+          # no compiler version. pybind11 keeps the registries in the interpreter state dictionary.
+          import ctypes
+          api = ctypes.pythonapi
+          api.PyInterpreterState_Get.restype = ctypes.c_void_p
+          api.PyInterpreterState_GetDict.argtypes = [ctypes.c_void_p]
+          api.PyInterpreterState_GetDict.restype = ctypes.c_void_p
+          state = ctypes.cast(api.PyInterpreterState_GetDict(api.PyInterpreterState_Get()), ctypes.py_object).value
+          registries = [key for key in state if key.startswith("__pybind11_internals_")]
+          assert registries == ["__pybind11_internals_v5_msvc__"], registries
+          # A host with its own omni.ui.dll (Kit) generates its forwarders with the SDK's script. From the wheel's
+          # ovui.dll it must give the forwards of the wheel's own omni.ui.dll.
+          import json, pathlib, runpy, subprocess, tempfile
+          ui_dir = pathlib.Path(omni.ui.__file__).parent
+          tool = ui_dir / "sdk" / "tools" / "generate_ui_forwarders.py"
+          with tempfile.TemporaryDirectory() as out:
+              subprocess.run([sys.executable, str(tool), "--input", str(ui_dir / "ovui.dll"),
+                              "--output", f"{out}/omni.ui.def", "--manifest", f"{out}/omni.ui.json"], check=True)
+              generated = set(json.loads(pathlib.Path(out, "omni.ui.json").read_text())["forwarded"])
+          shipped = {export.name for export in runpy.run_path(str(tool))["read_exports"](ui_dir / "omni.ui.dll")[1]
+                     if export.forwarder}
+          assert generated and generated == shipped, (len(generated), len(shipped))
+          '@
+          $scriptPath = Join-Path $env:RUNNER_TEMP "wheel_smoke.py"
+          Set-Content -Path $scriptPath -Value $checkScript -Encoding utf8
+          & $python $scriptPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python .github\scripts\validate_packaged_skills.py --expected omniverse-ui-apis omniverse-ui-inspector
+
   install-release-set:
-    name: Install the complete wheel set
-    needs: [resolve-source, build-wheel-linux, build-wheel-windows]
+    name: Install the release set
+    needs: [resolve-source, combine-wheel-linux, combine-wheel-windows, test-wheel-linux, test-wheel-windows]
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, windows-2022]
+        python: ["3.12", "3.13", "3.14", "3.15"]
+        include:
+          # usd-core 25.11 has wheels for Python 3.12 and 3.13 only, and the
+          # ovui-widgets-all aggregate requires it through the OpenUSD adapter's
+          # standalone extra.
+          - python: "3.14"
+            skip: --skip-distribution ovui_widgets_all
+          - python: "3.15"
+            skip: --skip-distribution ovui_widgets_all
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out validation scripts
@@ -526,10 +944,11 @@ jobs:
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
 
       - name: Download the complete wheel set
         uses: actions/download-artifact@v4
@@ -539,13 +958,17 @@ jobs:
           merge-multiple: true
 
       - name: Install the set
-        run: python .github/scripts/install_release_set.py --wheels-dir wheelhouse
+        # bash on every runner, so the same command line works on Windows too.
+        shell: bash
+        run: |
+          python .github/scripts/install_release_set.py --selftest
+          python .github/scripts/install_release_set.py --wheels-dir wheelhouse ${{ matrix.skip }}
 
   attach-release-wheels:
     name: Attach wheels to GitHub release
     if: needs.resolve-source.outputs.publish == 'true'
     runs-on: ubuntu-22.04
-    needs: [resolve-source, build-wheel-linux, build-wheel-windows, install-release-set]
+    needs: [resolve-source, combine-wheel-linux, combine-wheel-windows, test-wheel-linux, test-wheel-windows, install-release-set]
     permissions:
       contents: write
 
@@ -592,11 +1015,11 @@ jobs:
             echo "${label}: $(basename "${matches[0]}")"
           }
 
-          require_one "ovui-*-cp312-cp312-linux_x86_64.whl" "Linux x64"
-          require_one "ovui-*-cp312-cp312-linux_aarch64.whl" "Linux ARM64"
-          require_one "ovui-*-cp312-cp312-manylinux_2_35_x86_64.whl" "manylinux x64"
-          require_one "ovui-*-cp312-cp312-manylinux_2_35_aarch64.whl" "manylinux aarch64"
-          require_one "ovui-*-cp312-cp312-win_amd64.whl" "Windows x64"
+          require_one "ovui-*-${COMBINED_TAG}-linux_x86_64.whl" "Linux x64"
+          require_one "ovui-*-${COMBINED_TAG}-linux_aarch64.whl" "Linux ARM64"
+          require_one "ovui-*-${COMBINED_TAG}-manylinux_2_35_x86_64.whl" "manylinux x64"
+          require_one "ovui-*-${COMBINED_TAG}-manylinux_2_35_aarch64.whl" "manylinux aarch64"
+          require_one "ovui-*-${COMBINED_TAG}-win_amd64.whl" "Windows x64"
 
           universal_distributions=(
             ovui_data_adapters_common

@@ -14,7 +14,7 @@ namespace standalone {
 /// Standalone IByteImageGpu implementation using OpenGL.
 /// Creates GL textures from raw pixel data and returns ImGui-compatible
 /// texture references (GLuint cast to void*).
-class OpenGLByteImageGpu final : public IByteImageGpu
+class OpenGLByteImageGpu final : public IByteImageGpu, public IByteImageGpuChecked
 {
 public:
     /// Reads ``OMNIUI_OPENGL_INTEROP_DIRECT`` once at construction; setting
@@ -37,6 +37,27 @@ public:
                              uint32_t gpuDeviceMask,
                              uint32_t textureUsageFlags,
                              uint32_t resourceUsageFlags) override;
+    /// Same upload as updateImage, and a GL error raised by it makes the
+    /// result eFailed. A success is eEnqueued: the copy is in the command
+    /// stream of the GL context, and later draws in that context sample it,
+    /// but the GPU may still run it. A fence after it proves the end.
+    /// OpenGL has one device here. A mask that asks for another device fails
+    /// before any upload.
+    UploadResult updateImageChecked(Handle h,
+                                    const uint8_t* const* mipMapBuffers,
+                                    size_t* mipMapStrides,
+                                    size_t mipMapCount,
+                                    UInt2 size,
+                                    PixelFormat format,
+                                    bool fromGpu,
+                                    uint32_t gpuDeviceMask,
+                                    uint32_t textureUsageFlags,
+                                    uint32_t resourceUsageFlags) override;
+
+    /// The newest upload id whose fence has signaled, or 0. Call it with the
+    /// GL context of the upload current.
+    uint64_t getCompletedUploadId(Handle h) override;
+
     void releaseImage(Handle h) override;
 
     /// Reports whether the fromGpu path is usable on this binary AND host.

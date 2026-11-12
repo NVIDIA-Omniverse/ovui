@@ -4,8 +4,8 @@
 """End-to-end smoke tests for the OvGear pipeline — Step 67.
 
 Exercises the full open→select→move→undo→redo sequence using both mock
-adapters (no USD required) and a real Usd.Stage (pxr required, skipped if
-absent). These tests are the primary regression guard for future refactors.
+adapters (no USD required) and a real Usd.Stage (pxr required). These tests
+are the primary regression guard for future refactors.
 """
 
 import pytest
@@ -419,15 +419,11 @@ class TestApplicationE2E:
 
 
 # ---------------------------------------------------------------------------
-# USD-backed E2E (skipped if pxr unavailable)
+# USD-backed E2E
 # ---------------------------------------------------------------------------
 
 class TestUsdPipelineE2E:
     """Full open→select→move→undo→redo with a real Usd.Stage."""
-
-    @pytest.fixture(autouse=True)
-    def _require_pxr(self):
-        pytest.importorskip("pxr")
 
     def test_open_stage_sets_adapter(self, headless_app):
         from pxr import Usd, UsdGeom

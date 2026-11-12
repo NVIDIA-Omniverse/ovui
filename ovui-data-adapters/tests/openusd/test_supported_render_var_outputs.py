@@ -4,7 +4,6 @@
 
 import pytest
 
-pytest.importorskip("pxr")
 from ovui_data_adapters.openusd import renderer_adapter as module
 from ovui_data_adapters.openusd.renderer_adapter import OvRtxRendererAdapter
 

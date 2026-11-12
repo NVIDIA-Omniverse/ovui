@@ -15,6 +15,8 @@
 
 #include "AbstractShapeData.h"
 
+#include <utility>
+
 #include <numeric>
 
 OMNIUI_SCENE_NAMESPACE_OPEN_SCOPE
@@ -46,8 +48,14 @@ Arc::Arc(Float radius)
     this->_setRadiusChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setBeginChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setEndChangedFn(std::bind(&This::_dirtyCache, this));
-    this->_setThicknessChangedFn(std::bind(&This::_dirtyCache, this));
-    this->_setColorChangedFn(std::bind(&This::_dirtyCache, this));
+    this->_setThicknessChangedFn([this](const auto&) {
+        _getData<ArcData>().m_cacheIsDirty = true;
+        this->_dirtyAppearance();
+    });
+    this->_setColorChangedFn([this](const auto&) {
+        _getData<ArcData>().m_cacheIsDirty = true;
+        this->_dirtyAppearance();
+    });
     this->_setTesselationChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setWireframeChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setSectorChangedFn(std::bind(&This::_dirtyCache, this));
@@ -103,9 +111,10 @@ void Arc::intersect(const Vector3 origin,
         stateGesturePayload = std::make_unique<ArcGesturePayload>();
     }
 
-    Vector3 lastClosestPoint = data.m_lastGesturePayload.rayClosestPoint;
-    Float lastDistanceToCenter = data.m_lastGesturePayload.distanceToCenter;
-    Float lastAngle = data.m_lastGesturePayload.angle;
+    const bool held = std::exchange(data.m_baselineHeld, false);
+    Vector3 lastClosestPoint = held ? data.m_baselinePoint : data.m_lastGesturePayload.rayClosestPoint;
+    Float lastDistanceToCenter = held ? data.m_baselineA : data.m_lastGesturePayload.distanceToCenter;
+    Float lastAngle = held ? data.m_baselineB : data.m_lastGesturePayload.angle;
 
     auto transform = this->getParent()->getAccumulatedTransform();
 
@@ -218,6 +227,21 @@ void Arc::intersect(const Vector3 origin,
 
     // Copy
     *stateGesturePayload = data.m_lastGesturePayload;
+}
+
+bool Arc::_getFollowReport(Vector3& moved) const
+{
+    const auto& payload = _getData<ArcData>().m_lastGesturePayload;
+    moved = payload.moved;
+    return true;
+}
+
+void Arc::_captureBaseline() const
+{
+    auto& data = _getData<ArcData>();
+    data.m_baselinePoint = data.m_lastGesturePayload.rayClosestPoint;
+    data.m_baselineA = data.m_lastGesturePayload.distanceToCenter;
+    data.m_baselineB = data.m_lastGesturePayload.angle;
 }
 
 const Arc::ArcGesturePayload* Arc::getGesturePayload() const

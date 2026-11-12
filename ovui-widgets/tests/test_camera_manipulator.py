@@ -21,10 +21,11 @@ from omni.ui_scene import scene as sc
 from ovui_widgets.viewport.camera_controller import CameraController
 from ovui_widgets.viewport.camera_flight_keyboard import FlightModeKeyboard
 from ovui_widgets.viewport.camera_gesture import (
-    LookGesture,
-    PanGesture,
-    TumbleGesture,
-    ZoomScrollGesture,
+    MOD_ALT,
+    MOD_CTRL,
+    MOD_SHIFT,
+    MOUSE_LEFT,
+    parse_bindings,
 )
 from ovui_widgets.viewport.camera_inertia import TumbleInertia
 from ovui_widgets.viewport.camera_manipulator import (
@@ -410,28 +411,6 @@ class TestCameraManipulatorConstruction:
         for g in man.camera_gestures:
             assert g._model is model
 
-    def test_camera_gestures_in_order(self):
-        """Order: the original four match the former ``register_camera_gestures``
-        return list — [tumble, pan, look, zoom] — so existing unpacking
-        patterns still work. The Alt+LMB tumble alias is appended at index 4
-        (issue #24)."""
-        man = CameraManipulator(camera_controller=CameraController())
-        gestures = man.camera_gestures
-        assert len(gestures) == 5
-        assert isinstance(gestures[0], TumbleGesture)
-        assert isinstance(gestures[1], PanGesture)
-        assert isinstance(gestures[2], LookGesture)
-        assert isinstance(gestures[3], ZoomScrollGesture)
-        assert isinstance(gestures[4], TumbleGesture)
-
-    def test_named_gesture_properties_match_order(self):
-        man = CameraManipulator(camera_controller=CameraController())
-        assert man.tumble_gesture is man.camera_gestures[0]
-        assert man.pan_gesture is man.camera_gestures[1]
-        assert man.look_gesture is man.camera_gestures[2]
-        assert man.zoom_gesture is man.camera_gestures[3]
-        assert man.tumble_alt_gesture is man.camera_gestures[4]
-
     def test_viewport_size_fn_plumbed_to_angular_and_pan_gestures(self):
         man = CameraManipulator(
             camera_controller=CameraController(),
@@ -440,7 +419,6 @@ class TestCameraManipulatorConstruction:
         assert man.tumble_gesture._viewport_size_fn is _size_fn
         assert man.pan_gesture._viewport_size_fn is _size_fn
         assert man.look_gesture._viewport_size_fn is _size_fn
-        assert man.tumble_alt_gesture._viewport_size_fn is _size_fn
 
     def test_camera_gestures_returns_a_copy(self):
         """Mutating the returned list must not affect the manipulator's
@@ -449,7 +427,7 @@ class TestCameraManipulatorConstruction:
         man = CameraManipulator(camera_controller=CameraController())
         copy = man.camera_gestures
         copy.pop()
-        assert len(man.camera_gestures) == 5
+        assert len(man.camera_gestures) == len(copy) + 1
 
     def test_ctor_accepts_camera_controller_as_keyword(self):
         """Plan §B.5 example uses the ``camera_controller=`` kwarg."""
@@ -468,16 +446,6 @@ class TestCameraManipulatorTumbleInertiaWiring:
         )
         assert man.tumble_gesture._inertia is inertia
 
-    def test_look_gesture_does_not_get_inertia(self):
-        """Plan §B.4 restricts inertia to tumble for v1."""
-        cam = CameraController()
-        model = CameraManipulatorModel()
-        inertia = TumbleInertia(cam, model=model)
-        man = CameraManipulator(
-            camera_controller=cam, model=model, tumble_inertia=inertia
-        )
-        assert man.look_gesture._inertia is None
-
     def test_tumble_inertia_property_exposed(self):
         cam = CameraController()
         model = CameraManipulatorModel()
@@ -493,22 +461,6 @@ class TestCameraManipulatorTumbleInertiaWiring:
 
 
 class TestCameraManipulatorFlightKeyboardWiring:
-    def test_flight_keyboard_rmb_gestures_point_to_tumble_and_look(self):
-        """``FlightModeKeyboard.is_flying`` polls the two RMB-drag gestures
-        each frame. The manipulator must plumb those refs so the user can
-        WASD-fly while holding RMB without the widget re-wiring the
-        callback. The Alt+LMB tumble alias is *not* plumbed in — issue #24
-        intentionally excludes it so Alt+LMB+W does not trigger flight."""
-        cam = CameraController()
-        kb = FlightModeKeyboard(cam)
-        man = CameraManipulator(
-            camera_controller=cam, flight_keyboard=kb
-        )
-        assert man.tumble_gesture in kb._rmb_gestures
-        assert man.look_gesture in kb._rmb_gestures
-        assert man.tumble_alt_gesture not in kb._rmb_gestures
-        assert len(kb._rmb_gestures) == 2
-
     def test_flight_keyboard_property_exposed(self):
         cam = CameraController()
         kb = FlightModeKeyboard(cam)
@@ -644,72 +596,78 @@ class TestCameraManipulatorGesturesWriteThrough:
         assert cam.state.distance != before
 
 
-class TestCameraManipulatorAltTumble:
-    """Issue #24 — Alt+LMB tumble alias must be a distinct ``TumbleGesture``
-    instance configured for ``MOUSE_LEFT`` / ``MOD_ALT``, share the RMB
-    instance's :class:`TumbleInertia`, and be excluded from the
-    flight-keyboard's RMB-poll tuple."""
+def _press(gesture, modifiers=0):
+    gesture.raw_input.modifiers = modifiers
+    gesture.raw_input.mouse.x = 0.0
+    gesture.raw_input.mouse.y = 0.0
+    gesture._on_began()
+    return gesture.mode
 
-    def test_creates_alt_tumble_instance(self):
-        from ovui_widgets.viewport.camera_gesture import TumbleGesture as _Tumble
 
+class TestCameraManipulatorBindings:
+    """Which mode each button and modifier state navigates in."""
+
+    def test_kit_layout(self):
         man = CameraManipulator(camera_controller=CameraController())
-        assert isinstance(man.tumble_alt_gesture, _Tumble)
-        assert man.tumble_alt_gesture is not man.tumble_gesture
+        assert _press(man.look_gesture) == "look"
+        assert _press(man.look_gesture, MOD_ALT) == "dolly"
+        assert _press(man.tumble_gesture, MOD_ALT) == "orbit"
+        assert _press(man.pan_gesture) == "pan"
 
-    def test_alt_tumble_uses_left_button_alt_modifier(self):
-        from ovui_widgets.viewport.camera_gesture import MOD_ALT, MOUSE_LEFT
-
+    def test_an_unbound_modifier_does_not_block_a_button(self):
         man = CameraManipulator(camera_controller=CameraController())
-        assert man.tumble_alt_gesture.mouse_button == MOUSE_LEFT
-        assert man.tumble_alt_gesture.modifiers == MOD_ALT
+        assert _press(man.look_gesture, MOD_SHIFT) == "look"
+        assert _press(man.look_gesture, MOD_CTRL) == "look"
+        assert _press(man.pan_gesture, MOD_CTRL | MOD_SHIFT) == "pan"
 
-    def test_rmb_tumble_keeps_default_button_and_no_modifier(self):
-        """Regression: the RMB tumble binding must not be perturbed by the
-        Alt+LMB addition."""
-        from ovui_widgets.viewport.camera_gesture import MOD_NONE, MOUSE_RIGHT
+    def test_review_layout_tumbles_with_the_right_button(self):
+        man = CameraManipulator(camera_controller=CameraController(), bindings=parse_bindings("review"))
+        assert _press(man.tumble_gesture) == "orbit"
+        assert _press(man.tumble_gesture, MOD_CTRL) == "look"
+        assert _press(man.pan_gesture, MOD_ALT) == "dolly"
 
-        man = CameraManipulator(camera_controller=CameraController())
-        assert man.tumble_gesture.mouse_button == MOUSE_RIGHT
-        assert man.tumble_gesture.modifiers == MOD_NONE
-
-    def test_alt_tumble_shares_inertia_with_rmb(self):
-        cam = CameraController()
-        model = CameraManipulatorModel()
-        inertia = TumbleInertia(cam, model=model)
+    def test_a_binding_change_moves_a_mode_to_another_button(self):
         man = CameraManipulator(
-            camera_controller=cam, model=model, tumble_inertia=inertia
+            camera_controller=CameraController(), bindings=parse_bindings("kit", ["pan=back", "none=middle"])
         )
-        assert man.tumble_alt_gesture._inertia is inertia
-        assert man.tumble_alt_gesture._inertia is man.tumble_gesture._inertia
+        assert man.pan_gesture.mouse_button == 3
+        assert _press(man.pan_gesture) == "pan"
+        assert all(getattr(g, "mouse_button", None) != 2 for g in man.camera_gestures)
 
-    def test_alt_tumble_inherits_no_inertia_when_unset(self):
-        man = CameraManipulator(camera_controller=CameraController())
-        assert man.tumble_alt_gesture._inertia is None
+    def test_unknown_names_are_reported(self):
+        for change in ("spin=left", "pan=wheel9", "look=right+hyper"):
+            with pytest.raises(ValueError):
+                parse_bindings("kit", [change])
+        with pytest.raises(ValueError):
+            parse_bindings("maya")
 
-    def test_flight_keyboard_excludes_alt_tumble(self):
-        """Alt+LMB drag must not trigger flight mode. The ``_rmb_gestures``
-        tuple polled by ``FlightModeKeyboard.is_flying`` is exactly
-        (tumble_gesture, look_gesture)."""
+    def test_only_a_plain_right_drag_flies(self):
         cam = CameraController()
         kb = FlightModeKeyboard(cam)
         man = CameraManipulator(camera_controller=cam, flight_keyboard=kb)
-        assert kb._rmb_gestures == (man.tumble_gesture, man.look_gesture)
+        kb.handle_key_event(ord("W"), 0, True)
+        _press(man.look_gesture, MOD_ALT)
+        assert not kb.is_flying
+        man.look_gesture._on_ended()
+        _press(man.look_gesture, MOD_SHIFT)
+        assert kb.is_flying
+        _press(man.tumble_gesture, MOD_ALT)
+        man.look_gesture._on_ended()
+        assert not kb.is_flying
 
-    def test_alt_tumble_drag_orbits_camera(self):
-        """Drive the Alt+LMB instance through began → changed and assert
-        the camera azimuth changed (mirrors the existing
-        ``test_tumble_mutates_camera_via_manipulator`` test for RMB)."""
+    def test_the_drag_zoom_works_when_look_is_disabled(self):
         cam = CameraController()
-        man = CameraManipulator(
-            camera_controller=cam, viewport_size_fn=_size_fn
-        )
-        g = man.tumble_alt_gesture
-        before_az = cam.state.azimuth
-        g.raw_input.mouse.x = 0.0
-        g.raw_input.mouse.y = 0.0
-        g._on_began()
-        g.raw_input.mouse.x = 0.5
-        g.raw_input.mouse.y = 0.0
-        g._on_changed()
-        assert cam.state.azimuth != before_az
+        model = CameraManipulatorModel()
+        model.set_ints("disable_look", [1])
+        man = CameraManipulator(camera_controller=cam, model=model, viewport_size_fn=_size_fn)
+        assert _press(man.look_gesture) is None
+        assert _press(man.look_gesture, MOD_ALT) == "dolly"
+        man.look_gesture.raw_input.mouse.y = 0.25
+        man.look_gesture._on_changed()
+        assert cam.state.distance < 5.0
+
+    def test_tumble_alt_gesture_is_the_alt_left_tumble(self):
+        man = CameraManipulator(camera_controller=CameraController())
+        assert man.tumble_alt_gesture is man.tumble_gesture
+        assert man.tumble_gesture.mouse_button == MOUSE_LEFT
+        assert man.tumble_gesture.modifiers == MOD_ALT

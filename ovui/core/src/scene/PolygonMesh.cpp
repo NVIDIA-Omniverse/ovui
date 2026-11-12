@@ -38,10 +38,16 @@ PolygonMesh::PolygonMesh(const std::vector<Vector3>& positions,
     : AbstractShape(data ? data : new PolygonMeshData)
 {
     this->_setPositionsChangedFn(std::bind(&This::_dirtyCache, this));
-    this->_setColorsChangedFn(std::bind(&This::_dirtyCache, this));
+    this->_setColorsChangedFn([this](const auto&) {
+        _getData<PolygonMeshData>().m_cacheIsDirty = true;
+        this->_dirtyAppearance();
+    });
     this->_setVertexCountsChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setVertexIndicesChangedFn(std::bind(&This::_dirtyCache, this));
-    this->_setThicknessesChangedFn(std::bind(&This::_dirtyCache, this));
+    this->_setThicknessesChangedFn([this](const auto&) {
+        _getData<PolygonMeshData>().m_cacheIsDirty = true;
+        this->_dirtyAppearance();
+    });
     this->_setWireframeChangedFn(std::bind(&This::_dirtyCache, this));
     this->_setIntersectionThicknessChangedFn([this](const auto&) {
         _getData<PolygonMeshData>().m_intersectionThicknessExplicitlyChanged = true;

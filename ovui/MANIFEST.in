@@ -12,7 +12,6 @@ recursive-include third_party/imgui *
 include third_party/glad_extensions.txt
 include CMakeLists.txt
 recursive-include python *.py
-include python/ovui_imgui_preload.pth
 recursive-include cmake *.cmake
 
 recursive-include tools/sdk *.md

@@ -30,9 +30,14 @@ concurrency:
 
 jobs:
   pytest-vulkan-lavapipe:
-    name: pytest (B1 Vulkan-lavapipe)
+    name: pytest (B1 Vulkan-lavapipe, Python ${{ matrix.python }})
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14", "3.15"]
 
     env:
       OMNIUI_HEADLESS: "1"
@@ -55,6 +60,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libvulkan-dev \
             mesa-vulkan-drivers \
+            libgl1-mesa-dri \
+            xvfb \
             libglfw3-dev \
             libfreetype-dev \
             libfontconfig1-dev \
@@ -63,10 +70,11 @@ jobs:
             pkg-config \
             python3-dev
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
 
       - name: Upgrade pip toolchain
         run: |
@@ -133,7 +141,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-b1-log
+          name: pytest-b1-log-py${{ matrix.python }}
           path: /tmp/pytest-b1.log
           if-no-files-found: warn
 
@@ -141,7 +149,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-b1
+          name: coverage-b1-py${{ matrix.python }}
           path: ovui/coverage-reports/b1/
           if-no-files-found: warn
 
@@ -149,6 +157,87 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-b1-captured
+          name: pytest-b1-captured-py${{ matrix.python }}
           path: ovui/tests/captured/
           if-no-files-found: ignore
+
+  # The SVG option OFF build. The default builds above have the option ON, so the
+  # OFF form of tests/test_standalone_svg_image.py (nothing is drawn, and the cause
+  # is logged) runs only here. It builds the library with -DOMNIUI_ENABLE_SVG=OFF,
+  # checks the built library reports that state, and runs that one test file.
+  pytest-vulkan-lavapipe-svg-off:
+    name: pytest (B1 Vulkan-lavapipe, SVG option OFF)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    env:
+      OMNIUI_HEADLESS: "1"
+      OMNIUI_BACKEND: "vulkan"
+      OMNIUI_LAVAPIPE: "1"
+      OMNI_UI_GOLDEN_STRICT: "1"
+      DEBIAN_FRONTEND: noninteractive
+
+    defaults:
+      run:
+        working-directory: ovui
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Vulkan + Lavapipe + build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev \
+            mesa-vulkan-drivers \
+            libgl1-mesa-dri \
+            xvfb \
+            libglfw3-dev \
+            libfreetype-dev \
+            libfontconfig1-dev \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3-dev
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip toolchain
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+
+      - name: Build and install ovui (headless Vulkan, SVG option OFF)
+        env:
+          OMNIUI_CMAKE_ARGS: "-DOMNIUI_ENABLE_SVG=OFF"
+        run: |
+          pip install -e . -v
+
+      - name: Install test requirements
+        run: |
+          pip install -r requirements-test.txt
+
+      - name: Check the built library has the SVG option OFF
+        # Read from the compiled library, not from the build command above.
+        run: |
+          python -c "from omni.ui import _ui; assert not _ui._is_svg_rasterizer_built_in(), 'the SVG option is not OFF in this build'"
+
+      - name: Run the SVG image test (SVG option OFF)
+        shell: bash
+        run: |
+          set -o pipefail
+          ulimit -c 0
+          pytest tests/test_standalone_svg_image.py --forked -v -rs --color=no 2>&1 | tee /tmp/pytest-b1-svg-off.log
+          # The test must run, not be skipped.
+          grep -q "test_svg_file_draws_as_the_build_option_says PASSED" /tmp/pytest-b1-svg-off.log
+
+      - name: Upload pytest log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-b1-svg-off-log
+          path: /tmp/pytest-b1-svg-off.log
+          if-no-files-found: warn

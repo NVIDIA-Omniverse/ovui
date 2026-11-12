@@ -128,7 +128,7 @@ def test_requires_ovrtx_marker_runs_when_runtime_is_available() -> None:
     assert ovrtx.__name__ == "ovrtx"
 
 
-def test_runtime_marker_skip_reason_reports_missing_modules(monkeypatch) -> None:
+def test_runtime_marker_failure_reason_reports_missing_modules(monkeypatch) -> None:
     def fake_find_spec(name: str):
         if name == "ovrtx":
             return None
@@ -140,11 +140,11 @@ def test_runtime_marker_skip_reason_reports_missing_modules(monkeypatch) -> None
         fake_find_spec,
     )
 
-    assert (
-        adapter_pytest_config.runtime_skip_reason("requires_ovrtx")
-        == "requires_ovrtx: missing runtime module(s): ovrtx"
+    assert adapter_pytest_config.runtime_failure_reason("requires_ovrtx") == (
+        "requires_ovrtx: missing runtime module(s): ovrtx; "
+        "install them or deselect with -m 'not requires_ovrtx'"
     )
-    assert adapter_pytest_config.runtime_skip_reason("requires_ovphysx") is None
+    assert adapter_pytest_config.runtime_failure_reason("requires_ovphysx") is None
 
 
 def test_runtime_marker_rejects_collection_namespace_package(monkeypatch) -> None:
@@ -162,12 +162,13 @@ def test_runtime_marker_rejects_collection_namespace_package(monkeypatch) -> Non
     assert adapter_pytest_config.missing_runtime_modules("requires_ovstage") == (
         "ovstage",
     )
-    assert adapter_pytest_config.runtime_skip_reason("requires_ovstage") == (
-        "requires_ovstage: missing runtime module(s): ovstage"
+    assert adapter_pytest_config.runtime_failure_reason("requires_ovstage") == (
+        "requires_ovstage: missing runtime module(s): ovstage; "
+        "install them or deselect with -m 'not requires_ovstage'"
     )
 
 
-def test_collection_hook_marks_runtime_tests_skipped_when_missing(monkeypatch) -> None:
+def test_runtime_tests_fail_when_runtime_is_missing(monkeypatch) -> None:
     def fake_find_spec(name: str):
         if name == "ovstage":
             return None
@@ -177,10 +178,7 @@ def test_collection_hook_marks_runtime_tests_skipped_when_missing(monkeypatch) -
         keywords = {"requires_ovstage": True}
 
         def __init__(self) -> None:
-            self.added_markers = []
-
-        def add_marker(self, marker) -> None:
-            self.added_markers.append(marker)
+            self.stash = pytest.Stash()
 
     item = DummyItem()
     monkeypatch.setattr(
@@ -190,10 +188,10 @@ def test_collection_hook_marks_runtime_tests_skipped_when_missing(monkeypatch) -
     )
 
     adapter_pytest_config.pytest_collection_modifyitems(None, [item])
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        adapter_pytest_config.pytest_runtest_setup(item)
 
-    assert len(item.added_markers) == 1
-    added_marker = item.added_markers[0].mark
-    assert added_marker.name == "skip"
-    assert added_marker.kwargs["reason"] == (
-        "requires_ovstage: missing runtime module(s): ovstage"
+    assert str(excinfo.value) == (
+        "requires_ovstage: missing runtime module(s): ovstage; "
+        "install them or deselect with -m 'not requires_ovstage'"
     )

@@ -3,9 +3,46 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@config "../tailwind.config.js";
+
+/* Tailwind 4 uses unitless line heights for the text-* sizes. Restore the
+   Tailwind 3 fixed values so heading and code line boxes keep their size. */
+@theme {
+  --text-xs--line-height: 1rem;
+  --text-sm--line-height: 1.25rem;
+  --text-base--line-height: 1.5rem;
+  --text-lg--line-height: 1.75rem;
+  --text-xl--line-height: 1.75rem;
+  --text-2xl--line-height: 2rem;
+  --text-3xl--line-height: 2.25rem;
+}
+
+/* Tailwind 4 space-y-4 has zero specificity, so the Typography margins win.
+   Restore the Tailwind 3 rule that streamdown block spacing relies on. */
+.oracle-surface .space-y-4 > :not([hidden]) ~ :not([hidden]) {
+  margin-top: 1rem;
+  margin-bottom: 0;
+}
+
+/* Streamdown removes the last margin with a layered utility class. The
+   unlayered alert CSS wins over it, so a last .markdown-alert keeps 16 px
+   below it. Restore the Tailwind 3 result: no margin after the last block. */
+.oracle-surface .space-y-4 > :last-child {
+  margin-bottom: 0;
+}
+
+/* Tailwind 4 changed the default border color from gray-200 to currentColor.
+   Restore the Tailwind 3 default so tables and code blocks look the same. */
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentColor);
+  }
+}
 
 /* Bundle the same Noto Sans TTFs that the SUT renders with, so the oracle
    does not depend on whichever Noto / sans-serif fallback the harness host

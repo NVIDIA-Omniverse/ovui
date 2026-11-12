@@ -124,6 +124,9 @@ protected:
     OMNIUI_SCENE_API
     void _drawContent(const Matrix44& projection, const Matrix44& view) override;
 
+    bool _getFollowReport(Vector3& moved) const override;
+    void _captureBaseline() const override;
+
     void _dirtyCache();
     virtual void _rebuildCache();
 };

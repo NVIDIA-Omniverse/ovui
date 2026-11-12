@@ -49,9 +49,9 @@ class _TrackingSubscription:
 class _TrackingAdapter:
     """Minimal PropertyAdapter double used by row tests.
 
-    Records every ``begin_edit``/``set_value``/``end_edit`` on
-    ``self.calls`` so tests can assert the exact sequence produced by the
-    row → model → adapter chain. Exposes ``subscribe_changes`` and a
+    Records every ``begin_edit``/``set_value``/``set_component_value``/
+    ``end_edit`` on ``self.calls`` so tests can assert the exact sequence
+    produced by the row → model → adapter chain. Exposes ``subscribe_changes`` and a
     ``fire_change`` helper so tests can simulate external USD edits
     landing on the model's ``_on_backing_changed``.
     """
@@ -74,6 +74,12 @@ class _TrackingAdapter:
     def set_value(self, attr_name: str, value: Any) -> None:
         self._values[attr_name] = value
         self.calls.append(("set_value", attr_name, value))
+
+    def set_component_value(self, attr_name: str, index: int, value: Any) -> None:
+        components = list(self._values[attr_name])
+        components[index] = value
+        self._values[attr_name] = tuple(components)
+        self.calls.append(("set_component_value", attr_name, index, value))
 
     def end_edit(self, attr_name: str) -> None:
         self.calls.append(("end_edit", attr_name))
@@ -114,6 +120,10 @@ class _FakeFloatModel:
 
     def set_value(self, v):
         self._value = float(v)
+
+    def is_edit_cancelled(self):
+        # As the FloatDrag model outside an Escape: a normal edit.
+        return False
 
 
 class _FakeIntModel:
@@ -448,9 +458,10 @@ class TestVec3FloatAttributeRow:
         row._on_end_edit(widget_model)
         assert adapter.calls == [
             ("begin_edit", "t"),
-            ("set_value", "t", (0.0, 5.0, 0.0)),
+            ("set_component_value", "t", 1, 5.0),
             ("end_edit", "t"),
         ]
+        assert adapter.get_value("t") == (0.0, 5.0, 0.0)
 
     def test_begin_end_edit_pair_no_change(self, no_ui):
         from ovui_widgets.property.attribute_row import Vec3FloatAttributeRow
@@ -901,9 +912,10 @@ class TestVec2FloatAttributeRow:
         assert row._model.get_value() == (0.0, 5.0)
         assert adapter.calls == [
             ("begin_edit", "uv"),
-            ("set_value", "uv", (0.0, 5.0)),
+            ("set_component_value", "uv", 1, 5.0),
             ("end_edit", "uv"),
         ]
+        assert adapter.get_value("uv") == (0.0, 5.0)
 
     def test_default_base_when_current_is_none(self, no_ui):
         """Length-2 default for edits against an empty model (no current value)."""
@@ -951,9 +963,10 @@ class TestVec4FloatAttributeRow:
         assert row._model.get_value() == (0.0, 0.0, 0.0, 7.0)
         assert adapter.calls == [
             ("begin_edit", "q"),
-            ("set_value", "q", (0.0, 0.0, 0.0, 7.0)),
+            ("set_component_value", "q", 3, 7.0),
             ("end_edit", "q"),
         ]
+        assert adapter.get_value("q") == (0.0, 0.0, 0.0, 7.0)
 
     def test_default_base_when_current_is_none(self, no_ui):
         """Length-4 default for edits against an empty model (no current value)."""
@@ -1200,9 +1213,10 @@ class TestVec2IntAttributeRow:
             assert isinstance(v, int) and not isinstance(v, bool)
         assert adapter.calls == [
             ("begin_edit", "size"),
-            ("set_value", "size", (0, 5)),
+            ("set_component_value", "size", 1, 5),
             ("end_edit", "size"),
         ]
+        assert adapter.get_value("size") == (0, 5)
 
     def test_default_base_when_current_is_none(self, no_ui):
         """Length-2 integer default for edits against an empty model."""
@@ -1279,9 +1293,10 @@ class TestVec4IntAttributeRow:
             assert isinstance(v, int) and not isinstance(v, bool)
         assert adapter.calls == [
             ("begin_edit", "box"),
-            ("set_value", "box", (0, 0, 0, 7)),
+            ("set_component_value", "box", 3, 7),
             ("end_edit", "box"),
         ]
+        assert adapter.get_value("box") == (0, 0, 0, 7)
 
     def test_default_base_when_current_is_none(self, no_ui):
         """Length-4 integer default for edits against an empty model."""
@@ -2871,12 +2886,14 @@ class TestRelationshipLiveBuild:
 
     def test_string_field_is_readonly(self):
         """Step 3.7 done-signal core bullet: the row's input widget is a
-        read-only StringField — the user can copy but not type."""
+        read-only StringField. It is also disabled, so a click shows no
+        text cursor that takes no text (OMPE-118431)."""
         import omni.ui as ui
         row = self._build("test_rel_readonly")
         assert row._widget is not None
         assert isinstance(row._widget, ui.StringField)
         assert row._widget.read_only is True
+        assert row._widget.enabled is False
 
     def test_single_target_displays_path_verbatim(self):
         row = self._build(

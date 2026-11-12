@@ -76,6 +76,15 @@ def _filter_icon_provider(name: str) -> Any:
     return prov
 
 
+def _drop_widget_references(owner: Any) -> None:
+    """Set each ovui widget that ``owner`` keeps, alone or in a list, to None."""
+    for name, value in list(getattr(owner, "__dict__", {}).items()):
+        if isinstance(value, ui.Widget):
+            setattr(owner, name, None)
+        elif isinstance(value, list) and any(isinstance(item, ui.Widget) for item in value):
+            setattr(owner, name, [None if isinstance(item, ui.Widget) else item for item in value])
+
+
 class _SelectionHeaderInfo(NamedTuple):
     prim_type: str
     name: str
@@ -138,6 +147,8 @@ class PropertyWindow(ManagedWindow):
     # owner. Class-level default (lazily replaced per instance) keeps
     # headless bypass-``__init__`` tests compatible.
     _accepted_rebuild_tokens: Any = None
+    _filter_focused: bool = False
+
     def __init__(self) -> None:
         self._adapter: Optional[PropertyAdapter] = None
         self._selection: List[str] = []
@@ -149,6 +160,8 @@ class PropertyWindow(ManagedWindow):
         self._filter_text = ""
         self._pending_filter_handle: Optional[Any] = None
         self._filter_field: Optional[Any] = None
+        # True between begin-edit and end-edit of the filter field.
+        self._filter_focused = False
         # Filter-bar chrome (Step QA-polish). Mirrors the Stage filter
         # bar: ``_filter_icon`` is the vertically-centred magnifier
         # glyph, ``_filter_clear_button`` is the "x" inside a 20-px
@@ -209,6 +222,9 @@ class PropertyWindow(ManagedWindow):
         # :meth:`_build_registered_widgets`.
         self._pre_filter_container: Optional[Any] = None
         self._filter_accessory_container: Optional[Any] = None
+        # Stack holding the attribute groups. A filter change rebuilds only
+        # this stack, so the filter field keeps its keyboard focus.
+        self._group_stack_container: Optional[Any] = None
         # Step 6.2: the default catch-all attributes widget is still
         # constructed here so the five thin delegate methods below
         # (``_compute_display_group`` etc. — preserved for tests in
@@ -402,7 +418,51 @@ class PropertyWindow(ManagedWindow):
     def _apply_filter(self, text: str) -> None:
         self._filter_text = text
         self._pending_filter_handle = None
-        self._rebuild_content()
+        if not self._rebuild_filtered_groups():
+            self._rebuild_content()
+
+    def is_filter_editing(self) -> bool:
+        """Return ``True`` while the filter text field owns keyboard input.
+
+        The application key handler reads this, so Backspace and Delete in the
+        filter never delete the selected prim.
+        """
+        return self._filter_focused
+
+    def _rebuild_filtered_groups(self) -> bool:
+        """Rebuild only the attribute groups after a filter change.
+
+        The filter field must stay alive while the user types. A full
+        rebuild makes a new field without keyboard focus, so Backspace
+        would then reach the application delete shortcut and delete the
+        selected prim. With the large-selection banner shown there are no
+        groups to filter, so nothing is rebuilt. Returns ``False`` when the
+        window has no group stack to refresh (empty selection, not built
+        yet); the caller then does a full rebuild.
+        """
+        if self._content is None or not self._adapter or not self._selection:
+            return False
+        if self._is_selection_gated(self._make_payload()):
+            return True
+        container = getattr(self, "_group_stack_container", None)
+        if container is None:
+            return False
+        if self._scroll_preserver is not None:
+            self._scroll_preserver.save_position()
+        self._release_attribute_rows()
+        self._inspector_attribute_rows = {}
+        for name in ("_pre_filter_container", "_filter_accessory_container"):
+            slot = getattr(self, name, None)
+            if slot is not None:
+                slot.clear()
+        container.clear()
+        with container:
+            self._build_registered_widgets()
+        if self._scroll_preserver is not None:
+            self._scroll_preserver.restore_position(
+                self._make_payload().get_scheme()
+            )
+        return True
 
     def _clear_filter(self) -> None:
         if self._filter_field is not None:
@@ -416,12 +476,14 @@ class PropertyWindow(ManagedWindow):
             focus_keyboard()
 
     def _on_filter_begin_edit(self, model: Any) -> None:
+        self._filter_focused = True
         if self._filter_rect is not None:
             self._filter_rect.name = "focused"
         if self._filter_border_rect is not None:
             self._filter_border_rect.name = "focused"
 
     def _on_filter_end_edit(self, model: Any) -> None:
+        self._filter_focused = False
         if self._filter_rect is not None:
             self._filter_rect.name = ""
         if self._filter_border_rect is not None:
@@ -710,10 +772,23 @@ class PropertyWindow(ManagedWindow):
                 row._value_sub = None
             except Exception:
                 pass
+            # The value model of a row widget holds callbacks of the row, and
+            # the row holds the widget. After the panel was cleared, that loop
+            # through native code kept each row, its widgets and their models.
+            # Without these references the cleared widgets and
+            # their models are released, and with them the row. The state
+            # glyph of the row puts a click callback on its widget at each
+            # value change, also after the clear; without its widget it does
+            # not.
+            _drop_widget_references(row)
+            _drop_widget_references(getattr(row, "_indicator", None))
 
     def _rebuild_content(self) -> None:
         if self._content is None:
             return
+        # The filter field is rebuilt below. Its end-edit may not run for the
+        # old field, so the new field sets this flag again on begin-edit.
+        self._filter_focused = False
         self._dispose_scheme_widgets()
         # Step 7.3: snapshot the current scroll position before we blow
         # away the content stack. The preserver reads ``scroll_y`` off
@@ -724,6 +799,7 @@ class PropertyWindow(ManagedWindow):
             self._scroll_preserver.save_position()
         self._release_attribute_rows()
         self._inspector_attribute_rows = {}
+        self._group_stack_container = None
         self._content.clear()
         if not self._adapter or not self._selection:
             # QA BUG-002: show an explicit placeholder so the panel never
@@ -753,10 +829,7 @@ class PropertyWindow(ManagedWindow):
                 spacing=0, height=FIT_CONTENT_HEIGHT
             )
             self._build_filter_bar()
-            if (
-                payload.is_large_selection(self._large_selection_threshold)
-                and not self._large_selection_override
-            ):
+            if self._is_selection_gated(payload):
                 # Gate fires at the 100+ prim default threshold: skip the
                 # full attribute build, render the banner + override button
                 # instead.
@@ -924,7 +997,10 @@ class PropertyWindow(ManagedWindow):
 
     def _build_group_stack(self) -> None:
         ui.Spacer(height=_FILTER_TO_FIRST_GROUP_SPACING)
-        with ui.VStack(spacing=GROUP_STACK_SPACING, height=FIT_CONTENT_HEIGHT):
+        self._group_stack_container = ui.VStack(
+            spacing=GROUP_STACK_SPACING, height=FIT_CONTENT_HEIGHT
+        )
+        with self._group_stack_container:
             self._build_registered_widgets()
 
     # ------------------------------------------------------------------
@@ -1041,6 +1117,13 @@ class PropertyWindow(ManagedWindow):
                 alignment=ui.Alignment.CENTER,
             )
 
+    def _is_selection_gated(self, payload: PropertyPayload) -> bool:
+        """Return True while the banner replaces the attribute groups."""
+        return (
+            payload.is_large_selection(self._large_selection_threshold)
+            and not self._large_selection_override
+        )
+
     def _build_large_selection_banner(self, count: int) -> None:
         """Render the large-selection banner into the current content stack.
 
@@ -1120,7 +1203,7 @@ class PropertyWindow(ManagedWindow):
         self._default_attributes._show_group_context_menu(group, x, y)
 
 
-# ── Issue #35 Step 3: register the module-scope provider cache so
+# ── register the module-scope provider cache so
 # Application.shutdown() drops every ui.RasterImageProvider it holds
 # before omni.ui.shutdown() runs.
 from ovui_widgets.common.icon_caches import register_dict as _register_dict_for_shutdown

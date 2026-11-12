@@ -19,23 +19,17 @@ if str(_PYTHON) not in sys.path:
     sys.path.insert(0, str(_PYTHON))
 
 
-try:  # pragma: no cover - import guard for partial worktrees.
-    from omni.ui.markdown_providers import (  # noqa: E402
-        AsyncProviderPlugin,
-        HttpImageProviderPlugin,
-        MarkdownProviderChain,
-        MarkdownProviderDocumentRenderer,
-        MarkdownProviderRequest,
-        MarkdownProviderResult,
-        MermaidCliProviderPlugin,
-    )
-
-    _HAVE_PROVIDERS = True
-except Exception:  # noqa: BLE001 - tolerate any import failure
-    _HAVE_PROVIDERS = False
+from omni.ui.markdown_providers import (  # noqa: E402
+    AsyncProviderPlugin,
+    HttpImageProviderPlugin,
+    MarkdownProviderChain,
+    MarkdownProviderDocumentRenderer,
+    MarkdownProviderRequest,
+    MarkdownProviderResult,
+    MermaidCliProviderPlugin,
+)
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestMarkdownProviders(unittest.TestCase):
     def test_document_renderer_rewrites_ready_provider_blocks(self):
         class _ReadyDiagramPlugin(AsyncProviderPlugin):
@@ -94,38 +88,35 @@ class TestMarkdownProviders(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-if _HAVE_PROVIDERS:
+class _GatedPlugin(AsyncProviderPlugin):
+    """Plugin whose render() blocks until ``release`` is set.
 
-    class _GatedPlugin(AsyncProviderPlugin):
-        """Plugin whose render() blocks until ``release`` is set.
+    Each call increments ``render_calls`` so tests can assert how many
+    times the heavy work ran.  Concurrent callers should observe exactly
+    one render for a fixed cache key.
+    """
 
-        Each call increments ``render_calls`` so tests can assert how many
-        times the heavy work ran.  Concurrent callers should observe exactly
-        one render for a fixed cache key.
-        """
+    def __init__(self, cache_dir: Path, release: threading.Event):
+        super().__init__(cache_dir=cache_dir)
+        self.release = release
+        self.render_calls = 0
+        self._call_lock = threading.Lock()
 
-        def __init__(self, cache_dir: Path, release: threading.Event):
-            super().__init__(cache_dir=cache_dir)
-            self.release = release
-            self.render_calls = 0
-            self._call_lock = threading.Lock()
+    def can_handle(self, request: MarkdownProviderRequest) -> bool:
+        return request.kind == "diagram"
 
-        def can_handle(self, request: MarkdownProviderRequest) -> bool:
-            return request.kind == "diagram"
-
-        def render(self, request: MarkdownProviderRequest) -> MarkdownProviderResult:
-            with self._call_lock:
-                self.render_calls += 1
-            # Block until the test says we may complete. The default ~5s
-            # timeout is generous compared to the test runtime and ensures
-            # we don't hang CI forever if a test forgets to release.
-            self.release.wait(timeout=30)
-            target = self.cache_dir / "diagram.png"
-            target.write_bytes(b"ok")
-            return MarkdownProviderResult(state="ready", path=str(target), source=request.source)
+    def render(self, request: MarkdownProviderRequest) -> MarkdownProviderResult:
+        with self._call_lock:
+            self.render_calls += 1
+        # Block until the test says we may complete. The default ~5s
+        # timeout is generous compared to the test runtime and ensures
+        # we don't hang CI forever if a test forgets to release.
+        self.release.wait(timeout=30)
+        target = self.cache_dir / "diagram.png"
+        target.write_bytes(b"ok")
+        return MarkdownProviderResult(state="ready", path=str(target), source=request.source)
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestMarkdownProviderConcurrency(unittest.TestCase):
     def _request(self) -> "MarkdownProviderRequest":
         return MarkdownProviderRequest(kind="diagram", source="graph TD; A-->B")
@@ -248,45 +239,43 @@ class TestMarkdownProviderConcurrency(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-if _HAVE_PROVIDERS:
+class _InstantPlugin(AsyncProviderPlugin):
+    """Deterministic plugin: every ``render`` succeeds immediately."""
 
-    class _InstantPlugin(AsyncProviderPlugin):
-        """Deterministic plugin: every ``render`` succeeds immediately."""
+    def can_handle(self, request: MarkdownProviderRequest) -> bool:
+        return True
 
-        def can_handle(self, request: MarkdownProviderRequest) -> bool:
-            return True
+    def cache_key(self, request: MarkdownProviderRequest) -> str:
+        return f"instant:{request.source}"
 
-        def cache_key(self, request: MarkdownProviderRequest) -> str:
-            return f"instant:{request.source}"
-
-        def render(self, request: MarkdownProviderRequest) -> MarkdownProviderResult:
-            return MarkdownProviderResult(
-                state="ready", path=f"/tmp/{request.source}", source=request.source,
-            )
-
-    class _BlockingCancelPlugin(AsyncProviderPlugin):
-        """``render`` blocks until released.  Used for cancel-path tests."""
-
-        def __init__(self, cache_dir: Path, release: threading.Event, *, concurrency: int = 2):
-            super().__init__(cache_dir=cache_dir, concurrency=concurrency)
-            self._release = release
-            self.render_entered = threading.Event()
-
-        def can_handle(self, request: MarkdownProviderRequest) -> bool:
-            return True
-
-        def cache_key(self, request: MarkdownProviderRequest) -> str:
-            return f"block:{request.source}"
-
-        def render(self, request: MarkdownProviderRequest) -> MarkdownProviderResult:
-            self.render_entered.set()
-            self._release.wait(timeout=10.0)
-            return MarkdownProviderResult(
-                state="ready", path="/tmp/released", source=request.source,
-            )
+    def render(self, request: MarkdownProviderRequest) -> MarkdownProviderResult:
+        return MarkdownProviderResult(
+            state="ready", path=f"/tmp/{request.source}", source=request.source,
+        )
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
+class _BlockingCancelPlugin(AsyncProviderPlugin):
+    """``render`` blocks until released.  Used for cancel-path tests."""
+
+    def __init__(self, cache_dir: Path, release: threading.Event, *, concurrency: int = 2):
+        super().__init__(cache_dir=cache_dir, concurrency=concurrency)
+        self._release = release
+        self.render_entered = threading.Event()
+
+    def can_handle(self, request: MarkdownProviderRequest) -> bool:
+        return True
+
+    def cache_key(self, request: MarkdownProviderRequest) -> str:
+        return f"block:{request.source}"
+
+    def render(self, request: MarkdownProviderRequest) -> MarkdownProviderResult:
+        self.render_entered.set()
+        self._release.wait(timeout=10.0)
+        return MarkdownProviderResult(
+            state="ready", path="/tmp/released", source=request.source,
+        )
+
+
 class TestLruCache(unittest.TestCase):
     def test_lru_evicts_oldest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -328,7 +317,6 @@ class TestLruCache(unittest.TestCase):
                 plugin.shutdown()
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestCancellation(unittest.TestCase):
     def test_cancel_removes_pending_request(self):
         """After cancel() both _futures and _results are clear for the key."""
@@ -377,7 +365,6 @@ class TestCancellation(unittest.TestCase):
                 plugin.shutdown()
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestHttpSSRF(unittest.TestCase):
     def test_http_rejects_loopback(self):
         from unittest import mock as _mock
@@ -457,7 +444,6 @@ class TestHttpSSRF(unittest.TestCase):
             t.join(timeout=2)
 
 
-@unittest.skipUnless(_HAVE_PROVIDERS, "omni.ui.markdown_providers not available")
 class TestSubprocessSizeLimit(unittest.TestCase):
     def test_subprocess_size_limit(self):
         """Oversized Mermaid source returns failed without spawning ``mmdc``."""

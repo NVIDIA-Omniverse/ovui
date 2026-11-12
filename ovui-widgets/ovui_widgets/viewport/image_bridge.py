@@ -59,25 +59,36 @@ class ImageBridge:
     def provider(self) -> ui.ByteImageProvider:
         return self._provider
 
-    def update(self, frame: Union[np.ndarray, GpuFrame, None]) -> None:
+    def clear(self) -> None:
+        """Show no image: a fully transparent frame lets the background show."""
+        clear = np.zeros((self._height, self._width, 4), dtype=np.uint8)
+        self._provider.set_data_array(clear, [self._width, self._height])
+
+    def update(self, frame: Union[np.ndarray, GpuFrame, None]) -> Optional[bool]:
         """Push a new frame into the provider.
 
         Accepts either an (H, W, 4) uint8 ndarray or a :class:`GpuFrame`.
         ``None`` means a native frame-pacing coordinator owns publication;
         the provider's stable presentation key must remain untouched.
+
+        Returns ``False`` when ovui rejected the upload. The provider then
+        still shows the previous frame, so the caller must not count this
+        frame as presented. Returns ``True`` when ovui accepted the pixels
+        and ``None`` when nothing was pushed, when ovui has no GPU backend
+        (no renderer, which is not a refusal), or when ovui gave no answer
+        (an older ovui returns ``None`` from the setters).
         """
         if frame is None:
-            return
+            return None
         if isinstance(frame, GpuFrame):
-            self._update_gpu(frame)
-            return
+            return self._update_gpu(frame)
         h, w = frame.shape[:2]
         if w != self._width or h != self._height:
             self._width = w
             self._height = h
-        self._provider.set_data_array(frame, [w, h])
+        return _accepted(self._provider.set_data_array(frame, [w, h]))
 
-    def _update_gpu(self, frame: GpuFrame) -> None:
+    def _update_gpu(self, frame: GpuFrame) -> Optional[bool]:
         w, h = frame.width, frame.height
         if w != self._width or h != self._height:
             self._width = w
@@ -94,9 +105,9 @@ class ImageBridge:
                         "ovui build has no CUDA-Vulkan byte-image support "
                         "(omni.ui.has_gpu_byte_image() is False)"
                     )
-                    return
+                    return _gpu_frame_not_taken()
                 with _capture_fd2() as cap:
-                    self._set_gpu_frame_data(frame, [w, h])
+                    accepted = self._set_gpu_frame_data(frame, [w, h])
                 captured = cap.read()
                 if _STANDALONE_NOOP_MARKER in captured:
                     # Re-emit so users see the original warning once.
@@ -104,10 +115,20 @@ class ImageBridge:
                     self._state.mark_fallback(
                         "ovui standalone backend printed 'fromGpu not supported'"
                     )
-                    return
+                    return False
+                if accepted is False:
+                    # The return value is the truthful answer. The stderr
+                    # marker is only a fallback for an ovui that returns None.
+                    self._state.mark_fallback("ovui rejected the GPU upload")
+                    return False
                 self._state.mark_enabled()
-                return
-            self._set_gpu_frame_data(frame, [w, h])
+                return accepted
+            accepted = self._set_gpu_frame_data(frame, [w, h])
+            if accepted is False and self._state is not None:
+                # Safe choice: a rejected upload keeps the old frame on screen.
+                # Switch to the CPU path so the next frames arrive.
+                self._state.mark_fallback("ovui rejected the GPU upload")
+            return accepted
         finally:
             # Always release the CUDA mapping the renderer entered for us,
             # even if ovui's GPU push raised. The pointer is invalidated
@@ -115,16 +136,33 @@ class ImageBridge:
             # set_bytes_data_from_gpu call returns synchronously.
             frame.close()
 
-    def _set_gpu_frame_data(self, frame: GpuFrame, size: list[int]) -> None:
+    def _set_gpu_frame_data(self, frame: GpuFrame, size: list[int]) -> Optional[bool]:
         stride = getattr(frame, "stride", None)
         if stride is None:
-            self._provider.set_bytes_data_from_gpu(frame.ptr, size)
-            return
-        self._provider.set_bytes_data_from_gpu(
-            frame.ptr,
-            size,
-            stride=int(stride),
+            return _accepted(self._provider.set_bytes_data_from_gpu(frame.ptr, size))
+        return _accepted(
+            self._provider.set_bytes_data_from_gpu(
+                frame.ptr,
+                size,
+                stride=int(stride),
+            )
         )
+
+
+def _gpu_frame_not_taken() -> Optional[bool]:
+    """The answer for a GPU frame that ovui cannot take.
+
+    ``False`` (refused) when ovui has a GPU backend. ``None`` when it has none:
+    there is no renderer, and that is not a refusal. An older ovui cannot tell,
+    and ``None`` was the answer there before.
+    """
+    has_backend = getattr(ui.ByteImageProvider, "has_upload_backend", None)
+    return False if callable(has_backend) and has_backend() else None
+
+
+def _accepted(result: object) -> Optional[bool]:
+    """``True`` or ``False`` when ovui answered, ``None`` when it did not."""
+    return result if isinstance(result, bool) else None
 
 
 class _capture_fd2:

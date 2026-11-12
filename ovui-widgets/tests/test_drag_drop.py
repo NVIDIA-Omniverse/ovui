@@ -271,6 +271,110 @@ class TestHierarchyModelDragDrop:
         assert remapped == [["/World/Lights/Sphere"]]
 
 
+# ── Drop on a native USD instance (real OpenUSD adapter) ─────────────────────
+
+_INSTANCE_DROP_MESSAGE = (
+    "Cannot move Cube into Inst: "
+    "Inst is an instance, and USD does not show prims under an instance"
+)
+
+
+class TestDropOnNativeInstance:
+    """USD does not show children of a native instance; the drop must be refused."""
+
+    def setup_method(self):
+        # OpenUSD is imported here so that this file stays importable without it.
+        from pxr import Usd
+
+        from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
+
+        self.stage = Usd.Stage.CreateInMemory()
+        self.stage.DefinePrim("/World", "Xform")
+        self.stage.DefinePrim("/World/Cube", "Cube")
+        self.stage.DefinePrim("/World/Group", "Xform")
+        proto = self.stage.DefinePrim("/World/Proto", "Xform")
+        self.stage.DefinePrim("/World/Proto/Post", "Cylinder")
+        inst = self.stage.DefinePrim("/World/Inst", "Xform")
+        inst.GetReferences().AddInternalReference(proto.GetPath())
+        inst.SetInstanceable(True)
+        self.model = HierarchyModel(UsdStageAdapter(self.stage, None))
+        self.dvc = DropVisualController()
+        self.model.set_drop_visual_controller(self.dvc)
+        for child in self.model.get_item_children(self.model._root):
+            self.model.get_item_children(child)
+
+    def _item(self, path: str) -> HierarchyItem:
+        return self.model._path_cache[path]
+
+    def _record_warnings(self, monkeypatch) -> list:
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        warnings = []
+        monkeypatch.setattr(
+            ErrorReporter,
+            "show_warning",
+            lambda message, duration_ms=4000: warnings.append(message),
+        )
+        return warnings
+
+    def test_release_on_instance_reaches_drop_without_a_drop_target(self):
+        cube = self._item("/World/Cube")
+        inst = self._item("/World/Inst")
+        self.dvc.show_drop_target(inst, -1)
+        assert self.model.drop_accepted(inst, cube) is True
+        assert self.dvc.current_target is None
+
+    def test_drop_on_instance_keeps_the_prim_and_shows_the_reason(self, monkeypatch):
+        warnings = self._record_warnings(monkeypatch)
+        cube = self._item("/World/Cube")
+        inst = self._item("/World/Inst")
+
+        self.model.drop(inst, cube)
+
+        assert self.stage.GetPrimAtPath("/World/Cube").IsValid()
+        assert self.stage.GetRootLayer().GetPrimAtPath("/World/Inst/Cube") is None
+        assert warnings == [_INSTANCE_DROP_MESSAGE]
+
+    def test_target_that_becomes_an_instance_before_the_move_is_reported(
+        self, monkeypatch
+    ):
+        from ovui_widgets.common import scheduler
+
+        warnings = self._record_warnings(monkeypatch)
+        callbacks = []
+        monkeypatch.setattr(
+            scheduler,
+            "call_later",
+            lambda delay, callback: callbacks.append((delay, callback)),
+        )
+        cube = self._item("/World/Cube")
+        group = self._item("/World/Group")
+
+        self.model.drop(group, cube)
+        assert warnings == []
+        group_prim = self.stage.GetPrimAtPath("/World/Group")
+        group_prim.GetReferences().AddInternalReference("/World/Proto")
+        group_prim.SetInstanceable(True)
+        callbacks.pop(0)[1]()
+
+        assert self.stage.GetPrimAtPath("/World/Cube").IsValid()
+        assert self.stage.GetRootLayer().GetPrimAtPath("/World/Group/Cube") is None
+        assert warnings == [
+            "Cannot move Cube into Group: "
+            "Group is an instance, and USD does not show prims under an instance"
+        ]
+
+    def test_drop_of_the_instance_on_itself_stays_silent(self, monkeypatch):
+        warnings = self._record_warnings(monkeypatch)
+        inst = self._item("/World/Inst")
+
+        assert self.model.drop_accepted(inst, inst) is False
+        self.model.drop(inst, inst)
+
+        assert self.stage.GetPrimAtPath("/World/Inst").IsInstance()
+        assert warnings == []
+
+
 # ── MockStageAdapter reparent edge cases ─────────────────────────────────────
 
 

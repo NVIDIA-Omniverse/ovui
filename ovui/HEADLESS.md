@@ -192,7 +192,7 @@ pybind11 bindings; the underlying contract is documented in
 | `init() -> bool` | Initialise the export pipeline. Refuses unless `OMNIUI_HEADLESS=1` and `OMNIUI_BACKEND=vulkan`. |
 | `shutdown() -> None` | Tear it down. Safe when never initialised. |
 | `extent() -> (w, h)` | Width/height of the offscreen image (RGBA8). |
-| `format() -> str` | Pixel format string (currently `'rgba8'`). |
+| `format() -> str` | Pixel format string (currently `'rgba8'`, alpha premultiplied; see [Clear color and alpha](#clear-color-and-alpha-overlay-export)). |
 | `wait_ready(timeout_ns) -> bool` | Queue an async CUDA wait on the V→C semaphore. |
 | `copy_to_linear(dst_dev_ptr, dst_pitch_bytes, cuda_stream_handle=0) -> bool` | `cudaMemcpy2DFromArrayAsync` into a caller-owned pitched buffer. |
 | `signal_consumed() -> None` | Signal the C→V semaphore so ovui can reuse the image. |
@@ -241,6 +241,91 @@ finally:
 The pipeline does not allocate the destination buffer — the caller
 owns it (typical pattern: a 2-buffer ring of `cudaMallocPitch`
 allocations rotated each frame).
+
+## Clear color and alpha (overlay export)
+
+Each headless Vulkan frame starts with a clear of the offscreen RGBA8
+image. The pixels that no widget draws keep the clear color. The default
+clear color is the opaque `(0.12, 0.13, 0.14, 1.0)`, which is
+`(31, 33, 36, 255)` in 8-bit values.
+
+To export only the UI, for example a gizmo, and composite it over a frame
+from a different renderer, set a transparent clear color. Also give the
+windows the flag `ui.WINDOW_FLAGS_NO_BACKGROUND`, because a window
+background covers the clear color.
+
+```python
+import os
+os.environ["OMNIUI_HEADLESS"] = "1"
+os.environ["OMNIUI_BACKEND"] = "vulkan"
+
+import omni.ui as ui
+from omni.ui import standalone
+
+ui.init("Overlay", 1920, 1080)
+standalone.set_clear_color(0.0, 0.0, 0.0, 0.0)
+# Build the overlay, then export it with headless_frame or a screenshot.
+```
+
+| Function | Purpose |
+|---|---|
+| `standalone.set_clear_color(red, green, blue, alpha) -> None` | Set the clear color. |
+| `standalone.get_clear_color() -> (red, green, blue, alpha)` | Return the clear color, or `None` when there is no headless Vulkan backend. |
+
+In C++, use `omni::ui::standalone::setClearColor(red, green, blue, alpha, &error)`
+and `getClearColor(&red, &green, &blue, &alpha)` from `StandaloneInit.h`.
+
+### When the setting takes effect
+
+- Call `set_clear_color` after `init()`. `init()` draws no frame, so a
+  call before the first frame applies to the first frame.
+- A change applies from the next frame that starts after the call.
+- The color stays until `shutdown()`. After the next `init()`, the clear
+  color is the default again.
+
+### Alpha: premultiplied in memory, straight in PNG and BMP files
+
+ovui draws each shape, text and image with color `C` and alpha `A` over
+the pixel `P` below it: `rgb = C * A + P.rgb * (1 - A)` and
+`alpha = A + P.alpha * (1 - A)`. So the frame in memory is premultiplied
+by alpha: on a transparent clear, a drawn pixel holds its color times its
+alpha. Image files store straight (not premultiplied) color instead,
+because the readers of these formats expect it.
+
+| Output | Color form | Composite the frame `F` over an opaque image `B` |
+|---|---|---|
+| `headless_frame` export (`copy_to_linear`) | premultiplied | `out.rgb = F.rgb + B.rgb * (1 - F.alpha)` |
+| Vulkan read-back (C++ `VulkanBackend::readbackPixels`, the bytes that a screenshot starts from) | premultiplied | `out.rgb = F.rgb + B.rgb * (1 - F.alpha)` |
+| `.png` screenshot | straight, as the PNG format defines | any PNG reader, for example Pillow `Image.alpha_composite`; the formula is `out.rgb = F.rgb * F.alpha + B.rgb * (1 - F.alpha)` |
+| `.bmp` screenshot (32 bits with alpha) | straight, as image readers take it | the same as `.png` |
+| `.jpg` screenshot | no alpha | the file is the frame over black |
+
+- For a `.png` or `.bmp` file, ovui divides the color of each pixel that is
+  not opaque by its alpha (`rgb * 255 / alpha`, rounded; `0` where alpha
+  is `0`). Opaque pixels keep their bytes, so with an opaque clear color
+  the file holds the same bytes as the export.
+- A pixel that no widget draws holds the clear color. In the export and the
+  read-back, each 8-bit value is the clear value times 255, rounded: the
+  clear `(0.2, 0.4, 0.6, 0.6)` is `(51, 102, 153, 153)`. A `.png` file holds
+  the straight form of it, `(85, 170, 255, 153)`. A transparent clear is
+  `(0, 0, 0, 0)` in both.
+- Use the formula of the output. Premultiplied pixels multiplied by alpha
+  again give dark shapes and dark edges (halos) around smooth edges, text
+  and half-transparent shapes. Straight pixels used as premultiplied give
+  bright edges.
+- The clear color that you set uses the premultiplied form. Red, green and
+  blue must each be at most alpha.
+
+### Values that are not valid
+
+| Cause | Python | C++ `setClearColor` |
+|---|---|---|
+| A value is not a number from 0 to 1 (also NaN or infinity). | `ValueError` | returns `false` |
+| Red, green or blue is greater than alpha. | `ValueError` | returns `false` |
+| `init()` did not run, or the backend is not headless Vulkan (a window, or headless EGL). These backends do not use this color. | `RuntimeError` | returns `false` |
+
+In each case the current color stays, and the message gives the value and
+the cause. ovui also writes the message to stderr.
 
 ## Test executable
 
@@ -381,6 +466,7 @@ if (!captured || hasError) { /* handle failure */ }
 | CUDA-Vulkan interop | Not available (OpenGL path) |
 | NVENC hardware encoder | Not available |
 | `headless_frame` export | Not available |
+| `set_clear_color()` | Not available (`RuntimeError`) |
 | Screenshot / `scheduleScreenshot()` | Works |
 | Window creation / `DISPLAY` | Not required |
 

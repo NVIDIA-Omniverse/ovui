@@ -26,6 +26,7 @@ from ovui_data_adapters.ovstage.runtime_preflight import (
     load_required_runtimes,
 )
 from ovui_data_adapters.ovstage import renderer_adapter as renderer_module
+from test_root_precedence import _link_directory
 
 
 def _fake_ovrtx_module() -> ModuleType:
@@ -155,15 +156,11 @@ class TestOvstageRendererOvRtxResolution:
         assert not hasattr(adapter._renderer.config, "use_vulkan")
         assert not hasattr(adapter._renderer.config, "attach_mode")
 
-    def test_renderer_uses_active_env_ovrtx_first(
+    def test_renderer_uses_active_env_ovrtx_when_ovrtx_root_is_unset(
         self,
-        tmp_path,
         monkeypatch,
         isolated_shared_ovrtx,
     ) -> None:
-        root = tmp_path / "external"
-        (root / "python" / "ovrtx").mkdir(parents=True)
-        monkeypatch.setenv(resolver.OVRTX_ROOT_ENV, str(root))
         normal_module = _fake_ovrtx_module()
         calls: list[str] = []
 
@@ -180,9 +177,8 @@ class TestOvstageRendererOvRtxResolution:
         assert adapter._renderer.config.use_vulkan is True
         assert adapter._renderer.config.attach_mode is normal_module.AttachMode.BORROW
         assert calls == ["ovrtx"]
-        assert str(root / "python") not in sys.path
 
-    def test_renderer_uses_ovrtx_root_when_active_env_import_fails(
+    def test_renderer_uses_ovrtx_root_when_set(
         self,
         tmp_path,
         monkeypatch,
@@ -198,8 +194,6 @@ class TestOvstageRendererOvRtxResolution:
         def fake_import(name: str):
             calls.append(name)
             assert name == "ovrtx"
-            if len(calls) == 1:
-                raise ImportError("active environment missing")
             assert sys.path[0] == str(candidate)
             return external_module
 
@@ -209,10 +203,10 @@ class TestOvstageRendererOvRtxResolution:
 
         assert adapter._ovrtx is external_module
         assert adapter._renderer.config.attach_mode is external_module.AttachMode.BORROW
-        assert calls == ["ovrtx", "ovrtx"]
+        assert calls == ["ovrtx"]
         assert str(candidate) not in sys.path
 
-    def test_renderer_rejects_active_ovrtx_that_shadows_configured_root(
+    def test_renderer_rejects_ovrtx_from_outside_configured_root(
         self,
         tmp_path,
         monkeypatch,
@@ -229,10 +223,14 @@ class TestOvstageRendererOvRtxResolution:
             lambda _name: shadowed,
         )
 
-        with pytest.raises(RuntimeError, match="different installation"):
+        with pytest.raises(RuntimeError) as exc_info:
             renderer_module.OvstageRendererAdapter()
 
-    def test_renderer_uses_kit_ovrtx_root_when_active_env_import_fails(
+        message = str(exc_info.value)
+        assert f"{resolver.OVRTX_ROOT_ENV}={str(root)!r}" in message
+        assert shadowed.__file__ in message
+
+    def test_renderer_uses_kit_ovrtx_root_when_set(
         self,
         tmp_path: Path,
         monkeypatch,
@@ -251,8 +249,6 @@ class TestOvstageRendererOvRtxResolution:
         def fake_import(name: str):
             calls.append(name)
             assert name == "ovrtx"
-            if len(calls) == 1:
-                raise ImportError("active environment missing")
             assert sys.path[0] == str(candidate)
             return external_module
 
@@ -262,7 +258,7 @@ class TestOvstageRendererOvRtxResolution:
 
         assert adapter._ovrtx is external_module
         assert adapter._renderer.config.attach_mode is external_module.AttachMode.BORROW
-        assert calls == ["ovrtx", "ovrtx"]
+        assert calls == ["ovrtx"]
         assert resolver._ovrtx_python_path_candidates(str(root)) == (candidate,)
         assert resolver._ovrtx_runtime_dirs(str(root))[:3] == (
             build_dir,
@@ -298,7 +294,6 @@ class TestOvstageRendererOvRtxResolution:
 
         message = str(exc_info.value)
         assert "ovrtx is not available" in message
-        assert "active environment missing" in message
         assert resolver.OVRTX_ROOT_ENV in message
         assert f"{resolver.OVRTX_ROOT_ENV}={str(root)!r}" in message
 
@@ -420,15 +415,11 @@ class TestOvstagePreflightOvRtxResolution:
         (root / "python" / "ovrtx").mkdir(parents=True)
         monkeypatch.setenv(resolver.OVRTX_ROOT_ENV, str(root))
         external_module = _fake_ovrtx_module()
-        calls: list[str] = []
-
-        def fake_import(name: str):
-            calls.append(name)
-            if len(calls) == 1:
-                raise ImportError("active environment missing")
-            return external_module
-
-        monkeypatch.setattr(resolver.importlib, "import_module", fake_import)
+        monkeypatch.setattr(
+            resolver.importlib,
+            "import_module",
+            lambda _name: external_module,
+        )
         registry = AdapterRegistry()
 
         register(registry)
@@ -467,7 +458,6 @@ class TestOvstagePreflightOvRtxResolution:
         assert session.allows_renderer_fallback is False
         assert session.renderer_available() is False
         reason = session.renderer_unavailable_reason()
-        assert "active environment missing" in reason
         assert resolver.OVRTX_ROOT_ENV in reason
         assert f"{resolver.OVRTX_ROOT_ENV}={str(root)!r}" in reason
 
@@ -492,3 +482,87 @@ class TestOvstagePreflightOvRtxResolution:
         session = provider.factories.session()
         assert session.renderer_available() is False
         assert "ovrtx.Renderer.attach_ovstage" in session.renderer_unavailable_reason()
+
+
+def _write_ovrtx_package(python_dir: Path, version: str) -> None:
+    package_dir = python_dir / "ovrtx"
+    package_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text(f"__version__ = {version!r}\n", encoding="utf-8")
+
+
+class TestOvRtxRootSelection:
+    def test_ovrtx_root_wins_over_installed_ovrtx(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        isolated_shared_ovrtx,
+    ) -> None:
+        _write_ovrtx_package(tmp_path / "site-packages", "installed")
+        monkeypatch.syspath_prepend(str(tmp_path / "site-packages"))
+        root = tmp_path / "ovrtx-root"
+        _write_ovrtx_package(root / "python", "root")
+        monkeypatch.setenv(resolver.OVRTX_ROOT_ENV, str(root))
+
+        result = resolver.import_ovrtx()
+
+        assert result.module is not None
+        assert result.module.__version__ == "root"
+
+    @pytest.mark.parametrize("layout", ["empty", "directory_without_package"])
+    def test_ovrtx_root_without_ovrtx_fails_even_with_installed_ovrtx(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        isolated_shared_ovrtx,
+        layout: str,
+    ) -> None:
+        _write_ovrtx_package(tmp_path / "site-packages", "installed")
+        monkeypatch.syspath_prepend(str(tmp_path / "site-packages"))
+        root = tmp_path / "ovrtx-root"
+        root.mkdir()
+        if layout == "directory_without_package":
+            # A directory named ovrtx with no __init__.py: Python would take
+            # the installed ovrtx package instead.
+            (root / "python" / "ovrtx").mkdir(parents=True)
+        monkeypatch.setenv(resolver.OVRTX_ROOT_ENV, str(root))
+
+        result = resolver.import_ovrtx()
+
+        assert result.module is None
+        assert f"{resolver.OVRTX_ROOT_ENV}={str(root)!r}" in str(result.error)
+
+    def test_shadowed_ovrtx_report_names_ovrtx_root_and_its_value(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        root = tmp_path / "ovrtx-root"
+        monkeypatch.setenv(resolver.OVRTX_ROOT_ENV, str(root))
+        module = _fake_ovrtx_module()
+        module.__file__ = str(tmp_path / "site-packages" / "ovrtx" / "__init__.py")
+
+        with pytest.raises(RuntimeError) as exc_info:
+            renderer_module._validate_configured_ovrtx_source(module)
+
+        assert f"{resolver.OVRTX_ROOT_ENV}={str(root)!r}" in str(exc_info.value)
+
+    def test_a_root_that_links_its_package_starts_the_renderer(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """A root may link its package to an install elsewhere.
+
+        The resolver accepts such a root, so the renderer must accept it too.
+        """
+        root = tmp_path / "ovrtx-root"
+        root.mkdir()
+        installed = tmp_path / "site-packages" / "ovrtx"
+        installed.mkdir(parents=True)
+        (installed / "__init__.py").write_text("")
+        _link_directory(root / "ovrtx", installed)
+        monkeypatch.setenv(resolver.OVRTX_ROOT_ENV, str(root))
+        module = _fake_ovrtx_module()
+        module.__file__ = str(root / "ovrtx" / "__init__.py")
+
+        renderer_module._validate_configured_ovrtx_source(module)

@@ -3,9 +3,10 @@
 
 """Flight-mode keyboard handler — Step B.3 of the Viewport Plan.
 
-When RMB is held AND any of W/A/S/D/Space/C is pressed, the camera enters
-"flight mode": per frame, a velocity vector expressed in the camera basis
-is integrated into ``CameraController.state.target``. See
+When RMB is held AND any of W/A/S/D/Q/E/Space/C or an arrow is pressed,
+the camera enters "flight mode": per frame, a velocity vector expressed in
+the camera basis (Q/E and C/Space along the world vertical) is integrated
+into ``CameraController.state.target``. See
 the camera navigation behavior§17 for the reference
 architecture this handler distils.
 
@@ -20,16 +21,9 @@ noting:
   rates), key-repeat cannot affect correctness — a set add is idempotent,
   and the per-frame integrator reads the set each tick regardless of
   what the OS is sending between ticks.
-* The 0.15 s simultaneous-release guard (§17) is not needed yet: B.3
-  has no inertia (that's B.4). As soon as all motion keys are released
-  (or RMB comes up), ``is_flying`` becomes False and the integrator
-  stops writing to the camera. Step B.4 introduces the guard alongside
-  the ``Velocity`` class.
-* ``Q`` and ``E`` are reserved for roll (per the plan's text). The
-  current ``CameraController`` exposes only (azimuth, elevation,
-  distance, target) — there is no roll DOF. Q/E are still *tracked* in
-  ``_active_keys`` so releasing them updates the set, but they do not
-  contribute to the velocity vector. Adding roll is deferred.
+* The camera is heavy: its velocity eases toward the held keys' velocity
+  (speed and direction with their own half-lives) and coasts to a stop
+  after the keys or RMB come up, so ``is_flying`` stays True until then.
 
 Boundary: this module depends on ``CameraController`` (pure math) and
 ``CameraManipulatorModel`` (for the ``disable_fly`` gate). It never
@@ -52,8 +46,22 @@ MOD_SHIFT = 1 << 0
 MOD_CTRL = 1 << 1
 MOD_ALT = 1 << 2
 
-# Base flight speed in world units per second, matching the viewport behavior
+# Base flight speed: a multiplier of FLY_SPEED_SCALE.
 DEFAULT_BASE_SPEED = 1.0
+# Fly speed per second as a fraction of the distance to the target, and at
+# least FLY_SCENE_FLOOR of the scene's diagonal (close to a surface the
+# camera still moves).
+FLY_SPEED_SCALE = 0.2
+FLY_SCENE_FLOOR = 0.02
+# RMB + wheel changes the base speed by this factor per notch, within
+# [1 / FLY_SPEED_RANGE, FLY_SPEED_RANGE].
+FLY_WHEEL_STEP = 1.1
+FLY_SPEED_RANGE = 64.0
+# Heavy fly: the speed eases toward the keys' speed with these half-lives
+# (seconds), and a change of direction eases with FLY_TURN_HALF_LIFE.
+FLY_ACCEL_HALF_LIFE = 0.2
+FLY_DECEL_HALF_LIFE = 0.2
+FLY_TURN_HALF_LIFE = 0.35
 
 # Modifier-key speed multipliers (the viewport behavior). Shift = sprint,
 # Ctrl = tip-toe. Both held → Shift wins (faster motion is typically what
@@ -66,27 +74,19 @@ SPEED_CTRL = 0.5
 # of shift state (see glfw3.h); the ovui C++ binding passes that value
 # straight through. ``ord('W')`` is used for robustness — if a future
 # keyboard layer switches to lowercase we still match.
-_KEY_W = ord("W")
-_KEY_A = ord("A")
-_KEY_S = ord("S")
-_KEY_D = ord("D")
-_KEY_Q = ord("Q")
-_KEY_E = ord("E")
-_KEY_C = ord("C")
-_KEY_SPACE = ord(" ")
+# Direction of each key as (right, world up, forward); the arrows
+# (GLFW codes) alias W/A/S/D.
+_KEY_DIRECTIONS = {
+    ord("W"): (0.0, 0.0, 1.0), 265: (0.0, 0.0, 1.0),
+    ord("S"): (0.0, 0.0, -1.0), 264: (0.0, 0.0, -1.0),
+    ord("D"): (1.0, 0.0, 0.0), 262: (1.0, 0.0, 0.0),
+    ord("A"): (-1.0, 0.0, 0.0), 263: (-1.0, 0.0, 0.0),
+    ord("E"): (0.0, 1.0, 0.0), ord(" "): (0.0, 1.0, 0.0),
+    ord("Q"): (0.0, -1.0, 0.0), ord("C"): (0.0, -1.0, 0.0),
+}
 
-# All key codes flight mode watches, including roll placeholders.
-_TRACKED_KEYS: frozenset = frozenset({
-    _KEY_W, _KEY_A, _KEY_S, _KEY_D,
-    _KEY_Q, _KEY_E, _KEY_C, _KEY_SPACE,
-})
-
-# Subset that actually contributes translation in B.3 (no roll yet).
-# ``is_flying`` checks this set — holding only Q/E does not count as
-# "moving" so flight mode doesn't activate for roll-only input.
-_MOTION_KEYS: frozenset = frozenset({
-    _KEY_W, _KEY_A, _KEY_S, _KEY_D, _KEY_C, _KEY_SPACE,
-})
+# All key codes flight mode watches; each of them moves the camera.
+_TRACKED_KEYS: frozenset = frozenset(_KEY_DIRECTIONS)
 
 # Setting key polled by ``FlightModeKeyboard`` when constructed with an
 # application handle. the viewport behavior names this explicitly.
@@ -108,19 +108,20 @@ def _gate_is_set(model: Optional[CameraManipulatorModel], flag_name: str) -> boo
 class FlightModeKeyboard:
     """RMB + WASD flight-mode state machine and per-frame integrator.
 
-    The public surface is four methods and one property:
+    The public surface is five methods and one property:
 
     * ``handle_key_event(key, modifiers, pressed)`` — called by the
       ovui ``Window.set_key_pressed_fn`` dispatch path (or by tests).
       Updates ``_active_keys`` and ``_modifiers``.
     * ``notify_rmb_press()`` / ``notify_rmb_release()`` — called by the
       owning widget when the right mouse button is pressed / released.
-    * ``is_flying`` — True iff RMB is held AND at least one *motion*
-      key is active AND the model's ``disable_fly`` gate is clear.
-    * ``integrate(dt)`` — called once per frame. Advances the camera
-      target by ``velocity × speed × dt`` along the camera's right /
-      up / forward basis vectors. Safe to call unconditionally; it
-      short-circuits when ``is_flying`` is False.
+    * ``is_flying`` — True iff the model's ``disable_fly`` gate is clear
+      AND either RMB is held with a flight key, or the camera still coasts.
+    * ``integrate(dt)`` — called once per frame. Eases the velocity
+      toward the held keys' velocity (camera right / forward, world
+      vertical) and advances the camera target by it. Safe to call
+      unconditionally; it short-circuits when ``is_flying`` is False.
+    * ``step_speed(notches)`` — RMB + wheel changes the base speed.
     """
 
     def __init__(
@@ -144,6 +145,10 @@ class FlightModeKeyboard:
         self._rmb_held_manual: bool = False
         self._modifiers: int = 0
         self._active_keys: Set[int] = set()
+        self._velocity = np.zeros(3)
+        self.wheel_step = FLY_WHEEL_STEP
+        # Diagonal of the scene's bounds, for the speed floor (0: none).
+        self.scene_size = 0.0
 
     # -- speed / configuration ---------------------------------------------
 
@@ -154,6 +159,11 @@ class FlightModeKeyboard:
     @base_speed.setter
     def base_speed(self, value: float) -> None:
         self._base_speed = float(value)
+
+    def step_speed(self, notches: float) -> None:
+        """RMB + wheel: change the base speed by :attr:`wheel_step` per notch, within the speed range."""
+        speed = self._base_speed * self.wheel_step ** notches
+        self._base_speed = min(max(speed, 1.0 / FLY_SPEED_RANGE), FLY_SPEED_RANGE)
 
     # -- introspection (mostly for tests and QA) ---------------------------
 
@@ -169,7 +179,7 @@ class FlightModeKeyboard:
     @property
     def rmb_held(self) -> bool:
         """True if either ``notify_rmb_press`` was called or an attached
-        gesture reports itself active."""
+        gesture holds the fly button (its ``flies``, else ``is_active``)."""
         if self._rmb_held_manual:
             return True
         return any(self._gesture_is_active(g) for g in self._rmb_gestures)
@@ -178,9 +188,11 @@ class FlightModeKeyboard:
     def is_flying(self) -> bool:
         if _gate_is_set(self._model, "disable_fly"):
             return False
+        if self._velocity.any():
+            return True  # coasting to a stop
         if not self.rmb_held:
             return False
-        return any(k in self._active_keys for k in _MOTION_KEYS)
+        return bool(self._active_keys)
 
     # -- inputs ------------------------------------------------------------
 
@@ -240,58 +252,62 @@ class FlightModeKeyboard:
     # -- per-frame integration ---------------------------------------------
 
     def integrate(self, dt: float) -> None:
-        """Advance the camera target by ``velocity × speed × dt``.
+        """Ease the velocity toward the held keys' one, then move the target by it.
 
-        The velocity vector is expressed in the camera basis (right /
-        up / forward unit vectors from ``CameraController._get_basis``).
-        ``speed`` = ``base_speed × modifier_multiplier`` — Shift doubles
-        it, Ctrl halves it.
+        The keys' velocity is ``speed`` along the camera's right / forward
+        axes and the world vertical, with ``speed = base_speed ×
+        FLY_SPEED_SCALE × reach × modifier_multiplier`` (Shift doubles
+        it, Ctrl halves it), where ``reach`` is the distance to the target
+        and at least ``FLY_SCENE_FLOOR × scene_size``. Its speed eases in with FLY_ACCEL_HALF_LIFE,
+        a turn with FLY_TURN_HALF_LIFE, and without keys the camera coasts
+        to a stop with FLY_DECEL_HALF_LIFE.
 
         Safe to call every frame; does nothing when ``is_flying`` is
         False or ``dt`` is non-positive.
         """
         if not self.is_flying or dt <= 0.0:
             return
-        vx, vy, vz = self._velocity_components()
-        if vx == 0.0 and vy == 0.0 and vz == 0.0:
-            return
-        speed = self._speed_multiplier() * self._base_speed
-        right, up, forward = self._camera._get_basis()
-        delta = (
-            right * (vx * speed * dt)
-            + up * (vy * speed * dt)
-            + forward * (vz * speed * dt)
-        )
-        new_target = np.asarray(self._camera.state.target, dtype=np.float32) + delta
-        self._camera.state.target = new_target.tolist()
+        vx, vy, vz = self._velocity_components() if self.rmb_held else (0.0, 0.0, 0.0)
+        reach = max(float(self._camera.state.distance), FLY_SCENE_FLOOR * self.scene_size)
+        speed = self._speed_multiplier() * self._base_speed * FLY_SPEED_SCALE * reach
+        right, _, forward = self._camera._get_basis()
+        goal = (right * vx + np.asarray(self._camera.up_axis, dtype=np.float64) * vy + forward * vz) * speed
+        error = goal - self._velocity
+        goal_squared = float(np.dot(goal, goal))
+        if goal_squared > 0.0:
+            along = goal * (float(np.dot(error, goal)) / goal_squared)
+            self._velocity += along * (1.0 - 0.5 ** (dt / FLY_ACCEL_HALF_LIFE))
+            self._velocity += (error - along) * (1.0 - 0.5 ** (dt / FLY_TURN_HALF_LIFE))
+        else:
+            self._velocity *= 0.5 ** (dt / FLY_DECEL_HALF_LIFE)
+            if np.linalg.norm(self._velocity) < 1.0e-3 * speed:
+                self._velocity[:] = 0.0
+        target = np.asarray(self._camera.state.target, dtype=np.float64) + self._velocity * dt
+        self._camera.state.target = target.tolist()
+
+    def tick(self, dt: float) -> None:
+        """Camera process: fly for ``dt`` seconds (nothing when not flying)."""
+        self.integrate(dt)
+
+    def stop(self) -> None:
+        """Stop coasting at once."""
+        self._velocity[:] = 0.0
 
     # -- helpers -----------------------------------------------------------
 
     def _velocity_components(self) -> Tuple[float, float, float]:
-        """Return ``(vx, vy, vz)`` where components are in ``{-1, 0, +1}``.
+        """Return ``(vx, vy, vz)``, each in ``[-1, +1]``, from the held keys.
 
         * ``vx`` — right-axis: ``D=+1``, ``A=-1``.
-        * ``vy`` — up-axis:    ``Space=+1``, ``C=-1``.
-        * ``vz`` — forward:    ``W=+1``, ``S=-1``.
+        * ``vy`` — world vertical: ``E``/``Space=+1``, ``Q``/``C=-1``.
+        * ``vz`` — forward: ``W=+1``, ``S=-1``.
 
-        Opposing keys cancel (W+S → 0). Q and E are reserved for roll
-        and do not appear here.
+        The arrows alias W/A/S/D. Opposing keys cancel (W+S → 0). The
+        vector is at most 1 long, so a diagonal is not faster.
         """
-        vx = 0.0
-        vy = 0.0
-        vz = 0.0
-        if _KEY_D in self._active_keys:
-            vx += 1.0
-        if _KEY_A in self._active_keys:
-            vx -= 1.0
-        if _KEY_SPACE in self._active_keys:
-            vy += 1.0
-        if _KEY_C in self._active_keys:
-            vy -= 1.0
-        if _KEY_W in self._active_keys:
-            vz += 1.0
-        if _KEY_S in self._active_keys:
-            vz -= 1.0
+        sums = np.clip(sum((np.asarray(_KEY_DIRECTIONS[key]) for key in self._active_keys), np.zeros(3)), -1.0, 1.0)
+        sums /= max(1.0, float(np.linalg.norm(sums)))
+        vx, vy, vz = (float(v) for v in sums)
         return vx, vy, vz
 
     def _speed_multiplier(self) -> float:
@@ -306,5 +322,5 @@ class FlightModeKeyboard:
 
     @staticmethod
     def _gesture_is_active(gesture: Any) -> bool:
-        """True when the gesture exposes a truthy ``is_active`` property."""
-        return bool(getattr(gesture, "is_active", False))
+        """True when the gesture holds the fly button."""
+        return bool(getattr(gesture, "flies", getattr(gesture, "is_active", False)))

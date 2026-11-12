@@ -64,6 +64,20 @@ _initialized: bool = False
 _next_frame_futures: list[asyncio.Future] = []
 _frame_index: int = 0
 _last_tick_time: Optional[float] = None
+# Handing the GIL over costs real time, so the tick loop waits this long
+# between two hand-overs. A hand-over every 10 ms costs about one frame in a
+# hundred, and gives another Python thread up to 100 turns a second.
+_GIL_YIELD_WAIT: float = 0.010
+# How long the tick loop sleeps to hand the GIL over. ``time.sleep(0)`` is not
+# enough: on Windows it returns at once, so the loop often takes the GIL
+# straight back and the waiting thread gets nothing. Any value above zero
+# makes the loop wait on a timer, so the waiting thread gets the GIL. One
+# microsecond is the smallest such value; the call itself costs about 55 us,
+# and the sleep adds about a microsecond to that.
+_GIL_YIELD_SLEEP: float = 0.000001
+# When the tick loop last handed the GIL over, as a ``time.perf_counter``
+# value.
+_last_gil_yield: float = 0.0
 # Hard-cap on the standalone tick rate. ``None`` disables the cap; set via
 # :func:`set_max_frame_rate` or ``ui.init(..., max_fps=...)``. Uncapped by
 # default.
@@ -427,12 +441,17 @@ def _record_synchronous_content_selection() -> None:
 
 
 def set_window_size(width: int, height: int) -> bool:
-    """Resize the main OS window (and its default OpenGL framebuffer).
+    """Resize the main OS window in platform window coordinates.
 
-    Returns True if the backend reports the new framebuffer size matches the
-    requested dimensions after the next event-poll, False otherwise (e.g.
-    when running without a window system, or when the window manager clamps
-    the size).
+    May be called immediately after init(), without starting a UI loop.
+    On Windows, dimensions are physical pixels and may exceed the desktop
+    size; init() separately scales its initial dimensions for monitor DPI.
+    On macOS, dimensions are window points, which can differ from framebuffer
+    pixels on Retina displays.
+    Returns True only if the framebuffer matches after polling events, False
+    otherwise (including nonpositive dimensions, headless mode, or a window
+    system that refuses the size). A point/pixel mismatch can also return False
+    on macOS even when the window resized.
     """
     if not _initialized:
         return False
@@ -471,6 +490,42 @@ def get_window_title() -> str:
     return str(_ui._standalone_get_window_title())
 
 
+def set_clear_color(red: float, green: float, blue: float, alpha: float) -> None:
+    """Set the color that each headless Vulkan frame is cleared to.
+
+    The headless Vulkan backend (``OMNIUI_HEADLESS=1`` with Vulkan) clears
+    its offscreen RGBA8 image to this color at the start of each frame. The
+    pixels that no widget draws keep it, in the
+    :mod:`~omni.ui.standalone.headless_frame` export and in screenshots. The
+    default is the opaque ``(0.12, 0.13, 0.14, 1.0)``.
+
+    The frame is premultiplied by alpha, and so is this color: each value is
+    from 0 to 1, and ``red``, ``green`` and ``blue`` are each at most
+    ``alpha``. ``set_clear_color(0, 0, 0, 0)`` gives a transparent
+    background for an overlay. Composite such a frame over another image
+    with ``out = frame.rgb + image.rgb * (1 - frame.alpha)``. A ``.png`` or
+    ``.bmp`` screenshot file holds straight color instead, as the readers of
+    these formats expect (see "Clear color and alpha" in ``HEADLESS.md``).
+
+    Call it after :func:`init`. The color applies from the next frame that
+    starts after the call, and stays until :func:`shutdown`.
+
+    Raises :class:`ValueError` when a value is not valid, and
+    :class:`RuntimeError` when :func:`init` did not run or the backend is
+    not headless Vulkan (a window, or headless EGL). In both cases the
+    current color stays.
+    """
+    _ui._standalone_set_clear_color(red, green, blue, alpha)
+
+
+def get_clear_color() -> Optional[tuple[float, float, float, float]]:
+    """Return the ``(red, green, blue, alpha)`` clear color of the headless
+    Vulkan frame (see :func:`set_clear_color`), or ``None`` when there is no
+    headless Vulkan backend.
+    """
+    return _ui._standalone_get_clear_color()
+
+
 def set_software_cursor(enabled: bool) -> None:
     """Toggle ImGui's software-rendered mouse cursor (``io.MouseDrawCursor``).
 
@@ -505,6 +560,25 @@ def is_text_input_active() -> bool:
     Returns ``False`` when no ImGui context exists yet.
     """
     return bool(_ui._is_text_input_active())
+
+
+def end_text_input() -> bool:
+    """End the keyboard edit of the text input that owns the keyboard.
+
+    The edit ends in the same way as when the user clicks outside the field:
+    the field keeps the typed text, and when it is drawn next it calls its
+    end-edit callbacks as a commit, not as a cancel. A later Escape does not
+    go to the field. An application can call this before an action that must
+    see the committed value, for example a save shortcut.
+
+    Returns ``True`` when a text input was in typing mode and its edit ends,
+    and ``False`` (with no change) when no text input is in typing mode
+    (:func:`is_text_input_active` is ``False``) or no ImGui context exists
+    yet. A mouse drag of a ``FloatDrag`` or ``IntDrag`` is not typing mode,
+    also when the same field was edited as text before: the call returns
+    ``False`` and the drag continues.
+    """
+    return bool(_ui._end_text_input())
 
 
 def _ensure_initialized() -> None:
@@ -558,6 +632,7 @@ def _tick_one_frame() -> FrameInfo:
     """
     global _frame_index, _last_tick_time, _next_frame_futures
     global _tick_thread_ident, _shutdown_requested_in_tick
+    global _last_gil_yield
 
     deferred_teardown = False
     try:
@@ -603,6 +678,15 @@ def _tick_one_frame() -> FrameInfo:
         return None
 
     now = time.perf_counter()
+    # The uncapped run loops never wait between frames, so the main thread
+    # holds the GIL all the time and other Python threads never run. Hand the
+    # GIL over here. A short sleep is what hands it over; it takes about 55 us
+    # on Linux, far more than a frame, so the loop spaces hand-overs out by
+    # ``_GIL_YIELD_WAIT`` and makes one only when a thread can take it.
+    if now - _last_gil_yield >= _GIL_YIELD_WAIT and threading.active_count() > 1:
+        time.sleep(_GIL_YIELD_SLEEP)
+        _last_gil_yield = now
+
     if _last_tick_time is None:
         dt = 0.0
     else:
@@ -657,6 +741,42 @@ def _max_fps_remaining_since(frame_start: float) -> float:
         return 0.0
     elapsed = max(0.0, time.perf_counter() - frame_start)
     return max(0.0, period - elapsed)
+
+
+def get_present_timings() -> list:
+    """Window present timing, a diagnostic: the records finished since the previous call.
+
+    With ``OMNIUI_PRESENT_TIMING=1`` in the environment before the window is
+    created (and VK_KHR_present_id and VK_KHR_present_wait on the device),
+    each paced window present gives a ``(tag, submitted, completed)`` row:
+    the tag of :func:`set_present_timing_tag`, the time the present was
+    queued and the time it was seen complete, in ``time.perf_counter``
+    seconds (``completed`` is -1 when it was not seen within half a second).
+    The completion is a bound, not the scanout time. Empty otherwise.
+    """
+    getter = getattr(_ui, "_get_present_timings", None)
+    return list(getter()) if callable(getter) else []
+
+
+def set_present_timing_tag(tag: int) -> None:
+    """Tag the next window presents (for example with a frame number); -1 clears the tag."""
+    setter = getattr(_ui, "_set_present_timing_tag", None)
+    if callable(setter):
+        setter(int(tag))
+
+
+def _pacing_anchor(frame_start: float, deadline: float) -> float:
+    """Return the instant the budget of an iteration starting at ``frame_start`` counts from.
+
+    An iteration that wakes at most ``min(0.5 ms, period / 4)`` after the
+    previous iteration's deadline counts from that deadline, so wake-up
+    lateness does not add up to a lower frame rate (a 60 Hz cap ran at
+    16.74 ms). Otherwise it counts from its own start: no iteration runs
+    shorter than the period to catch up.
+    """
+    if 0.0 <= frame_start - deadline <= min(0.0005, _max_fps_target_period() / 4.0):
+        return deadline
+    return frame_start
 
 
 def _pump_asyncio(loop: asyncio.AbstractEventLoop) -> None:
@@ -714,11 +834,13 @@ def run(coro: Optional[Coroutine] = None) -> None:
             task = loop.create_task(coro)
 
         _reset_pacing_wake_state()
+        deadline = 0.0
         while _initialized and not _stop_requested and not _ui._standalone_should_close():
             # Capture frame_start BEFORE the tick so the budget covers the
             # tick itself plus the asyncio pump. See _max_fps_remaining_since
             # for why this matters on hardware-vsync hosts.
-            frame_start = time.perf_counter()
+            frame_start = _pacing_anchor(time.perf_counter(), deadline)
+            deadline = frame_start + _max_fps_target_period()
             _tick_one_frame()
             # Pump asyncio: run all ready callbacks.
             loop.call_soon(loop.stop)
@@ -790,8 +912,10 @@ async def run_async() -> None:
 
 
 async def _run_async_loop() -> None:
+    deadline = 0.0
     while _initialized and not _stop_requested and not _ui._standalone_should_close():
-        frame_start = time.perf_counter()
+        frame_start = _pacing_anchor(time.perf_counter(), deadline)
+        deadline = frame_start + _max_fps_target_period()
         _tick_one_frame()
         # Same interruptible per-iteration pacing as :func:`run`: rate
         # changes recompute the remaining budget (both directions, no

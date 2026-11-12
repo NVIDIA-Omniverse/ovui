@@ -31,6 +31,26 @@ _UNCAPPED_RATE_LIMIT_MIGRATION_KEY = "app.migrations.uncappedRateLimitDefaultV1"
 RENDER_FLOW_MODE_SETTING_KEY = "app.renderer.flowMode"
 DEFAULT_RENDER_FLOW_MODE = "nativePacing"
 RENDER_FLOW_MODES = frozenset({"fast", "nativePacing"})
+# When the viewport renders: "continuous" renders every frame; "on_change"
+# renders a changed camera or size, a stage edit, a selection change, a
+# render-settings change or a new scene, then the settle frames (the native
+# render worker and the renderer adapter's synchronous steps both apply it).
+# ovrtx keeps memory on every step, so a viewer that renders a still picture
+# again grows without end: "on_change" is the default.
+# The real-time renderer builds its picture over many frames (its lighting
+# cache trains on every frame): after a new scene it needs about 500 frames to
+# reach the sharp picture that continuous rendering shows, after a camera move
+# fewer. With 8 settle frames the still picture stayed soft; 512 give the same
+# picture as continuous rendering. Path tracing settles over its sample target.
+# The two keys are not in _DEFAULTS, so a settings file holds them only when
+# the user sets them, and a later default reaches every other user.
+RENDER_POLICY_SETTING_KEY = "app.renderer.renderPolicy"
+RENDER_POLICY_CONTINUOUS = "continuous"
+RENDER_POLICY_ON_CHANGE = "on_change"
+RENDER_POLICIES = frozenset({RENDER_POLICY_CONTINUOUS, RENDER_POLICY_ON_CHANGE})
+DEFAULT_RENDER_POLICY = RENDER_POLICY_ON_CHANGE
+RENDER_SETTLE_FRAMES_SETTING_KEY = "app.renderer.renderSettleFrames"
+DEFAULT_RENDER_SETTLE_FRAMES = 512
 
 
 def valid_rate_limit_fps(value: Any, default: Optional[float]) -> Optional[float]:
@@ -45,15 +65,37 @@ def valid_rate_limit_fps(value: Any, default: Optional[float]) -> Optional[float
         return default
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a whole number too large for a float.
         return default
     if not math.isfinite(result) or result <= 0.0:
         return default
     return result
 
 
+def _json_kind(value: Any) -> str:
+    """Name the JSON kind of a value that ``json.load`` returned."""
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, bool):
+        return "true or false value"
+    if value is None:
+        return "null value"
+    return "number"
+
+
 def _rate_limit_fps_is_valid(value: Any) -> bool:
     return value is None or valid_rate_limit_fps(value, default=None) is not None
+
+
+def _render_policy_is_valid(value: Any) -> bool:
+    return isinstance(value, str) and value in RENDER_POLICIES
+
+
+def _render_settle_frames_is_valid(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _render_flow_mode_is_valid(value: Any) -> bool:
@@ -67,6 +109,8 @@ def _render_flow_mode_is_valid(value: Any) -> bool:
 # runtime write cannot shadow a launch-local CLI overlay or replace a valid
 # persisted baseline.
 _KEY_VALIDATORS: dict = {
+    RENDER_POLICY_SETTING_KEY: _render_policy_is_valid,
+    RENDER_SETTLE_FRAMES_SETTING_KEY: _render_settle_frames_is_valid,
     RATE_LIMIT_FPS_SETTING_KEY: _rate_limit_fps_is_valid,
     RENDER_FLOW_MODE_SETTING_KEY: _render_flow_mode_is_valid,
 }
@@ -244,6 +288,11 @@ class Settings(_SettingsBase):
         """Load persisted state and perform the bounded legacy-rate migration."""
         with open(path, encoding="utf-8") as stream:
             persisted = json.load(stream)
+        if not isinstance(persisted, dict):
+            raise ValueError(
+                f"The file holds a JSON {_json_kind(persisted)}, not a JSON "
+                "object with settings"
+            )
         migrate_legacy_rate_limit = (
             persisted.get(_UNCAPPED_RATE_LIMIT_MIGRATION_KEY) is not True
         )

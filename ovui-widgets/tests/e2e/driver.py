@@ -113,6 +113,14 @@ def nvidia_gpu_present() -> tuple[bool, str]:
     return False, f"nvidia-smi listed no GPU (rc={proc.returncode}): {out or proc.stderr.strip()}"
 
 
+def _probe_text(text: str | None, limit: int = 8000) -> str:
+    """Return the end of a probe stream, bounded so a failure message stays readable."""
+    text = (text or "").strip()
+    if not text:
+        return "(empty)"
+    return text if len(text) <= limit else "...(truncated)...\n" + text[-limit:]
+
+
 def ovrtx_device_available() -> tuple[bool, str]:
     """Probe for a working ovrtx renderer *without* importing omni.ui.
 
@@ -141,9 +149,14 @@ def ovrtx_device_available() -> tuple[bool, str]:
         return False, f"ovrtx renderer probe could not start: {exc!r}"
     if "OVRTX_DEVICE_OK" in proc.stdout:
         return True, "ovrtx renderer constructed"
-    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-    reason = tail[-1] if tail else "unknown error"
-    return False, f"ovrtx renderer unavailable: {reason}"
+    # Report everything the probe printed. The last stderr line alone can be the
+    # tail of a longer native error (ovrtx appends ``config: RendererConfig()``
+    # after the native message), which hides the real cause.
+    return False, (
+        f"ovrtx renderer unavailable: probe exit status {proc.returncode}\n"
+        f"--- probe stdout ---\n{_probe_text(proc.stdout)}\n"
+        f"--- probe stderr ---\n{_probe_text(proc.stderr)}"
+    )
 
 
 # Product import packages that MUST come from the installed wheels, never the
@@ -267,9 +280,14 @@ def selection_overlay_pixels(image_path: Path) -> int:
 class AppSession:
     """A running USD Viewer driven through the inspector CLI (see FullAppSession)."""
 
-    def __init__(self, workdir: Path, log_path: Path):
+    def __init__(self, workdir: Path, log_path: Path, capture_frames: bool = True):
         self.workdir = workdir
         self.log_path = log_path
+        # True: the frame-loop warm-up and the click pumps take screenshots
+        # (``_warmup.png``, ``_pump.png``). False: they ask for the app state
+        # instead, so the session takes no screenshot of its own. A test that
+        # has no reference image sets False.
+        self.capture_frames = capture_frames
         self.port = _free_port()
         self.proc: Optional[subprocess.Popen] = None
         self._log_fh = None
@@ -320,8 +338,10 @@ class AppSession:
     # reports healthy — the first real ovrtx frames compile shaders, and on a
     # shared/MIG GPU that is slow. The inspector then answers an action with
     # "timed out before the ovui frame loop started it". That is transient:
-    # retry the action until the loop is actually servicing commands.
-    _TRANSIENT = "before the ovui frame loop started it"
+    # retry the action until the loop is actually servicing commands. When the
+    # loop reaches the command just after its deadline, the inspector answers
+    # "timed out before it started" instead. Both end with "it was not run".
+    _TRANSIENT = "it was not run"
     _WARMUP_TRANSIENT = (_TRANSIENT, "timed out after it started")
 
     def _cli_retry(
@@ -339,6 +359,14 @@ class AppSession:
                 continue
             break
         return last
+
+    def _frame_command(self, out: Path, timeout: str, cli_timeout: float):
+        """A command that the frame loop must service: a screenshot, or the
+        app state when this session takes no screenshots."""
+        if self.capture_frames:
+            return self._cli("screenshot", "--out", str(out), "--timeout", timeout,
+                             timeout=cli_timeout)
+        return self._cli("state", "--timeout", timeout, timeout=cli_timeout)
 
     def wait_ready(self, timeout: float = 120.0) -> None:
         """Wait for the inspector server, then for the frame loop to service a
@@ -365,9 +393,7 @@ class AppSession:
         res = None
         for _ in range(30):
             self._assert_alive()
-            res = self._cli(
-                "screenshot", "--out", str(warm), "--timeout", "60", timeout=90
-            )
+            res = self._frame_command(warm, "60", 90)
             if res.returncode == 0:
                 return
             if not any(t in (res.stdout or "") + (res.stderr or "") for t in self._WARMUP_TRANSIENT):
@@ -402,7 +428,10 @@ class AppSession:
         pump = self.workdir / "_pump.png"
         for _ in range(40):
             self._assert_alive()
-            self._cli("screenshot", "--out", str(pump), timeout=30)
+            if self.capture_frames:
+                self._cli("screenshot", "--out", str(pump), timeout=30)
+            else:
+                self._cli("state", timeout=30)
             res = self._cli(
                 "click", str(x), str(y), *(("--double",) if double else ()), timeout=30
             )
@@ -466,7 +495,7 @@ def selection_sources(state: dict) -> list:
 #
 # The windowed test launches the *regular* USD Viewer exactly as a user does
 # (``python -m ovui_widgets.app``: a real GLFW window, the full app chrome); on
-# Linux the window may use an Xvfb display, while the NVIDIA Vulkan driver
+# Linux CI the window lives on an Xvfb display and the NVIDIA Vulkan driver
 # still renders it on the GPU. The headless test runs the same flow on the
 # offscreen app. Both screenshot the whole 1000x720 frame.
 
@@ -569,8 +598,8 @@ class FullAppSession(AppSession):
     """
 
     def __init__(self, workdir: Path, log_path: Path, provider: str, headless: bool,
-                 scene: Optional[Path] = None):
-        super().__init__(workdir, log_path)
+                 scene: Optional[Path] = None, capture_frames: bool = True):
+        super().__init__(workdir, log_path, capture_frames)
         self.provider = provider
         self.headless = headless
         self.scene = scene or scene_path()
@@ -588,7 +617,7 @@ class FullAppSession(AppSession):
             # design* — see ovui_data_adapters.common._gpu_frame. Pin this one
             # session to the tier-1 CPU ingest path so the viewport's own
             # output is readable; the pixels the renderer produces are the
-            # same either way, and the windowed golden runs keep covering
+            # same either way, and the six windowed golden jobs keep covering
             # the default zero-copy path (they screenshot through ovui).
             env["OVGEAR_ZERO_COPY"] = "0"
             module = ["ovui_widgets.app.headless", "--width", str(width), "--height", str(height)]
@@ -719,7 +748,7 @@ def assert_zero_copy_tier(session: "FullAppSession", expected: str, where: str) 
     raises, and the viewport keeps rendering from a CPU readback instead —
     correct pixels, so every golden still matches and nothing else in this
     suite notices. That is how an ovrtx 0.5 mapping change silently took all
-    OVStage runs off the GPU ingest path. The windowed sessions must
+    three ovstage jobs off the GPU ingest path. The windowed sessions must
     therefore end on ``enabled``, and the headless session — deliberately
     pinned to tier-1 with ``OVGEAR_ZERO_COPY=0`` — on ``disabled``;
     ``fallback`` is always a failure.
@@ -778,6 +807,43 @@ def _click_cube(session: FullAppSession) -> None:
     _assert_cube_selected(session, f"after the viewport click at {cube_xy}")
 
 
+def close_content_browser(session: FullAppSession, state: dict, menu_shot: Path,
+                          closed_shot: Path) -> dict:
+    """Close the Content browser with two mouse clicks; return the new viewport rect.
+
+    Click the *Window* menu, then *Content Browser*. Prove only Content was
+    hidden and the viewport grew into the freed space, then keep the stable
+    frame at ``closed_shot``.
+    """
+    viewport_before = state["viewport"]["image_rect"]
+    menu = next(m for m in state["menus"]["top_levels"] if m["label"] == "Window")
+    row = menu_row(menu, "Content Browser")
+    session.click(*menu["point"])
+    session.screenshot(menu_shot)
+    rect = menu["rect"]
+    item_xy = (
+        int(rect["x"]) + 60,
+        int(rect["y"] + rect["height"]) + WINDOW_MENU_FIRST_ROW_OFFSET
+        + row * WINDOW_MENU_ROW_HEIGHT,
+    )
+    print(f"[menu] Window entries {menu['items']}; 'Content Browser' is row {row}")
+    session.click(*item_xy)
+
+    shown = session.window_visibility()
+    assert shown.get("Content") is False, (
+        f"Content browser still shown after the mouse clicks: {shown}"
+    )
+    others = {k: v for k, v in shown.items() if k != "Content"}
+    assert all(others.values()), f"the click closed the wrong window(s): {shown}"
+    viewport = session.state()["viewport"]["image_rect"]
+    assert viewport["height"] > viewport_before["height"], (
+        "viewport did not grow into the space the Content browser left: "
+        f"{viewport_before} -> {viewport}"
+    )
+    session.wait_stable(closed_shot, viewport)
+    return viewport
+
+
 def run_user_flow(session: FullAppSession, workdir: Path) -> tuple:
     """Drive the windowed app the way a user does and capture the window.
 
@@ -803,37 +869,12 @@ def run_user_flow(session: FullAppSession, workdir: Path) -> tuple:
     frame = workdir / "full_window.png"
 
     state = _start_and_check(session, with_content)
-    viewport_before = state["viewport"]["image_rect"]
     shown = session.window_visibility()
     assert all(shown.values()) and len(shown) == 5, (
         f"expected every window shown at start, got {shown}"
     )
 
-    menu = next(m for m in state["menus"]["top_levels"] if m["label"] == "Window")
-    row = menu_row(menu, "Content Browser")
-    session.click(*menu["point"])
-    session.screenshot(menu_open)
-    rect = menu["rect"]
-    item_xy = (
-        int(rect["x"]) + 60,
-        int(rect["y"] + rect["height"]) + WINDOW_MENU_FIRST_ROW_OFFSET
-        + row * WINDOW_MENU_ROW_HEIGHT,
-    )
-    print(f"[menu] Window entries {menu['items']}; 'Content Browser' is row {row}")
-    session.click(*item_xy)
-
-    shown = session.window_visibility()
-    assert shown.get("Content") is False, (
-        f"Content browser still shown after the mouse clicks: {shown}"
-    )
-    others = {k: v for k, v in shown.items() if k != "Content"}
-    assert all(others.values()), f"the click closed the wrong window(s): {shown}"
-    viewport = session.state()["viewport"]["image_rect"]
-    assert viewport["height"] > viewport_before["height"], (
-        "viewport did not grow into the space the Content browser left: "
-        f"{viewport_before} -> {viewport}"
-    )
-    session.wait_stable(content_closed, viewport)
+    viewport = close_content_browser(session, state, menu_open, content_closed)
 
     _click_cube(session)
 
@@ -853,6 +894,278 @@ def run_user_flow(session: FullAppSession, workdir: Path) -> tuple:
     )
     assert_zero_copy_tier(session, "enabled", "after the windowed flow")
     return frame, viewport
+
+
+# --- Camera pan flow ---------------------------------------------------------
+
+EMPTY_SCENE = """#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+}
+"""
+
+# Create menu entries the user clicks to add a cube: Create > Shape > Cube.
+CREATED_PRIM = "/World/Cube"
+CREATE_SHAPE_ENTRY = "Shape"
+# The Shape submenu opens to the right of the Create menu, its rows 22 px
+# apart. The Cube row is the third one (Capsule, Cone, Cube).
+CREATE_SUBMENU_X_OFFSET = 130
+CREATE_CUBE_ROW_IN_SUBMENU = 2
+
+# The middle-mouse drag that pans the camera: right and down, in screenshot
+# pixels, with an exact number of move steps so every run drags the same way.
+PAN_DRAG_PIXELS = (80, 40)
+PAN_DRAG_STEPS = 20
+# A pan moves the cube on screen by the drag distance. Allow for rounding of the
+# camera gesture and the width of the gizmo line.
+PAN_MOVE_TOLERANCE = 12
+# The pan must change the viewport render: the cube moves by tens of pixels.
+MIN_PAN_RENDER_CHANGE = 1.0
+
+
+def create_cube_from_menu(session: FullAppSession) -> None:
+    """Create a cube with the mouse: Create > Shape > Cube. Assert it exists."""
+    menu = next(m for m in session.state()["menus"]["top_levels"] if m["label"] == "Create")
+    shape_row = menu_row(menu, CREATE_SHAPE_ENTRY)
+    rect = menu["rect"]
+    first_row_y = (
+        int(rect["y"] + rect["height"]) + WINDOW_MENU_FIRST_ROW_OFFSET
+    )
+    session.click(*menu["point"])
+    shape_y = first_row_y + shape_row * WINDOW_MENU_ROW_HEIGHT
+    session.move(int(rect["x"]) + 40, shape_y)
+    # Cube is the third row of the Shape submenu; the submenu starts level
+    # with the Shape row.
+    cube_xy = (
+        int(rect["x"]) + CREATE_SUBMENU_X_OFFSET,
+        shape_y + CREATE_CUBE_ROW_IN_SUBMENU * WINDOW_MENU_ROW_HEIGHT,
+    )
+    session.click(*cube_xy)
+    state = session.state()
+    selected = state["selection"]["paths"]
+    assert selected == [CREATED_PRIM], (
+        f"after Create > Shape > Cube the selection is {selected}, expected "
+        f"[{CREATED_PRIM!r}]"
+    )
+
+
+def pan_camera(session: FullAppSession, viewport: dict) -> tuple:
+    """Pan with the middle mouse button; return the drag start and end points."""
+    start = (int(viewport["x"] + viewport["width"] / 2), int(viewport["y"] + viewport["height"] / 2))
+    end = (start[0] + PAN_DRAG_PIXELS[0], start[1] + PAN_DRAG_PIXELS[1])
+    last = None
+    for _ in range(20):
+        session._assert_alive()
+        res = session._cli(
+            "drag", str(start[0]), str(start[1]), str(end[0]), str(end[1]),
+            "--button", "middle", "--steps", str(PAN_DRAG_STEPS), timeout=60,
+        )
+        if res.returncode == 0:
+            return start, end
+        last = res
+        if session._TRANSIENT not in (res.stdout or "") + (res.stderr or ""):
+            break
+        time.sleep(2.0)
+    raise RuntimeError(
+        f"middle-button drag failed: {getattr(last, 'stdout', '')}\n"
+        f"{getattr(last, 'stderr', '')}\n--- app log ---\n{session.log_tail()}"
+    )
+
+
+def gizmo_origin(frame: Path, viewport: dict) -> tuple:
+    """Screen position of the move gizmo's origin, where the selected cube is.
+
+    The gizmo is drawn at the cube's centre, so it moves with the cube when the
+    camera pans. Read from the pixels, so it works for every data provider.
+    """
+    gizmo = gizmo_arrows(frame, viewport)
+    assert gizmo["drawn"], f"the move gizmo of the new cube is not drawn: {gizmo} ({frame})"
+    return gizmo["y"]["bbox"][0], gizmo["y"]["bbox"][3]
+
+
+def run_camera_pan_flow(session: FullAppSession, workdir: Path) -> tuple:
+    """Create a cube, pan the camera, and capture the window.
+
+    1. Start the app on an empty stage; check the frame is APP_WINDOW_SIZE.
+    2. Close the Content browser with the mouse (as the window flow does).
+    3. Create a cube with the mouse (Create > Shape > Cube); it is selected.
+    4. Park the cursor and wait for a stable frame (``before_pan.png``).
+    5. Pan the camera: drag with the middle mouse button inside the viewport.
+    6. Park the cursor and wait for a stable frame (the capture). Assert the
+       cube (its move gizmo) moved on screen by the drag distance and the
+       render changed.
+
+    Returns ``(frame_path, viewport_rect)``.
+    """
+    from PIL import Image
+
+    start_shot = workdir / "1_start.png"
+    menu_shot = workdir / "2_window_menu_open.png"
+    closed_shot = workdir / "3_content_closed.png"
+    before = workdir / "4_before_pan.png"
+    frame = workdir / "5_after_pan.png"
+
+    state = _start_and_check(session, start_shot)
+    assert not state["selection"]["paths"], (
+        f"the stage must start with nothing selected, got {state['selection']['paths']}"
+    )
+    viewport = close_content_browser(session, state, menu_shot, closed_shot)
+
+    create_cube_from_menu(session)
+    park = (APP_WINDOW_SIZE[0] - 4, APP_WINDOW_SIZE[1] - 4)
+    session.move(*park)
+    session.wait_stable(before, viewport)
+    origin_before = gizmo_origin(before, viewport)
+
+    start, end = pan_camera(session, viewport)
+    session.move(*park)
+    captures = session.wait_stable(frame, viewport)
+    origin_after = gizmo_origin(frame, viewport)
+    moved = (origin_after[0] - origin_before[0], origin_after[1] - origin_before[1])
+    expected = PAN_DRAG_PIXELS
+    print(f"[pan] drag {start} -> {end}; gizmo origin {origin_before} -> {origin_after} "
+          f"(moved {moved}, drag {expected}); settled after {captures} captures")
+    assert abs(moved[0] - expected[0]) <= PAN_MOVE_TOLERANCE and (
+        abs(moved[1] - expected[1]) <= PAN_MOVE_TOLERANCE
+    ), (
+        f"the cube moved {moved} on screen, expected about {expected} for a "
+        f"middle-button pan of {expected}. See {before} and {frame}."
+    )
+    changed = render_mean_difference(before, frame, viewport)
+    print(f"[pan] render before vs after the pan: MEAN_ERROR={changed:.3f} "
+          f"(min {MIN_PAN_RENDER_CHANGE})")
+    assert changed >= MIN_PAN_RENDER_CHANGE, (
+        f"the viewport render did not change after the pan (MEAN_ERROR={changed:.3f}). "
+        f"See {before} and {frame}."
+    )
+    assert session.window_visibility().get("Content") is False
+    assert Image.open(frame).size == APP_WINDOW_SIZE
+    assert_zero_copy_tier(session, "enabled", "after the camera pan flow")
+    return frame, viewport
+
+
+def camera_pan_golden_name(provider: str) -> str:
+    return f"camera_pan_{provider}.png"
+
+
+# --- Camera zoom flow --------------------------------------------------------
+
+# One scroll-wheel gesture over the viewport centre. Each notch scales the
+# distance to the surface under the cursor by 1.2 (wheel down) or 1 / 1.2
+# (wheel up). Wheel down by 2 moves the camera to 1.44 times its distance. The
+# test zooms out because the ovstage provider frames the new cube so close that
+# it fills the viewport, and zoom in would clip it on every side.
+ZOOM_SCROLL_DIRECTION = "down"
+ZOOM_SCROLL_AMOUNT = 2
+# After the zoom the lit cube area must be at most this share of the area before.
+# The ideal ratio is about 0.55; a missed zoom gives 1.0.
+MAX_ZOOM_AREA_RATIO = 0.85
+MIN_ZOOM_RENDER_CHANGE = 1.0
+
+
+def zoom_camera(session: FullAppSession, viewport: dict) -> tuple:
+    """Zoom out with the mouse wheel over the viewport centre; return that point."""
+    point = (int(viewport["x"] + viewport["width"] / 2), int(viewport["y"] + viewport["height"] / 2))
+    last = None
+    for _ in range(20):
+        session._assert_alive()
+        res = session._cli(
+            "scroll", ZOOM_SCROLL_DIRECTION, "--amount", str(ZOOM_SCROLL_AMOUNT),
+            "--x", str(point[0]), "--y", str(point[1]), timeout=60,
+        )
+        if res.returncode == 0:
+            return point
+        last = res
+        if session._TRANSIENT not in (res.stdout or "") + (res.stderr or ""):
+            break
+        time.sleep(2.0)
+    raise RuntimeError(
+        f"mouse wheel scroll failed: {getattr(last, 'stdout', '')}\n"
+        f"{getattr(last, 'stderr', '')}\n--- app log ---\n{session.log_tail()}"
+    )
+
+
+def cube_area(frame: Path, viewport: dict) -> int:
+    """Count the light grey cube pixels inside the viewport, below its HUD band.
+
+    The background is dark blue and the outline and gizmo are saturated, so
+    light, nearly grey pixels come from the cube faces.
+    """
+    import numpy as np
+    from PIL import Image
+
+    left, top, right, bottom = viewport_box(viewport)
+    top += VIEWPORT_CHROME_HEIGHT
+    a = np.asarray(Image.open(frame).convert("RGB"), dtype=np.int16)[top:bottom, left:right]
+    spread = a.max(axis=2) - a.min(axis=2)
+    area = int(((a.min(axis=2) >= 150) & (spread <= 25)).sum())
+    assert area >= 1000, f"no cube faces are visible in {frame} (area {area})"
+    return area
+
+
+def run_camera_zoom_flow(session: FullAppSession, workdir: Path) -> tuple:
+    """Create a cube, zoom the camera out, and capture the window.
+
+    Same start as the pan flow: empty stage, Content browser closed with the
+    mouse, cube made with Create > Shape > Cube. Then scroll the mouse wheel down
+    over the viewport, wait for a stable frame (the capture), and assert the
+    cube area shrank and the render changed.
+
+    Returns ``(frame_path, viewport_rect)``.
+    """
+    from PIL import Image
+
+    start_shot = workdir / "1_start.png"
+    menu_shot = workdir / "2_window_menu_open.png"
+    closed_shot = workdir / "3_content_closed.png"
+    before = workdir / "4_before_zoom.png"
+    frame = workdir / "5_after_zoom.png"
+
+    state = _start_and_check(session, start_shot)
+    assert not state["selection"]["paths"], (
+        f"the stage must start with nothing selected, got {state['selection']['paths']}"
+    )
+    viewport = close_content_browser(session, state, menu_shot, closed_shot)
+
+    create_cube_from_menu(session)
+    park = (APP_WINDOW_SIZE[0] - 4, APP_WINDOW_SIZE[1] - 4)
+    session.move(*park)
+    session.wait_stable(before, viewport)
+    area_before = cube_area(before, viewport)
+
+    point = zoom_camera(session, viewport)
+    session.move(*park)
+    captures = session.wait_stable(frame, viewport)
+    area_after = cube_area(frame, viewport)
+    ratio = area_after / area_before
+    print(f"[zoom] wheel {ZOOM_SCROLL_DIRECTION} {ZOOM_SCROLL_AMOUNT} at {point}; cube area "
+          f"{area_before} -> {area_after} px (ratio {ratio:.2f}, max {MAX_ZOOM_AREA_RATIO}); "
+          f"settled after {captures} captures")
+    assert ratio <= MAX_ZOOM_AREA_RATIO, (
+        f"the cube area changed by {ratio:.2f}x after the zoom out, expected at most "
+        f"{MAX_ZOOM_AREA_RATIO}x. See {before} and {frame}."
+    )
+    changed = render_mean_difference(before, frame, viewport)
+    print(f"[zoom] render before vs after the zoom: MEAN_ERROR={changed:.3f} "
+          f"(min {MIN_ZOOM_RENDER_CHANGE})")
+    assert changed >= MIN_ZOOM_RENDER_CHANGE, (
+        f"the viewport render did not change after the zoom (MEAN_ERROR={changed:.3f}). "
+        f"See {before} and {frame}."
+    )
+    assert session.window_visibility().get("Content") is False
+    assert Image.open(frame).size == APP_WINDOW_SIZE
+    assert_zero_copy_tier(session, "enabled", "after the camera zoom flow")
+    return frame, viewport
+
+
+def camera_zoom_golden_name(provider: str) -> str:
+    return f"camera_zoom_{provider}.png"
 
 
 # The selection overlay (outline + gizmo) alone changes the viewport render by
@@ -959,8 +1272,8 @@ def run_headless_flow(session: FullAppSession, workdir: Path) -> Path:
 #  * render: the rest of the viewport. Its mean error must stay within
 #    RENDER_MEAN_LIMIT, and after a 3x3 box blur of both images at most
 #    RENDER_PIXEL_LIMIT pixels may differ by more than RENDER_PIXEL_DELTA.
-#    The blur absorbs sub-pixel rasterization differences across platforms
-#    using ovui's default SceneView for the gizmo; the pixel
+#    The blur absorbs sub-pixel rasterization differences (Linux draws the
+#    gizmo with OpenGL, Windows with ovui's default SceneView); the pixel
 #    count catches a local change such as a missing, moved or squashed gizmo
 #    or outline, which barely moves the mean of the whole viewport.
 GOLDEN_SCALE = 2
@@ -1106,7 +1419,7 @@ def _compare_or_generate(frame: Path, viewport: Optional[dict], golden: Path,
         return
     assert golden.exists(), (
         f"No golden image for {label} at {golden}. Generate it with "
-        "OMNI_UI_GENERATE_GOLDEN=1."
+        "OMNI_UI_GENERATE_GOLDEN=1 (CI: workflow_dispatch mode=generate)."
     )
     reference = Image.open(golden).convert("RGB")
     assert reference.size == GOLDEN_SIZE, (

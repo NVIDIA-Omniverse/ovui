@@ -119,6 +119,15 @@ public:
     OMNIUI_SCENE_API
     void forceDirty(DirtyReason reason);
 
+    /**
+     * @brief The value of a process-wide counter at the last write to this item itself that can change what a gesture
+     * on a shape below it sees: the geometry of a shape, the matrix of a transform, the structure above it. The changes of
+     * the descendants of the item, its redraw and the writes of its colors and sizes do not change it. DragGesture compares
+     * it between frames to know whether code wrote to the shape or to a parent.
+     */
+    OMNIUI_SCENE_API
+    uint64_t getWriteStamp() const;
+
     OMNIUI_SCENE_API
     bool needDrawContent();
 
@@ -160,6 +169,12 @@ protected:
 
     OMNIUI_SCENE_API
     virtual void _forceDirty(DirtyReason reason);
+
+    /**
+     * @brief Takes a new value of the process-wide counter as the write stamp of this item.
+     */
+    OMNIUI_SCENE_API
+    void _markWritten();
 
     OMNIUI_SCENE_API
     virtual bool _needDrawContent();

@@ -31,12 +31,7 @@ from ovui_widgets.common.testing.mock_layer_stack import ROOT_LAYER_IDENTIFIER, 
 from ovui_widgets.common.undo import UndoManager
 from ovui_widgets.layers.layer_model import LayerModel
 
-try:  # pragma: no cover — import guard, not exercised in no-pxr CI
-    from pxr import Sdf, Usd
-
-    _HAS_USD = True
-except ImportError:  # pragma: no cover
-    _HAS_USD = False
+from pxr import Sdf, Usd
 
 
 class _DeferringApp:
@@ -298,7 +293,6 @@ class TestFilter10kPrimSpecs:
 
 
 @pytest.mark.performance
-@pytest.mark.skipif(not _HAS_USD, reason="pxr (OpenUSD) not available")
 class TestFlattenSnapshotMemory:
     """LAYERS-PLAN Step 61 — retained snapshot buffer stays bounded on flatten."""
 

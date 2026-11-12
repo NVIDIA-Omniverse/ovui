@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <path id="tri" d="M0 0 L12 0 L6 10 Z"/>
+    <g id="pair" fill="#1e88e5">
+      <circle cx="4" cy="4" r="4"/>
+      <circle cx="14" cy="4" r="4" fill="#e53935"/>
+    </g>
+    <symbol id="sym" viewBox="0 0 10 10">
+      <rect x="1" y="1" width="8" height="8" rx="2" fill="#43a047"/>
+    </symbol>
+  </defs>
+  <use href="#tri" x="4" y="4" fill="#8e24aa"/>
+  <use xlink:href="#tri" x="20" y="4" fill="#fb8c00" transform="rotate(10 26 9)"/>
+  <use href="#pair" x="40" y="4"/>
+  <use href="#pair" x="40" y="16" fill="#212121"/>
+  <use href="#sym" x="4" y="28" width="20" height="20"/>
+  <use href="#sym" x="28" y="28" width="32" height="16"/>
+  <use href="#tri" transform="translate(30 50) scale(2 1)" fill="#00897b" stroke="#212121"/>
+</svg>

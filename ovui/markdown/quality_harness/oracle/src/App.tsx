@@ -88,6 +88,11 @@ export function App() {
             plugins={{ code, math: mathPlugin }}
             remarkPlugins={remarkPlugins}
             controls={{ code: { copy: true, download: false } }}
+            // Streamdown 2.5 and newer cap tables at 300 px and code blocks at
+            // 400 px, and scroll the rest inside the box. The capture takes the
+            // whole surface without scrolling, so 0 turns the limits off.
+            tableMaxHeight={0}
+            codeBlockMaxHeight={0}
             allowedTags={{
               div: ["className", "dir"],
               p: ["className", "dir"],

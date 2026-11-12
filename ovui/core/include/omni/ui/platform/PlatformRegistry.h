@@ -17,6 +17,7 @@ class IUiFileIO;
 class IUiRenderer;
 class IUiPlatform;
 class IByteImageGpu;
+class IByteImageGpuChecked;
 class IGlyphManager;
 class IImageBackend;
 class IImageProviderRenderer;
@@ -45,7 +46,17 @@ public:
     void setPlatform(std::shared_ptr<IUiPlatform> p) { m_platform = std::move(p); }
     void setWindowCallbackManager(windowmanager::IWindowCallbackManager* m) { m_windowCallbackManager = m; }
     void setGlyphManager(std::shared_ptr<IGlyphManager> g) { m_glyphManager = std::move(g); }
-    void setByteImageGpu(std::shared_ptr<IByteImageGpu> g) { m_byteImageGpu = std::move(g); }
+    /// Replacing the backend also drops the checked interface of the old one,
+    /// so an upload never goes to a backend that was replaced. Call
+    /// setByteImageGpuChecked() after this function to register a new one.
+    void setByteImageGpu(std::shared_ptr<IByteImageGpu> g)
+    {
+        m_byteImageGpu = std::move(g);
+        m_byteImageGpuChecked.reset();
+    }
+    /// Optional. Use the same object that was given to setByteImageGpu(), and
+    /// call this after it.
+    void setByteImageGpuChecked(std::shared_ptr<IByteImageGpuChecked> g) { m_byteImageGpuChecked = std::move(g); }
     void setImageBackend(std::shared_ptr<IImageBackend> b) { m_imageBackend = std::move(b); }
     void setImageProviderRenderer(std::shared_ptr<IImageProviderRenderer> r) { m_imageProviderRenderer = std::move(r); }
     void setSvgRasterizer(std::shared_ptr<ISvgRasterizer> r) { m_svgRasterizer = std::move(r); }
@@ -60,6 +71,8 @@ public:
     windowmanager::IWindowCallbackManager* windowCallbackManager() const { return m_windowCallbackManager; }
     IGlyphManager* glyphManager() const { return m_glyphManager.get(); }
     IByteImageGpu* byteImageGpu() const { return m_byteImageGpu.get(); }
+    /// Null when the backend cannot report upload results.
+    IByteImageGpuChecked* byteImageGpuChecked() const { return m_byteImageGpuChecked.get(); }
     IImageBackend* imageBackend() const { return m_imageBackend.get(); }
     IImageProviderRenderer* imageProviderRenderer() const { return m_imageProviderRenderer.get(); }
     ISvgRasterizer* svgRasterizer() const { return m_svgRasterizer.get(); }
@@ -84,6 +97,7 @@ public:
         m_svgRasterizer.reset();
         m_imageProviderRenderer.reset();
         m_imageBackend.reset();
+        m_byteImageGpuChecked.reset();
         m_byteImageGpu.reset();
         m_glyphManager.reset();
         m_windowCallbackManager = nullptr;
@@ -112,6 +126,9 @@ private:
     std::shared_ptr<ISvgRasterizer> m_svgRasterizer;
     std::shared_ptr<IRasterImageLoader> m_rasterImageLoader;
     std::shared_ptr<IUiLog> m_log;
+    // Last, so that the offsets of the members above do not change for code
+    // that was built against an older header.
+    std::shared_ptr<IByteImageGpuChecked> m_byteImageGpuChecked;
 };
 
 } // namespace ui

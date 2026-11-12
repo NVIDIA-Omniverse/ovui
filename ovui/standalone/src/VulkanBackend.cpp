@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <limits>
 
 namespace omni {
@@ -26,10 +27,16 @@ namespace standalone {
 namespace {
 
 constexpr uint32_t kPreferredSwapchainImageCount = 3;
-constexpr uint32_t kDescriptorCapacity = 1024;
+constexpr uint32_t kDescriptorCapacity = 65536;
 constexpr VkDeviceSize kMinImGuiAllocationSize = 1024 * 1024;
 constexpr char kRenderFlowModeEnvironment[] = "OMNIUI_RENDER_FLOW_MODE";
 constexpr char kFastRenderFlowMode[] = "fast";
+
+/// Seconds on the steady clock, the clock of Python's time.perf_counter.
+double steadySeconds()
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 } // namespace
 
@@ -88,6 +95,11 @@ void VulkanBackend::runDeferredReleases()
 
 void VulkanBackend::shutdown()
 {
+    if (m_presentTimingThread.joinable())
+    {
+        m_presentTimingStop = true;
+        m_presentTimingThread.join();
+    }
     runDeferredReleases();
     m_frameHealthy = false;
     m_windowSurfaceActive = false;
@@ -122,6 +134,12 @@ void VulkanBackend::shutdown()
         vkDestroyFence(m_device, m_fence, nullptr);
         m_fence = VK_NULL_HANDLE;
     }
+    if (m_windowFence != VK_NULL_HANDLE)
+    {
+        vkDestroyFence(m_device, m_windowFence, nullptr);
+        m_windowFence = VK_NULL_HANDLE;
+    }
+    m_windowCommandBuffer = VK_NULL_HANDLE; // freed with the command pool
     if (m_commandPool != VK_NULL_HANDLE)
     {
         vkDestroyCommandPool(m_device, m_commandPool, nullptr);
@@ -213,6 +231,18 @@ bool VulkanBackend::init(GLFWwindow* glfwWindow, int width, int height)
     {
         VkSemaphoreCreateInfo semaphoreInfo = {};
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        VkCommandBufferAllocateInfo windowCommandInfo = {};
+        windowCommandInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        windowCommandInfo.commandPool = m_commandPool;
+        windowCommandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        windowCommandInfo.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(m_device, &windowCommandInfo, &m_windowCommandBuffer) != VK_SUCCESS ||
+            vkCreateFence(m_device, &fenceInfo, nullptr, &m_windowFence) != VK_SUCCESS)
+        {
+            // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+            fprintf(stderr, "VulkanBackend: failed to create the window copy command buffer\n");
+            return false;
+        }
         if (vkCreateSemaphore(m_device, &semaphoreInfo, nullptr, &m_imageAvailable) != VK_SUCCESS)
         {
             fprintf(stderr, "VulkanBackend: failed to create window presentation semaphores\n");
@@ -277,6 +307,22 @@ bool VulkanBackend::createInstance()
     VkInstanceCreateInfo createInfo = {};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     createInfo.pApplicationInfo = &appInfo;
+#ifdef __APPLE__
+    // MoltenVK is a portability driver: newer loaders list it only for an
+    // instance that enables portability enumeration.
+    uint32_t instanceExtensionCount = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &instanceExtensionCount, nullptr);
+    std::vector<VkExtensionProperties> instanceExtensions(instanceExtensionCount);
+    vkEnumerateInstanceExtensionProperties(nullptr, &instanceExtensionCount, instanceExtensions.data());
+    for (const VkExtensionProperties& extension : instanceExtensions)
+    {
+        if (strcmp(extension.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0)
+        {
+            extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+            createInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
+    }
+#endif
     createInfo.enabledExtensionCount = (uint32_t)extensions.size();
     createInfo.ppEnabledExtensionNames = extensions.empty() ? nullptr : extensions.data();
 
@@ -448,6 +494,42 @@ bool VulkanBackend::createDevice()
     if (!m_headless)
         deviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 
+#ifdef __APPLE__
+    // A portability device (MoltenVK) must enable VK_KHR_portability_subset.
+    uint32_t deviceExtensionCount = 0;
+    vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &deviceExtensionCount, nullptr);
+    std::vector<VkExtensionProperties> deviceExtensionList(deviceExtensionCount);
+    vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &deviceExtensionCount, deviceExtensionList.data());
+    for (const VkExtensionProperties& extension : deviceExtensionList)
+        if (strcmp(extension.extensionName, "VK_KHR_portability_subset") == 0)
+            deviceExtensions.push_back("VK_KHR_portability_subset");
+#endif
+
+    // Present timing (a diagnostic, see takePresentTimings).
+    const char* timingRequest = std::getenv("OMNIUI_PRESENT_TIMING");
+    bool presentTiming = !m_headless && timingRequest && timingRequest[0] && std::strcmp(timingRequest, "0") != 0;
+    VkPhysicalDevicePresentIdFeaturesKHR presentIdFeatures = {};
+    presentIdFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
+    VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeatures = {};
+    presentWaitFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
+    presentWaitFeatures.pNext = &presentIdFeatures;
+    if (presentTiming)
+    {
+        VkPhysicalDeviceFeatures2 probe = {};
+        probe.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        probe.pNext = &presentWaitFeatures;
+        vkGetPhysicalDeviceFeatures2(m_physicalDevice, &probe);
+        presentTiming = presentIdFeatures.presentId && presentWaitFeatures.presentWait;
+        // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+        fprintf(stdout, "VulkanBackend: present timing %s\n",
+                presentTiming ? "on" : "off (VK_KHR_present_id/VK_KHR_present_wait not supported)");
+    }
+    if (presentTiming)
+    {
+        deviceExtensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+        deviceExtensions.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+    }
+
 #if OMNIUI_HAS_CUDA
     // External memory extensions for CUDA interop. Software devices such as
     // Lavapipe may not advertise all of them; requesting a missing one makes
@@ -537,11 +619,24 @@ bool VulkanBackend::createDevice()
     }
 #endif
 
+    if (presentTiming)
+    {
+        presentIdFeatures.pNext = const_cast<void*>(createInfo.pNext);
+        createInfo.pNext = &presentWaitFeatures;
+    }
+
     VkResult err = vkCreateDevice(m_physicalDevice, &createInfo, nullptr, &m_device);
     if (err != VK_SUCCESS)
     {
         fprintf(stderr, "VulkanBackend: vkCreateDevice failed (%d)\n", err);
         return false;
+    }
+    if (presentTiming)
+    {
+        m_vkWaitForPresentKHR =
+            reinterpret_cast<PFN_vkWaitForPresentKHR>(vkGetDeviceProcAddr(m_device, "vkWaitForPresentKHR"));
+        if (m_vkWaitForPresentKHR)
+            m_presentTimingThread = std::thread([this] { presentTimingLoop(); });
     }
 
     vkGetDeviceQueue(m_device, m_queueFamily, 0, &m_queue);
@@ -730,6 +825,8 @@ bool VulkanBackend::createSwapchain(int width, int height, bool recreation)
     m_swapchainExtent = extent;
     m_swapchainUsesBlit = useBlit;
     m_swapchainNeedsRecreate = false;
+    m_swapchainRequestWidth = width;
+    m_swapchainRequestHeight = height;
     m_swapchainWidth = extent.width;
     m_swapchainHeight = extent.height;
     m_windowPresentMode = static_cast<int32_t>(presentMode);
@@ -753,6 +850,8 @@ void VulkanBackend::destroySwapchain()
     m_swapchainFormat = VK_FORMAT_UNDEFINED;
     m_swapchainExtent = {};
     m_swapchainNeedsRecreate = false;
+    m_swapchainRequestWidth = 0;
+    m_swapchainRequestHeight = 0;
     m_swapchainUsesBlit = false;
     m_swapchainWidth = 0;
     m_swapchainHeight = 0;
@@ -1089,6 +1188,18 @@ bool VulkanBackend::createOrResizeFastWindowPresentation(int width, int height)
     }
 
     ImGui_ImplVulkanH_Window& window = m_fastWindowPresentation->window;
+    // Ask for TRANSFER_SRC only when the surface allows it, so that a capture
+    // can copy the swapchain image. Without it FAST still presents as before.
+    VkImageUsageFlags swapchainUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VkSurfaceCapabilitiesKHR surfaceCaps = {};
+    m_fastCaptureSupported = false;
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+            m_physicalDevice, m_surface, &surfaceCaps) == VK_SUCCESS
+        && (surfaceCaps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+    {
+        swapchainUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        m_fastCaptureSupported = true;
+    }
     ImGui_ImplVulkanH_CreateOrResizeWindow(
         m_instance,
         m_physicalDevice,
@@ -1099,7 +1210,7 @@ bool VulkanBackend::createOrResizeFastWindowPresentation(int width, int height)
         width,
         height,
         kPreferredSwapchainImageCount,
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        swapchainUsage);
 
     if (window.Swapchain == VK_NULL_HANDLE || window.ImageCount == 0)
     {
@@ -1288,6 +1399,95 @@ bool VulkanBackend::beginFastFrame(int width, int height)
     return true;
 }
 
+bool VulkanBackend::recordFastCaptureCopy(
+    VkCommandBuffer commandBuffer, VkImage image, int width, int height, VkBuffer buffer)
+{
+    if (commandBuffer == VK_NULL_HANDLE || image == VK_NULL_HANDLE || width <= 0 || height <= 0)
+    {
+        return false;
+    }
+
+    // The FAST render pass leaves the image in PRESENT_SRC. Move it to
+    // TRANSFER_SRC for the copy and back before the present.
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy region = {};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = { static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1 };
+    vkCmdCopyImageToBuffer(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = 0;
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+    return true;
+}
+
+void VulkanBackend::finishFastCapture(
+    VkBuffer buffer, VkDeviceMemory memory, VkFormat format, int width, int height)
+{
+    // The copy was submitted with the frame. Wait for the device so the host
+    // buffer is complete, then keep the pixels as RGBA for readbackPixels().
+    m_fastCapturePixels.clear();
+    m_fastCaptureWidth = 0;
+    m_fastCaptureHeight = 0;
+    if (vkQueueWaitIdle(m_queue) == VK_SUCCESS)
+    {
+        const size_t byteCount = static_cast<size_t>(width) * height * 4;
+        void* mapped = nullptr;
+        if (vkMapMemory(m_device, memory, 0, byteCount, 0, &mapped) == VK_SUCCESS)
+        {
+            m_fastCapturePixels.resize(byteCount);
+            std::memcpy(m_fastCapturePixels.data(), mapped, byteCount);
+            vkUnmapMemory(m_device, memory);
+            if (format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB)
+            {
+                for (size_t i = 0; i < byteCount; i += 4)
+                {
+                    std::swap(m_fastCapturePixels[i], m_fastCapturePixels[i + 2]);
+                }
+            }
+            m_fastCaptureWidth = width;
+            m_fastCaptureHeight = height;
+        }
+    }
+    vkDestroyBuffer(m_device, buffer, nullptr);
+    vkFreeMemory(m_device, memory, nullptr);
+}
+
+void VulkanBackend::requestFastCapture()
+{
+    if (usesFastPresentationMode())
+    {
+        std::lock_guard<std::mutex> queueLock(m_queueMutex);
+        m_fastCapturePixels.clear();
+        m_fastCaptureWidth = 0;
+        m_fastCaptureHeight = 0;
+        m_fastCaptureRequested = true;
+    }
+}
+
 bool VulkanBackend::endFastFrame()
 {
     if (!m_fastFrameReady || !m_fastWindowPresentation)
@@ -1301,8 +1501,55 @@ bool VulkanBackend::endFastFrame()
         window.FrameSemaphores[window.SemaphoreIndex];
 
     vkCmdEndRenderPass(frame.CommandBuffer);
+
+    // A requested capture copies this frame's finished swapchain image to a
+    // host buffer in the same submission, before the image is presented.
+    VkBuffer captureBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory captureMemory = VK_NULL_HANDLE;
+    bool captureRecorded = false;
+    const auto discardCapture = [&]() {
+        if (captureBuffer != VK_NULL_HANDLE)
+            vkDestroyBuffer(m_device, captureBuffer, nullptr);
+        if (captureMemory != VK_NULL_HANDLE)
+            vkFreeMemory(m_device, captureMemory, nullptr);
+        captureBuffer = VK_NULL_HANDLE;
+        captureMemory = VK_NULL_HANDLE;
+    };
+    if (m_fastCaptureRequested.exchange(false) && m_fastCaptureSupported)
+    {
+        const VkDeviceSize captureSize =
+            static_cast<VkDeviceSize>(window.Width) * window.Height * 4;
+        VkBufferCreateInfo bufInfo = {};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufInfo.size = captureSize;
+        bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(m_device, &bufInfo, nullptr, &captureBuffer) == VK_SUCCESS)
+        {
+            VkMemoryRequirements memReqs;
+            vkGetBufferMemoryRequirements(m_device, captureBuffer, &memReqs);
+            VkMemoryAllocateInfo allocInfo = {};
+            allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            allocInfo.allocationSize = memReqs.size;
+            allocInfo.memoryTypeIndex = findMemoryType(memReqs.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (vkAllocateMemory(m_device, &allocInfo, nullptr, &captureMemory) == VK_SUCCESS
+                && vkBindBufferMemory(m_device, captureBuffer, captureMemory, 0) == VK_SUCCESS)
+            {
+                captureRecorded = recordFastCaptureCopy(
+                    frame.CommandBuffer, frame.Backbuffer,
+                    window.Width, window.Height, captureBuffer);
+            }
+        }
+        if (!captureRecorded)
+        {
+            discardCapture();
+        }
+    }
+
     if (vkEndCommandBuffer(frame.CommandBuffer) != VK_SUCCESS)
     {
+        discardCapture();
         m_fastFrameReady = false;
         m_fastActiveCommandBuffer = VK_NULL_HANDLE;
         return false;
@@ -1322,15 +1569,24 @@ bool VulkanBackend::endFastFrame()
 
     if (vkResetFences(m_device, 1, &frame.Fence) != VK_SUCCESS)
     {
+        discardCapture();
         m_fastFrameReady = false;
         m_fastActiveCommandBuffer = VK_NULL_HANDLE;
         return false;
     }
     if (vkQueueSubmit(m_queue, 1, &submitInfo, frame.Fence) != VK_SUCCESS)
     {
+        discardCapture();
         m_fastFrameReady = false;
         m_fastActiveCommandBuffer = VK_NULL_HANDLE;
         return false;
+    }
+    if (captureBuffer != VK_NULL_HANDLE)
+    {
+        finishFastCapture(captureBuffer, captureMemory, window.SurfaceFormat.format,
+                          window.Width, window.Height);
+        captureBuffer = VK_NULL_HANDLE;
+        captureMemory = VK_NULL_HANDLE;
     }
 
     VkPresentInfoKHR presentInfo = {};
@@ -1341,6 +1597,10 @@ bool VulkanBackend::endFastFrame()
     presentInfo.pSwapchains = &window.Swapchain;
     presentInfo.pImageIndices = &window.FrameIndex;
 
+    // FAST presentation is not inside a PresentWaitScope on purpose. The caller
+    // holds m_queueMutex here. If a host let other Python threads run during
+    // this wait, one of them could hold the host lock and wait for that mutex,
+    // and the UI thread would deadlock when it takes the host lock back.
     VkResult presentResult = vkQueuePresentKHR(m_queue, &presentInfo);
     if (
         presentResult == VK_ERROR_OUT_OF_DATE_KHR
@@ -1365,7 +1625,7 @@ bool VulkanBackend::endFastFrame()
     return true;
 }
 
-bool VulkanBackend::beginFrame(int width, int height, bool preserve, bool waitForPrevious)
+bool VulkanBackend::beginFrame(int width, int height, bool preserve, bool waitForPrevious, uint64_t noWaitTimeoutNs)
 {
     if (usesFastPresentationMode())
     {
@@ -1393,14 +1653,18 @@ bool VulkanBackend::beginFrame(int width, int height, bool preserve, bool waitFo
         }
     }
 
-    uint64_t fenceTimeout = 0;
+    uint64_t fenceTimeout = noWaitTimeoutNs;
     if (waitForPrevious)
     {
         fenceTimeout = UINT64_MAX;
     }
+    // The previous composition and the previous window copy, which reads
+    // the image this frame draws into.
+    const VkFence fences[] = {m_fence, m_windowFence};
+    const uint32_t fenceCount = m_windowFence != VK_NULL_HANDLE ? 2 : 1;
     VkResult fenceResult = VK_SUCCESS;
     {
-        fenceResult = vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, fenceTimeout);
+        fenceResult = vkWaitForFences(m_device, fenceCount, fences, VK_TRUE, fenceTimeout);
     }
     if (!waitForPrevious && fenceResult == VK_TIMEOUT)
     {
@@ -1428,8 +1692,9 @@ bool VulkanBackend::beginFrame(int width, int height, bool preserve, bool waitFo
         return false;
     }
 
+    const std::array<float, 4> clearColor = getClearColor();
     VkClearValue clearValue = {};
-    clearValue.color = { { 0.12f, 0.13f, 0.14f, 1.0f } };
+    clearValue.color = { { clearColor[0], clearColor[1], clearColor[2], clearColor[3] } };
 
     VkRenderPassBeginInfo rpBegin = {};
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -1449,6 +1714,18 @@ bool VulkanBackend::beginFrame(int width, int height, bool preserve, bool waitFo
     rpBegin.renderArea.extent = { static_cast<uint32_t>(m_fbWidth), static_cast<uint32_t>(m_fbHeight) };
     vkCmdBeginRenderPass(m_commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
     return true;
+}
+
+void VulkanBackend::setClearColor(const std::array<float, 4>& rgba)
+{
+    std::lock_guard<std::mutex> lock(m_clearColorMutex);
+    m_clearColor = rgba;
+}
+
+std::array<float, 4> VulkanBackend::getClearColor() const
+{
+    std::lock_guard<std::mutex> lock(m_clearColorMutex);
+    return m_clearColor;
 }
 
 bool VulkanBackend::endFrame()
@@ -1507,19 +1784,25 @@ VulkanBackend::WindowPresentResult VulkanBackend::prepareWindowFrame(
         return WindowPresentResult::eDeferred;
     }
 
-    // All offscreen composition/copy work uses this same fence and queue.  The
-    // public contract requires the caller to own m_queueMutex, so waiting here
-    // also establishes the offscreen TRANSFER_SRC visibility needed below.
-    VkResult offscreenFenceResult = VK_SUCCESS;
-    {
-        offscreenFenceResult = vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX);
-    }
-    if (offscreenFenceResult != VK_SUCCESS)
+    // The previous window copy, which beginFrame() has normally waited for
+    // already: it waited on the image-available semaphore and used the window
+    // command buffer. The composition is not waited for: the copy below is
+    // submitted after it on the same queue, behind a barrier.
+    if (m_windowFence == VK_NULL_HANDLE || m_windowCommandBuffer == VK_NULL_HANDLE ||
+        vkWaitForFences(m_device, 1, &m_windowFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
     {
         m_frameHealthy = false;
         return WindowPresentResult::eFailed;
     }
 
+    // A new window size makes the swapchain out of date. Re-create it before this
+    // frame is presented: a present to the old swapchain fails, the frame (already
+    // drawn at the new size) is lost, and the new window area stays black one frame
+    // longer, for example after a maximize. The check uses the size that the
+    // swapchain was created for, so a driver extent that differs from the window
+    // size does not make a new swapchain on each frame.
+    if (width != m_swapchainRequestWidth || height != m_swapchainRequestHeight)
+        m_swapchainNeedsRecreate = true;
     if (m_swapchainNeedsRecreate)
     {
         if (vkDeviceWaitIdle(m_device) != VK_SUCCESS || !createSwapchain(width, height, true))
@@ -1559,8 +1842,8 @@ VulkanBackend::WindowPresentResult VulkanBackend::prepareWindowFrame(
 
     if (imageIndex >= m_swapchainImages.size() ||
         imageIndex >= m_renderFinishedSemaphores.size() ||
-        vkResetFences(m_device, 1, &m_fence) != VK_SUCCESS ||
-        vkResetCommandBuffer(m_commandBuffer, 0) != VK_SUCCESS)
+        vkResetFences(m_device, 1, &m_windowFence) != VK_SUCCESS ||
+        vkResetCommandBuffer(m_windowCommandBuffer, 0) != VK_SUCCESS)
     {
         m_frameHealthy = false;
         return WindowPresentResult::eFailed;
@@ -1569,11 +1852,30 @@ VulkanBackend::WindowPresentResult VulkanBackend::prepareWindowFrame(
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(m_commandBuffer, &beginInfo) != VK_SUCCESS)
+    if (vkBeginCommandBuffer(m_windowCommandBuffer, &beginInfo) != VK_SUCCESS)
     {
         m_frameHealthy = false;
         return WindowPresentResult::eFailed;
     }
+
+    // The composition (and a base restore) wrote the offscreen image in an
+    // earlier submission: make those writes visible to this copy.
+    VkImageMemoryBarrier sourceReady{};
+    sourceReady.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    sourceReady.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    sourceReady.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    sourceReady.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    sourceReady.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    sourceReady.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    sourceReady.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    sourceReady.image = m_colorImage;
+    sourceReady.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    sourceReady.subresourceRange.levelCount = 1;
+    sourceReady.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(m_windowCommandBuffer,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &sourceReady);
 
     VkImageMemoryBarrier toTransfer{};
     toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1589,7 +1891,7 @@ VulkanBackend::WindowPresentResult VulkanBackend::prepareWindowFrame(
     toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     toTransfer.subresourceRange.levelCount = 1;
     toTransfer.subresourceRange.layerCount = 1;
-    vkCmdPipelineBarrier(m_commandBuffer,
+    vkCmdPipelineBarrier(m_windowCommandBuffer,
                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &toTransfer);
@@ -1608,7 +1910,7 @@ VulkanBackend::WindowPresentResult VulkanBackend::prepareWindowFrame(
         region.dstOffsets[1] = {
             static_cast<int32_t>(m_swapchainExtent.width),
             static_cast<int32_t>(m_swapchainExtent.height), 1};
-        vkCmdBlitImage(m_commandBuffer,
+        vkCmdBlitImage(m_windowCommandBuffer,
                        m_colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        m_swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &region, VK_FILTER_NEAREST);
@@ -1621,7 +1923,7 @@ VulkanBackend::WindowPresentResult VulkanBackend::prepareWindowFrame(
         region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         region.dstSubresource.layerCount = 1;
         region.extent = {m_swapchainExtent.width, m_swapchainExtent.height, 1};
-        vkCmdCopyImage(m_commandBuffer,
+        vkCmdCopyImage(m_windowCommandBuffer,
                        m_colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        m_swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &region);
@@ -1639,12 +1941,12 @@ VulkanBackend::WindowPresentResult VulkanBackend::prepareWindowFrame(
     toPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     toPresent.subresourceRange.levelCount = 1;
     toPresent.subresourceRange.layerCount = 1;
-    vkCmdPipelineBarrier(m_commandBuffer,
+    vkCmdPipelineBarrier(m_windowCommandBuffer,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &toPresent);
 
-    if (vkEndCommandBuffer(m_commandBuffer) != VK_SUCCESS)
+    if (vkEndCommandBuffer(m_windowCommandBuffer) != VK_SUCCESS)
     {
         m_frameHealthy = false;
         return WindowPresentResult::eFailed;
@@ -1657,10 +1959,10 @@ VulkanBackend::WindowPresentResult VulkanBackend::prepareWindowFrame(
     submitInfo.pWaitSemaphores = &m_imageAvailable;
     submitInfo.pWaitDstStageMask = &waitStage;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &m_commandBuffer;
+    submitInfo.pCommandBuffers = &m_windowCommandBuffer;
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = &m_renderFinishedSemaphores[imageIndex];
-    if (vkQueueSubmit(m_queue, 1, &submitInfo, m_fence) != VK_SUCCESS)
+    if (vkQueueSubmit(m_queue, 1, &submitInfo, m_windowFence) != VK_SUCCESS)
     {
         m_frameHealthy = false;
         return WindowPresentResult::eFailed;
@@ -1686,10 +1988,24 @@ VulkanBackend::WindowPresentResult VulkanBackend::presentWindowFrame(uint32_t im
     presentInfo.swapchainCount = 1;
     presentInfo.pSwapchains = &m_swapchain;
     presentInfo.pImageIndices = &imageIndex;
+    VkPresentIdKHR presentId{};
+    presentId.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
+    presentId.swapchainCount = 1;
     VkResult result = VK_SUCCESS;
     {
         std::lock_guard<std::mutex> presentLock(m_presentQueueMutex);
+        const uint64_t id = ++m_presentId;
+        if (m_vkWaitForPresentKHR)
+        {
+            presentId.pPresentIds = &id;
+            presentInfo.pNext = &presentId;
+        }
         result = vkQueuePresentKHR(m_presentQueue, &presentInfo);
+        if (m_vkWaitForPresentKHR && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR))
+        {
+            std::lock_guard<std::mutex> timingLock(m_presentTimingMutex);
+            m_presentsPending.push_back({id, PresentTiming{m_presentTimingTag.load(), steadySeconds(), -1.0}});
+        }
     }
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR && result != VK_ERROR_OUT_OF_DATE_KHR)
     {
@@ -1710,24 +2026,57 @@ VulkanBackend::WindowPresentResult VulkanBackend::presentWindowFrame(uint32_t im
     return WindowPresentResult::ePresented;
 }
 
-bool VulkanBackend::waitForFrameCompletion()
+std::vector<VulkanBackend::PresentTiming> VulkanBackend::takePresentTimings()
 {
-    if (!m_frameHealthy || m_device == VK_NULL_HANDLE || m_fence == VK_NULL_HANDLE)
-        return false;
-    if (vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+    std::lock_guard<std::mutex> lock(m_presentTimingMutex);
+    return std::move(m_presentTimings);
+}
+
+void VulkanBackend::presentTimingLoop()
+{
+    // vkWaitForPresentKHR needs the swapchain externally synchronized, so it
+    // is polled, without waiting, under the present queue mutex.
+    while (!m_presentTimingStop)
     {
-        m_frameHealthy = false;
-        return false;
+        std::pair<uint64_t, PresentTiming> pending{};
+        {
+            std::lock_guard<std::mutex> lock(m_presentTimingMutex);
+            if (!m_presentsPending.empty())
+                pending = m_presentsPending.front();
+        }
+        VkResult result = VK_TIMEOUT;
+        if (pending.first)
+        {
+            std::lock_guard<std::mutex> presentLock(m_presentQueueMutex);
+            if (m_swapchain != VK_NULL_HANDLE)
+                result = m_vkWaitForPresentKHR(m_device, m_swapchain, pending.first, 0);
+        }
+        const double now = steadySeconds();
+        if (pending.first && (result != VK_TIMEOUT || now - pending.second.submitted > 0.5))
+        {
+            pending.second.completed = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR ? now : -1.0;
+            std::lock_guard<std::mutex> lock(m_presentTimingMutex);
+            m_presentsPending.pop_front();
+            if (m_presentTimings.size() < 8192)
+                m_presentTimings.push_back(pending.second);
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
     }
-    return true;
 }
 
 bool VulkanBackend::snapshotNativeFramePacingBase(int width, int height)
 {
     if (!m_frameHealthy || m_device == VK_NULL_HANDLE || m_fence == VK_NULL_HANDLE ||
         m_commandBuffer == VK_NULL_HANDLE || m_colorImage == VK_NULL_HANDLE ||
-        width <= 0 || height <= 0 || width != m_fbWidth || height != m_fbHeight)
+        width <= 0 || height <= 0 || width != m_fbWidth || height != m_fbHeight ||
+        usesFastPresentationMode())
+    {
+        // Close the frame as usual; the caller treats the snapshot as failed.
+        if (m_frameHealthy)
+            endFrame();
         return false;
+    }
 
     const bool replacing = m_framePacingBaseImage == VK_NULL_HANDLE ||
         width != m_framePacingBaseWidth || height != m_framePacingBaseHeight;
@@ -1775,15 +2124,9 @@ bool VulkanBackend::snapshotNativeFramePacingBase(int width, int height)
             vkBindImageMemory(m_device, targetImage, targetMemory, 0) != VK_SUCCESS)
         {
             destroyTarget();
+            endFrame();
             return false;
         }
-    }
-
-    if (vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-    {
-        destroyTarget();
-        m_frameHealthy = false;
-        return false;
     }
 
     const auto terminalFailure = [&]() {
@@ -1795,15 +2138,11 @@ bool VulkanBackend::snapshotNativeFramePacingBase(int width, int height)
         destroyTarget();
         return false;
     };
-    if (vkResetFences(m_device, 1, &m_fence) != VK_SUCCESS ||
-        vkResetCommandBuffer(m_commandBuffer, 0) != VK_SUCCESS)
-        return terminalFailure();
-
-    VkCommandBufferBeginInfo begin = {};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(m_commandBuffer, &begin) != VK_SUCCESS)
-        return terminalFailure();
+    // The composition is recorded in m_commandBuffer and beginFrame waited for
+    // the frame fence, so nothing in flight uses the old base image. Append the
+    // copy to the same command buffer: one submission, no wait. The next user
+    // of the frame fence waits for it.
+    vkCmdEndRenderPass(m_commandBuffer);
 
     VkImageMemoryBarrier toDestination = {};
     toDestination.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1860,8 +2199,7 @@ bool VulkanBackend::snapshotNativeFramePacingBase(int width, int height)
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &m_commandBuffer;
-    if (vkQueueSubmit(m_queue, 1, &submit, m_fence) != VK_SUCCESS ||
-        vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+    if (vkQueueSubmit(m_queue, 1, &submit, m_fence) != VK_SUCCESS)
         return terminalFailure();
 
     if (replacing)
@@ -1883,28 +2221,31 @@ bool VulkanBackend::restoreNativeFramePacingBase(
     if (!m_frameHealthy || m_device == VK_NULL_HANDLE || m_fence == VK_NULL_HANDLE ||
         m_commandBuffer == VK_NULL_HANDLE || m_colorImage == VK_NULL_HANDLE ||
         m_framePacingBaseImage == VK_NULL_HANDLE || width != m_fbWidth || height != m_fbHeight ||
-        width != m_framePacingBaseWidth || height != m_framePacingBaseHeight)
-        return false;
-    if (regions.empty())
-        return waitForFrameCompletion();
-    if (vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        width != m_framePacingBaseWidth || height != m_framePacingBaseHeight || usesFastPresentationMode())
     {
-        m_frameHealthy = false;
+        // Close the frame as usual; the caller treats the restore as failed.
+        if (m_frameHealthy)
+            endFrame();
         return false;
     }
-    const auto terminalFailure = [&]() {
-        m_frameHealthy = false;
-        vkDeviceWaitIdle(m_device);
-        return false;
-    };
-    if (vkResetFences(m_device, 1, &m_fence) != VK_SUCCESS ||
-        vkResetCommandBuffer(m_commandBuffer, 0) != VK_SUCCESS)
-        return terminalFailure();
-    VkCommandBufferBeginInfo begin = {};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(m_commandBuffer, &begin) != VK_SUCCESS)
-        return terminalFailure();
+    for (const NativeFramePacingCopyRegion& region : regions)
+    {
+        if (!region.width || !region.height || region.x >= static_cast<uint32_t>(width) ||
+            region.y >= static_cast<uint32_t>(height) || region.width > static_cast<uint32_t>(width) - region.x ||
+            region.height > static_cast<uint32_t>(height) - region.y)
+        {
+            endFrame();
+            m_frameHealthy = false;
+            return false;
+        }
+    }
+    if (regions.empty())
+        return endFrame();
+
+    // The composition is recorded in m_commandBuffer. Append the copies to the
+    // same command buffer: one submission, no wait. The next user of the frame
+    // fence waits for it, so the queue mutex is not held for a GPU round trip.
+    vkCmdEndRenderPass(m_commandBuffer);
 
     VkImageMemoryBarrier toDestination = {};
     toDestination.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1923,10 +2264,6 @@ bool VulkanBackend::restoreNativeFramePacingBase(
 
     for (const NativeFramePacingCopyRegion& region : regions)
     {
-        if (!region.width || !region.height || region.x >= static_cast<uint32_t>(width) ||
-            region.y >= static_cast<uint32_t>(height) || region.width > static_cast<uint32_t>(width) - region.x ||
-            region.height > static_cast<uint32_t>(height) - region.y)
-            return terminalFailure();
         VkImageCopy copy = {};
         copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         copy.srcSubresource.layerCount = 1;
@@ -1947,14 +2284,21 @@ bool VulkanBackend::restoreNativeFramePacingBase(
     vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
     if (vkEndCommandBuffer(m_commandBuffer) != VK_SUCCESS)
-        return terminalFailure();
+    {
+        m_frameHealthy = false;
+        return false;
+    }
     VkSubmitInfo submit = {};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &m_commandBuffer;
-    if (vkQueueSubmit(m_queue, 1, &submit, m_fence) != VK_SUCCESS ||
-        vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-        return terminalFailure();
+    if (vkQueueSubmit(m_queue, 1, &submit, m_fence) != VK_SUCCESS)
+    {
+        // The fence was reset but no submission owns it: retire the backend
+        // from frame use instead of waiting on an unsignalled fence.
+        m_frameHealthy = false;
+        return false;
+    }
     return true;
 }
 
@@ -1965,6 +2309,23 @@ bool VulkanBackend::restoreNativeFramePacingBase(
 bool VulkanBackend::readbackPixels(uint8_t* outPixels, int width, int height)
 {
     std::lock_guard<std::mutex> queueLock(m_queueMutex);
+    if (usesFastPresentationMode())
+    {
+        // FAST has no offscreen image. Return the copy that the requested
+        // frame made, once.
+        m_fastCaptureRequested = false;
+        const bool ready = outPixels && width > 0 && height > 0
+            && width == m_fastCaptureWidth && height == m_fastCaptureHeight
+            && m_fastCapturePixels.size() == static_cast<size_t>(width) * height * 4;
+        if (ready)
+        {
+            std::memcpy(outPixels, m_fastCapturePixels.data(), m_fastCapturePixels.size());
+        }
+        m_fastCapturePixels.clear();
+        m_fastCaptureWidth = 0;
+        m_fastCaptureHeight = 0;
+        return ready;
+    }
     if (!m_frameHealthy || !m_device || !m_colorImage || !outPixels ||
         width <= 0 || height <= 0 || width != m_fbWidth || height != m_fbHeight)
         return false;

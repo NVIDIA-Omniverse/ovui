@@ -16,6 +16,8 @@ from ovui_widgets.viewport.prim_transform_model import (
     PrimTransformModel,
     _apply_delta,
     _apply_scale,
+    _invert_matrix_4x4,
+    _matrix_multiply,
 )
 
 _IDENTITY = [
@@ -2528,3 +2530,188 @@ class TestUndoBeginContamination:
         model.set_selection(["/World/A"])
         model.on_drag_start()
         assert model._drag_active is True
+
+
+class TestPivotBeforeAndAfterTheDragStarts:
+    """The gizmo writes its pivot when the pivot changes, so the pivot must be the same number before the drag starts and
+    until the prim has moved: a pivot that differs in the last digit is written outside the gesture callback
+    and the gesture reports it as a change, with the pointer still on the press point."""
+
+    # Turned about two axes and scaled differently along each, with a translation that no binary number holds. The world
+    # transform of a prim under it is rounded, and ``inverse(local) * world`` is not the parent to the last digit.
+    _TURNED_SCALED_PARENT = _matrix_multiply(
+        _matrix_multiply(
+            [[1.3, 0, 0, 0], [0, 0.7, 0, 0], [0, 0, 2.1, 0], [0, 0, 0, 1.0]],
+            [[math.cos(0.7), math.sin(0.7), 0, 0], [-math.sin(0.7), math.cos(0.7), 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]],
+        ),
+        [[math.cos(-0.4), 0, -math.sin(-0.4), 0], [0, 1.0, 0, 0], [math.sin(-0.4), 0, math.cos(-0.4), 0], [-7.77, 3.21, 0.05, 1.0]],
+    )
+    _LOCAL = _matrix_multiply(
+        [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0.31, -0.17, 0.2, 1.0]], _invert_matrix_4x4(_TURNED_SCALED_PARENT)
+    )
+    _LOCAL[0:3] = [row[:] for row in _IDENTITY[0:3]]
+
+    def _model(self):
+        adapter = _ParentedTransformAdapter(self._TURNED_SCALED_PARENT)
+        adapter.set_local_transform("/World/A", [row[:] for row in self._LOCAL])
+        model = PrimTransformModel(adapter, _make_mock_stage(), UndoManager())
+        model.set_selection(["/World/A"])
+        return model, adapter
+
+    def test_pivot_and_world_matrix_are_the_same_numbers_after_the_drag_starts(self):
+        model, adapter = self._model()
+        pivot, matrix = model.get_pivot_world(), model.get_first_world_transform()
+        model.on_drag_start()
+        assert model.get_pivot_world() == pivot
+        assert model.get_first_world_transform() == matrix
+        assert matrix == [v for row in adapter.get_world_transform("/World/A") for v in row]
+
+    def test_pivot_follows_the_live_transform_and_is_the_adapter_number_again_when_back_at_the_start(self):
+        model, adapter = self._model()
+        rest = model.get_pivot_world()
+        model.on_drag_start()
+        model.on_drag_moved(_translate_delta())
+        moved = model.get_pivot_world()
+        # The gizmo moves along the world axes: 10 along world X, whatever the parent turns or scales.
+        assert moved == pytest.approx((rest[0] + 10.0, rest[1], rest[2]), abs=1e-9)
+        # A small real change of the live transform is a different pivot, not the number of the adapter.
+        model.on_drag_moved([[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [1e-9, 0, 0, 1.0]])
+        assert model.get_pivot_world() != rest
+        model.on_drag_moved(_IDENTITY)
+        assert model.get_pivot_world() == rest
+        model.on_drag_cancelled()
+        assert model.get_pivot_world() == rest
+
+
+class _NotInheritingTransformAdapter(_ParentedTransformAdapter):
+    """``/World/Parent/Child`` does not take the transform of its parent (as with ``!resetXformStack!``)."""
+
+    def get_world_transform(self, path):
+        if path == "/World/Parent":
+            return [row[:] for row in self._parent_world]
+        return self.get_local_transform(path)
+
+
+class _UnreadableParentTransformAdapter(_ParentedTransformAdapter):
+    def get_world_transform(self, path):
+        if path == "/World/Parent":
+            raise RuntimeError("no world matrix for /World/Parent")
+        return super().get_world_transform(path)
+
+
+def _record_reports(monkeypatch):
+    """The reports of ``ErrorReporter`` as ``(function name, message)``."""
+    from ovui_widgets.common.error_reporter import ErrorReporter
+
+    reports = []
+    for name in ("log_info", "log_warning", "log_error", "show_warning", "show_error"):
+        monkeypatch.setattr(ErrorReporter, name, lambda *args, _name=name: reports.append((_name, args[-1])))
+    return reports
+
+
+class TestTranslateUnderATurnedParent:
+    """The translate gizmo moves along the world axes. Under a parent that turns or scales, the drag must move the prim
+    by the same world distance along the dragged axis, not along the turned axis (regression: under a parent with Rotate
+    XYZ 0 0 90, a drag of the red X arrow moved the prim along world Y)."""
+
+    # Rotate XYZ 0 0 90 and a translation, as /World/Samples/Car_Lift_Adjust of the Factory scene.
+    _TURNED_PARENT = [[0.0, 1.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [436.2, -2767.4, 0.0, 1.0]]
+
+    @pytest.mark.parametrize("parent", [_TURNED_PARENT, TestPivotBeforeAndAfterTheDragStarts._TURNED_SCALED_PARENT])
+    @pytest.mark.parametrize("move", [(143.5, 0.0, 0.0), (0.0, -7.0, 0.0), (3.0, 4.0, 0.0)])
+    def test_the_world_move_is_the_gizmo_move(self, parent, move):
+        adapter = _ParentedTransformAdapter(parent)
+        local = [[1.0, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [1.5, -2.0, 0.25, 1.0]]
+        adapter.set_local_transform("/World/Parent/Child", [row[:] for row in local])
+        world_before = adapter.get_world_transform("/World/Parent/Child")
+        model = PrimTransformModel(adapter, _make_mock_stage(), UndoManager())
+        model.set_selection(["/World/Parent/Child"])
+
+        model.on_drag_start()
+        model.on_drag_moved(_translate_delta_xyz(*move))
+        model.on_drag_ended()
+
+        world_after = adapter.get_world_transform("/World/Parent/Child")
+        assert world_after[3][:3] == pytest.approx([world_before[3][i] + move[i] for i in range(3)], abs=1e-9)
+        # Only the translation of the local matrix changes; its turn and scale stay the same numbers.
+        assert adapter.get_local_transform("/World/Parent/Child")[:3] == local[:3]
+
+    # Scale X 0 (a flat cube): ``inverse(local) * world`` gives no parent matrix.
+    _FLAT_LOCAL = [[0.0, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0], [1.5, -2.0, 0.25, 1.0]]
+
+    @pytest.mark.parametrize("parent", [_TURNED_PARENT, TestPivotBeforeAndAfterTheDragStarts._TURNED_SCALED_PARENT])
+    @pytest.mark.parametrize("move", [(143.5, 0.0, 0.0), (0.0, -7.0, 0.0), (3.0, 4.0, 0.0)])
+    def test_a_prim_whose_local_matrix_cannot_be_inverted_moves_along_the_dragged_axis(self, parent, move, monkeypatch):
+        """A flat prim under a turned parent (review of the pull request of the regression): the drag takes the parent matrix
+        from the parent prim, and reports this once."""
+        reports = _record_reports(monkeypatch)
+        adapter = _ParentedTransformAdapter(parent)
+        adapter.set_local_transform("/World/Parent/Child", [row[:] for row in self._FLAT_LOCAL])
+        world_before = adapter.get_world_transform("/World/Parent/Child")
+        model = PrimTransformModel(adapter, _make_mock_stage(), UndoManager())
+        model.set_selection(["/World/Parent/Child"])
+
+        model.on_drag_start()
+        model.on_drag_moved(_translate_delta_xyz(*(value / 2.0 for value in move)))
+        model.on_drag_moved(_translate_delta_xyz(*move))
+        # The gizmo is drawn at the live world position of the prim.
+        moved = tuple(world_before[3][i] + move[i] for i in range(3))
+        assert model.get_pivot_world() == pytest.approx(moved, abs=1e-9)
+        model.on_drag_ended()
+
+        assert adapter.get_world_transform("/World/Parent/Child")[3][:3] == pytest.approx(list(moved), abs=1e-9)
+        assert adapter.get_local_transform("/World/Parent/Child")[:3] == self._FLAT_LOCAL[:3]
+        assert [name for name, _ in reports] == ["log_info"]
+        assert "/World/Parent/Child" in reports[0][1] and reports[0][1].endswith("world matrix of /World/Parent")
+
+    @pytest.mark.parametrize(
+        "adapter_type, parent, local, cause",
+        [
+            (
+                _ParentedTransformAdapter,
+                _matrix_multiply([[0.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]], _TURNED_PARENT),
+                [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [1.5, -2.0, 0.25, 1.0]],
+                "the world matrix of its parent cannot be inverted",
+            ),
+            (
+                _NotInheritingTransformAdapter,
+                _TURNED_PARENT,
+                _FLAT_LOCAL,
+                "its local matrix cannot be inverted, and the world matrix of its parent /World/Parent does not give its "
+                "world matrix",
+            ),
+            (
+                _UnreadableParentTransformAdapter,
+                _TURNED_PARENT,
+                _FLAT_LOCAL,
+                "its local matrix cannot be inverted, and the world matrix of its parent /World/Parent cannot be read: "
+                "RuntimeError: no world matrix for /World/Parent",
+            ),
+        ],
+        ids=["parent-cannot-be-inverted", "world-is-not-local-times-parent", "parent-cannot-be-read"],
+    )
+    def test_a_move_along_the_axes_of_the_parent_is_reported_once_for_each_drag(
+        self, adapter_type, parent, local, cause, monkeypatch
+    ):
+        """Without an inverse parent matrix the move goes into the local translation, as before the fix of the regression,
+        and each drag reports this once, with the prim and the cause."""
+        reports = _record_reports(monkeypatch)
+        adapter = adapter_type(parent)
+        adapter.set_local_transform("/World/Parent/Child", [row[:] for row in local])
+        model = PrimTransformModel(adapter, _make_mock_stage(), UndoManager())
+        model.set_selection(["/World/Parent/Child"])
+
+        for drag in (1, 2):
+            model.on_drag_start()
+            model.on_drag_moved(_translate_delta_xyz(1.0, 0.0, 0.0))
+            model.on_drag_moved(_translate_delta_xyz(2.0, 0.0, 0.0))
+            model.on_drag_ended()
+
+            warnings = [message for name, message in reports if name == "log_warning"]
+            assert len(warnings) == drag
+            assert [message for name, message in reports if name == "show_warning"] == warnings
+            assert warnings[-1].startswith(f"Move Prims: /World/Parent/Child: {cause}, so it moves along the axes of its parent")
+        # The move is not lost: it is in the local translation.
+        assert adapter.get_local_transform("/World/Parent/Child")[3][:3] == pytest.approx(
+            [local[3][0] + 4.0, local[3][1], local[3][2]], abs=1e-9
+        )

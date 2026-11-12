@@ -70,6 +70,8 @@ ui.CollapsableFrame(
 
 Use `CollapsableFrame` for grouped sections that should expand/collapse; use plain `Frame` everywhere else.
 
+With the global style of ovui-widgets, a plain `CollapsableFrame` shows its default title and arrow in the panel color and has a margin of 8 px above and below. Its `padding` is 0, so put a small spacer at the top of the body. The "section" preset in `references/layout-presets.md` does this.
+
 Frame sizing behavior:
 
 - Pixel length is fixed.
@@ -216,7 +218,7 @@ For complex production-style tools:
 - Use fixed heights for filter bars, column headers, footers, toolbars, and status bars.
 - Put the flexible body in a `ui.Frame`, `ui.ScrollingFrame`, or `ui.ZStack` with default fraction size.
 - Put overlay empty states and HUDs in the same `ZStack` as the body, above content but below active modal controls.
-- Keep row heights stable: Stage rows use about 16 px; property rows about 20 px; toolbar buttons about 24-28 px.
+- Keep row heights stable: Stage rows use about 18 px; property rows 24 px; toolbar buttons about 24-28 px. For forms, sections, button rows and toolbars, use the presets of `references/layout-presets.md`.
 - Keep icon slots fixed so labels do not shift when state badges appear/disappear.
 
 ## Docked Workbench Layout Pattern

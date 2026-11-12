@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="a">
+      <stop offset="0" stop-color="#e53935"/>
+      <stop offset="0.5" stop-color="#fdd835"/>
+      <stop offset="1" stop-color="#1e88e5"/>
+    </linearGradient>
+    <linearGradient id="b" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#43a047"/>
+      <stop offset="100%" stop-color="#43a047" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="c" gradientUnits="userSpaceOnUse" x1="4" y1="40" x2="16" y2="40" spreadMethod="reflect" xlink:href="#a"/>
+    <linearGradient id="d" gradientUnits="userSpaceOnUse" x1="36" y1="40" x2="44" y2="48" spreadMethod="repeat">
+      <stop offset="0.2" style="stop-color:#8e24aa"/>
+      <stop offset="0.8" style="stop-color:#fb8c00;stop-opacity:0.7"/>
+    </linearGradient>
+    <linearGradient id="e" gradientTransform="rotate(45 0.5 0.5)" href="#a"/>
+  </defs>
+  <rect x="4" y="4" width="26" height="26" fill="url(#a)"/>
+  <rect x="34" y="4" width="26" height="26" fill="url(#b)" stroke="url(#e)" stroke-width="3"/>
+  <rect x="4" y="34" width="26" height="26" fill="url(#c)"/>
+  <circle cx="47" cy="47" r="13" fill="url(#d)"/>
+</svg>

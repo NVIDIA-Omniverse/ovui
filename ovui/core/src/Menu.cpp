@@ -44,7 +44,15 @@ Menu::Menu(const std::string& text, MenuData* dataPtr)
 
     // Know if the parent is a menu
     this->setParentChangedFn([this](auto* parent) {
-        _getData<MenuData>().m_parentMenu = dynamic_cast<Menu*>(parent);
+        auto& data = _getData<MenuData>();
+        if (parent)
+        {
+            data.m_parentMenu = std::dynamic_pointer_cast<Menu>(parent->shared_from_this());
+        }
+        else
+        {
+            data.m_parentMenu.reset();
+        }
     });
 
     // Clear the title when tearable is changed
@@ -210,6 +218,15 @@ void Menu::addChild(std::shared_ptr<Widget> widget)
 
 void Menu::clear()
 {
+    // Honour the deferred-destruction guard, as Stack::clear() and Frame::clear() do. Menu
+    // overrides clear() and never consulted it, so a clear reaching a menu reentrantly -- e.g.
+    // from a widget callback firing during the menu's guarded draw pass -- destroyed the children
+    // that pass was iterating, instead of deferring like every other container.
+    if (OMNIUI_UNLIKELY(_getData<MenuData>().clear()))
+    {
+        return;
+    }
+
     // Destroy everything except the first and the last one.
     auto& children = _getMutableChildren();
     if (!children.empty())
@@ -415,12 +432,13 @@ void Menu::_drawMenu(float elapsedTime, bool isInSeparateWindow, bool isPopupWin
         popFloatCount += 1;
     }
 
+    auto parentMenu = data.m_parentMenu.lock();
     Stack::Direction parentDirection = Stack::Direction::eTopToBottom;
     bool parentIsMoving = false;
-    if (data.m_parentMenu)
+    if (parentMenu)
     {
-        parentDirection = data.m_parentMenu->getDirection();
-        parentIsMoving = data.m_parentMenu->_getData<MenuData>().m_windowIsMoving;
+        parentDirection = parentMenu->getDirection();
+        parentIsMoving = parentMenu->_getData<MenuData>().m_windowIsMoving;
     }
     bool isParentHorizontal =
         parentDirection == Stack::Direction::eLeftToRight || parentDirection == Stack::Direction::eRightToLeft;
@@ -438,11 +456,12 @@ void Menu::_drawMenu(float elapsedTime, bool isInSeparateWindow, bool isPopupWin
     // menuLevel for the root is 0. Root is usually a menu bar.
     int menuLevel = 0;
     {
-        auto iterator = this;
-        while (auto parent = iterator->_getData<MenuData>().m_parentMenu)
+        const Menu* iterator = this;
+        std::shared_ptr<Menu> parent;
+        while ((parent = iterator->_getData<MenuData>().m_parentMenu.lock()))
         {
             menuLevel++;
-            iterator = parent;
+            iterator = parent.get();
         }
     }
 
@@ -468,28 +487,21 @@ void Menu::_drawMenu(float elapsedTime, bool isInSeparateWindow, bool isPopupWin
 
     if (hovered && !popupWindowWasOpen)
     {
-        // We need to open the window if something is open in horizontal menu
-        if (needWindowType == _WindowType::eMenu && data.m_parentMenu && isParentHorizontal)
+        // Open alongside another popup in the same horizontal menu.
+        if (parentMenu && needWindowType == _WindowType::eMenu && isParentHorizontal)
         {
-            // Since every Widget pushes ID, we need to compensate it when
-            // looking for ID of siblings.
+            // Sibling popups are rooted at the parent ID scope, not this menu's scope.
             ImGui::PopID();
-
-            for (const auto& sibling : data.m_parentMenu->_getChildren())
+            for (const auto& sibling : parentMenu->_getChildren())
             {
                 if (const auto* menu = dynamic_cast<const Menu*>(sibling.get()))
                 {
                     auto& menuData = menu->_getData<MenuData>();
-                    // Like in the begin. We can't save ID and we can't use
-                    // `menu->isShown()` because it's possible that this method
-                    // is called twice for different windows, foe example for
-                    // teared of window and for the menu popup.
                     ImGui::PushID(menu);
                     const ImGuiID siblingId = isInSeparateWindow ? window->GetID(menuData.m_popupUniqueId.c_str()) :
-                                                                   window->GetID(menuData.m_menuUniqueId.c_str());
-                    bool siblingWindowIsOpen = ImGui::IsPopupOpen(siblingId, 0);
+                                                                 window->GetID(menuData.m_menuUniqueId.c_str());
+                    const bool siblingWindowIsOpen = ImGui::IsPopupOpen(siblingId, 0);
                     ImGui::PopID();
-
                     if (siblingWindowIsOpen)
                     {
                         wantOpenPopup = true;
@@ -497,7 +509,6 @@ void Menu::_drawMenu(float elapsedTime, bool isInSeparateWindow, bool isPopupWin
                     }
                 }
             }
-
             ImGui::PushID(this);
         }
 

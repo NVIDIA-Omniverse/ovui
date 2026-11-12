@@ -13,8 +13,10 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
+from ovui_data_adapters.ovstage._handles import handle_number
 from ovui_data_adapters.common import Command
 from ovui_data_adapters.ovstage._native import read_token_attribute
+from ovui_data_adapters.ovstage._scene import note_value_edit_ordinal
 from ovui_data_adapters.ovstage._stage_write import wait_operation
 from ovui_data_adapters.ovstage.runtime_import import import_ovstage_runtime_module
 
@@ -199,6 +201,9 @@ def _commit_state(
         ordinal = int(stage.begin_frame())
     except Exception as exc:
         raise RuntimeError("failed to begin an OVStage value frame") from exc
+    # Before any write: a reader at this ordinal must not count it as a
+    # structure change. A rollback or an abort also writes only this column.
+    note_value_edit_ordinal(stage, ordinal, descriptor.name, paths)
 
     operation_error: BaseException | None = None
     try:
@@ -357,7 +362,7 @@ def _fixed_row(
 ) -> np.ndarray:
     code, bits, lanes = descriptor.dtype
     if descriptor.semantic == _SEMANTIC_TOKEN_ID:
-        return np.asarray([dictionary.intern_token(str(value))], dtype=np.uint64)
+        return np.asarray([handle_number(dictionary.intern_token(str(value)))], dtype=np.uint64)
     components = _flatten_components(value)
     if len(components) != int(lanes):
         raise ValueError(
@@ -401,12 +406,12 @@ def _make_array_tensor(
         array = np.frombuffer(encoded, dtype=np.uint8).copy()
     elif descriptor.semantic == _SEMANTIC_TOKEN_ID:
         array = np.asarray(
-            [dictionary.intern_token(str(item)) for item in value],
+            [handle_number(dictionary.intern_token(str(item))) for item in value],
             dtype=np.uint64,
         )
     elif descriptor.semantic == _SEMANTIC_RELATIONSHIP_PATH_ID:
         array = np.asarray(
-            [dictionary.intern_path(str(item)) for item in value],
+            [handle_number(dictionary.intern_path(str(item))) for item in value],
             dtype=np.uint64,
         )
     elif descriptor.semantic == _SEMANTIC_CONNECTION_PATH_ID:
@@ -415,8 +420,8 @@ def _make_array_tensor(
             prim_path, property_name = _split_connection_target(str(item))
             pairs.extend(
                 (
-                    dictionary.intern_path(prim_path),
-                    dictionary.intern_token(property_name),
+                    handle_number(dictionary.intern_path(prim_path)),
+                    handle_number(dictionary.intern_token(property_name)),
                 )
             )
         array = np.asarray(pairs, dtype=np.uint64)

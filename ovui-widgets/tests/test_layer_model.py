@@ -1715,6 +1715,27 @@ class TestStep32MixedBatch:
         finally:
             model.destroy()
 
+    def test_edit_target_and_sublayers_in_same_batch_clear_old_target(
+        self,
+    ) -> None:
+        # Undo of a remove puts the sublayer back and makes it the
+        # authoring layer again in one batch. The root row survives the
+        # reload and must lose its "Authoring Layer" mark.
+        app = _DeferringApp()
+        adapter = MockLayerStackAdapter()
+        adapter.add_sublayer(ROOT_LAYER_IDENTIFIER, "sub_a")
+        model = LayerModel(adapter, services=app)
+        try:
+            app.tick()
+            assert model.root_item.is_edit_target is True
+            adapter.add_sublayer(ROOT_LAYER_IDENTIFIER, "sub_b")
+            adapter.set_edit_target("sub_b")
+            app.tick()
+            assert model._items_by_id["sub_b"].is_edit_target is True
+            assert model.root_item.is_edit_target is False
+        finally:
+            model.destroy()
+
 
 class TestStep32AutoHealEditTarget:
     """LAYERS-WINDOW-ARCHITECTURE §16.6 / §37.9 #9 — USD silently

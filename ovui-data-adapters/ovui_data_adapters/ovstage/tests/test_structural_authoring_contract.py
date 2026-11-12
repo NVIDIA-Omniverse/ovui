@@ -830,7 +830,7 @@ def test_structural_events_are_single_observer_safe_and_reentrant_safe(
             subscription.cancel()
 
 
-def test_failed_multi_type_native_batch_rolls_back_without_committed_ordinal(
+def test_failed_multi_type_native_batch_rolls_back_without_topology_change(
     opened: tuple[Any, Any, Any, UndoManager],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -856,7 +856,12 @@ def test_failed_multi_type_native_batch_rolls_back_without_committed_ordinal(
                 ("/World/GroupB/RollbackSphere", "Sphere"),
             ),
         )
-    assert (scene.current_ordinal, scene.topology_revision) == before
+    # The aborted frame seals its ordinal so ovrtx can step over the
+    # rollback rows; the topology stays the same.
+    assert (scene.current_ordinal, scene.topology_revision) == (
+        before[0] + 1,
+        before[1],
+    )
     assert adapter.get_item_at_path("/World/GroupA/Box") is not None
     assert adapter.get_item_at_path("/World/GroupB/RollbackCube") is None
     assert adapter.get_item_at_path("/World/GroupB/RollbackSphere") is None

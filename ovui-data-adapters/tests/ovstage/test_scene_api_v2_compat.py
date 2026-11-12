@@ -12,6 +12,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
+from ovui_data_adapters.common import VisibilityState
 from ovui_data_adapters.ovstage import _scene as scene_module
 from ovui_data_adapters.ovstage import stage_adapter as stage_module
 from ovui_data_adapters.ovstage._native import read_token_attribute
@@ -148,7 +149,12 @@ def test_real_topology_version_still_invalidates_hierarchy(monkeypatch):
 def test_native_visibility_reads_only_exact_path_columns(
     monkeypatch, visibility, world, expected,
 ):
-    stage = SimpleNamespace(_ovui_read_attribute_source="native Kit read_attributes")
+    stage = SimpleNamespace(
+        _ovui_read_attribute_source="native Kit read_attributes",
+        # An edit moved the stage past its whole-scene cache.
+        current_ordinal=2,
+        _ovui_kit_stage_bridge_cache=SimpleNamespace(ordinal=1),
+    )
     whole_scene_read = Mock(side_effect=AssertionError("whole-scene read"))
     monkeypatch.setattr(scene_module, "_build_kit_stage_cache", whole_scene_read)
     scene_module._install_kit_stage_bridge_compat(stage)
@@ -171,7 +177,12 @@ def test_native_visibility_reads_only_exact_path_columns(
     (None, "geometry"), ("", "geometry"), (21, "proxy"), (0, "geometry"),
 ])
 def test_native_purpose_reads_only_exact_path_column(monkeypatch, value, expected):
-    stage = SimpleNamespace(_ovui_read_attribute_source="native Kit read_attributes")
+    stage = SimpleNamespace(
+        _ovui_read_attribute_source="native Kit read_attributes",
+        # An edit moved the stage past its whole-scene cache.
+        current_ordinal=2,
+        _ovui_kit_stage_bridge_cache=SimpleNamespace(ordinal=1),
+    )
     records = {"purpose": SimpleNamespace(value=value)} if value is not None else {}
     read = Mock(return_value=records)
     broad_read = Mock(side_effect=AssertionError("compatibility token read"))
@@ -185,7 +196,12 @@ def test_native_purpose_reads_only_exact_path_column(monkeypatch, value, expecte
 
 
 def test_native_spatial_read_failure_does_not_fall_back_to_whole_scene(monkeypatch):
-    stage = SimpleNamespace(_ovui_read_attribute_source="native Kit read_attributes")
+    stage = SimpleNamespace(
+        _ovui_read_attribute_source="native Kit read_attributes",
+        # An edit moved the stage past its whole-scene cache.
+        current_ordinal=2,
+        _ovui_kit_stage_bridge_cache=SimpleNamespace(ordinal=1),
+    )
     read = Mock(side_effect=RuntimeError("native read failed"))
     monkeypatch.setattr(stage_module, "read_path_attribute_records", read)
     broad_read = Mock(side_effect=AssertionError("whole-scene read"))
@@ -195,6 +211,115 @@ def test_native_spatial_read_failure_does_not_fall_back_to_whole_scene(monkeypat
     assert stage_module._read_raw_visibility(stage, "/World/Box") == "inherited"
     assert stage_module._read_raw_purpose(stage, "/World/Box") == "geometry"
     broad_read.assert_not_called()
+
+
+@pytest.mark.parametrize("cache", [None, SimpleNamespace(ordinal=2)])
+def test_native_spatial_reads_use_whole_scene_cache_on_open(monkeypatch, cache):
+    # On open, camera framing builds the whole-scene cache for this ordinal.
+    # One exact-path read per prim would only add time to the open.
+    stage = SimpleNamespace(
+        _ovui_read_attribute_source="native Kit read_attributes",
+        current_ordinal=2,
+        _ovui_kit_stage_bridge_cache=cache,
+        read_attribute=Mock(return_value=b"invisible"),
+    )
+    exact_read = Mock(side_effect=AssertionError("exact-path read"))
+    monkeypatch.setattr(stage_module, "read_path_attribute_records", exact_read)
+    monkeypatch.setattr(stage_module, "read_token_attribute", Mock(return_value="proxy"))
+
+    assert stage_module._read_raw_visibility(stage, "/World/Box") == "invisible"
+    assert stage_module._read_raw_purpose(stage, "/World/Box") == "proxy"
+    exact_read.assert_not_called()
+
+
+# A Kit population can publish only the effective '_worldVisibility'. It is
+# invisible also for a prim that a hidden ancestor hides, so it must not read
+# as the prim's own hide (the Stage eye would show the closed eye).
+_OWN_HIDDEN = {"visibility": b"invisible", "_worldVisibility": b"\x00"}
+_OWN_INHERITED = {"visibility": b"inherited", "_worldVisibility": b"\x00"}
+_WORLD_HIDDEN = {"_worldVisibility": b"\x00"}
+_WORLD_VISIBLE = {"_worldVisibility": b"\x01"}
+_EYE_OF_BOX_UNDER_PARENT = [
+    # The stage gives the own value: the own hide comes first.
+    (_OWN_HIDDEN, _OWN_HIDDEN, VisibilityState.INVISIBLE),
+    (_OWN_HIDDEN, _OWN_INHERITED, VisibilityState.INHERITED_INVISIBLE),
+    # Only the effective value: the ancestors decide.
+    (_WORLD_HIDDEN, _WORLD_HIDDEN, VisibilityState.INHERITED_INVISIBLE),
+    (_WORLD_VISIBLE, _WORLD_HIDDEN, VisibilityState.INVISIBLE),
+    (_WORLD_VISIBLE, _WORLD_VISIBLE, VisibilityState.VISIBLE),
+]
+
+
+class _KitPopulationStage:
+    """A Kit-integrated stage with /World/Parent/Box and the columns of its population."""
+
+    def __init__(self, columns: dict[str, dict[str, bytes]], *, cache_ordinal: int) -> None:
+        self.current_ordinal = 2
+        self._ovui_kit_stage_bridge_cache = _KitStageBridgeCache(
+            ordinal=cache_ordinal,
+            path_order=tuple(columns),
+            attrs={
+                (path, name): value
+                for path, values in columns.items()
+                for name, value in values.items()
+            },
+            types={},
+        )
+        scene_module._install_kit_stage_bridge_compat(self)
+
+    def query_prims(self, _ordinal: int) -> dict[str, object]:
+        # The eye does not need the prim types.
+        return {"groups": ()}
+
+    def get_topology_version(self) -> int:
+        return 1
+
+    def get_child_paths(self, parent: str) -> tuple[str, ...]:
+        return {
+            "": ("/World",),
+            "/World": ("/World/Parent",),
+            "/World/Parent": ("/World/Parent/Box",),
+        }.get(parent, ())
+
+    def get_parent_path(self, path: str) -> str:
+        return path.rsplit("/", 1)[0]
+
+
+def _eye_state_of_box(stage: _KitPopulationStage) -> VisibilityState:
+    scene = OvstageScene(
+        stage=stage, source_path="fixture.usda", initial_ordinal=2,
+        root_paths=("/World",),
+    )
+    adapter = OvstageStageAdapter(scene)
+    return adapter.compute_visibility(adapter.get_item_at_path("/World/Parent/Box"))
+
+
+@pytest.mark.parametrize("parent,box,expected", _EYE_OF_BOX_UNDER_PARENT)
+def test_eye_on_open_tells_own_hide_from_world_visibility(parent, box, expected):
+    stage = _KitPopulationStage(
+        {"/World/Parent": parent, "/World/Parent/Box": box}, cache_ordinal=2,
+    )
+
+    assert _eye_state_of_box(stage) is expected
+
+
+@pytest.mark.parametrize("parent,box,expected", _EYE_OF_BOX_UNDER_PARENT)
+def test_eye_after_edit_tells_own_hide_from_world_visibility(
+    monkeypatch, parent, box, expected,
+):
+    columns = {"/World/Parent": parent, "/World/Parent/Box": box}
+    # An edit moved the stage past its whole-scene cache.
+    stage = _KitPopulationStage(columns, cache_ordinal=1)
+    monkeypatch.setattr(
+        stage_module,
+        "read_path_attribute_records",
+        lambda _stage, path, _names: {
+            name: SimpleNamespace(value=value.decode() if name == "visibility" else value[0])
+            for name, value in columns.get(path, {}).items()
+        },
+    )
+
+    assert _eye_state_of_box(stage) is expected
 
 
 def test_legacy_spatial_token_reads_remain_unchanged(monkeypatch):

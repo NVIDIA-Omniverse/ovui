@@ -94,7 +94,8 @@ fl.radius_small               # 2  — subtle rounding
 fl.radius_medium              # 4  — standard rounding
 fl.radius_large               # 8  — prominent rounding
 
-# Spacing
+# Spacing (for padding and margin in style dictionaries; the stack spacing and
+# the sizes of a layout come from the layout presets of the omniverse-ui-apis skill)
 fl.spacing_none               # 0
 fl.spacing_small              # 4
 fl.spacing_medium             # 8

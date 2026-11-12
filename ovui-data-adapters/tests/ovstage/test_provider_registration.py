@@ -19,6 +19,7 @@ import pytest
 
 from ovui_data_adapters.common import (
     ADAPTER_ENTRY_POINT_GROUP,
+    AdapterRegistry,
     LayerStackAdapter,
     PropertyAdapter,
     RendererAdapter,
@@ -46,6 +47,7 @@ OPENUSD_DIST_PYPROJECT = (
     / "pyproject.toml"
 )
 COMPONENT_ENTRY_POINT_GROUP = "ovui_widgets.components"
+NATIVE_RENDERER_ENTRY_POINT_GROUP = "ovui_data_adapters.native_renderer_factories"
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,20 @@ def test_openusd_and_ovstage_dist_metadata_declare_provider_entry_points() -> No
         ovstage["project"]["entry-points"][ADAPTER_ENTRY_POINT_GROUP]["ovstage"]
         == "ovui_data_adapters.ovstage.register:register"
     )
+
+
+def test_ovstage_native_renderer_entry_point_registers_its_factory() -> None:
+    pyproject = tomllib.loads(OVSTAGE_DIST_PYPROJECT.read_text(encoding="utf-8"))
+    value = pyproject["project"]["entry-points"][NATIVE_RENDERER_ENTRY_POINT_GROUP][
+        "ovstage"
+    ]
+    registry = AdapterRegistry()
+
+    _FakeEntryPoint("ovstage", value, NATIVE_RENDERER_ENTRY_POINT_GROUP).load()(registry)
+
+    from ovui_data_adapters.ovstage.renderer_adapter import OvstageRendererAdapter
+
+    assert registry.require_adapter("ovstage").factories.renderer is OvstageRendererAdapter
 
 
 def test_ovstage_dist_metadata_declares_component_entry_point() -> None:

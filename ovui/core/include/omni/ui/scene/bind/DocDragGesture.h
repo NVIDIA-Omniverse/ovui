@@ -7,8 +7,13 @@
 
 #define OMNIUI_PYBIND_DOC_DragGesture                                                                                  \
     "The gesture that provides a way to capture click-and-drag mouse event.\n"                                         \
-    "\n"
+    "\n"                                                                                                               \
+    "on_began and on_ended are called once for each drag. on_changed is called in each frame of the drag in which the payload of the shape changed (the item closest point or the ray closest point is not the one of the previous frame), except a frame that only shows the follow of the last call. Pointer movements that are queued before one frame give one call, with the payload of the last of them. A frame in which nothing changed gives no call, also when the pointer is held. The payload changes when the pointer moves, when the camera moves, and when the shape or an item above it is written by any code; every such change is called, also under a still pointer, however small it is. A color, a thickness or a size is not a change of the payload. moved (and the other moved_* values) is the change of the payload values since the last call, so the moved of the calls add up to the change of the payload since the drag began.\n" \
+    "\n"                                                                                                               \
+    "The follow of the pointer: a consumer that moves the shape, or a Transform above it, by the moved that a call reported, while its callback runs, gets no second call for that movement. The next frame, under the same pointer and camera, has the payload of the new place; it has no call when the writes of the callback are the follow. They are the follow when the consumer declares them with gesture.following(), or when each is exactly what the movement gives (the old translation plus moved, of one Transform; the movement divided equally between several Transforms; both ends of a Line or all positions of a Points moved by it), with only plain translations above and each written once in the callback. Everything else is called, however small: it has the data of a call for an independent edit with the same numbers, and a lost real update is worse than one extra call.\n"
 
+
+#define OMNIUI_PYBIND_DOC_DragGesture_following "Returns a context manager. The writes to the shape, or to the transforms above it, that are made inside its block are the follow of the pointer: the movement that the last on_changed call reported, applied by the consumer. The frame that follows, which has the payload of the new place under a still pointer, is then not a second on_changed call for the same movement.\n"
 
 #define OMNIUI_PYBIND_DOC_DragGesture_preProcess "Called before processing to determine the state of the gesture.\n"
 

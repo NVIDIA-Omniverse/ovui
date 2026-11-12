@@ -34,7 +34,7 @@ import os
 import threading
 import weakref
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from pxr import Sdf, Tf, Usd, UsdUtils
 
@@ -48,8 +48,14 @@ from ovui_data_adapters.common import (
     LayerStackCapabilities,
     PrimSpecDescriptor,
     PrimSpecifier,
+    SublayerEntry,
     SubscriptionProtocol,
     UndoManagerProtocol,
+)
+from ovui_data_adapters.openusd._layer_modified_state import (
+    add_modified_state_listener,
+    is_layer_modified,
+    remove_modified_state_listener,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -279,6 +285,174 @@ def _extract_key(notice: Any) -> Optional[str]:
     return key if isinstance(key, str) else None
 
 
+def _usd_error_causes(exc: Exception) -> str:
+    """Return the readable causes of a USD error, for a failure report.
+
+    A ``Tf.ErrorException`` holds one ``Tf.Error`` for each USD error; its
+    ``commentary`` is the text without the C++ source location.
+    """
+    causes = [
+        getattr(error, "commentary", "") for error in getattr(exc, "args", ())
+    ]
+    text = "; ".join(cause for cause in causes if isinstance(cause, str) and cause)
+    return text or str(exc).strip() or type(exc).__name__
+
+
+_ANIMATION_BLOCK = getattr(Sdf, "AnimationBlock", None)
+"""``Sdf.AnimationBlock``, or ``None`` for an OpenUSD that does not have it."""
+
+_VALUE_SOURCE_KEYS = ("default", "timeSamples", "spline")
+"""Attribute fields that give a value. The strongest layer with one of them wins."""
+
+
+def _prepare_stitch(
+    strong: Any,
+    weak: Any,
+    path: Any,
+    common: List[Any],
+    orders: List[Tuple[Any, List[str]]],
+) -> None:
+    """Prepare the prim spec ``path`` of two holder layers for ``UsdUtils.StitchLayers``.
+
+    ``StitchLayers`` merges the weaker layer into the stronger layer in
+    place. Where its rules differ from USD composition, this changes the
+    holder copies so that the stitched spec composes like the layer stack
+    ``[strong, weak]``:
+
+    - the stronger specifier wins unless it is ``over`` (stitch keeps the
+      weaker one unless that is ``over``);
+    - an empty type name is no opinion;
+    - the time samples and the spline of the weaker attribute have no effect
+      when the stronger attribute has a value (stitch would join the time
+      samples of both);
+    - an ``AnimationBlock`` default of the stronger attribute gives way to
+      the default of the weaker attribute;
+    - a weaker property of the other kind (attribute or relationship) has
+      no effect.
+
+    The child prims and the variants that both layers have are prepared in
+    the same way. Each prim and property spec that both layers have goes
+    into ``common``. When the ``primOrder`` of the weaker spec changes the
+    order of its children, the spec and its composed child order go into
+    ``orders``.
+    """
+    s = strong.GetPrimAtPath(path)
+    w = weak.GetPrimAtPath(path)
+    common.append(path)
+    if s.specifier != Sdf.SpecifierOver:
+        w.specifier = Sdf.SpecifierOver
+    if s.HasInfo("typeName") and not s.typeName and w.typeName:
+        s.ClearInfo("typeName")
+    for w_prop in list(w.properties):
+        s_prop = s.properties.get(w_prop.name)
+        if s_prop is None:
+            continue
+        if type(s_prop) is not type(w_prop):
+            w.RemoveProperty(w_prop)
+            continue
+        common.append(w_prop.path)
+        if not isinstance(s_prop, Sdf.AttributeSpec):
+            continue
+        if any(s_prop.HasInfo(key) for key in _VALUE_SOURCE_KEYS):
+            for key in ("timeSamples", "spline"):
+                if w_prop.HasInfo(key):
+                    w_prop.ClearInfo(key)
+        if (
+            _ANIMATION_BLOCK is not None
+            and s_prop.HasInfo("default")
+            and isinstance(s_prop.default, _ANIMATION_BLOCK)
+            and w_prop.HasInfo("default")
+        ):
+            s_prop.ClearInfo("default")
+
+    w_names = [child.name for child in w.nameChildren]
+    w_order = list(w.ApplyNameChildrenOrder(w_names))
+    known = set(w_names)
+    if w_order != w_names:
+        # The merged spec keeps only one ``primOrder``, so the order of
+        # the weaker spec goes into its children.
+        orders.append((path, w_order + [
+            child.name for child in s.nameChildren if child.name not in known
+        ]))
+    for child in s.nameChildren:
+        if child.name in known:
+            _prepare_stitch(strong, weak, path.AppendChild(child.name), common, orders)
+    for set_name, w_set in w.variantSets.items():
+        s_set = s.variantSets.get(set_name)
+        if s_set is None:
+            continue
+        for variant_name in w_set.variants.keys():
+            if variant_name in s_set.variants:
+                _prepare_stitch(
+                    strong, weak,
+                    path.AppendVariantSelection(set_name, variant_name), common, orders,
+                )
+
+
+def _copy_fields(src: Any, dst: Any, path: Any) -> None:
+    """Make the fields of the spec ``path`` in ``dst`` the same as in ``src``.
+
+    The children (prims, properties, variants) of the spec do not change.
+    """
+    Sdf.CopySpec(src, path, dst, path, lambda *_args: True, lambda *_args: False)
+
+
+def _clear_prim_contents(spec: Any) -> None:
+    """Remove the child prims and the properties of a prim spec, also in its variants.
+
+    ``CopySpec`` onto an existing spec keeps the existing children in their
+    place, and an existing property of the other kind; after this, the copy
+    makes all of them again in the order of the source.
+    """
+    spec.nameChildren.clear()
+    spec.properties.clear()
+    for variant_set in spec.variantSets.values():
+        for variant in variant_set.variants.values():
+            _clear_prim_contents(variant.primSpec)
+
+
+def _reorder_prim_children(layer: Any, path: Any, order: List[str], scratch: Any) -> None:
+    """Put the child prims of ``path`` (``/`` for the root prims) in ``order``.
+
+    Sdf cannot move a child inside its list, so the children from the first
+    one in the wrong place go out to the empty ``scratch`` layer and come
+    back in ``order``: a new child goes to the end of the list.
+    """
+    parent = layer.GetPrimAtPath(path)
+    current = [child.name for child in parent.nameChildren]
+    first = 0
+    while first < len(order) and first < len(current) and order[first] == current[first]:
+        first += 1
+    moved = [path.AppendChild(name) for name in order[first:]]
+    if not moved:
+        return
+    if path != Sdf.Path.absoluteRootPath:
+        Sdf.CreatePrimInLayer(scratch, path)
+    for child in moved:
+        Sdf.CopySpec(layer, child, scratch, child)
+    edit = Sdf.BatchNamespaceEdit()
+    for child in moved:
+        edit.Add(Sdf.NamespaceEdit.Remove(child))
+    if not layer.Apply(edit):
+        raise RuntimeError(f"Could not reorder the child prims of {path} in {layer.identifier}")
+    for child in moved:
+        Sdf.CopySpec(scratch, child, layer, child)
+    scratch.Clear()
+
+
+def layer_display_name(sdf: Any) -> str:
+    """Return the name of an open layer, as the Layers window shows it.
+
+    The window adds a state suffix to this name, for example ``[anon]``.
+    """
+    if sdf.anonymous:
+        return _ANONYMOUS_DISPLAY_NAME
+    name = Sdf.Layer.GetDisplayNameFromIdentifier(sdf.identifier)
+    if name:
+        return name
+    return os.path.basename(sdf.identifier) or sdf.identifier
+
+
 class UsdLayerStackAdapter(LayerStackAdapter):
     """USD-backed :class:`LayerStackAdapter` over one ``Usd.Stage``.
 
@@ -330,6 +504,10 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         # ``_dirty_snapshot`` refresh handles the deferred dirty-poll.
         # See LAYERS-PLAN Step 7 for the full rationale.
         self._persisting: bool = False
+
+        # Holder layers of :meth:`transfer_layer_content`, made at the
+        # first merge and kept for later merges (see :meth:`_merge_holders`).
+        self._merge_layers: Optional[Tuple[Any, Any]] = None
 
         # Prime the handle cache with the well-known root / session layers
         # so downstream ``find_layer`` / sublayer walks never have to
@@ -552,6 +730,41 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         )
         return result
 
+    def get_scene_file_identifiers(self) -> List[str]:
+        """Return every file that the open scene uses, or can use.
+
+        The layers that the stage uses (the root and session layer
+        stacks, references and loaded payloads), each file that those
+        layers name (also unloaded payloads and muted or missing
+        sublayers), the files of the layer stack, and each file layer
+        that is open in memory (for example a removed sublayer that Undo
+        can bring back).
+        """
+        result: List[str] = []
+        seen: set[str] = set()
+
+        def _add(identifier: str) -> None:
+            if identifier and not identifier.startswith("anon:"):
+                if identifier not in seen:
+                    seen.add(identifier)
+                    result.append(identifier)
+
+        for sdf_layer in self._stage.GetUsedLayers():
+            if not sdf_layer.anonymous:
+                _add(sdf_layer.identifier)
+            for asset_path in sdf_layer.GetCompositionAssetDependencies():
+                if asset_path and not asset_path.startswith("anon:"):
+                    _add(sdf_layer.ComputeAbsolutePath(asset_path))
+        for identifier in self.get_layer_stack_identifiers(
+            include_session=True,
+            include_anonymous=False,
+        ):
+            _add(identifier)
+        for sdf_layer in Sdf.Layer.GetLoadedLayers():
+            if not sdf_layer.anonymous:
+                _add(sdf_layer.identifier)
+        return result
+
     def _walk(
         self,
         sdf_layer: Optional[Sdf.Layer],
@@ -588,12 +801,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
             # Missing layer — fall back to the basename of the identifier
             # so the UI has something to show.
             return os.path.basename(layer.identifier) or layer.identifier
-        if sdf.anonymous:
-            return _ANONYMOUS_DISPLAY_NAME
-        name = Sdf.Layer.GetDisplayNameFromIdentifier(sdf.identifier)
-        if name:
-            return name
-        return os.path.basename(sdf.identifier) or sdf.identifier
+        return layer_display_name(sdf)
 
     def get_layer_owner(self, layer: LayerHandle) -> str:
         sdf = self._sdf_for(layer)
@@ -625,7 +833,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         sdf = self._sdf_for(layer)
         if sdf is None:
             return False
-        return bool(sdf.dirty)
+        return is_layer_modified(sdf)
 
     def is_muted(self, layer: LayerHandle) -> bool:
         return bool(self._stage.IsLayerMuted(layer.identifier))
@@ -801,6 +1009,40 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         # keeps anonymous layers alive.
         return identifier
 
+    def get_sublayer_entry(self, parent_id: str, position: int) -> SublayerEntry:
+        parent = self._require_sdf(parent_id)
+        if position < 0 or position >= len(parent.subLayerPaths):
+            raise IndexError(
+                f"sublayer position {position} out of range for {parent_id!r}"
+            )
+        layer_offset = parent.subLayerOffsets[position]
+        return SublayerEntry(
+            path=parent.subLayerPaths[position],
+            offset=layer_offset.offset,
+            scale=layer_offset.scale,
+        )
+
+    def insert_sublayer_entry(
+        self,
+        parent_id: str,
+        position: int,
+        entry: SublayerEntry,
+    ) -> None:
+        parent = self._require_sdf(parent_id)
+        if position < 0 or position > len(parent.subLayerPaths):
+            position = len(parent.subLayerPaths)
+        # USD gives an inserted path offset 0 and scale 1. One change
+        # block sets the path and its offset together, so the stage
+        # never composes the layer at the wrong time.
+        with Sdf.ChangeBlock():
+            parent.subLayerPaths.insert(position, entry.path)
+            parent.subLayerOffsets[position] = Sdf.LayerOffset(
+                entry.offset, entry.scale
+            )
+        child = Sdf.Layer.FindOrOpen(parent.ComputeAbsolutePath(entry.path))
+        if child is not None:
+            self._register(child)
+
     def move_sublayer(
         self,
         from_parent_id: str,
@@ -824,18 +1066,23 @@ class UsdLayerStackAdapter(LayerStackAdapter):
                 f"{from_parent_id!r}"
             )
         path = source.subLayerPaths[from_position]
+        # The time offset is part of the entry. USD deletes it with the
+        # path and gives an inserted path offset 0 and scale 1, so write
+        # it again at the new slot, in the same change block.
+        layer_offset = source.subLayerOffsets[from_position]
 
-        if remove_source:
-            del source.subLayerPaths[from_position]
-            # Same-parent reorder: the delete shifted indices, so an
-            # insert at a later slot must be adjusted down by one.
-            if source is destination and to_position > from_position:
-                to_position -= 1
+        with Sdf.ChangeBlock():
+            if remove_source:
+                del source.subLayerPaths[from_position]
+                # Same-parent reorder: the delete shifted indices, so an
+                # insert at a later slot must be adjusted down by one.
+                if source is destination and to_position > from_position:
+                    to_position -= 1
 
-        if to_position < 0 or to_position > len(destination.subLayerPaths):
-            destination.subLayerPaths.append(path)
-        else:
+            if to_position < 0 or to_position > len(destination.subLayerPaths):
+                to_position = len(destination.subLayerPaths)
             destination.subLayerPaths.insert(to_position, path)
+            destination.subLayerOffsets[to_position] = layer_offset
 
     def replace_sublayer(
         self,
@@ -1004,8 +1251,65 @@ class UsdLayerStackAdapter(LayerStackAdapter):
 
         return identifier
 
+    def _merge_holders(self) -> Tuple[Any, Any]:
+        """Return the two holder layers of :meth:`transfer_layer_content`.
+
+        The first one is a working layer; the second one gets the result
+        of :meth:`_merge_root_prims`. They are made at the first merge, are
+        empty between merges, and are kept for later merges. A new layer for each merge would keep
+        memory in OpenUSD after the layer is released: OpenUSD 25.11 does
+        not delete the spec identities that wait for clean-up in a layer
+        that it deletes, so each merge would lose memory for each spec.
+        """
+        if self._merge_layers is None:
+            self._merge_layers = (
+                Sdf.Layer.CreateAnonymous(".usda"),
+                Sdf.Layer.CreateAnonymous(".usda"),
+            )
+        return self._merge_layers
+
+    def _merge_root_prims(self, stronger: Any, weaker: Any, names: List[str]) -> None:
+        """Merge the root prims ``names`` of two layers into the second holder layer.
+
+        Both layers must have each root prim in ``names``. The result
+        composes like the layer stack ``[stronger, weaker]``: the union of
+        the prims and the children of both layers, the stronger opinion
+        where both layers have one, and the composed order (the children
+        of the weaker spec first). Only copies of the ``names`` root prims
+        are merged, so the layer metadata and the sublayers of the two
+        layers have no effect. Asset paths stay as authored. No new layer
+        is made.
+
+        1. ``UsdUtils.StitchLayers`` merges the weaker copy into the
+           stronger copy, after :func:`_prepare_stitch`: the stronger copy
+           has the merged values, but the stronger children come first.
+        2. The specs that both copies have get the merged values in the
+           weaker copy; their children do not change.
+        3. ``StitchLayers`` adds the children that only the stronger copy
+           has to the weaker copy, after its own children.
+        """
+        top, result = self._merge_holders()
+        for holder, layer in ((top, stronger), (result, weaker)):
+            for name in names:
+                Sdf.CopySpec(layer, f"/{name}", holder, f"/{name}")
+        common: List[Any] = []
+        orders: List[Tuple[Any, List[str]]] = []
+        for name in names:
+            _prepare_stitch(top, result, Sdf.Path(f"/{name}"), common, orders)
+        UsdUtils.StitchLayers(top, result)
+        for path in common:
+            _copy_fields(top, result, path)
+        UsdUtils.StitchLayers(result, top)
+        top.Clear()
+        for path, order in orders:
+            _reorder_prim_children(result, path, order, top)
+
     def transfer_layer_content(
-        self, src_identifier: str, dst_identifier: str
+        self,
+        src_identifier: str,
+        dst_identifier: str,
+        *,
+        dst_is_stronger: bool = False,
     ) -> None:
         src = self._require_sdf(src_identifier)
         dst = self._require_sdf(dst_identifier)
@@ -1014,8 +1318,44 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         # dispatches notices that can, via batched flush, race back
         # into layer-cache bookkeeping in a future iteration).
         names: List[str] = [spec.name for spec in src.rootPrims]
-        for name in names:
-            Sdf.CopySpec(src, f"/{name}", dst, f"/{name}")
+        # A plain ``CopySpec`` replaces the whole destination prim spec,
+        # so two layers that share a root prim such as ``/World`` would
+        # lose the destination's children. Merge the shared ones first.
+        shared = [name for name in names if dst.GetPrimAtPath(f"/{name}") is not None]
+        # When the destination is stronger, composition lists the root
+        # prims of the weaker source first. ``CopySpec`` adds the new ones
+        # at the end, so they are put in this order after the copy.
+        root_order: List[str] = []
+        if dst_is_stronger:
+            known = set(names)
+            root_order = names + [
+                spec.name for spec in dst.rootPrims if spec.name not in known
+            ]
+        scratch, merged = self._merge_holders()
+        try:
+            if shared:
+                if dst_is_stronger:
+                    self._merge_root_prims(dst, src, shared)
+                else:
+                    self._merge_root_prims(src, dst, shared)
+            with Sdf.ChangeBlock():
+                for name in names:
+                    path = f"/{name}"
+                    if name in shared:
+                        # The merged spec holds all the content of the
+                        # destination spec; clear that content so the copy
+                        # makes it again in the merged order.
+                        _clear_prim_contents(dst.GetPrimAtPath(path))
+                        Sdf.CopySpec(merged, path, dst, path)
+                    else:
+                        Sdf.CopySpec(src, path, dst, path)
+                if dst_is_stronger:
+                    _reorder_prim_children(
+                        dst, Sdf.Path.absoluteRootPath, root_order, scratch
+                    )
+        finally:
+            scratch.Clear()
+            merged.Clear()
 
     # ── Prim-spec mutation (Step 31a) ────────────────────────────────
 
@@ -1128,7 +1468,9 @@ class UsdLayerStackAdapter(LayerStackAdapter):
             ok = bool(sdf_layer.Export(new_path))
         except Exception as exc:
             self._report_error("save_layer_as", identifier, exc)
-            return None
+            # The write error names its cause (for example a folder with no
+            # write permission). ``SaveLayerAsCommand`` shows it to the user.
+            raise OSError(_usd_error_causes(exc)) from exc
         if not ok:
             return None
 
@@ -1174,10 +1516,18 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         Lookup order: cached registration, then ``Sdf.Layer.Find``. A
         successful fallback re-registers the layer so subsequent reads
         short-circuit.
+
+        The cache does not keep a layer alive: after a remove takes a
+        layer out of the stack, USD can destroy it while the cached
+        wrapper stays. Such an expired wrapper is dropped, the same way
+        :meth:`_sdf_for` does, because USD stops the process when code
+        reads from it (``rootPrims`` on a removed, expanded sublayer).
         """
         sdf = self._sdf_layers.get(identifier)
         if sdf is not None:
-            return sdf
+            if sdf:
+                return sdf
+            self._sdf_layers.pop(identifier, None)
         found = Sdf.Layer.Find(identifier)
         if found is not None:
             self._register(found)
@@ -1247,7 +1597,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         # for our own edit. The root is genuinely dirty now; a subsequent
         # stage.Save() clears it back to False, and that transition IS
         # surfaced normally via the next poll.
-        self._dirty_snapshot[root.identifier] = bool(root.dirty)
+        self._dirty_snapshot[root.identifier] = is_layer_modified(root)
 
     def _persist_lock_map(self) -> None:
         """Persist ``self._lock_map`` into the root layer's customLayerData."""
@@ -1363,7 +1713,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         # We diff against this snapshot on every flush; any missing entry
         # is seeded silently (no synthetic event on first observation).
         for identifier, sdf_layer in list(self._sdf_layers.items()):
-            self._dirty_snapshot[identifier] = bool(sdf_layer.dirty)
+            self._dirty_snapshot[identifier] = is_layer_modified(sdf_layer)
 
         # Register globally (not per-layer) and filter by sender / layer
         # identity inside each handler. Per-layer registration would
@@ -1397,6 +1747,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
                 self._stage,
             ),
         ]
+        add_modified_state_listener(self._on_modified_state_changed)
 
     def detach_stage(self) -> None:
         """Unwire notices and tear down batching state.
@@ -1428,6 +1779,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
             # handler has already fired.
             key.Revoke()
         self._notice_keys.clear()
+        remove_modified_state_listener(self._on_modified_state_changed)
 
         if flush_handle is not None:
             cancel = getattr(flush_handle, "cancel", None)
@@ -1435,6 +1787,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
                 cancel()
 
         self._dirty_snapshot.clear()
+        self._merge_layers = None
         # Deliberately *do not* clear ``_sdf_layers`` or ``_layer_cache``:
         # read-only queries (``get_display_name``, ``is_missing``, …) must
         # still work after detach. If the caller destroys the adapter, the
@@ -1490,6 +1843,19 @@ class UsdLayerStackAdapter(LayerStackAdapter):
         with self._pending_lock:
             if self._destroyed:
                 return
+        self._schedule_flush_threadsafe()
+
+    def _on_modified_state_changed(self, identifier: str) -> None:
+        """The shown modified state of ``identifier`` changed.
+
+        A cancelled edit gave the layer its clean content again, or that
+        record ended at a change. No dirtiness notice tells this, so the
+        dirty-poll of the next flush reads the state again.
+        """
+        with self._pending_lock:
+            if self._destroyed or identifier not in self._sdf_layers:
+                return
+            self._pending[identifier].add(_TOKEN_TOUCHED)
         self._schedule_flush_threadsafe()
 
     def _on_layers_did_change(self, notice: Any, sender: Any) -> None:
@@ -1679,7 +2045,7 @@ class UsdLayerStackAdapter(LayerStackAdapter):
             if persisting and identifier == root_id:
                 continue
             try:
-                current = bool(sdf_layer.dirty)
+                current = is_layer_modified(sdf_layer)
             except Exception:
                 # Layer was closed/invalidated between cache insert and
                 # poll. Drop from snapshot; next round will re-seed.

@@ -6,6 +6,12 @@ install(DIRECTORY "${CMAKE_SOURCE_DIR}/core/include/" DESTINATION include
     COMPONENT ovui-sdk FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/core/src/" DESTINATION src
     COMPONENT ovui-sdk FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
+# The renderer slot of native frame pacing. An optional package builds its own
+# hooks table against this exact layout, so the header ships with the SDK. Its
+# render worker records the same native timing scopes as ovui's own threads.
+install(FILES "${CMAKE_SOURCE_DIR}/standalone/src/NativeFramePacingHooks.h"
+    "${CMAKE_SOURCE_DIR}/standalone/src/NativeTiming.h"
+    DESTINATION src COMPONENT ovui-sdk)
 install(DIRECTORY "${OVUI_IMGUI_ROOT}/imgui/" DESTINATION third_party/imgui
     COMPONENT ovui-sdk FILES_MATCHING PATTERN "*.h")
 
@@ -29,6 +35,8 @@ if(WIN32)
     # import libraries produced by this exact build/configuration.
     install(FILES "$<TARGET_LINKER_FILE:ovui>" "$<TARGET_LINKER_FILE:ovui_forwarders>" "$<TARGET_LINKER_FILE:ovuiscene>" "$<TARGET_LINKER_FILE:imgui>"
         DESTINATION lib COMPONENT ovui-sdk)
+    # A host that has its own omni.ui.dll (Kit) generates its forwarders to ovui.dll with this script.
+    install(FILES "${CMAKE_SOURCE_DIR}/tools/forwarders/generate_ui_forwarders.py" DESTINATION tools COMPONENT ovui-sdk)
 endif()
 
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/sdk-build-$<CONFIG>.json" CONTENT

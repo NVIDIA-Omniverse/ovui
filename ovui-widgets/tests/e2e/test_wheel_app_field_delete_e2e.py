@@ -3,7 +3,7 @@
 
 """Delete/Backspace in a Property Inspector number field must not delete the prim.
 
-Regression: with a prim selected, a double-click on a float or int field in
+with a prim selected, a double-click on a float or int field in
 the Property Inspector puts the field in keyboard-edit mode. Delete and
 Backspace then edited the field text and also ran the app-wide delete
 shortcut, which removed the selected prim.
@@ -74,7 +74,7 @@ def _require_renderer_and_display() -> None:
     if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
         if require_render:
             pytest.fail("OVUI_E2E_REQUIRE_RENDER=1 but DISPLAY is not set; the "
-                        "windowed app needs an X display (for example, Xvfb).")
+                        "windowed app needs an X display (CI runs Xvfb).")
         pytest.skip("No X display (DISPLAY unset) for the windowed app.")
 
 
@@ -156,7 +156,7 @@ class _Flow:
         )
 
 
-# Provider-specific runs may select tests with ``-k <provider>``; the fault is in the
+# The CI window jobs select tests with ``-k <provider>``; the fault is in the
 # app's key dispatch, not in a data provider, so one provider is enough.
 @pytest.mark.parametrize("provider", ["openusd"])
 def test_field_delete_keys_keep_prim_and_shortcut_still_deletes(provider, tmp_path):

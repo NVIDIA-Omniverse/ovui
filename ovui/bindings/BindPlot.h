@@ -84,19 +84,19 @@ void wrapPlot(module& m)
                              }
                          }
                      }
-                     else if (isinstance<float_>(arg))
+                     else if (isinstance<float_>(arg) || isinstance<int_>(arg))
                      {
                          valueList.reserve(args.size());
                          while (argsBegin != argsEnd)
                          {
                              auto& argValue = *argsBegin;
-                             if (isinstance<float_>(*argValue))
+                             if (isinstance<float_>(*argValue) || isinstance<int_>(*argValue))
                              {
                                  valueList.push_back(argValue.cast<float_t>());
                              }
                              else
                              {
-                                 OMNIUI_LOG_WARN("Plot Constructor: argument is not float");
+                                 OMNIUI_LOG_WARN("Plot Constructor: argument is not a number");
                              }
                              argsBegin++;
                          }
@@ -176,18 +176,19 @@ void wrapPlot(module& m)
 
                  auto argsBegin = args.begin();
                  auto argsEnd = args.end();
+                 valueList.reserve(args.size());
                  while (argsBegin != argsEnd)
                  {
                      auto& arg = *argsBegin;
-                     if (isinstance<float_>(arg))
+                     if (isinstance<float_>(arg) || isinstance<int_>(arg))
                      {
                          valueList.push_back(arg.cast<float_t>());
-                         argsBegin++;
                      }
                      else
                      {
                          OMNIUI_LOG_WARN("Plot data: unknown argument");
                      }
+                     argsBegin++;
                  }
                  self.setData(valueList);
              },

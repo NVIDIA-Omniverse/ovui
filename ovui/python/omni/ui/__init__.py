@@ -154,9 +154,6 @@ if _sys.platform == "win32" and hasattr(_os, "add_dll_directory"):
                     _os.add_dll_directory(_cuda_bin)
                     break
 
-# Detect whether we are running inside Kit or standalone
-from ._compat import _IN_KIT
-
 # The standalone bridge registers its platform hooks before `_ui` loads, so
 # `_ui` gains the standalone entry points (`_standalone_init`, ...).
 if _sys.platform != "emscripten":
@@ -192,14 +189,6 @@ from .markdown_styles import markdown_background, markdown_style, markdown_theme
 from .style_utils import style
 from .url_utils import url
 
-if _IN_KIT:
-    from .workspace_utils import dump_workspace
-    from .workspace_utils import restore_workspace
-    from .workspace_utils import compare_workspace
-    from .extension import UIPreferencesExtension
-    from .internal_session_notification import InternalSessionNotificationExtension
-    from .workspace_utils import CompareDelegate
-
 def add_to_namespace(module=None, module_locals=locals()):
     class AutoRemove:
         def __init__(self):
@@ -213,17 +202,6 @@ def add_to_namespace(module=None, module_locals=locals()):
         return
 
     return AutoRemove()
-
-
-if _IN_KIT:
-    # Add the static methods to Workspace
-    setattr(Workspace, "dump_workspace", dump_workspace)
-    setattr(Workspace, "restore_workspace", restore_workspace)
-    setattr(Workspace, "compare_workspace", compare_workspace)
-
-    del dump_workspace
-    del restore_workspace
-    del compare_workspace
 
 
 def set_shade(shade_name: str | None = None):
@@ -276,8 +254,8 @@ if _sys.platform == "emscripten":
     def run():
         raise RuntimeError("ui.run() is not used in the browser; requestAnimationFrame calls ui.next_frame().")
 
-# Standalone helpers -- only available outside Kit
-elif not _IN_KIT:
+# Standalone helpers
+else:
     from .standalone import (
         FrameInfo,
         _record_synchronous_content_selection,

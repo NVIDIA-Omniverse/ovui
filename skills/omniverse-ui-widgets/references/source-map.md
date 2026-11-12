@@ -57,6 +57,27 @@ Purpose and required calls:
   stage_adapter=stage_adapter, undo_manager=undo_manager,
   snap_system=snap_system)`, then `viewport.set_renderer(renderer)`,
   `viewport.update_prim_count(count)`, and `viewport.frame_paths(["/"])`.
+- `viewport.subscribe_render_product_change(callback)` (a method of
+  `ViewportSurface`, so also of `ViewportWidget`) is for a tool that chooses
+  the renderer's render product, for example a render target menu that an
+  optional module adds to the viewport. The viewport changes the render product
+  itself only when it leaves a bound USD camera for the free camera: H (home),
+  or Camera > Perspective or Ortho. Then it first asks the renderer for its own
+  render product (`set_active_render_product_path(None)`). When the shown
+  render product is then not the one from before, the viewport calls
+  `callback(render_product_path)` one time, with the render product that is
+  now shown (an empty string when the renderer gives none). This also occurs
+  when the step fails and the earlier render product cannot come back. There
+  is no call when no USD camera is bound, or when the renderer cannot give its
+  active render product (`get_active_render_product_path`). The returned handle
+  has `remove()`, which stops the calls; you can call it more than one time.
+  `viewport.destroy()` also stops all calls. When a callback raises an error,
+  `ErrorReporter` reports the render product and the error, and the other
+  callbacks still get the call. A `callback` that is not callable raises
+  `TypeError`. Subscribe when the tool attaches to the viewport, and call
+  `remove()` when it detaches. In the callback, the tool changes its own state
+  and its open windows to the shown render product, so that its edits go to
+  the render product that the user sees.
 - `StageWindow(adapter=stage_adapter, selection_bus=selection_bus)` is the
   existing Stage Browser shell. It hosts `StageWidget`, which publishes user
   row selections through `SelectionBus.publish(paths, source="stage")` and

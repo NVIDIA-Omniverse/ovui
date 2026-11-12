@@ -28,6 +28,8 @@ from ovui_data_adapters.common import (
     PropertyCapabilities,
     UndoManagerProtocol,
 )
+from ovui_data_adapters.common.matrix_transform import with_matrix_part
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Type and group mapping tables
@@ -310,8 +312,28 @@ def _to_python(value: Any, value_type: str) -> Any:
     return value
 
 
-def _to_usd(value: Any, value_type: str) -> Any:
-    """Convert plain Python value to a USD-compatible type."""
+_VECTOR_COMPONENT_COUNTS: Dict[str, int] = {
+    "float2": 2, "float3": 3, "float4": 4, "color3f": 3, "color4f": 4,
+}
+
+
+def _to_usd(value: Any, value_type: str, usd_type_str: str = "") -> Any:
+    """Convert plain Python value to a USD-compatible type.
+
+    A float vector keeps the precision of its USD type ``usd_type_str``:
+    ``double3`` gets ``Gf.Vec3d``. A 32-bit vector for a double attribute
+    would round each value, and a value above the 32-bit float range
+    would become infinity. The callers give the type of each
+    attribute that they write: selected prims can have attributes of the
+    same name with other precisions (``half4`` and ``float4``).
+    """
+    count = _VECTOR_COMPONENT_COUNTS.get(value_type)
+    if count is not None and usd_type_str:
+        value_type_name = Sdf.ValueTypeNames.Find(usd_type_str)
+        if value_type_name:
+            vector_class = value_type_name.type.pythonClass
+            if getattr(vector_class, "dimension", None) == count:
+                return vector_class(*(float(value[i]) for i in range(count)))
     if value_type == "float2":
         return Gf.Vec2f(float(value[0]), float(value[1]))
     if value_type in ("float3", "color3f"):
@@ -386,14 +408,18 @@ class _PropertyEditToken:
     whether THIS invocation actually authored — foreign or invalidation
     changes observed at ``end_edit`` without an owned write never create
     history. ``registry_keys`` are this token's claims in the shared
-    cross-adapter spec-ownership registry.
+    cross-adapter spec-ownership registry. ``layer_was_clean`` records
+    whether the layer had no unsaved change when the edit began, and
+    ``watch`` finds a change of the layer that this edit did not make.
     """
 
     __slots__ = ("edit_target", "layer", "paths", "spec_paths", "attr_name",
-                 "pre", "wrote", "registry_keys", "__weakref__")
+                 "pre", "wrote", "registry_keys", "start_values",
+                 "last_values", "layer_was_clean", "watch", "own_prims",
+                 "own_prims_before", "__weakref__")
 
     def __init__(self, edit_target, layer, paths, spec_paths, attr_name,
-                 pre, registry_keys):
+                 pre, registry_keys, stage):
         self.edit_target = edit_target
         self.layer = layer
         self.paths = paths
@@ -402,6 +428,49 @@ class _PropertyEditToken:
         self.pre = pre
         self.wrote = False
         self.registry_keys = registry_keys
+        from ovui_data_adapters.openusd._layer_modified_state import (
+            LayerChangeWatch,
+            is_layer_modified,
+        )
+
+        self.layer_was_clean = not is_layer_modified(layer)
+        own_properties = [
+            Sdf.Path(str(path)).AppendProperty(attr_name) for path in paths
+        ]
+        # With a plain edit target, a write creates the prim specs of these
+        # prims when the layer has none; the end of the edit compares them
+        # with their state before the edit (``own_prims_before``).
+        own_prims = []
+        if [str(p) for p in spec_paths] == [str(p) for p in own_properties]:
+            own_prims = sorted({
+                prefix for path in paths
+                for prefix in Sdf.Path(str(path)).GetPrefixes()
+            }, key=str)
+        self.own_prims = own_prims
+        self.own_prims_before = _prim_specs_state(layer, own_prims, attr_name)
+        self.watch = LayerChangeWatch(layer, stage, own_properties, own_prims)
+
+
+def _prim_specs_state(layer: Any, prim_paths: List[Any], attr_name: str) -> list:
+    """The state of these prim specs in ``layer`` that an edit of
+    ``attr_name`` does not own: presence, metadata values, the names of the
+    other properties, and the names of the children.
+
+    Values are compared by equality, not by text, so the result of the same
+    layer content is always equal.
+    """
+    state = []
+    for path in prim_paths:
+        spec = layer.GetPrimAtPath(path)
+        if spec is None:
+            state.append(None)
+            continue
+        state.append((
+            {key: spec.GetInfo(key) for key in spec.ListInfoKeys()},
+            sorted(p.name for p in spec.properties if p.name != attr_name),
+            [child.name for child in spec.nameChildren],
+        ))
+    return state
 
 
 # Cross-adapter spec ownership: (layer identifier, spec path) → weak token.
@@ -915,7 +984,17 @@ class UsdPropertyAdapter(PropertyAdapter):
         # history entry and made unmatched end_edit close foreign groups.
         token = _PropertyEditToken(
             edit_target, layer, list(self._paths), spec_paths, attr_name,
-            pre, registry_keys)
+            pre, registry_keys, self._stage)
+        prop = self._props.get(attr_name)
+        token.start_values = [
+            _to_python(attr.Get(), prop.value_type) if attr and prop else None
+            for attr in (
+                self._stage.GetAttributeAtPath(Sdf.Path(str(path)).AppendProperty(attr_name))
+                for path in self._paths
+            )
+        ]
+        # The value this edit last wrote to each prim; ``None`` for none.
+        token.last_values = [None] * len(token.paths)
         for key in registry_keys:
             _ACTIVE_SPEC_EDITS[key] = weakref.ref(token)
         self._edit_snapshots[attr_name] = token
@@ -938,56 +1017,159 @@ class UsdPropertyAdapter(PropertyAdapter):
             # attempting a ``Python tuple → Vt.*Array`` conversion that
             # would raise mid-edit.
             return
-        usd_val = _to_usd(value, prop.value_type)
+        # Each attribute gets the value in its own USD type: the selected
+        # prims can have attributes of this name with other precisions.
+        writes = [
+            (attr, _to_usd(value, prop.value_type, str(attr.GetTypeName())))
+            for attr in self._selected_attributes(attr_name)
+            if attr is not None
+        ]
         token = self._edit_snapshots.get(attr_name)
 
         if isinstance(token, _PropertyEditToken):
-            # Author EVERY member against the FROZEN edit target. A
-            # genuine synchronous notice callback fired by one member's
-            # Set() may change the stage target before the next member,
-            # so the frozen target is re-asserted PER MEMBER — one
-            # transaction can never split across layers. A foreign
-            # mid-write target change is preserved: the previous target
-            # is restored only when the current one is still ours.
             # ``wrote`` is marked BEFORE the attempt so even a write that
             # throws mid-way stays owned — end_edit/cancel_edit then
             # restore or record the exact truth instead of ignoring
             # partial authorship.
             token.wrote = True
-            for path in self._paths:
-                prim = self._stage.GetPrimAtPath(path)
-                if not prim.IsValid():
-                    continue
-                attr = prim.GetAttribute(attr_name)
-                if not attr.IsValid():
-                    continue
-                previous_target = self._stage.GetEditTarget()
-                self._stage.SetEditTarget(token.edit_target)
-                try:
-                    attr.Set(usd_val)
-                finally:
-                    if self._stage.GetEditTarget() == token.edit_target:
-                        self._stage.SetEditTarget(previous_target)
-        else:
-            for path in self._paths:
-                prim = self._stage.GetPrimAtPath(path)
-                if prim.IsValid():
-                    attr = prim.GetAttribute(attr_name)
-                    if attr.IsValid():
-                        attr.Set(usd_val)
+            token.last_values = [value] * len(token.paths)
+        for attr, usd_val in writes:
+            self._author_member(attr, usd_val, token)
         self._notify()
 
-    def end_edit(self, attr_name: str) -> None:
-        from ovui_data_adapters.openusd.commands import (
-            _TargetedVisibilitySnapshot,
-        )
+    def set_component_value(self, attr_name: str, index: int, value: Any) -> None:
+        """Set channel ``index`` of a vector attribute on each selected prim.
 
+        Each prim keeps its own values in the other channels: the new
+        value of a prim is its current value with only this channel
+        replaced.
+        """
+        prop = self._props[attr_name]
+        if prop.value_type not in _VECTOR_VALUE_TYPES:
+            raise ValueError(
+                f"set_component_value: {attr_name!r} is not a vector attribute"
+            )
+        attrs = self._selected_attributes(attr_name)
+        new_values: List[Any] = []
+        for attr in attrs:
+            if attr is None:
+                new_values.append(None)
+                continue
+            components = list(_to_python(attr.Get(), prop.value_type))
+            components[index] = value
+            new_values.append(tuple(components))
+        self._author_each(attr_name, prop, attrs, new_values)
+
+    def set_matrix_part_value(
+        self, attr_name: str, part: str, index: int, value: float
+    ) -> None:
+        """Set channel ``index`` of the Translate, Rotate or Scale part of a
+        4x4 transform matrix on each selected prim.
+
+        Each prim keeps its own matrix in the other parts and channels. In
+        an edit, the new matrix of a prim comes from its matrix at the start
+        of the edit: the angles of a matrix can change their form after a
+        write (Y above 90 degrees), so the last written matrix is not used.
+        When the matrix of one prim cannot give the part,
+        ``MatrixPartError`` is raised before any prim is written.
+        """
+        prop = self._props[attr_name]
+        if prop.value_type != "matrix4d":
+            raise ValueError(
+                f"set_matrix_part_value: {attr_name!r} is not a 4x4 matrix attribute"
+            )
+        attrs = self._selected_attributes(attr_name)
+        token = self._edit_snapshots.get(attr_name)
+        start_values = (
+            token.start_values if isinstance(token, _PropertyEditToken) else None
+        )
+        new_values: List[Any] = []
+        for member, attr in enumerate(attrs):
+            if attr is None:
+                new_values.append(None)
+                continue
+            start = start_values[member] if start_values is not None else None
+            if start is None:
+                start = _to_python(attr.Get(), prop.value_type)
+            new_values.append(with_matrix_part(start, part, index, value))
+        self._author_each(attr_name, prop, attrs, new_values)
+
+    def _author_each(
+        self,
+        attr_name: str,
+        prop: UsdAttributeProp,
+        attrs: List[Any],
+        new_values: List[Any],
+    ) -> None:
+        """Author ``new_values[i]`` to ``attrs[i]``; ``None`` keeps a prim as it is."""
+        token = self._edit_snapshots.get(attr_name)
+        if isinstance(token, _PropertyEditToken):
+            # Marked BEFORE the attempt, as in :meth:`set_value`. A prim
+            # with no valid attribute keeps the value it had.
+            token.wrote = True
+            token.last_values = [
+                last if new is None else new
+                for new, last in zip(new_values, token.last_values)
+            ]
+        for attr, new_value in zip(attrs, new_values):
+            if attr is not None:
+                # The type of this attribute, not of the first selected
+                # prim: a half4 of one prim must not round the other
+                # channels of a float4 of another prim.
+                self._author_member(
+                    attr,
+                    _to_usd(new_value, prop.value_type, str(attr.GetTypeName())),
+                    token,
+                )
+        self._notify()
+
+    def _selected_attributes(self, attr_name: str) -> List[Any]:
+        """The attribute of each selected prim; ``None`` where not valid."""
+        attrs: List[Any] = []
+        for path in self._paths:
+            prim = self._stage.GetPrimAtPath(path)
+            attr = prim.GetAttribute(attr_name) if prim.IsValid() else None
+            attrs.append(attr if attr is not None and attr.IsValid() else None)
+        return attrs
+
+    def _author_member(self, attr: Any, usd_val: Any, token: Any) -> None:
+        """Author one prim's value; inside an edit, on the frozen target."""
+        if not isinstance(token, _PropertyEditToken):
+            attr.Set(usd_val)
+            return
+        # Author EVERY member against the FROZEN edit target. A genuine
+        # synchronous notice callback fired by one member's Set() may
+        # change the stage target before the next member, so the frozen
+        # target is re-asserted PER MEMBER — one transaction can never
+        # split across layers. A foreign mid-write target change is
+        # preserved: the previous target is restored only when the
+        # current one is still ours.
+        previous_target = self._stage.GetEditTarget()
+        self._stage.SetEditTarget(token.edit_target)
+        try:
+            with token.watch.own_change():
+                attr.Set(usd_val)
+        finally:
+            if self._stage.GetEditTarget() == token.edit_target:
+                self._stage.SetEditTarget(previous_target)
+
+    def end_edit(self, attr_name: str) -> None:
         token = self._edit_snapshots.pop(attr_name, None)
         if not isinstance(token, _PropertyEditToken):
             # Unmatched end: inert by contract — it owns nothing and may
             # not close a foreign group or touch any state.
             return
         _release_spec_claims(token)
+        try:
+            self._finish_edit(token, attr_name)
+        finally:
+            token.watch.close()
+
+    def _finish_edit(self, token: _PropertyEditToken, attr_name: str) -> None:
+        from ovui_data_adapters.openusd.commands import (
+            _TargetedVisibilitySnapshot,
+        )
+
         if not token.wrote:
             # This invocation authored nothing: whatever changed (foreign
             # concurrent edits, a deletion, nothing at all) is not this
@@ -1006,6 +1188,15 @@ class UsdPropertyAdapter(PropertyAdapter):
             # history for a foreign change.
             return
         try:
+            if all(
+                start == last
+                for start, last in zip(token.start_values, token.last_values)
+            ):
+                # The edit wrote back the start value of every object
+                # (Escape after typing): remove it, record no undo step,
+                # and show a layer that was clean as clean again.
+                self._restore_start(token)
+                return
             # "Changed" is decided from the FROZEN TARGET's truth, not the
             # resolved value: an edit shadowed by a stronger layer still
             # authored real state and must stay undoable, while a
@@ -1037,6 +1228,34 @@ class UsdPropertyAdapter(PropertyAdapter):
                     )
             raise
 
+    def _restore_start(self, token: _PropertyEditToken) -> None:
+        """Put back the exact specs from before the edit, with no undo step.
+
+        A layer that had no unsaved change when the edit began then has that
+        content again, so the application shows it as not modified (Save All
+        off, no modified dot). This needs no read of the file and no reload,
+        which would rebuild the whole stage. The layer stays modified when it
+        was modified before the edit (the edit cannot know if that earlier
+        change is saved), when anything else changed it during the edit, also
+        a listener that wrote while the edit wrote, and when the prim specs of
+        the edited prims differ from their state before the edit.
+        """
+        from ovui_data_adapters.openusd._layer_modified_state import (
+            mark_clean_again,
+        )
+
+        with token.watch.own_change():
+            token.pre.replay(token.layer)
+        if (
+            token.layer_was_clean
+            and not token.watch.changed_by_others
+            and token.pre.matches(token.layer)
+            and _prim_specs_state(
+                token.layer, token.own_prims, token.attr_name
+            ) == token.own_prims_before
+        ):
+            mark_clean_again(token.layer)
+
     def cancel_edit(self, attr_name: str) -> None:
         """Cancel an active edit transaction, restoring its exact baseline.
 
@@ -1050,15 +1269,18 @@ class UsdPropertyAdapter(PropertyAdapter):
         if not isinstance(token, _PropertyEditToken):
             return
         _release_spec_claims(token)
-        if token.wrote and all(
-            self._stage.GetPrimAtPath(path).IsValid()
-            for path in token.paths
-        ):
-            # Restore the exact pre-edit specs. Skipped when a target
-            # prim was genuinely deleted out-of-band: replaying would
-            # RESURRECT spec shells for a prim the foreign mutation
-            # removed.
-            token.pre.replay(token.layer)
+        try:
+            if token.wrote and all(
+                self._stage.GetPrimAtPath(path).IsValid()
+                for path in token.paths
+            ):
+                # Restore the exact pre-edit specs. Skipped when a target
+                # prim was genuinely deleted out-of-band: replaying would
+                # RESURRECT spec shells for a prim the foreign mutation
+                # removed.
+                self._restore_start(token)
+        finally:
+            token.watch.close()
 
     def _settle_active_edits(self) -> None:
         """Finalize or cancel every active edit transaction NOW.
@@ -1121,13 +1343,18 @@ class UsdPropertyAdapter(PropertyAdapter):
         prop = self._props.get(attr_name)
         if prop is None or prop.value_type in ("relationship", "array"):
             return
-        for path in self._paths:
-            prim = self._stage.GetPrimAtPath(path)
-            if not prim.IsValid():
-                continue
-            attr = prim.GetAttribute(attr_name)
-            if attr.IsValid():
-                attr.Clear()
+        self.begin_edit(attr_name)
+        self._edit_snapshots[attr_name].wrote = True
+        try:
+            for path in self._paths:
+                prim = self._stage.GetPrimAtPath(path)
+                if not prim.IsValid():
+                    continue
+                attr = prim.GetAttribute(attr_name)
+                if attr.IsValid():
+                    attr.Clear()
+        finally:
+            self.end_edit(attr_name)
         self._notify()
 
     def get_resolved_asset_path(self, attr_name: str) -> Optional[str]:

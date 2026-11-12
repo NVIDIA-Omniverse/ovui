@@ -393,10 +393,11 @@ float Stack::_evaluateConsecutiveLayout(float length, bool isWidthEvaluation)
     // TODO: We will get rid of dpiScale soon
     float dpiScale = this->getDpiScale();
 
-    // Skip invisible children.
-    auto& children = _getData<StackData>().m_children;
+    // Snapshot children: computing a child's size can reentrantly rebuild the UI and mutate m_children, so
+    // iterating the live vector by reference risks a use-after-free on reallocation.
+    std::vector<std::shared_ptr<Widget>> children = _getData<StackData>().m_children;
     size_t visibleChildrenNumber = std::count_if(
-        children.begin(), children.end(), [](const std::shared_ptr<Widget>& w) { return w->isVisible(); });
+        children.begin(), children.end(), [](const std::shared_ptr<Widget>& w) { return w && w->isVisible(); });
 
     // Compute the scale of one unit for column length.
     float totalSpacing = visibleChildrenNumber == 0 ? 0.0f : (visibleChildrenNumber - 1) * this->getSpacing() * dpiScale;
@@ -506,6 +507,10 @@ float Stack::_evaluateSimultaneousLayout(float length, bool isWidthEvaluation)
 
     float maxLength = length;
 
+    // Snapshot children: computing a child's size can reentrantly rebuild the UI and mutate m_children, so
+    // iterating the live vector by reference risks a use-after-free on reallocation.
+    std::vector<std::shared_ptr<Widget>> children = _getData<StackData>().m_children;
+
     // If one of the widgets expands the boundaries of the stack, we need to readjust other children that depend on
     // the parent size. So it's a two-step algorithm. In the first step, we set the geometry, and if one of the
     // children expands provided size, we do the second iteration and provide other children the new size. This
@@ -513,7 +518,7 @@ float Stack::_evaluateSimultaneousLayout(float length, bool isWidthEvaluation)
     // to get the minimal size from the widget, which increases the complexity of the code.
     for (int32_t i = 0; i < 2; ++i)
     {
-        for (auto& child : _getData<StackData>().m_children)
+        for (auto& child : children)
         {
             if (!child || !child->isVisible())
             {
@@ -553,7 +558,7 @@ float Stack::_evaluateSimultaneousLayout(float length, bool isWidthEvaluation)
             maxLength = std::max(maxLength, computedLength);
         }
 
-        if (_getChildren().size() == 1 || maxLength == length)
+        if (children.size() == 1 || maxLength == length)
         {
             // The widget was not expanded by one of the children. We don't need to do the second pass and readjust
             // other children.
@@ -580,7 +585,7 @@ void Stack::_forceChildDirty(std::shared_ptr<Widget>& child, bool width) const
     }
     else if (dirtyReason == SizeDirtyReason::eChildDirty)
     {
-        if (childSize.unit == UnitType::eFraction)
+        if (childSize.unit == UnitType::ePercent || childSize.unit == UnitType::eFraction)
         {
             dirty = true;
         }

@@ -31,6 +31,7 @@ visible during QA without pre-empting the real gizmo work.
 from __future__ import annotations
 
 import math
+import weakref
 from typing import Any, List, Optional, Tuple
 
 from omni.ui_scene import scene as sc
@@ -447,6 +448,11 @@ class TransformManipulator(sc.Manipulator):
         # first build or when the active tool is not scale.
         self._scale_handles: Any = None
         super().__init__(**kwargs)
+        # The pivot is written into the gizmo while the gesture's callback runs, so that the gizmo follows the pointer in
+        # the call that reported the movement.
+        add_live_listener = getattr(model, "add_live_listener", None)
+        if callable(add_live_listener):
+            add_live_listener(weakref.WeakMethod(self.refresh_transform))
 
     # -- public API --------------------------------------------------------
 

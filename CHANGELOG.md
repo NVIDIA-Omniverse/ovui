@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.1
+
+- ovui works with the newest and the previous renderer and stage libraries.
+- If the renderer and stage libraries do not match, the app tells you to
+  install a matched pair.
+- Viewport navigation is smoother.
+- One wheel for each platform works with all supported Python versions.
+- `ui.Image` and the Markdown widget show SVG files.
+- You can select a light when you click its gizmo in the viewport.
+- Save, Save As and Exit keep your edits and layers.
+- Memory grows less when the app is idle or when you open the same file again.
+- The app no longer crashes sometimes when it opens a large scene with the
+  ovstage data source.
+
+- `import omni.ui` no longer imports the Kit modules `carb` and `omni.kit.app`
+  when they are installed. A host such as Kit gives its mouse-button and
+  modifier constants, logging and settings store to the new
+  `omni.ui_scene.gesture_bindings.set_host()`. `ui.RpResource` and
+  `ui.TextureFormat` are unchanged.
+- `omni.ui.get_frame_pacing_status()` has the new key `renderer_version`.
+  **Announced for removal:** the old key `ovrtx_version`. It still holds the
+  same value in this release.
+
 ## 0.3.0
 
 - Publish the framework, widgets, adapters, and packaged agent skills as the

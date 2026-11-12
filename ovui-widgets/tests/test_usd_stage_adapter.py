@@ -1,35 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for UsdStageAdapter — hierarchy traversal (Step 22).
-
-All tests skip gracefully when pxr (OpenUSD) is not available.
-"""
+"""Tests for UsdStageAdapter — hierarchy traversal (Step 22)."""
 
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-try:
-    from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux
-    try:
-        from pxr import UsdShade
-        HAS_USD_SHADE = True
-    except ImportError:
-        HAS_USD_SHADE = False
-    try:
-        from pxr import UsdRender
-        HAS_USD_RENDER = True
-    except ImportError:
-        HAS_USD_RENDER = False
-    HAS_USD = True
-except ImportError:
-    HAS_USD = False
-    HAS_USD_RENDER = False
-    HAS_USD_SHADE = False
-
-pytestmark = pytest.mark.skipif(not HAS_USD, reason="pxr (OpenUSD) not available")
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdRender, UsdShade
 
 from ovui_data_adapters.common import (
     BadgeFlags,
@@ -635,8 +614,6 @@ class TestViewportSelectors:
         )
 
     def test_list_render_products_returns_product_choices(self):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.Scope.Define(stage, "/Render")
         UsdRender.Product.Define(stage, "/Render/Beauty")
@@ -652,8 +629,6 @@ class TestViewportSelectors:
         ]
 
     def test_render_target_catalog_empty_when_no_render_products(self, empty_stage):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
 
         catalog = UsdStageAdapter(empty_stage).get_render_target_catalog()
 
@@ -661,8 +636,6 @@ class TestViewportSelectors:
         assert catalog.is_empty
 
     def test_render_target_catalog_camera_backed_image_product(self):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.Camera.Define(stage, "/World/MainCamera")
         self._render_var(stage, "/Render/Vars/LdrColor", "LdrColor")
@@ -697,8 +670,6 @@ class TestViewportSelectors:
         assert descriptor.warnings == ()
 
     def test_render_target_catalog_sensor_backed_point_cloud_product(self):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         stage = Usd.Stage.CreateInMemory()
         stage.DefinePrim("/World/Lidar", "OmniLidar")
         self._render_var(stage, "/Render/Vars/PointCloud", "PointCloud")
@@ -727,8 +698,6 @@ class TestViewportSelectors:
         assert self._warning_codes(descriptor) == {"unsupported_output"}
 
     def test_multiple_render_targets_sample_catalog(self):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         sample_path = Path(__file__).parent / "data" / "multiple_render_targets.usda"
         stage = Usd.Stage.Open(str(sample_path))
         assert stage is not None
@@ -755,8 +724,6 @@ class TestViewportSelectors:
         assert "unsupported_output" in self._warning_codes(lidar)
 
     def test_render_target_catalog_missing_source_keeps_descriptor_with_warning(self):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         stage = Usd.Stage.CreateInMemory()
         self._render_var(stage, "/Render/Vars/LdrColor", "LdrColor")
         self._render_product(
@@ -779,8 +746,6 @@ class TestViewportSelectors:
         assert "missing_source" in self._warning_codes(descriptor)
 
     def test_render_target_catalog_invalid_source_path_is_disabled(self):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         stage = Usd.Stage.CreateInMemory()
         self._render_var(stage, "/Render/Vars/LdrColor", "LdrColor")
         self._render_product(
@@ -801,8 +766,6 @@ class TestViewportSelectors:
         assert "missing_source" in self._warning_codes(descriptor)
 
     def test_render_target_catalog_missing_resolution_warns_without_crashing(self):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.Camera.Define(stage, "/World/MainCamera")
         self._render_var(stage, "/Render/Vars/LdrColor", "LdrColor")
@@ -822,8 +785,6 @@ class TestViewportSelectors:
         assert "missing_resolution" in self._warning_codes(descriptor)
 
     def test_render_target_catalog_unknown_output_is_disabled(self):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.Camera.Define(stage, "/World/MainCamera")
         self._render_var(stage, "/Render/Vars/WeirdBuffer", "WeirdBuffer")
@@ -1378,8 +1339,6 @@ class TestCoreMaterialBinding:
         return stage.GetPrimAtPath(prim_path).GetRelationship("material:binding").GetTargets()
 
     def test_bind_material_success_authors_relationship_with_strength(self):
-        if not HAS_USD_SHADE:
-            pytest.skip("UsdShade is unavailable in this OpenUSD build")
         stage, adapter, material_path = self._stage_with_material_and_prims()
 
         result = adapter.bind_material(
@@ -1477,8 +1436,6 @@ class TestCoreMaterialBinding:
         assert self._binding_targets(stage, "/World/Sphere") == []
 
     def test_bind_material_default_strength_is_weaker_than_descendants(self):
-        if not HAS_USD_SHADE:
-            pytest.skip("UsdShade is unavailable in this OpenUSD build")
         stage, adapter, material_path = self._stage_with_material_and_prims()
 
         result = adapter.bind_material(
@@ -1495,8 +1452,6 @@ class TestCoreMaterialBinding:
         )
 
     def test_create_and_bind_material_success_creates_material_and_binds_selection(self):
-        if not HAS_USD_SHADE:
-            pytest.skip("UsdShade is unavailable in this OpenUSD build")
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.Xform.Define(stage, "/World")
         UsdGeom.Cube.Define(stage, "/World/Cube")
@@ -1995,8 +1950,6 @@ class TestCreateActionCatalog:
         assert tuple(translate) == pytest.approx((0.0, -150.0, 0.0))
 
     def test_create_prim_render_product_targets_selected_lidar_with_point_cloud_output(self, empty_stage):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         adapter = UsdStageAdapter(empty_stage)
         lidar_result = adapter.create_prim(CreateRequest("create.sensor.generic-lidar"))
         assert lidar_result.accepted
@@ -2043,8 +1996,6 @@ class TestCreateActionCatalog:
         assert lidar_target.output_kind is RenderTargetOutputKind.POINT_CLOUD
 
     def test_create_prim_render_product_targets_selected_lidar_parent(self, empty_stage):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         adapter = UsdStageAdapter(empty_stage)
         assert adapter.create_prim(CreateRequest("create.sensor.generic-lidar")).accepted
 
@@ -2057,8 +2008,6 @@ class TestCreateActionCatalog:
         assert product.GetCameraRel().GetTargets() == [Sdf.Path("/World/Lidar/Sensor")]
 
     def test_create_prim_render_product_targets_selected_camera_with_ldr_output(self, empty_stage):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         UsdGeom.Camera.Define(empty_stage, "/World/MainCamera")
 
         result = UsdStageAdapter(empty_stage).create_prim(
@@ -2091,8 +2040,6 @@ class TestCreateActionCatalog:
         assert empty_stage.GetRootLayer().ExportToString() == before
 
     def test_create_prim_render_product_backend_failure_rolls_back(self, empty_stage, monkeypatch):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         adapter = UsdStageAdapter(empty_stage)
         before = empty_stage.GetRootLayer().ExportToString()
 
@@ -2108,8 +2055,6 @@ class TestCreateActionCatalog:
         assert empty_stage.GetRootLayer().ExportToString() == before
 
     def test_create_render_var_authors_useful_aov_default(self, empty_stage):
-        if not HAS_USD_RENDER:
-            pytest.skip("UsdRender is unavailable in this OpenUSD build")
         adapter = UsdStageAdapter(empty_stage)
 
         result = adapter.create_prim(CreateRequest("create.render_var"))
@@ -2234,8 +2179,6 @@ class TestCreateActionCatalog:
     ):
         from ovui_widgets.common.undo import UndoManager
 
-        if not (HAS_USD_RENDER and HAS_USD_SHADE):
-            pytest.skip("UsdRender or UsdShade not available")
         layer = simple_stage.GetRootLayer()
         undo = UndoManager()
         adapter = UsdStageAdapter(simple_stage, undo_manager=undo)
@@ -2248,6 +2191,29 @@ class TestCreateActionCatalog:
 
         assert result.accepted
         assert undo.undo()
+        assert layer.ExportToString() == before
+        assert undo.redo()
+        assert layer.ExportToString() == after
+
+    @pytest.mark.parametrize("method", ["create_material", "create_and_bind_material"])
+    def test_create_material_is_one_undo_step(self, simple_stage, method):
+        from ovui_widgets.common.undo import UndoManager
+
+        layer = simple_stage.GetRootLayer()
+        undo = UndoManager()
+        adapter = UsdStageAdapter(simple_stage, undo_manager=undo)
+        before = layer.ExportToString()
+
+        result = getattr(adapter, method)(CreateMaterialRequest(
+            "core_material.usd_preview_surface",
+            selection_paths=("/World/Cube",),
+        ))
+        after = layer.ExportToString()
+
+        assert result.accepted
+        assert len(undo._undo_stack) == 1
+        assert undo.undo()
+        assert not simple_stage.GetPrimAtPath(result.created_material_path)
         assert layer.ExportToString() == before
         assert undo.redo()
         assert layer.ExportToString() == after
@@ -2269,8 +2235,6 @@ class TestCreateActionCatalog:
     def test_create_prim_undo_keeps_later_edit_to_an_existing_child(self):
         from ovui_widgets.common.undo import UndoManager
 
-        if not HAS_USD_SHADE:
-            pytest.skip("UsdShade not available")
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.Xform.Define(stage, "/World")
         group = UsdGeom.Xform.Define(stage, "/World/Group").GetPrim()

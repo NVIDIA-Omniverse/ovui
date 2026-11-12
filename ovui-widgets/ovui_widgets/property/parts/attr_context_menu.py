@@ -126,9 +126,11 @@ def copy_value(
     the same namespace — a fresh Copy wins over stale data so
     "copy A → copy B → paste" pastes B's value.
 
-    Ambiguous attributes (``adapter.is_ambiguous`` True →
-    ``adapter.get_value`` returns ``None``) store as ``{"type_name":
-    ..., "value": None}``; :func:`can_paste` treats a ``None`` value
+    Ambiguous attributes (``adapter.is_ambiguous`` True) store as
+    ``{"type_name": ..., "value": None}``, also when ``get_value``
+    gives the vector of the first object (the ovstage adapter does
+    this for a vector, so that a vector row can show the channels
+    that are equal); :func:`can_paste` treats a ``None`` value
     as "don't paste" so a subsequent Paste into a concrete selection
     doesn't clobber the target with "mixed". Mirrors the group-level
     Copy semantics in :mod:`ovui_widgets.property.parts.group_context_menu`.
@@ -139,7 +141,9 @@ def copy_value(
     meta = adapter.get_attribute_metadata(attr_name)
     record = {
         "type_name": meta.type_name,
-        "value": adapter.get_value(attr_name),
+        "value": None
+        if adapter.is_ambiguous(attr_name)
+        else adapter.get_value(attr_name),
     }
     _CLIPBOARD[clipboard_id] = record
     return record

@@ -191,8 +191,11 @@ class TestKeyboardShortcuts:
 
     def test_f2_calls_begin_rename_selected(self, app):
         mock_stage_win = MagicMock()
+        # No field edits: F2 is the rename shortcut.
+        mock_stage_win.is_filter_editing.return_value = False
         app._stage_window = mock_stage_win
-        app._on_key_pressed(self._KEY_F2, 0, True)
+        with patch("ovui_widgets.app.application._is_text_input_active", return_value=False):
+            app._on_key_pressed(self._KEY_F2, 0, True)
         mock_stage_win.begin_rename_selected.assert_called_once()
 
     def test_f2_without_stage_window_no_crash(self, app):
@@ -262,7 +265,6 @@ class TestNoAdapterSafety:
 
 class TestOpenStageWiring:
     def test_open_stage_sets_stage_adapter(self, app):
-        pytest.importorskip("pxr", reason="pxr not available")
         mock_stage = MagicMock()
         with patch("ovui_data_adapters.openusd.stage_adapter.UsdStageAdapter", autospec=True), \
              patch("ovui_data_adapters.openusd.property_adapter.UsdPropertyAdapter", autospec=True):
@@ -270,7 +272,6 @@ class TestOpenStageWiring:
             assert app._stage_adapter is not None
 
     def test_open_stage_no_crash_without_windows(self, app):
-        pytest.importorskip("pxr", reason="pxr not available")
         app._stage_window = None
         app._property_window = None
         mock_stage = MagicMock()
@@ -279,7 +280,6 @@ class TestOpenStageWiring:
             app.open_stage(mock_stage)  # must not raise
 
     def test_open_stage_twice_no_crash(self, app):
-        pytest.importorskip("pxr", reason="pxr not available")
         mock_stage = MagicMock()
         with patch("ovui_data_adapters.openusd.stage_adapter.UsdStageAdapter", autospec=True), \
              patch("ovui_data_adapters.openusd.property_adapter.UsdPropertyAdapter", autospec=True):

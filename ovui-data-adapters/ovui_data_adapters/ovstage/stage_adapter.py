@@ -81,6 +81,8 @@ from ovui_data_adapters.ovstage._native import read_token_attribute
 from ovui_data_adapters.ovstage._native import resolve_query_names
 from ovui_data_adapters.ovstage._native import resolve_token_id
 from ovui_data_adapters.ovstage._scene import _kit_type_records
+from ovui_data_adapters.ovstage._scene import kit_stage_has_attribute_value
+from ovui_data_adapters.ovstage._scene import value_edit_paths
 from ovui_data_adapters.ovstage._structural import (
     NativeCreatePrimsCommand,
     NativeMovePrimsCommand,
@@ -100,6 +102,8 @@ _VISIBILITY_INHERITED = "inherited"
 _VISIBILITY_INVISIBLE = "invisible"
 _VISIBILITY_TOKENS = frozenset({_VISIBILITY_INHERITED, _VISIBILITY_INVISIBLE})
 _PURPOSE_ATTR = "purpose"
+# The columns that the cached visibility and purpose tokens come from.
+_TOKEN_ATTRIBUTE_NAMES = frozenset({_VISIBILITY_ATTR, _WORLD_VISIBILITY_ATTR, _PURPOSE_ATTR})
 _PURPOSE_DEFAULTS = frozenset({"default", "geometry"})
 _DLPACK_FLOAT = 2
 _BOUND_CAMERA_FOV_DEGREES = 45.0
@@ -796,7 +800,7 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         }
         self._stage_up_axis: str | None = None
         self._spatial_token_ordinal: int | None = None
-        self._raw_visibility_by_path: dict[str, str] = {}
+        self._raw_visibility_by_path: dict[str, tuple[str, bool]] = {}
         self._raw_purpose_by_path: dict[str, str] = {}
         self._suppressed = 0
         self._visibility_group_depth = 0
@@ -902,12 +906,19 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         path = record.path
         stage = self._require_stage()
 
+        # The prim's own 'invisible' comes first, as in the OpenUSD adapter:
+        # the Stage eye shows it also under a hidden ancestor, so a click can
+        # show the prim again. A value from the effective '_worldVisibility'
+        # cannot tell an own hide from an inherited one; the ancestors decide.
+        value, own = self._read_visibility_value(path)
+        if own and value == _VISIBILITY_INVISIBLE:
+            return VisibilityState.INVISIBLE
         parent = self._parent_path(stage, path)
         while parent not in ("", _ROOT_PATH):
             if self._read_raw_visibility(parent) == _VISIBILITY_INVISIBLE:
                 return VisibilityState.INHERITED_INVISIBLE
             parent = self._parent_path(stage, parent)
-        if self._read_raw_visibility(path) == _VISIBILITY_INVISIBLE:
+        if value == _VISIBILITY_INVISIBLE:
             return VisibilityState.INVISIBLE
         return VisibilityState.VISIBLE
 
@@ -1892,10 +1903,16 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
             current_ordinal is not None
             and not stream.has_pending_suppressed_range
             and stream.last_ordinal >= int(current_ordinal)
+            and stream.discarded_through_ordinal < int(current_ordinal)
         ):
             # A direct TransformAdapter write already published the committed
             # native ordinal. Manipulator callers may still invoke this
             # compatibility hook; do not emit the same change twice.
+            #
+            # A scheduled poll may instead have dropped the current ordinal
+            # with the suppressed live-preview writes. The final commit then
+            # writes the same matrix and adds no ordinal, so nothing has
+            # published the move: fall through and publish it.
             return
         events = stream.poll(source=source, deliver_suppressed=True)
         if not events:
@@ -2648,10 +2665,13 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         return tuple(result)
 
     def _read_raw_visibility(self, path: str) -> str:
+        return self._read_visibility_value(path)[0]
+
+    def _read_visibility_value(self, path: str) -> tuple[str, bool]:
         self._ensure_spatial_token_cache_current()
         value = self._raw_visibility_by_path.get(path)
         if value is None:
-            value = _read_raw_visibility(self._require_stage(), path)
+            value = _read_visibility_value(self._require_stage(), path)
             self._raw_visibility_by_path[path] = value
         return value
 
@@ -2664,12 +2684,35 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
         return value
 
     def _ensure_spatial_token_cache_current(self) -> None:
-        ordinal = int(self._require_stage().current_ordinal)
-        if self._spatial_token_ordinal == ordinal:
+        stage = self._require_stage()
+        ordinal = int(stage.current_ordinal)
+        cached_ordinal = self._spatial_token_ordinal
+        if cached_ordinal == ordinal:
             return
         self._spatial_token_ordinal = ordinal
-        self._raw_visibility_by_path.clear()
-        self._raw_purpose_by_path.clear()
+        edited = (
+            None
+            if cached_ordinal is None
+            else value_edit_paths(stage, cached_ordinal, ordinal, _TOKEN_ATTRIBUTE_NAMES)
+        )
+        if edited is None:
+            self._raw_visibility_by_path.clear()
+            self._raw_purpose_by_path.clear()
+            return
+        # Only value writes ran since the last read, and these prims got a new
+        # visibility or purpose. Their descendants can inherit it: read them too,
+        # but keep a descendant's own visibility value, which these writes did not
+        # change, so a hide does not read every prim under the hidden one again.
+        visibility = self._raw_visibility_by_path
+        for path in [
+            path for path in visibility
+            if _is_at_or_under(path, edited)
+            and (path in edited or not visibility[path][1])
+        ]:
+            del visibility[path]
+        purpose = self._raw_purpose_by_path
+        for path in [path for path in purpose if _is_at_or_under(path, edited)]:
+            del purpose[path]
 
     def _read_world_matrix(self, path: str) -> tuple[float, ...] | None:
         scene = self._scene
@@ -2704,6 +2747,14 @@ class OvstageStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapt
             for path in snapshot.paths_of_type(*type_names)
             if not self._is_secondary_viewport_path(path)
         ]
+
+
+def _is_at_or_under(path: str, roots: frozenset[str]) -> bool:
+    while path:
+        if path in roots:
+            return True
+        path = path.rpartition("/")[0]
+    return False
 
 
 def _is_imageable(record: _OvstageStageItem) -> bool:
@@ -2750,13 +2801,28 @@ def _catalog_revision(snapshot: Any) -> str:
 
 
 def _read_raw_visibility(stage: Any, path: str) -> str:
+    return _read_visibility_value(stage, path)[0]
+
+
+def _read_visibility_value(stage: Any, path: str) -> tuple[str, bool]:
+    """Return the visibility token of ``path`` and whether it is the prim's own value.
+
+    The second value is False when the stage has no 'visibility' value for
+    the prim and the token comes from the effective '_worldVisibility' of a
+    Kit population, which is invisible also for a prim that a hidden
+    ancestor hides.
+    """
     try:
-        if (
+        bridge = (
             getattr(stage, "_ovui_read_attribute_source", None)
             == "native Kit read_attributes"
-        ):
-            # The compatibility read_attribute rebuilds a whole-scene cache.
-            # An eye icon only needs visibility columns for this exact path.
+        )
+        whole_scene = getattr(stage, "_ovui_kit_stage_bridge_cache", None)
+        ordinal = int(stage.current_ordinal)
+        if bridge and whole_scene is not None and whole_scene.ordinal != ordinal:
+            # After an edit, the compatibility read_attribute rebuilds the
+            # whole-scene cache. An eye icon only needs this exact path.
+            # On open, camera framing builds that cache for this ordinal.
             records = read_path_attribute_records(
                 stage, path, (_VISIBILITY_ATTR, _WORLD_VISIBILITY_ATTR),
             )
@@ -2765,30 +2831,32 @@ def _read_raw_visibility(stage: Any, path: str) -> str:
                 token = record.value
                 if isinstance(token, int):
                     token = resolve_token_id(stage, token)
-                return token if token in _VISIBILITY_TOKENS else _VISIBILITY_INHERITED
+                return (
+                    token if token in _VISIBILITY_TOKENS else _VISIBILITY_INHERITED,
+                    True,
+                )
             world = records.get(_WORLD_VISIBILITY_ATTR)
             return (
                 _VISIBILITY_INVISIBLE
                 if world is not None and world.value == 0
-                else _VISIBILITY_INHERITED
+                else _VISIBILITY_INHERITED,
+                False,
             )
-        raw_value = bytes(
-            stage.read_attribute(
-                int(stage.current_ordinal),
-                [str(path)],
-                _VISIBILITY_ATTR,
-            )
-        )
+        raw_value = bytes(stage.read_attribute(ordinal, [str(path)], _VISIBILITY_ATTR))
+        own = not bridge or kit_stage_has_attribute_value(stage, path, _VISIBILITY_ATTR)
     except Exception:
-        return _VISIBILITY_INHERITED
+        return _VISIBILITY_INHERITED, False
     token = _decode_visibility_token(stage, raw_value)
-    return token if token in _VISIBILITY_TOKENS else _VISIBILITY_INHERITED
+    return (token if token in _VISIBILITY_TOKENS else _VISIBILITY_INHERITED), own
 
 
 def _read_raw_purpose(stage: Any, path: str) -> str:
+    whole_scene = getattr(stage, "_ovui_kit_stage_bridge_cache", None)
     if (
         getattr(stage, "_ovui_read_attribute_source", None)
         == "native Kit read_attributes"
+        and whole_scene is not None
+        and whole_scene.ordinal != int(stage.current_ordinal)
     ):
         try:
             records = read_path_attribute_records(stage, path, (_PURPOSE_ATTR,))

@@ -57,11 +57,12 @@ _run_default_migration_once()
 
 
 class MarkdownAssetResolver:
-    """Resolve Markdown image sources to local raster files.
+    """Resolve Markdown image sources to local image files.
 
-    The native widget decodes local raster files and data URIs. This helper
-    covers the application-level cases: document-relative paths, provider-backed
-    HTTP/S cache, and optional SVG rasterization when cairosvg is installed.
+    The native widget decodes local raster files, local SVG files and data URIs.
+    It draws an SVG file with the same SVG painter as ``ui.Image`` and
+    ``ui.ImageWithProvider``. This helper covers the application-level cases:
+    document-relative paths and a provider-backed HTTP/S cache.
     """
 
     def __init__(self, markdown_path: Path, cache_dir: Path | None = None):
@@ -76,14 +77,14 @@ class MarkdownAssetResolver:
         if src.startswith(("http://", "https://")):
             return self._cache_http(src)
         if src.startswith("file:"):
-            return self._resolve_svg(Path(src[5:])) if src.lower().endswith(".svg") else ""
+            return ""
 
         path = Path(src)
         if not path.is_absolute():
             path = (self.base_dir / path).resolve()
         if not path.exists():
             return ""
-        return self._resolve_svg(path) if path.suffix.lower() == ".svg" else str(path)
+        return str(path)
 
     def _cache_http(self, url: str) -> str:
         parsed = urllib.parse.urlparse(url)
@@ -98,20 +99,5 @@ class MarkdownAssetResolver:
                     target.write_bytes(response.read())
             except Exception as exc:
                 print(f"image cache miss: {url}: {exc}")
-                return ""
-        return self._resolve_svg(target) if target.suffix.lower() == ".svg" else str(target)
-
-    def _resolve_svg(self, path: Path) -> str:
-        try:
-            import cairosvg  # type: ignore
-        except Exception:
-            return ""
-
-        target = self.cache_dir / f"{path.stem}-{hashlib.sha256(str(path).encode()).hexdigest()[:12]}.png"
-        if not target.exists() or target.stat().st_mtime < path.stat().st_mtime:
-            try:
-                cairosvg.svg2png(url=str(path), write_to=str(target), output_width=256)
-            except Exception as exc:
-                print(f"svg rasterization failed: {path}: {exc}")
                 return ""
         return str(target)

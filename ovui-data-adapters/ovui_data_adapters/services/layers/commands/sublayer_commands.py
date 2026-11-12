@@ -25,9 +25,9 @@ undo stack:
 
 - :class:`RemoveSublayerCommand` — remove the sublayer at a given
   slot. ``do_impl`` snapshots enough state to round-trip: the
-  identifier at the slot, its per-layer mute + lock bits, and — if
-  the removed layer was the edit target — the stack's edit target.
-  When the removed layer is the current edit target, ``do_impl``
+  identifier at the slot and its per-layer mute + lock bits. When
+  the current edit target leaves the layer stack with the removed
+  layer (it is that layer or a sublayer inside it), ``do_impl``
   first flips the edit target to root so the removal does not leave
   the adapter pointing at a detached layer. ``undo_impl`` reinserts
   the layer at the original position and restores mute + lock; the
@@ -65,9 +65,9 @@ LAYERS-WINDOW-ARCHITECTURE §13.3 / §13.4 for the full design contract.
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
-from ovui_data_adapters.common import LayerStackAdapter
+from ovui_data_adapters.common import LayerStackAdapter, SublayerEntry
 
 from ovui_data_adapters.services.layers.commands.base import AbstractLayerCommand
 from ovui_data_adapters.services.selection import SelectionBus
@@ -193,23 +193,29 @@ class RemoveSublayerCommand(AbstractLayerCommand):
 
     ``do_impl`` snapshots enough state for a round-trip:
 
-    - The identifier currently at the slot — stored so ``undo_impl``
-      can reinsert the same reference and so peer subscribers can
-      see a stable target in the emitted event stream.
+    - The identifier currently at the slot — stored so peer
+      subscribers can see a stable target in the emitted event stream.
+    - The sublayer entry at the slot (the path as the parent writes it,
+      and its time offset and scale) — stored so ``undo_impl`` can
+      reinsert the same entry, not only the same layer.
     - The removed layer's mute + lock bits — the USD-backed adapter
       may clear these on removal, so we restore them explicitly.
       The mock adapter persists the ``MockLayer`` record after
       removal, making the restore a harmless no-op there.
-    - An edit-target-was-here flag — if the removed layer was the
-      stack's edit target, ``do_impl`` flips the target to root
-      *before* the removal so the adapter never points at a
-      detached layer. The base class's
-      :meth:`~AbstractLayerCommand._restore_state` reverts the edit
-      target after ``undo_impl`` has already reinserted the layer
-      (so the re-target's ``find_layer`` + ``is_writable`` check
-      succeeds).
+    - An edit-target check — if the stack's edit target leaves the
+      layer stack with this remove (it is the removed layer or a
+      sublayer that no other unmuted parent brings into the
+      composition), ``do_impl`` flips the target to root *before* the
+      removal so the adapter never points at a detached layer. The
+      check runs on every ``do`` and redo, and each flip calls
+      ``on_edit_target_moved(previous_id, root_id)`` after the
+      removal, so the caller can tell the user on a redo too. The
+      base class's :meth:`~AbstractLayerCommand._restore_state`
+      reverts the edit target after ``undo_impl`` has already
+      reinserted the layer (so the re-target's ``find_layer`` +
+      ``is_writable`` check succeeds).
 
-    ``undo_impl`` reinserts by identifier at the original slot, then
+    ``undo_impl`` reinserts the stored entry at the original slot, then
     replays mute + lock bits; edit-target restoration happens in the
     base class's state-restore phase.
     """
@@ -221,14 +227,15 @@ class RemoveSublayerCommand(AbstractLayerCommand):
         parent_id: str,
         position: int,
         confirm_callback: Optional[Callable[[str], bool]] = None,
+        on_edit_target_moved: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         super().__init__(adapter, selection_bus)
         self._parent_id = parent_id
         self._position = position
         self._removed_identifier: Optional[str] = None
+        self._removed_entry: Optional[SublayerEntry] = None
         self._was_muted: bool = False
         self._was_locked: bool = False
-        self._was_edit_target: bool = False
         # LAYERS-PLAN Step 37 guard hook. ``confirm_callback(child_id)``
         # returns ``True`` to proceed, ``False`` to abort with
         # :class:`~ovui_widgets.common.undo.CommandCancelled`. Tests drive this
@@ -238,6 +245,11 @@ class RemoveSublayerCommand(AbstractLayerCommand):
         # the first ``do`` — a redo replays the captured state without
         # re-asking.
         self._confirm_callback = confirm_callback
+        # ``on_edit_target_moved(previous_id, root_id)`` runs after each
+        # ``do`` or redo that moved the edit target to root (see
+        # ``LayerModel._push_remove_command``, which shows a status
+        # message from it).
+        self._on_edit_target_moved = on_edit_target_moved
 
     def do_impl(self) -> None:
         parent_handle = self._adapter.find_layer(self._parent_id)
@@ -272,33 +284,101 @@ class RemoveSublayerCommand(AbstractLayerCommand):
         # command mutated the layer in between).
         if self._removed_identifier is None:
             self._removed_identifier = identifier
+            self._removed_entry = self._adapter.get_sublayer_entry(
+                self._parent_id, self._position
+            )
             removed_handle = self._adapter.find_layer(identifier)
             if removed_handle is not None:
                 self._was_muted = self._adapter.is_muted(removed_handle)
                 self._was_locked = self._adapter.is_locked(removed_handle)
-            self._was_edit_target = (
-                self._adapter.get_edit_target_identifier() == identifier
+
+        # If the edit target leaves the stack with this remove, move the
+        # target to root first so the adapter never points at a
+        # detached layer. USD can destroy a detached layer at once: the
+        # next edit then has no valid target, and its unsaved edits are
+        # gone from the stack. This also runs on redo, after an undo has
+        # made the old layer the edit target again.
+        moved_from = ""
+        if self._edit_target_leaves_stack(identifier):
+            moved_from = self._adapter.get_edit_target_identifier()
+            self._adapter.set_edit_target(
+                self._adapter.get_root_layer().identifier
             )
 
-        # If the layer we're about to remove is the edit target, move
-        # the target to root first so the adapter never points at a
-        # detached layer during the brief window inside ``remove_sublayer``.
-        if self._was_edit_target:
-            root_identifier = self._adapter.get_root_layer().identifier
-            if self._adapter.get_edit_target_identifier() != root_identifier:
-                self._adapter.set_edit_target(root_identifier)
-
         self._adapter.remove_sublayer(self._parent_id, self._position)
+
+        if moved_from and self._on_edit_target_moved is not None:
+            self._on_edit_target_moved(
+                moved_from, self._adapter.get_edit_target_identifier()
+            )
+
+    def _edit_target_leaves_stack(self, removed_identifier: str) -> bool:
+        """Return ``True`` when this remove takes the edit target out.
+
+        That is so when the edit target is the removed layer or a layer
+        below it, and no other parent still brings it into the
+        composition. USD allows the same layer under more than one
+        parent, but a muted parent does not bring its sublayers in.
+        """
+        edit_target = self._adapter.get_edit_target_identifier()
+        if edit_target not in self._sublayer_tree([removed_identifier]):
+            return False
+        starts = [self._adapter.get_root_layer().identifier]
+        session = self._adapter.get_session_layer()
+        if session is not None:
+            starts.append(session.identifier)
+        return edit_target not in self._sublayer_tree(
+            starts, after_remove=True
+        )
+
+    def _sublayer_tree(
+        self,
+        starts: List[str],
+        after_remove: bool = False,
+    ) -> Set[str]:
+        """Return ``starts`` and every layer below them.
+
+        With ``after_remove`` the result is the composed stack after the
+        remove: the walk ignores the slot that this command removes, and
+        each muted layer with its sublayers, because USD leaves a muted
+        layer out of the composition.
+        """
+        found: Set[str] = set()
+        pending = list(starts)
+        while pending:
+            identifier = pending.pop()
+            if identifier in found:
+                continue
+            handle = self._adapter.find_layer(identifier)
+            if (
+                after_remove
+                and handle is not None
+                and self._adapter.is_muted(handle)
+            ):
+                continue
+            found.add(identifier)
+            if handle is None:
+                continue
+            children = self._adapter.get_sublayer_identifiers(handle)
+            for index, child in enumerate(children):
+                if (
+                    after_remove
+                    and identifier == self._parent_id
+                    and index == self._position
+                ):
+                    continue
+                pending.append(child)
+        return found
 
     def undo_impl(self) -> None:
         if self._removed_identifier is None:
             return
-        # Reinsert at the original slot. ``insert_sublayer`` tolerates
-        # unknown identifiers by creating a missing-layer stub, but
-        # after ``do_impl`` the record still lives in the adapter so
-        # this lands the original layer back in place.
-        self._adapter.insert_sublayer(
-            self._parent_id, self._position, self._removed_identifier
+        # Reinsert the same entry at the original slot: the same path
+        # text and the same time offset and scale. After ``do_impl`` the
+        # record still lives in the adapter, so this lands the original
+        # layer back in place.
+        self._adapter.insert_sublayer_entry(
+            self._parent_id, self._position, self._removed_entry
         )
         # Replay mute + lock. The mock's setters no-op when the bit
         # already matches; the USD adapter may have cleared them on

@@ -4,7 +4,6 @@
 """Tests for Step 26 — Application.open_file() and stage bootstrap.
 
 Headless-only tests: no UI widgets created.
-All USD tests skip gracefully when pxr is not available.
 """
 
 from unittest.mock import patch
@@ -14,13 +13,7 @@ import pytest
 from ovui_widgets.app.application import Application
 from ovui_widgets.common.selection import SelectionBus
 
-try:
-    from pxr import Usd, UsdGeom
-    HAS_USD = True
-except ImportError:
-    HAS_USD = False
-
-usd_only = pytest.mark.skipif(not HAS_USD, reason="pxr (OpenUSD) not available")
+from pxr import Usd, UsdGeom
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +66,6 @@ def usda_file(tmp_path):
 # ---------------------------------------------------------------------------
 
 class TestHierarchyModelSetAdapter:
-    @usd_only
     def test_set_adapter_changes_adapter(self):
         from ovui_widgets.common.testing.mock_stage import MockStageAdapter
         from ovui_widgets.stage.hierarchy_model import HierarchyModel
@@ -83,7 +75,6 @@ class TestHierarchyModelSetAdapter:
         model.set_adapter(adapter2)
         assert model._adapter is adapter2
 
-    @usd_only
     def test_set_adapter_cancels_old_subscription(self):
         from ovui_widgets.common.testing.mock_stage import MockStageAdapter
         from ovui_widgets.stage.hierarchy_model import HierarchyModel
@@ -94,7 +85,6 @@ class TestHierarchyModelSetAdapter:
         model.set_adapter(adapter2)
         assert old_sub._cancelled
 
-    @usd_only
     def test_set_adapter_clears_path_cache(self):
         from ovui_widgets.common.testing.mock_stage import MockStageAdapter
         from ovui_widgets.stage.hierarchy_model import HierarchyModel
@@ -105,7 +95,6 @@ class TestHierarchyModelSetAdapter:
         model.set_adapter(adapter2)
         assert model._path_cache == {}
 
-    @usd_only
     def test_set_adapter_clears_selected_items(self):
         from ovui_widgets.common.testing.mock_stage import MockStageAdapter
         from ovui_widgets.stage.hierarchy_model import HierarchyItem, HierarchyModel
@@ -116,7 +105,6 @@ class TestHierarchyModelSetAdapter:
         model.set_adapter(adapter2)
         assert model._selected_items == []
 
-    @usd_only
     def test_set_adapter_subscribes_to_new_adapter(self):
         from ovui_widgets.common.testing.mock_stage import MockStageAdapter
         from ovui_widgets.stage.hierarchy_model import HierarchyModel
@@ -132,7 +120,6 @@ class TestHierarchyModelSetAdapter:
 # ---------------------------------------------------------------------------
 
 class TestStageWidgetSetAdapter:
-    @usd_only
     def test_set_adapter_updates_adapter(self):
         from ovui_widgets.common.testing.mock_stage import MockStageAdapter
         from ovui_widgets.stage.stage_widget import StageWidget
@@ -168,7 +155,6 @@ class TestStageWidgetSetAdapter:
 # Application.open_stage() — headless stage bootstrap
 # ---------------------------------------------------------------------------
 
-@usd_only
 class TestOpenStage:
     def test_open_stage_creates_adapter(self, app, simple_stage):
         app.open_stage(simple_stage)
@@ -222,7 +208,6 @@ class TestOpenStage:
 # Application.open_file() — file-based bootstrap
 # ---------------------------------------------------------------------------
 
-@usd_only
 class TestOpenFile:
     def test_open_file_valid_creates_adapter(self, app, usda_file):
         app.open_file(usda_file)
@@ -260,7 +245,6 @@ class TestOpenFile:
 # Application.shutdown() — subscription cleanup
 # ---------------------------------------------------------------------------
 
-@usd_only
 class TestShutdownCleanup:
     def test_shutdown_cancels_stage_subscription(self, simple_stage):
         app = Application()

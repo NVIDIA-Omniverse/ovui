@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <utility>
 
 OMNIUI_NAMESPACE_OPEN_SCOPE
 
@@ -137,7 +138,16 @@ void Placer::clear()
         return;
     }
 
-    data.m_childWidget = nullptr;
+    // Destroy and detach the retained child, matching Frame::clear()/Placer::destroy().
+    if (std::shared_ptr<Widget> childWidget = std::exchange(data.m_childWidget, std::shared_ptr<Widget>()))
+    {
+        childWidget->destroy();
+        childWidget->setParent(nullptr);
+    }
+
+    this->forceWidthDirty(SizeDirtyReason::eChildDirty);
+    this->forceHeightDirty(SizeDirtyReason::eChildDirty);
+    this->forceRasterDirty(BakeDirtyReason::eContentChanged);
 }
 
 void Placer::setComputedContentWidth(float width)
@@ -160,16 +170,24 @@ void Placer::setComputedContentWidth(float width)
         data.m_offsetXCached = width;
     }
 
-    if (data.m_childWidget && isWidthDirty() != SizeDirtyReason::eNone && data.m_childWidget->getWidth().unit != UnitType::ePixel)
+    // Hold the child by value, not through the member. The layout calls below can
+    // run user code -- a MenuDelegate's build callbacks execute Python mid-layout -- which can
+    // clear() this Placer. clear() does std::exchange(data.m_childWidget, {}) and destroys the
+    // subtree, so later reads of the member would dereference an emptied shared_ptr. The copy
+    // keeps the child alive until this pass unwinds, matching the Stack children snapshot
+    // and the same fix in Frame.
+    auto childWidget = data.m_childWidget;
+
+    if (childWidget && isWidthDirty() != SizeDirtyReason::eNone && childWidget->getWidth().unit != UnitType::ePixel)
     {
-        data.m_childWidget->forceWidthDirty(SizeDirtyReason::eParentDirty);
+        childWidget->forceWidthDirty(SizeDirtyReason::eParentDirty);
     }
 
     if (this->isStableSize())
     {
-        if (data.m_childWidget)
+        if (childWidget)
         {
-            data.m_childWidget->setComputedWidth(width);
+            childWidget->setComputedWidth(width);
         }
         Widget::setComputedContentWidth(width);
         return;
@@ -188,10 +206,10 @@ void Placer::setComputedContentWidth(float width)
     // +---------------+-----------------------------------------------+
 
     float computedWidth = data.m_offsetXCached;
-    if (data.m_childWidget)
+    if (childWidget)
     {
-        data.m_childWidget->setComputedWidth(Frame::_evaluateLayout(data.m_childWidget->getWidth(), width, this->getDpiScale()));
-        computedWidth += data.m_childWidget->getComputedWidth();
+        childWidget->setComputedWidth(Frame::_evaluateLayout(childWidget->getWidth(), width, this->getDpiScale()));
+        computedWidth += childWidget->getComputedWidth();
     }
 
     Widget::setComputedContentWidth(std::max(width, computedWidth));
@@ -217,16 +235,20 @@ void Placer::setComputedContentHeight(float height)
         data.m_offsetYCached = height;
     }
 
-    if (data.m_childWidget && isHeightDirty() != SizeDirtyReason::eNone && data.m_childWidget->getHeight().unit != UnitType::ePixel)
+    // Held by value for the same reason as the width path above: the child's layout
+    // can run user code that clears this Placer, emptying the member mid-call.
+    auto childWidget = data.m_childWidget;
+
+    if (childWidget && isHeightDirty() != SizeDirtyReason::eNone && childWidget->getHeight().unit != UnitType::ePixel)
     {
-        data.m_childWidget->forceHeightDirty(SizeDirtyReason::eParentDirty);
+        childWidget->forceHeightDirty(SizeDirtyReason::eParentDirty);
     }
 
     if (this->isStableSize())
     {
-        if (data.m_childWidget)
+        if (childWidget)
         {
-            data.m_childWidget->setComputedHeight(height);
+            childWidget->setComputedHeight(height);
         }
         Widget::setComputedContentHeight(height);
         return;
@@ -235,10 +257,10 @@ void Placer::setComputedContentHeight(float height)
     // See Placer::setComputedContentWidth
 
     float computedHeight = data.m_offsetYCached;
-    if (data.m_childWidget)
+    if (childWidget)
     {
-        data.m_childWidget->setComputedHeight(Frame::_evaluateLayout(data.m_childWidget->getHeight(), height, this->getDpiScale()));
-        computedHeight += data.m_childWidget->getComputedHeight();
+        childWidget->setComputedHeight(Frame::_evaluateLayout(childWidget->getHeight(), height, this->getDpiScale()));
+        computedHeight += childWidget->getComputedHeight();
     }
 
     Widget::setComputedContentHeight(std::max(height, computedHeight));

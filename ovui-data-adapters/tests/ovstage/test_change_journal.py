@@ -227,6 +227,29 @@ def test_python_dirty_query_tracks_equal_count_membership_changes(monkeypatch):
         assert stage._ovui_kit_dirty_topology == (current, 2, expected_revision)
 
 
+def test_python_dirty_query_keeps_attributes_when_result_handle_is_released(monkeypatch):
+    stage = _NativeStage()
+    module = _fake_ovstage_module(stage)
+    dictionary = _PathDictionary(stage)
+
+    def released(_handle):
+        raise RuntimeError("ovx error 1: Path list handle was not found")
+
+    dictionary.get_paths = released
+    module.PathDictionary = lambda _stage: dictionary
+    monkeypatch.setattr(change_stream, "import_module", lambda _name: module)
+    query = _Query((stage.intern_token("focalLength"),))
+    query.result = lambda: SimpleNamespace(
+        attributes=query._attributes, all_handle=1, total_prim_count=2,
+    )
+    monkeypatch.setattr(stage, "query", lambda **_kwargs: query)
+
+    dirty, complete = change_stream._native_dirty_paths_by_attribute(stage, 0, 1)
+
+    assert "/World/Cube" in dirty.get("focalLength", ())
+    assert not complete
+
+
 def test_private_journal_rows_never_reach_events_and_public_rows_are_deduped(
     monkeypatch,
 ) -> None:

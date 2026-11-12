@@ -333,6 +333,40 @@ GLOBAL_STYLES: dict = {
         "border_color": cl.border_focused,
     },
     # -----------------------------------------------------------------------
+    # Slider (all sliders and drags)
+    #
+    # ovui gives every slider and drag (FloatSlider, IntSlider, UIntSlider,
+    # FloatDrag, IntDrag, UIntDrag) the style type "Slider", as it gives every
+    # field the style type "Field". Without this entry they have no frame and
+    # do not look like controls. HANDLE mode draws the field look with a knob
+    # on sliders; drags have no knob.
+    # -----------------------------------------------------------------------
+    "Slider": {
+        "draw_mode": ui.SliderDrawMode.HANDLE,
+        "background_color": cl.background_field,
+        "background_selected_color": cl.field_text_selection,
+        "secondary_color": cl.border_strong,
+        "secondary_selected_color": cl.accent_primary,
+        "color": cl.text_value,
+        "border_radius": fl.radius_small,
+        "border_color": cl.border_default,
+        "border_width": 1,
+        "font_size": fl.font_size_value,
+    },
+    "Slider:hovered": {
+        "border_color": cl.border_strong,
+    },
+    "Slider:pressed": {
+        "border_color": cl.border_focused,
+    },
+    "Slider:focused": {
+        "border_color": cl.border_focused,
+    },
+    "Slider:disabled": {
+        "color": cl.text_disabled,
+        "border_color": cl.border_default,
+    },
+    # -----------------------------------------------------------------------
     # ComboBox
     # -----------------------------------------------------------------------
     "ComboBox": {
@@ -397,25 +431,33 @@ GLOBAL_STYLES: dict = {
     # -----------------------------------------------------------------------
     # CollapsableFrame
     # -----------------------------------------------------------------------
+    # A plain CollapsableFrame draws its default title and arrow with
+    # "color". Keep them visible, so that each section has a header that a
+    # user can see and click. The header is not a coloured box: it has the
+    # panel colour, like the sections of the Property Inspector. The margin
+    # keeps the sections apart; only the outer frame reads it.
+    # Keep "padding" at 0: the inner header and body frames of every
+    # CollapsableFrame read it, also the frames that have their own
+    # style_type_name_override (for example "Property.GroupFrame").
     "CollapsableFrame": {
         "background_color": cl.background_primary,
         "secondary_color": cl.background_primary,
-        "color": cl.transparent,
+        "color": cl.text_primary,
         "border_radius": fl.radius_none,
         "border_color": cl.transparent,
         "border_width": 0,
         "padding": 0,
-        "margin_height": 0,
+        "margin_height": fl.collapsable_frame_margin_height,
         "font_size": fl.font_size_medium,
     },
     "CollapsableFrame:hovered": {
         "secondary_color": cl.background_primary,
-        "color": cl.transparent,
+        "color": cl.text_primary,
         "border_color": cl.transparent,
     },
     "CollapsableFrame:pressed": {
         "secondary_color": cl.background_primary,
-        "color": cl.transparent,
+        "color": cl.text_primary,
         "border_color": cl.transparent,
     },
     # -----------------------------------------------------------------------

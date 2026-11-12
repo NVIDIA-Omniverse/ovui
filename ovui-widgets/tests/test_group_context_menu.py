@@ -916,6 +916,7 @@ def _make_headless_property_widget():
     w._content = None
     w._group_collapse_state = {}
     w._active_context_menu = None
+    w._undo_manager_ref = None
     w._widgets = []
     w._default_attributes = AttributesWidget(w)
     return w
@@ -976,7 +977,7 @@ class TestPropertyWindowContextMenuWiring:
 
         seen_groups: List[Any] = []
 
-        def _spy_show(adapter, group, x, y, clipboard_id="ovgear_group"):
+        def _spy_show(adapter, group, x, y, clipboard_id="ovgear_group", undo_manager=None):
             seen_groups.append(group.name)
             return object()
 
@@ -1036,6 +1037,50 @@ class TestPropertyWindowContextMenuWiring:
         group = UiDisplayGroup(name="Transform")
         w._show_group_context_menu(group, 0.0, 0.0)
         assert w._active_context_menu is sentinel
+
+    def test_paste_all_is_one_undo_step(self, monkeypatch):
+        import omni.ui as ui
+        from ovui_data_adapters.openusd import UsdPropertyAdapter
+        from ovui_widgets.common.undo import UndoManager
+        from pxr import Usd, UsdGeom
+
+        items: Dict[str, Any] = {}
+
+        class _Menu:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def show_at(self, x, y):
+                pass
+
+        def _menu_item(text, triggered_fn=None, **_):
+            items[text] = triggered_fn
+
+        monkeypatch.setattr(ui, "MenuItem", _menu_item)
+        monkeypatch.setattr("ovui_widgets.common.menu.create_flat_menu", _Menu)
+        stage = Usd.Stage.CreateInMemory()
+        cube = UsdGeom.Cube.Define(stage, "/Cube")
+        cube.GetSizeAttr().Set(3.0)
+        cube.GetPurposeAttr().Set("render")
+        undo = UndoManager()
+        adapter = UsdPropertyAdapter(stage, ["/Cube"], undo_manager=undo)
+        group = UiDisplayGroup(name="Attributes")
+        group.props += [adapter.get_attribute_metadata(n) for n in ("size", "purpose")]
+        copy_group(adapter, group)
+        cube.GetSizeAttr().Set(5.0)
+        cube.GetPurposeAttr().Set("guide")
+        w = _make_headless_property_widget()
+        w._adapter = adapter
+        w._undo_manager_ref = undo
+        w._show_group_context_menu(group, 0.0, 0.0)
+        items["Paste All Property Values in Attributes"]()
+        assert cube.GetSizeAttr().Get() == 3.0
+        assert undo.undo()
+        assert cube.GetSizeAttr().Get() == 5.0
+        assert cube.GetPurposeAttr().Get() == "guide"
 
 
 # ---------------------------------------------------------------------------

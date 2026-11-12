@@ -86,7 +86,7 @@ LAYERS_STYLES: dict = {
     # rather than by composing two backgrounds, so the base entry
     # cannot carry a colour that would leak through to edit-target rows.
     #
-    # Group D (audit issue #5) — the selected-row background uses the
+    # Group D — the selected-row background uses the
     # shared ``cl.treeview_selection`` token (the same token Stage uses
     # at ``ovui_widgets.stage/style.py:124``) so the two panels' selected rows
     # paint the same colour when docked side-by-side. The previous

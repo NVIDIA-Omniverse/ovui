@@ -26,8 +26,8 @@ compares the whole window as the user sees it:
    by its mean error and by the number of clearly changed pixels.
 
 The flow and the compare live in ``driver.py``. A missing golden fails.
-Goldens are written only with ``OMNI_UI_GENERATE_GOLDEN=1`` and require
-separate visual review; ordinary compare runs never regenerate them.
+Goldens are written only with ``OMNI_UI_GENERATE_GOLDEN=1`` (in CI: a
+``workflow_dispatch`` run with ``mode: generate``).
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def _require_renderer_and_display() -> None:
     if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
         if require_render:
             pytest.fail("OVUI_E2E_REQUIRE_RENDER=1 but DISPLAY is not set; the "
-                        "windowed app needs an X display (for example, Xvfb).")
+                        "windowed app needs an X display (CI runs Xvfb).")
         pytest.skip("No X display (DISPLAY unset) for the windowed app.")
 
 

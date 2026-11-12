@@ -32,17 +32,33 @@ pybind11::object appWindowToPython(AppWindowHandle window)
 AppWindowHandle appWindowFromPython(pybind11::handle window)
 {
     const auto* hooks = getPlatformHooks();
-    if (hooks && hooks->appWindowFromPython)
-        return hooks->appWindowFromPython(window.ptr());
-    return pybind11::cast<AppWindowHandle>(window);
+    try
+    {
+        if (hooks && hooks->appWindowFromPython)
+            return hooks->appWindowFromPython(window.ptr());
+        return pybind11::cast<AppWindowHandle>(window);
+    }
+    catch (const pybind11::cast_error&)
+    {
+        // A wrong argument type: pybind11 raises TypeError with the function signature.
+        throw pybind11::reference_cast_error();
+    }
 }
 
 PixelFormat pixelFormatFromPython(pybind11::handle value)
 {
     const auto* hooks = getPlatformHooks();
-    if (hooks && hooks->pixelFormatFromPython)
-        return hooks->pixelFormatFromPython(value.ptr());
-    return pybind11::cast<PixelFormat>(value);
+    try
+    {
+        if (hooks && hooks->pixelFormatFromPython)
+            return hooks->pixelFormatFromPython(value.ptr());
+        return pybind11::cast<PixelFormat>(value);
+    }
+    catch (const pybind11::cast_error&)
+    {
+        // A wrong argument type: pybind11 raises TypeError with the function signature.
+        throw pybind11::reference_cast_error();
+    }
 }
 
 pybind11::object pixelFormatToPython(PixelFormat value)

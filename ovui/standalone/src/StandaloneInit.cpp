@@ -6,6 +6,7 @@
 #include "StandaloneInit.h"
 
 #include "NativeTiming.h"
+#include "HeadlessClipboard.h"
 #include "GlfwPlatform.h"
 #ifdef OMNIUI_HAS_VULKAN
 #include "HeadlessVulkanPlatform.h"
@@ -17,6 +18,11 @@
 #include "StandaloneFileIO.h"
 #include "StandaloneImageBackend.h"
 #include "StandaloneRasterImageLoader.h"
+#ifdef OMNIUI_HAS_SVG
+#include "StandaloneSvgRasterizer.h"
+#else
+#include "StandaloneSvgOffRasterizer.h"
+#endif
 #include "StandaloneSettings.h"
 #include "StandaloneLog.h"
 #include "StandaloneWindowCallbackManager.h"
@@ -35,10 +41,15 @@
 #endif
 
 #include <omni/ui/platform/PlatformRegistry.h>
+
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <omni/ui/Workspace.h>
 #include "WorkspaceLifecycle.h"
 
 #include <imgui/imgui.h>
+#include <imgui/imgui_internal.h>
 #include <imgui/backends/imgui_impl_opengl3.h>
 
 #ifndef OMNIUI_HEADLESS_ONLY
@@ -46,7 +57,7 @@
 #include <GLFW/glfw3.h>
 #endif
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
+// stb_image_write is compiled in PngZlibCompress.cpp, with its PNG compressor.
 #include <stb_image_write.h>
 
 #ifdef OMNIUI_HAS_CUDA
@@ -57,26 +68,77 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <cstdlib>
 #include <vector>
 
 namespace omni {
 namespace ui {
 namespace standalone {
 
+#ifdef OMNIUI_HAS_VULKAN
+// Vulkan has no OpenGL functions, so OpenGLRenderer cannot make textures there.
+// This renderer uploads Markdown images and emoji through the registered IByteImageGpu.
+class ByteImageGpuRenderer final : public IUiRenderer
+{
+    struct Texture
+    {
+        IByteImageGpu::Handle state;
+        void* imGuiId;
+    };
+
+public:
+    TextureHandle createTexture(int width, int height, TextureFormat format, const void* data) override
+    {
+        auto* gpu = PlatformRegistry::instance().byteImageGpu();
+        if (!gpu || format != TextureFormat::eRGBA8)
+            return kInvalidTexture;
+        auto* texture = new Texture{ gpu->createState(), nullptr };
+        const auto* pixels = static_cast<const uint8_t*>(data);
+        size_t stride = static_cast<size_t>(width) * 4;
+        texture->imGuiId = gpu->updateImage(texture->state, &pixels, &stride, 1,
+                                            { static_cast<uint32_t>(width), static_cast<uint32_t>(height) },
+                                            PixelFormat::eRGBA8_UNORM, false, 0, 0, 0)
+                               .imGuiReference;
+        return reinterpret_cast<TextureHandle>(texture);
+    }
+    void updateTexture(TextureHandle, const void*, size_t) override {}
+    void destroyTexture(TextureHandle handle) override
+    {
+        auto* texture = reinterpret_cast<Texture*>(handle);
+        if (!texture)
+            return;
+        if (auto* gpu = PlatformRegistry::instance().byteImageGpu())
+            gpu->destroyState(texture->state);
+        delete texture;
+    }
+    void* getImGuiTextureId(TextureHandle handle) override
+    {
+        return handle ? reinterpret_cast<Texture*>(handle)->imGuiId : nullptr;
+    }
+    TextureHandle uploadFontAtlas(const unsigned char*, int, int) override { return kInvalidTexture; }
+    void beginFrame() override {}
+    void endFrame() override {}
+};
+#endif
+
 // Keep shared_ptrs alive so we can access the concrete types for tick/shouldClose.
 static std::shared_ptr<IUiPlatform> s_platform;
 static WindowId s_mainWindowId = kInvalidWindowId;
 static std::shared_ptr<GlfwPlatform> s_glfwPlatform; // Non-null only in non-headless mode
-static std::shared_ptr<OpenGLRenderer> s_renderer;
+static std::shared_ptr<IUiRenderer> s_renderer;
 static bool s_headlessMode = false;
 static std::shared_ptr<StandaloneFileIO> s_fileIO;
 static std::shared_ptr<StandaloneSettings> s_settings;
 static std::shared_ptr<IByteImageGpu> s_byteImageGpu;
 static std::shared_ptr<StandaloneRasterImageLoader> s_rasterImageLoader;
+#ifdef OMNIUI_HAS_SVG
+static std::shared_ptr<StandaloneSvgRasterizer> s_svgRasterizer;
+#endif
 static std::shared_ptr<StandaloneImageBackend> s_imageBackend;
 static std::shared_ptr<StandaloneLog> s_log;
 static std::unique_ptr<StandaloneWindowCallbackManager> s_windowCallbackManager;
@@ -91,7 +153,7 @@ static bool s_shutdownInProgress = false;
 
 static void shutdownPlatformResources()
 {
-    // Revoke/join the borrowed ovrtx renderer before Python-owned renderer or
+    // Revoke/join the borrowed renderer before Python-owned renderer or
     // provider objects and before ImGui/Vulkan resources can be destroyed.
     registerNativeFramePacingBackend(nullptr);
     shutdownNativeFramePacing();
@@ -110,6 +172,10 @@ static void shutdownPlatformResources()
     // this point. Free its GPU textures while IByteImageGpu is registered.
     if (s_rasterImageLoader)
         s_rasterImageLoader->shutdown();
+#ifdef OMNIUI_HAS_SVG
+    if (s_svgRasterizer)
+        s_svgRasterizer->shutdown();
+#endif
 
     PlatformRegistry::instance().reset();
     // GPU provider destructors retain a raw backend pointer by design. Retire
@@ -117,10 +183,13 @@ static void shutdownPlatformResources()
     s_mainWindowId = kInvalidWindowId;
     s_imageBackend.reset();
     s_rasterImageLoader.reset();
+#ifdef OMNIUI_HAS_SVG
+    s_svgRasterizer.reset();
+#endif
     s_byteImageGpu.reset();
+    s_renderer.reset();
     s_platform.reset();
     s_glfwPlatform.reset();
-    s_renderer.reset();
     s_fileIO.reset();
     s_settings.reset();
     s_log.reset();
@@ -148,8 +217,43 @@ static StreamNalCallback s_streamNalCallback = nullptr;
 static std::unique_ptr<CudaVulkanInterop> s_headlessFrameInterop;
 #endif
 
+#if defined(__APPLE__) && defined(OMNIUI_HAS_VULKAN)
+// Point the Vulkan loader at MoltenVK when no driver was chosen: the Vulkan
+// SDK and Homebrew install its ICD outside the loader's default search.
+static void findMoltenVkIcd()
+{
+    if (getenv("VK_DRIVER_FILES") || getenv("VK_ICD_FILENAMES"))
+        return;
+    std::vector<std::string> prefixes;
+    if (const char* sdk = getenv("VULKAN_SDK"))
+        prefixes.push_back(sdk);
+    if (const char* brew = getenv("HOMEBREW_PREFIX"))
+        prefixes.push_back(brew);
+    prefixes.push_back("/opt/homebrew");
+    prefixes.push_back("/usr/local");
+    for (const std::string& prefix : prefixes)
+    {
+        for (const char* dir : {"/share/vulkan/icd.d/", "/etc/vulkan/icd.d/"})
+        {
+            const std::string path = prefix + dir + "MoltenVK_icd.json";
+            if (FILE* file = fopen(path.c_str(), "r"))
+            {
+                fclose(file);
+                setenv("VK_DRIVER_FILES", path.c_str(), 1);
+                // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+                fprintf(stdout, "standalone::init: Vulkan driver %s\n", path.c_str());
+                return;
+            }
+        }
+    }
+}
+#endif
+
 bool init(const char* title, int width, int height)
 {
+#if defined(__APPLE__) && defined(OMNIUI_HAS_VULKAN)
+    findMoltenVkIcd();
+#endif
     if (PlatformRegistry::instance().isInitialized())
     {
         // A backend is already active (for example from init_streaming() or an
@@ -318,6 +422,10 @@ bool init(const char* title, int width, int height)
     {
         s_byteImageGpu = std::make_shared<OpenGLByteImageGpu>();
     }
+#ifdef OMNIUI_HAS_VULKAN
+    if (dynamic_cast<VulkanByteImageGpu*>(s_byteImageGpu.get()))
+        s_renderer = std::make_shared<ByteImageGpuRenderer>();
+#endif
 
     // Create the window callback manager (must be before any Window objects are created)
     s_windowCallbackManager = std::make_unique<StandaloneWindowCallbackManager>();
@@ -330,7 +438,17 @@ bool init(const char* title, int width, int height)
     reg.setRenderer(s_renderer);
     reg.setPlatform(s_platform);
     if (s_byteImageGpu)
+    {
         reg.setByteImageGpu(s_byteImageGpu);
+        // Both standalone backends report upload results.
+#ifdef OMNIUI_HAS_VULKAN
+        if (auto vulkan = std::dynamic_pointer_cast<VulkanByteImageGpu>(s_byteImageGpu))
+            reg.setByteImageGpuChecked(vulkan);
+        else
+#endif
+        if (auto opengl = std::dynamic_pointer_cast<OpenGLByteImageGpu>(s_byteImageGpu))
+            reg.setByteImageGpuChecked(opengl);
+    }
 
     // Register the raster image loader (stb_image + registered IByteImageGpu).
     // Depends on IByteImageGpu; only register when byteImageGpu is available.
@@ -340,10 +458,27 @@ bool init(const char* title, int width, int height)
         reg.setRasterImageLoader(s_rasterImageLoader);
     }
 
-    // Register the ui.Image backend. It loads through the raster loader above.
+    std::shared_ptr<ISvgRasterizer> svgRasterizer;
+#ifdef OMNIUI_HAS_SVG
+    // Register the SVG rasterizer that VectorImageProvider asks for.
+    // Register it also without IByteImageGpu, so that an SVG logs an error
+    // instead of drawing nothing with no message.
+    s_svgRasterizer = std::make_shared<StandaloneSvgRasterizer>();
+    svgRasterizer = s_svgRasterizer;
+#else
+    // Built with OMNIUI_ENABLE_SVG=OFF. Register a rasterizer that draws
+    // nothing and logs this cause, so that an .svg image does not stay empty
+    // with no message.
+    svgRasterizer = std::make_shared<StandaloneSvgOffRasterizer>();
+#endif
+    reg.setSvgRasterizer(svgRasterizer);
+
+    // Register the ui.Image backend. It loads raster files through the raster
+    // loader above and .svg files through the SVG rasterizer above, so that
+    // ui.Image and ui.ImageWithProvider show the same picture of a file.
     // Register it also without a loader, so ui.Image logs an error instead of
     // showing an empty area with no message.
-    s_imageBackend = std::make_shared<StandaloneImageBackend>(s_rasterImageLoader);
+    s_imageBackend = std::make_shared<StandaloneImageBackend>(s_rasterImageLoader, svgRasterizer);
     reg.setImageBackend(s_imageBackend);
 
     fprintf(stdout, "standalone::init: initialized successfully (%dx%d)\n", width, height);
@@ -370,6 +505,61 @@ bool init(const char* title, int width, int height)
     return true;
 }
 
+namespace
+{
+thread_local PresentWaitBeginFn t_presentWaitBegin = nullptr;
+thread_local PresentWaitEndFn t_presentWaitEnd = nullptr;
+} // namespace
+
+void setPresentWaitHooks(PresentWaitBeginFn begin, PresentWaitEndFn end)
+{
+    t_presentWaitBegin = begin;
+    t_presentWaitEnd = end;
+}
+
+static std::atomic<int> g_presentWaitTestDelayMs{0};
+static std::atomic<double> g_presentWaitTestBegin{0.0};
+static std::atomic<double> g_presentWaitTestEnd{0.0};
+
+static double steadyNowSeconds()
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void setPresentWaitTestDelayMs(int ms)
+{
+    g_presentWaitTestDelayMs = ms;
+}
+
+void getPresentWaitTestWindow(double* begin, double* end)
+{
+    *end = g_presentWaitTestEnd;
+    *begin = g_presentWaitTestBegin;
+}
+
+PresentWaitScope::PresentWaitScope()
+{
+    if (t_presentWaitBegin && t_presentWaitEnd)
+    {
+        m_end = t_presentWaitEnd;
+        m_token = t_presentWaitBegin();
+    }
+    const int delayMs = g_presentWaitTestDelayMs;
+    if (delayMs > 0)
+    {
+        g_presentWaitTestEnd = 0.0;
+        g_presentWaitTestBegin = steadyNowSeconds();
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        g_presentWaitTestEnd = steadyNowSeconds();
+    }
+}
+
+PresentWaitScope::~PresentWaitScope()
+{
+    if (m_end)
+        m_end(m_token);
+}
+
 bool tick()
 {
     if (!s_platform)
@@ -390,7 +580,7 @@ bool setWindowSize(int width, int height)
     // Ask the window system to resize the OS window. On an Xvnc / headless
     // display this is synchronous; on a real window manager the size change
     // arrives via a ConfigureNotify during the next glfwPollEvents().
-    glfwSetWindowSize(win, width, height);
+    s_glfwPlatform->setWindowSize(s_mainWindowId, width, height);
 
     // Pump the event queue so GLFW's cached framebuffer size updates before
     // any subsequent glfwGetFramebufferSize()/tick() call.
@@ -713,11 +903,58 @@ bool isSoftwareCursorEnabled()
     return ImGui::GetIO().MouseDrawCursor;
 }
 
+bool isSvgRasterizerBuiltIn()
+{
+#ifdef OMNIUI_HAS_SVG
+    return true;
+#else
+    return false;
+#endif
+}
+
+std::vector<std::tuple<int64_t, double, double>> takePresentTimings()
+{
+    std::vector<std::tuple<int64_t, double, double>> records;
+#ifdef OMNIUI_HAS_VULKAN
+    if (VulkanBackend* backend = s_glfwPlatform ? s_glfwPlatform->getVulkanBackend() : nullptr)
+        for (const VulkanBackend::PresentTiming& timing : backend->takePresentTimings())
+            records.emplace_back(timing.tag, timing.submitted, timing.completed);
+#endif
+    return records;
+}
+
+void setPresentTimingTag(int64_t tag)
+{
+#ifdef OMNIUI_HAS_VULKAN
+    if (VulkanBackend* backend = s_glfwPlatform ? s_glfwPlatform->getVulkanBackend() : nullptr)
+        backend->setPresentTimingTag(tag);
+#endif
+}
+
 bool isTextInputActive()
 {
     if (!ImGui::GetCurrentContext())
         return false;
     return ImGui::GetIO().WantTextInput;
+}
+
+bool endTextInput()
+{
+    // The context is read through its pointer: GImGui is not exported from the ImGui library.
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    // io.WantTextInput is true only when a text input was in typing mode in the last frame. The
+    // ID check alone is not enough: ImGui keeps InputTextState.ID after a text edit ends, and a
+    // mouse drag of the same FloatDrag or IntDrag makes the same ID active.
+    if (!ctx || !ctx->IO.WantTextInput || ctx->ActiveId == 0 || ctx->InputTextState.ID != ctx->ActiveId)
+        return false;
+    // The same call that ImGui makes when the user clicks outside an active text input.
+    ImGui::ClearActiveID();
+    return true;
+}
+
+bool isClipboardProcessPrivate()
+{
+    return isHeadlessClipboardInstalled();
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +1019,34 @@ static bool completeScreenshotResult(
     return true;
 }
 
+static bool hasNonOpaquePixel(const std::vector<unsigned char>& pixels)
+{
+    // A reduction lets the compiler check opaque images in parallel. An
+    // early exit per pixel makes every ordinary opaque screenshot slower.
+    unsigned char alpha = 255;
+    for (size_t i = 3; i < pixels.size(); i += 4)
+        alpha &= pixels[i];
+    return alpha != 255;
+}
+
+// Divide the color of each pixel that is not opaque by its alpha: c * 255 /
+// alpha, rounded, and 0 where alpha is 0. Opaque pixels keep their bytes.
+static void unpremultiplyAlpha(std::vector<unsigned char>& pixels)
+{
+    for (size_t i = 0; i + 3 < pixels.size(); i += 4)
+    {
+        const unsigned alpha = pixels[i + 3];
+        if (alpha == 255)
+            continue;
+        for (size_t c = i; c < i + 3; ++c)
+        {
+            pixels[c] = alpha == 0
+                ? 0
+                : static_cast<unsigned char>((std::min)(255u, (pixels[c] * 255u + alpha / 2) / alpha));
+        }
+    }
+}
+
 static bool savePixelsToFile(
     const std::string& filepath,
     const std::vector<unsigned char>& pixels,
@@ -809,6 +1074,18 @@ static bool savePixelsToFile(
     }
 
     const std::string format = screenshotFormatForPath(filepath);
+    // The pixels are premultiplied by alpha (see setClearColor), but PNG
+    // defines straight color, and image readers also take the alpha of a
+    // 32-bit BMP as straight. These two formats get straight color. JPEG has
+    // no alpha and keeps the premultiplied color: the frame over black.
+    std::vector<unsigned char> straight;
+    if ((format == "png" || format == "bmp") && hasNonOpaquePixel(pixels))
+    {
+        straight.assign(outputPixels, outputPixels + pixels.size());
+        unpremultiplyAlpha(straight);
+        outputPixels = straight.data();
+    }
+
     int result = 0;
     if (format == "jpeg")
         result = stbi_write_jpg(filepath.c_str(), width, height, 4, outputPixels, 95);
@@ -862,7 +1139,9 @@ static bool captureVulkanScreenshot(
     if (!vkBackend->readbackPixels(pixels.data(), width, height))
     {
         if (error)
-            *error = "Vulkan framebuffer readback failed";
+            *error = (vkBackend->usesFastPresentationMode() && !vkBackend->fastCaptureSupported())
+                ? "Vulkan FAST presentation swapchain does not support readback"
+                : "Vulkan framebuffer readback failed";
         return false;
     }
     return savePixelsToFile(path, pixels, width, height, false, error);
@@ -964,6 +1243,13 @@ bool scheduleScreenshot(const char* filepath)
             "GLFW screenshot backend is unavailable");
         return false;
     }
+
+#ifdef OMNIUI_HAS_VULKAN
+    // FAST direct presentation has no offscreen image. Ask the next frame to
+    // copy its swapchain image before it is presented.
+    if (s_glfwPlatform->getBackendType() == BackendType::eVulkan && s_glfwPlatform->getVulkanBackend())
+        s_glfwPlatform->getVulkanBackend()->requestFastCapture();
+#endif
 
     s_glfwPlatform->setPreSwapCallback([pathCopy, requestId]() {
         if (!isScreenshotRequestPending(requestId))
@@ -1638,6 +1924,109 @@ void setStreamNalCallback(StreamNalCallback callback)
 #else
     (void)callback;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Clear color of the headless Vulkan frame
+// ---------------------------------------------------------------------------
+
+#ifdef OMNIUI_HAS_VULKAN
+static VulkanBackend* getHeadlessVulkanBackend()
+{
+    if (s_glfwPlatform || !s_platform)
+        return nullptr;
+    auto* platform = dynamic_cast<HeadlessVulkanPlatform*>(s_platform.get());
+    return platform ? platform->getVulkanBackend() : nullptr;
+}
+
+// Enough digits to read back as the same float, so that a message never
+// shows 1 for a value just above 1.
+static std::string formatClearValue(float value)
+{
+    char text[32];
+    for (int digits = 6; digits <= 9; ++digits)
+    {
+        snprintf(text, sizeof(text), "%.*g", digits, value);
+        if (strtof(text, nullptr) == value)
+            break;
+    }
+    return text;
+}
+
+// The cause when the values are not a valid premultiplied color, or empty.
+static std::string clearColorValueError(const float rgba[4])
+{
+    static const char* const kNames[4] = { "red", "green", "blue", "alpha" };
+    for (int i = 0; i < 4; ++i)
+    {
+        if (!std::isfinite(rgba[i]) || rgba[i] < 0.0f || rgba[i] > 1.0f)
+        {
+            return std::string(kNames[i]) + " is " + formatClearValue(rgba[i]) +
+                   "; each value of the clear color must be from 0 to 1";
+        }
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+        if (rgba[i] > rgba[3])
+        {
+            return std::string(kNames[i]) + " " + formatClearValue(rgba[i]) + " is greater than alpha " +
+                   formatClearValue(rgba[3]) +
+                   "; the clear color is premultiplied by alpha, so red, green and blue must each be at "
+                   "most alpha (a transparent clear is 0, 0, 0, 0)";
+        }
+    }
+    return {};
+}
+#endif
+
+static bool refuseClearColor(const std::string& cause, std::string* error)
+{
+    // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+    fprintf(stderr, "setClearColor: %s\n", cause.c_str());
+    if (error)
+        *error = cause;
+    return false;
+}
+
+bool setClearColor(float red, float green, float blue, float alpha, std::string* error)
+{
+#ifdef OMNIUI_HAS_VULKAN
+    if (VulkanBackend* backend = getHeadlessVulkanBackend())
+    {
+        const float rgba[4] = { red, green, blue, alpha };
+        const std::string cause = clearColorValueError(rgba);
+        if (!cause.empty())
+            return refuseClearColor(cause, error);
+        backend->setClearColor({ red, green, blue, alpha });
+        return true;
+    }
+#endif
+    const char* active = !s_platform ? "not started (call init() first)"
+                         : s_glfwPlatform ? "a window (GLFW)"
+                                          : "headless EGL";
+    return refuseClearColor(std::string("the clear color applies only to the headless Vulkan backend "
+                                        "(OMNIUI_HEADLESS=1 with Vulkan); the backend is ") + active,
+                            error);
+}
+
+bool getClearColor(float* red, float* green, float* blue, float* alpha)
+{
+#ifdef OMNIUI_HAS_VULKAN
+    if (VulkanBackend* backend = getHeadlessVulkanBackend())
+    {
+        const std::array<float, 4> rgba = backend->getClearColor();
+        *red = rgba[0];
+        *green = rgba[1];
+        *blue = rgba[2];
+        *alpha = rgba[3];
+        return true;
+    }
+#endif
+    (void)red;
+    (void)green;
+    (void)blue;
+    (void)alpha;
+    return false;
 }
 
 // ---------------------------------------------------------------------------

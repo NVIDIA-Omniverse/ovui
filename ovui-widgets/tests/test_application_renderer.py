@@ -511,6 +511,9 @@ class TestPreconstructOrdering:
                 self._renderer = renderer
                 self.calls = []
 
+            def mark_camera_home(self):
+                pass
+
             def set_renderer(self, value):
                 self.calls.append(value)
                 if value is None and self._renderer is not None:
@@ -856,6 +859,46 @@ class TestPreconstructOrdering:
 
         assert adapter is None
         assert app._adapter_session is not None
+
+
+class TestRendererStageMismatch:
+    """A renderer and stage library that do not match are named to the user."""
+
+    def test_open_shows_the_cause_and_clears_the_placeholder(
+        self, app, patched_ovrtx, monkeypatch
+    ):
+        from ovui_data_adapters.common import RendererStageMismatchError
+
+        from ovui_widgets.common import dialogs
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        message = "the installed renderer and stage libraries do not match"
+
+        class _MismatchedAdapter(_FailingOvRtxAdapter):
+            def load_stage(self, stage) -> None:
+                raise RendererStageMismatchError(message)
+
+        patched_ovrtx.set_adapter_cls(_MismatchedAdapter)
+        monkeypatch.setattr(
+            app.get_adapter_session(), "open_stage", lambda path: MagicMock()
+        )
+        cleared: list[str] = []
+        app._viewport_window = types.SimpleNamespace(
+            clear_image=lambda: cleared.append("viewport"),
+            set_renderer=lambda renderer: True,
+            destroy=lambda: None,
+        )
+        shown: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            dialogs, "message_dialog", lambda title, text: shown.append((title, text))
+        )
+        monkeypatch.setattr(ErrorReporter, "log_error", lambda *args, **kwargs: None)
+
+        with pytest.raises(RendererStageMismatchError, match=message):
+            app.open_file("scene.usda")
+
+        assert shown == [("Renderer and Stage Libraries Do Not Match", message)]
+        assert cleared == ["viewport"]
 
 
 class TestCliNoRendererFlag:

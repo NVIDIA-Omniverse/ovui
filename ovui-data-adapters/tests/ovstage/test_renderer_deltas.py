@@ -95,6 +95,39 @@ def test_visibility_edit_is_presented_without_an_ovrtx_delta_write(
     assert renderer.forbidden_data_api_lookups == []
 
 
+@pytest.mark.requires_ovstage
+@pytest.mark.requires_ovrtx
+def test_a_held_drag_preview_keeps_the_stage_tree_hierarchy(
+    ovstage_scene: OvstageScene,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect #501: the first read after a gizmo drag read the type of every prim again."""
+    from ovui_data_adapters.ovstage import stage_adapter as stage_adapter_module
+
+    stage_adapter = OvstageStageAdapter(ovstage_scene)
+    item = stage_adapter.get_item_at_path(_NESTED_PARENT)
+    assert item is not None
+    adapter = _borrow_adapter(ovstage_scene, _BorrowRenderer())
+    type_reads: list[int] = []
+    read_types = stage_adapter_module._kit_type_records
+
+    def counted_types(stage: Any, ordinal: int) -> Any:
+        type_reads.append(ordinal)
+        return read_types(stage, ordinal)
+
+    monkeypatch.setattr(stage_adapter_module, "_kit_type_records", counted_types)
+    before = int(ovstage_scene.current_ordinal)
+    for step in range(3):
+        assert adapter.set_live_local_transform(
+            _NESTED_PARENT,
+            _translation_matrix(float(step), 0.0, 0.0),
+        )
+
+    assert int(ovstage_scene.current_ordinal) == before + 3
+    assert stage_adapter.get_item_at_path(_NESTED_PARENT) is item
+    assert type_reads == []
+
+
 def test_live_transform_preview_without_an_owner_never_uses_ovrtx_data() -> None:
     adapter = OvstageRendererAdapter.__new__(OvstageRendererAdapter)
     renderer = _BorrowRenderer()

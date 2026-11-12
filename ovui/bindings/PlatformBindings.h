@@ -26,5 +26,29 @@ AppWindowHandle appWindowFromPython(pybind11::handle window);
 
 void registerPlatformBindings(pybind11::module_& m);
 
+// Parameters that take any Python object for the host to convert. Help text
+// and TypeError messages name the type that ovui itself accepts.
+struct PixelFormatObject : pybind11::object
+{
+    using pybind11::object::object;
+    static bool check_(pybind11::handle) { return true; }
+};
+struct AppWindowObject : pybind11::object
+{
+    using pybind11::object::object;
+    static bool check_(pybind11::handle) { return true; }
+};
+
 } // namespace ui
 } // namespace omni
+
+template <>
+struct pybind11::detail::handle_type_name<omni::ui::PixelFormatObject>
+{
+    static constexpr auto name = make_caster<omni::ui::PixelFormat>::name;
+};
+template <>
+struct pybind11::detail::handle_type_name<omni::ui::AppWindowObject>
+{
+    static constexpr auto name = make_caster<omni::ui::AppWindowHandle>::name;
+};

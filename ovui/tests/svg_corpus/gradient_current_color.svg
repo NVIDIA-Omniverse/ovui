@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="128" height="128" viewBox="0 0 128 128" color="#e53935">
+  <!-- currentColor in gradient stops takes the color of the stop's own ancestors
+       (the gradient, its <defs>, the root), not of the shape that uses it. -->
+  <defs>
+    <linearGradient id="root"><stop offset="0" stop-color="currentColor"/><stop offset="1" stop-color="#1e88e5"/></linearGradient>
+    <linearGradient id="onGradient" color="#fb8c00" x2="0" y2="1"><stop offset="0" stop-color="currentColor"/><stop offset="1" stop-color="#ffffff"/></linearGradient>
+    <linearGradient id="onStop"><stop offset="0" stop-color="currentColor" color="#8e24aa"/><stop offset="1" stop-color="currentColor"/></linearGradient>
+    <radialGradient id="radial"><stop offset="0" stop-color="currentColor" stop-opacity="0.4"/><stop offset="1" stop-color="currentColor"/></radialGradient>
+    <linearGradient id="inherit" stop-color="#00897b"><stop offset="0" stop-color="inherit"/><stop offset="1" stop-color="#fdd835"/></linearGradient>
+  </defs>
+  <g color="#43a047">
+    <defs>
+      <linearGradient id="template"><stop offset="0" stop-color="currentColor"/><stop offset="1" stop-color="#000000"/></linearGradient>
+    </defs>
+    <rect x="4" y="88" width="56" height="36" fill="url(#template)"/>
+  </g>
+  <linearGradient id="fromTemplate" xlink:href="#template" x1="1" x2="0"/>
+  <rect x="4" y="4" width="56" height="36" fill="url(#root)" color="#3949ab"/>
+  <rect x="68" y="4" width="56" height="36" fill="url(#onGradient)"/>
+  <rect x="4" y="46" width="56" height="36" fill="url(#onStop)"/>
+  <circle cx="96" cy="64" r="18" fill="url(#radial)"/>
+  <rect x="68" y="88" width="26" height="36" fill="url(#inherit)"/>
+  <rect x="98" y="88" width="26" height="36" fill="url(#fromTemplate)" color="#6d4c41"/>
+</svg>

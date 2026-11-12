@@ -119,7 +119,9 @@ def test_stream_trace_summarizes_a_second(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setenv("OVUI_STREAM_TRACE", "1")
     trace = StreamTrace(60, tmp_path)
-    start = trace._second_start
+    # A fixed start: (perf_counter() + 1.0) - perf_counter() can be a little below 1.0 for some clock values,
+    # and then tick() does not roll the second.
+    start = trace._second_start = 100.0
     for i in range(60):
         if i == 30:
             continue  # a frame that never came: one 33 ms send interval

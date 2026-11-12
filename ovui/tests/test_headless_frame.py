@@ -209,6 +209,49 @@ class TestHeadlessFrameEndToEnd(unittest.TestCase):
         finally:
             self._cudart.cudaFree(dst)
 
+    def _export_last_pixel(self, w: int, h: int) -> tuple:
+        """Tick once, export the frame through copy_to_linear and return its last RGBA pixel."""
+        standalone._tick_one_frame()
+        dst = ctypes.c_void_p(0)
+        pitch = ctypes.c_size_t(0)
+        self._check(
+            self._cudart.cudaMallocPitch(
+                ctypes.byref(dst), ctypes.byref(pitch), ctypes.c_size_t(w * 4), ctypes.c_size_t(h)
+            ),
+            "cudaMallocPitch",
+        )
+        try:
+            self.assertTrue(headless_frame.wait_ready(timeout_ns=10_000_000_000))
+            self.assertTrue(headless_frame.copy_to_linear(dst.value, pitch.value, cuda_stream_handle=0))
+            headless_frame.signal_consumed()
+            host = (ctypes.c_uint8 * (w * h * 4))()
+            self._check(
+                self._cudart.cudaMemcpy2D(
+                    ctypes.cast(host, ctypes.c_void_p), ctypes.c_size_t(w * 4), dst, pitch,
+                    ctypes.c_size_t(w * 4), ctypes.c_size_t(h), ctypes.c_int(self._CUDA_MEMCPY_DEVICE_TO_HOST),
+                ),
+                "cudaMemcpy2D D2H",
+            )
+            self._check(self._cudart.cudaDeviceSynchronize(), "cudaDeviceSynchronize")
+            return tuple(host[(w * h - 1) * 4:(w * h) * 4])
+        finally:
+            self._cudart.cudaFree(dst)
+
+    def test_export_has_the_clear_color(self):
+        # Regression: the pixels that no widget draws hold the clear color in
+        # the export, so a transparent clear gives alpha 0 for an overlay.
+        saved = standalone.get_clear_color()
+        self.assertTrue(headless_frame.init(), "headless_frame.init() refused — check env vars")
+        w, h = headless_frame.extent()
+        try:
+            self.assertEqual(self._export_last_pixel(w, h), (31, 33, 36, 255), "the default clear is opaque")
+            standalone.set_clear_color(0.0, 0.0, 0.0, 0.0)
+            self.assertEqual(self._export_last_pixel(w, h), (0, 0, 0, 0))
+            standalone.set_clear_color(0.2, 0.4, 0.6, 0.6)
+            self.assertEqual(self._export_last_pixel(w, h), (51, 102, 153, 153))
+        finally:
+            standalone.set_clear_color(*saved)
+
 
 if __name__ == "__main__":
     unittest.main()

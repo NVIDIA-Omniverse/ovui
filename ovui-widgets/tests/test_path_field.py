@@ -27,6 +27,7 @@ singleton.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import List
 
 import omni.ui as ui
@@ -622,12 +623,18 @@ class TestEditMode:
 
 
 class TestOverlayDoubleClick:
-    """The transparent overlay rectangle routes double-clicks into edit mode."""
+    """The transparent overlay rectangle routes double-clicks into edit mode.
+
+    The field opens at the release of the second click (issue 509): in a
+    floating window, ImGui ignores a keyboard focus request while the press
+    moves the window.
+    """
 
     def test_left_double_click_enters_edit_mode(self, ephemeral_window):
         with in_window_frame(ephemeral_window):
             widget = PathField(apply_path_handler=_noop)
         widget._on_overlay_double_clicked(0, 0, 0, 0)  # button=0 → left
+        widget._on_overlay_released(0, 0, 0, 0)
         assert widget._mode == MODE_EDIT
         widget.destroy()
 
@@ -636,6 +643,7 @@ class TestOverlayDoubleClick:
         with in_window_frame(ephemeral_window):
             widget = PathField(apply_path_handler=_noop)
         widget._on_overlay_double_clicked(0, 0, 1, 0)
+        widget._on_overlay_released(0, 0, 1, 0)
         assert widget._mode == MODE_BREADCRUMB
         widget.destroy()
 
@@ -643,6 +651,7 @@ class TestOverlayDoubleClick:
         with in_window_frame(ephemeral_window):
             widget = PathField(apply_path_handler=_noop)
         widget._on_overlay_double_clicked(0, 0, 2, 0)
+        widget._on_overlay_released(0, 0, 2, 0)
         assert widget._mode == MODE_BREADCRUMB
         widget.destroy()
 
@@ -658,6 +667,81 @@ class TestOverlayDoubleClick:
             try:
                 assert widget._overlay_rect is not None
                 assert widget._overlay_rect.has_mouse_double_clicked_fn() is True
+                assert widget._overlay_rect.has_mouse_released_fn() is True
+            finally:
+                widget.destroy()
+
+
+class TestOverlaySingleClick:
+    """A left click on an empty part of the bar enters edit mode (issue 509).
+
+    The field opens at the release of the click, so it gets the keyboard
+    focus also in a floating window, and typed keys go to the field and not
+    to the application shortcuts. A click on a folder name only navigates
+    (the label under the overlay gets it), so the folder names stay.
+    """
+
+    @staticmethod
+    def _bar(ephemeral_window):
+        with in_window_frame(ephemeral_window):
+            widget = PathField(apply_path_handler=_noop)
+        # A folder name label at x 0..40, y 0..24.
+        widget._breadcrumb_labels = [SimpleNamespace(
+            screen_position_x=0, screen_position_y=0,
+            computed_width=40, computed_height=24,
+        )]
+        return widget
+
+    def test_click_off_the_names_enters_edit_mode_at_the_release(self, ephemeral_window):
+        widget = self._bar(ephemeral_window)
+        widget._on_overlay_pressed(200, 12, 0, 0)
+        assert widget._mode == MODE_BREADCRUMB
+        widget._on_overlay_released(200, 12, 0, 0)
+        assert widget._mode == MODE_EDIT
+        widget.destroy()
+
+    def test_click_on_a_folder_name_keeps_the_names(self, ephemeral_window):
+        widget = self._bar(ephemeral_window)
+        widget._on_overlay_pressed(20, 12, 0, 0)
+        widget._on_overlay_released(20, 12, 0, 0)
+        assert widget._mode == MODE_BREADCRUMB
+        widget.destroy()
+
+    def test_double_click_on_a_folder_name_enters_edit_mode(self, ephemeral_window):
+        widget = self._bar(ephemeral_window)
+        widget._on_overlay_pressed(20, 12, 0, 0)
+        widget._on_overlay_released(20, 12, 0, 0)
+        widget._on_overlay_pressed(20, 12, 0, 0)
+        widget._on_overlay_double_clicked(20, 12, 0, 0)
+        widget._on_overlay_released(20, 12, 0, 0)
+        assert widget._mode == MODE_EDIT
+        widget.destroy()
+
+    def test_drag_from_the_bar_does_not_enter_edit_mode(self, ephemeral_window):
+        # For example a drag that moves a floating Content window.
+        widget = self._bar(ephemeral_window)
+        widget._on_overlay_pressed(200, 12, 0, 0)
+        widget._on_overlay_released(320, 60, 0, 0)
+        assert widget._mode == MODE_BREADCRUMB
+        widget.destroy()
+
+    @pytest.mark.parametrize("button", [1, 2])
+    def test_other_buttons_ignored(self, ephemeral_window, button):
+        widget = self._bar(ephemeral_window)
+        widget._on_overlay_pressed(200, 12, button, 0)
+        widget._on_overlay_released(200, 12, button, 0)
+        assert widget._mode == MODE_BREADCRUMB
+        widget.destroy()
+
+    def test_rebuild_lists_one_label_per_breadcrumb(self, ephemeral_window):
+        with in_window_frame(ephemeral_window):
+            widget = PathField(apply_path_handler=_noop)
+            try:
+                widget.set_path("file:///home/user")
+                widget._rebuild_breadcrumbs()
+                assert [label.text for label in widget._breadcrumb_labels] == [
+                    "file://", "home", "user",
+                ]
             finally:
                 widget.destroy()
 
@@ -676,6 +760,7 @@ _GLFW_KEY_TAB = 258
 _GLFW_KEY_DOWN = 264
 _GLFW_KEY_UP = 265
 _GLFW_KEY_ENTER = 257
+_GLFW_KEY_RIGHT = 262
 _GLFW_MOD_CTRL = 1 << 1
 
 
@@ -989,7 +1074,13 @@ class TestAutocompleteKeyboardNavigation:
         assert widget._mode == MODE_EDIT
         widget.destroy()
 
-    def test_enter_with_selection_commits_into_field(self, ephemeral_window):
+    def test_enter_with_selection_opens_the_folder(self, ephemeral_window):
+        """Enter on a highlighted suggestion opens it, as a click does.
+
+        Issue 509: Enter always ends the edit of a single-line field, so
+        "fill the field and stay in edit mode" left the field with no
+        keyboard focus; the next typed key went to the app shortcuts.
+        """
         received: List[str] = []
         def handler(prefix: str, cb) -> None:
             cb(["Documents/", "Textures/"])
@@ -1003,12 +1094,8 @@ class TestAutocompleteKeyboardNavigation:
         widget._edit_field.model.set_value("/home/")
         widget._autocomplete_selected = 0  # "Documents/"
         widget._on_edit_key_pressed(_GLFW_KEY_ENTER, 0, pressed=False)
-        # First Enter commits the selection without applying.
-        assert received == []
-        assert widget._edit_field.model.get_value_as_string() == (
-            "/home/Documents/"
-        )
-        assert widget._mode == MODE_EDIT
+        assert received == ["/home/Documents/"]
+        assert widget._mode == MODE_BREADCRUMB
         widget.destroy()
 
     def test_enter_without_selection_applies_and_dismisses(
@@ -1030,6 +1117,180 @@ class TestAutocompleteKeyboardNavigation:
         widget._commit_autocomplete_selection()
         assert widget._autocomplete_matches == []
         assert widget._autocomplete_container.visible is False
+        widget.destroy()
+
+
+class TestSuggestionKeysFromTheWindow:
+    """The Content Browser window sends its key presses to the path bar.
+
+    Issue 509: the field gets its own key events only while the mouse is on
+    it, and the release of Down did not come, so Down never moved the
+    highlight. The window gets each key press while it has the focus.
+    """
+
+    @staticmethod
+    def _editing(ephemeral_window, received):
+        def handler(prefix: str, cb) -> None:
+            cb(["Documents/", "Textures/", "Scripts/"])
+
+        with in_window_frame(ephemeral_window):
+            widget = PathField(
+                apply_path_handler=received.append,
+                autocomplete_handler=handler,
+            )
+        widget._enter_edit_mode()
+        widget._edit_field.model.set_value("/home/")
+        return widget
+
+    def test_down_and_up_move_the_highlight(self, ephemeral_window):
+        widget = self._editing(ephemeral_window, [])
+        assert widget.handle_window_key(_GLFW_KEY_DOWN, 0) is True
+        assert widget._autocomplete_selected == 0
+        assert widget.handle_window_key(_GLFW_KEY_DOWN, 0) is True
+        assert widget._autocomplete_selected == 1
+        assert widget.handle_window_key(_GLFW_KEY_UP, 0) is True
+        assert widget._autocomplete_selected == 0
+        widget.destroy()
+
+    def test_field_release_after_a_window_press_moves_once(self, ephemeral_window):
+        widget = self._editing(ephemeral_window, [])
+        widget.handle_window_key(_GLFW_KEY_DOWN, 0)
+        widget._on_edit_key_pressed(_GLFW_KEY_DOWN, 0, pressed=False)
+        assert widget._autocomplete_selected == 0
+        widget.destroy()
+
+    def test_enter_on_a_highlight_opens_it_when_the_edit_ends(self, ephemeral_window):
+        received: List[str] = []
+        widget = self._editing(ephemeral_window, received)
+        widget.handle_window_key(_GLFW_KEY_DOWN, 0)
+        widget.handle_window_key(_GLFW_KEY_DOWN, 0)
+        assert widget.handle_window_key(_GLFW_KEY_ENTER, 0) is True
+        # The field has not drawn yet; it ends its edit on the same Enter.
+        assert widget._mode == MODE_EDIT
+        widget._on_edit_end_edit(widget._edit_field.model)
+        assert received == ["/home/Textures/"]
+        assert widget._mode == MODE_BREADCRUMB
+        widget.destroy()
+
+    def test_enter_without_a_highlight_applies_the_typed_path(self, ephemeral_window):
+        received: List[str] = []
+        widget = self._editing(ephemeral_window, received)
+        assert widget.handle_window_key(_GLFW_KEY_ENTER, 0) is False
+        widget._on_edit_end_edit(widget._edit_field.model)
+        assert received == ["/home/"]
+        widget.destroy()
+
+    def test_keys_are_not_used_outside_edit_mode(self, ephemeral_window):
+        with in_window_frame(ephemeral_window):
+            widget = PathField(apply_path_handler=_noop)
+        assert widget.handle_window_key(_GLFW_KEY_DOWN, 0) is False
+        widget.destroy()
+
+
+class TestSuggestionMousePress:
+    """A mouse press on a suggestion ends the edit before the row's click.
+
+    Issue 509: the end of the edit applied the typed text ("Folder not
+    found") and closed the list, so the row's click never came.
+    """
+
+    @staticmethod
+    def _editing(ephemeral_window, received):
+        def handler(prefix: str, cb) -> None:
+            cb(["Documents/", "Textures/"])
+
+        with in_window_frame(ephemeral_window):
+            widget = PathField(
+                apply_path_handler=received.append,
+                autocomplete_handler=handler,
+            )
+        widget._enter_edit_mode()
+        widget._edit_field.model.set_value("/home/T")
+        return widget
+
+    def test_press_on_a_row_opens_that_folder(self, ephemeral_window):
+        received: List[str] = []
+        widget = self._editing(ephemeral_window, received)
+        widget._on_suggestion_hovered(0, True)
+        widget._on_edit_end_edit(widget._edit_field.model)
+        assert received == ["/home/Textures/"]
+        assert widget._mode == MODE_BREADCRUMB
+        widget.destroy()
+
+    def test_enter_with_the_mouse_on_a_row_applies_the_typed_path(self, ephemeral_window):
+        received: List[str] = []
+        widget = self._editing(ephemeral_window, received)
+        widget._on_suggestion_hovered(0, True)
+        widget.handle_window_key(_GLFW_KEY_ENTER, 0)
+        widget._on_edit_end_edit(widget._edit_field.model)
+        assert received == ["/home/T"]
+        widget.destroy()
+
+    def test_press_after_the_mouse_left_the_row_applies_the_typed_path(self, ephemeral_window):
+        received: List[str] = []
+        widget = self._editing(ephemeral_window, received)
+        widget._on_suggestion_hovered(0, True)
+        widget._on_suggestion_hovered(0, False)
+        widget._on_edit_end_edit(widget._edit_field.model)
+        assert received == ["/home/T"]
+        widget.destroy()
+
+    def test_press_on_a_row_after_tab_opens_that_folder(self, ephemeral_window):
+        # Tab does not end the edit. The mouse is on the row before Tab, so
+        # only the Tab key comes between the hover and the press.
+        received: List[str] = []
+        widget = self._editing(ephemeral_window, received)
+        widget._on_suggestion_hovered(0, True)
+        widget.handle_window_key(_GLFW_KEY_TAB, 0)
+        widget._on_edit_end_edit(widget._edit_field.model)
+        assert received == ["/home/Textures/"]
+        widget.destroy()
+
+    def test_enter_that_did_not_end_the_edit_is_forgotten_on_the_next_key(
+        self, ephemeral_window,
+    ):
+        # The mouse is on the row before Enter. Right does not change the
+        # text, so the rows and their hover stay: only the key clears the note.
+        received: List[str] = []
+        widget = self._editing(ephemeral_window, received)
+        widget._on_suggestion_hovered(0, True)
+        widget.handle_window_key(_GLFW_KEY_ENTER, 0)
+        widget.handle_window_key(_GLFW_KEY_RIGHT, 0)
+        widget._on_edit_end_edit(widget._edit_field.model)
+        assert received == ["/home/Textures/"]
+        widget.destroy()
+
+    def test_escape_with_the_mouse_on_a_row_does_not_open_it(self, ephemeral_window):
+        # ImGui reverts the text on Escape and reports the revert as a text
+        # change before the end of the edit; the row must not open.
+        received: List[str] = []
+
+        def handler(prefix: str, cb) -> None:
+            cb(["Documents/", "Textures/"])
+
+        with in_window_frame(ephemeral_window):
+            widget = PathField(
+                apply_path_handler=received.append,
+                autocomplete_handler=handler,
+            )
+            widget.set_path("/home/")
+        widget._enter_edit_mode()
+        widget._edit_field.model.set_value("/home/T")
+        widget._on_suggestion_hovered(0, True)
+        widget.handle_window_key(_GLFW_KEY_ESCAPE, 0)
+        widget._edit_field.model.set_value("/home/")
+        widget._on_edit_end_edit(widget._edit_field.model)
+        assert "/home/Textures/" not in received
+        assert widget._mode == MODE_BREADCRUMB
+        widget.destroy()
+
+    def test_enter_that_did_not_end_the_edit_is_forgotten_on_hover(self, ephemeral_window):
+        received: List[str] = []
+        widget = self._editing(ephemeral_window, received)
+        widget.handle_window_key(_GLFW_KEY_ENTER, 0)
+        widget._on_suggestion_hovered(0, True)
+        widget._on_edit_end_edit(widget._edit_field.model)
+        assert received == ["/home/Textures/"]
         widget.destroy()
 
 
@@ -1642,3 +1903,190 @@ class TestAutocompleteDropdownStyling:
         assert (
             "Content.PathBar.Autocomplete.Item::selected" in CONTENT_STYLES
         )
+
+
+class TestAutocompletePopupInRenderedFrames:
+    """The dropdown shows while the edit field keeps the typed keys."""
+
+    def test_results_show_dropdown_and_field_keeps_text_input(self, monkeypatch):
+        from omni.ui import standalone
+
+        from tests._vulkan_device import use_headless_vulkan
+
+        use_headless_vulkan(monkeypatch)
+        standalone.init("_test_path_field_frames", 800, 300)
+        pending = []
+        window = ui.Window(
+            "_test_path_field_frames", width=800, height=100,
+            position_x=0, position_y=0,
+        )
+        try:
+            with window.frame:
+                widget = PathField(
+                    apply_path_handler=_noop,
+                    autocomplete_handler=lambda _prefix, cb: pending.append(cb),
+                )
+            widget.set_path("/home/user")
+            for _ in range(3):
+                standalone._tick_one_frame()
+            widget._enter_edit_mode()
+            for _ in range(3):
+                standalone._tick_one_frame()
+            widget._edit_field.model.set_value("/home/us")
+            pending[-1](["user/", "other/"])
+            for _ in range(3):
+                standalone._tick_one_frame()
+
+            assert widget._autocomplete_window.visible
+            assert widget._autocomplete_container.visible
+            assert standalone.is_text_input_active()
+            widget.destroy()
+        finally:
+            window.destroy()
+            standalone.shutdown()
+
+    def test_no_match_hides_dropdown_window_and_a_match_shows_it_again(
+        self, monkeypatch
+    ):
+        from omni.ui import standalone
+
+        from tests._vulkan_device import use_headless_vulkan
+
+        use_headless_vulkan(monkeypatch)
+        standalone.init("_test_path_field_no_match", 800, 300)
+        pending = []
+        window = ui.Window(
+            "_test_path_field_no_match", width=800, height=100,
+            position_x=0, position_y=0,
+        )
+        try:
+            with window.frame:
+                widget = PathField(
+                    apply_path_handler=_noop,
+                    autocomplete_handler=lambda _prefix, cb: pending.append(cb),
+                )
+            widget.set_path("/home/user")
+            for _ in range(3):
+                standalone._tick_one_frame()
+            widget._enter_edit_mode()
+            for _ in range(3):
+                standalone._tick_one_frame()
+            entries = ["user/", "other/"]
+
+            widget._edit_field.model.set_value("/home/us")
+            pending[-1](entries)
+            for _ in range(3):
+                standalone._tick_one_frame()
+            assert widget._autocomplete_window.visible
+
+            widget._edit_field.model.set_value("/home/uszz")
+            pending[-1](entries)
+            for _ in range(3):
+                standalone._tick_one_frame()
+            assert widget._autocomplete_matches == []
+            assert not widget._autocomplete_window.visible
+
+            widget._edit_field.model.set_value("/home/u")
+            pending[-1](entries)
+            for _ in range(3):
+                standalone._tick_one_frame()
+            assert widget._autocomplete_matches == ["user/"]
+            assert widget._autocomplete_window.visible
+            assert widget._autocomplete_container.visible
+            widget.destroy()
+        finally:
+            window.destroy()
+            standalone.shutdown()
+
+    # ovui does not send Tab, Down or Ctrl+V to ``key_pressed_fn`` while the
+    # edit field has text focus, so these tests call the key handler that
+    # the field registers. The paste text and the frames are real.
+
+    _FOLDERS = {"/home/": ["user/", "other/"], "/home/user/": ["docs/"]}
+
+    @contextmanager
+    def _edit_with_matches(self, monkeypatch, title):
+        from omni.ui import standalone
+
+        from tests._vulkan_device import use_headless_vulkan
+
+        use_headless_vulkan(monkeypatch)
+        standalone.init(title, 800, 300)
+        window = ui.Window(
+            title, width=800, height=100, position_x=0, position_y=0,
+        )
+        try:
+            with window.frame:
+                widget = PathField(
+                    apply_path_handler=_noop,
+                    autocomplete_handler=lambda prefix, cb: cb(
+                        self._FOLDERS.get(prefix, [])
+                    ),
+                )
+            widget.set_path("/home/user")
+            self._tick()
+            widget._enter_edit_mode()
+            self._tick()
+            widget._edit_field.model.set_value("/home/us")
+            self._tick()
+            assert widget._autocomplete_matches == ["user/"]
+            assert widget._autocomplete_window.visible
+            yield widget
+            widget.destroy()
+        finally:
+            window.destroy()
+            standalone.shutdown()
+
+    @staticmethod
+    def _tick():
+        from omni.ui import standalone
+
+        for _ in range(3):
+            standalone._tick_one_frame()
+
+    def test_paste_hides_dropdown_window(self, monkeypatch):
+        from omni.ui import _ui
+        from omni.ui import testing as ui_testing
+
+        from ovui_widgets.content.widget.path_field import (
+            _KEY_MOD_CTRL,
+            _KEY_V,
+        )
+
+        with self._edit_with_matches(
+            monkeypatch, "_test_path_field_paste"
+        ) as widget:
+            ui_testing.set_clipboard_text("/home/user/docs")
+            widget._on_edit_key_pressed(_KEY_V, _KEY_MOD_CTRL, True)
+            _ui._inject_key_event(341, True)  # Left Ctrl
+            _ui._inject_key_event(86, True)  # V
+            self._tick()
+            _ui._inject_key_event(86, False)
+            _ui._inject_key_event(341, False)
+            self._tick()
+
+            assert widget._edit_field.model.get_value_as_string() == (
+                "/home/user/docs"
+            )
+            assert widget._autocomplete_matches == []
+            assert not widget._autocomplete_window.visible
+
+    def test_tab_commit_hides_dropdown_window(self, monkeypatch):
+        from ovui_widgets.content.widget.path_field import (
+            _KEY_DOWN,
+            _KEY_TAB,
+        )
+
+        with self._edit_with_matches(
+            monkeypatch, "_test_path_field_tab"
+        ) as widget:
+            widget._on_edit_key_pressed(_KEY_DOWN, 0, False)
+            self._tick()
+            widget._on_edit_key_pressed(_KEY_TAB, 0, True)
+            self._tick()
+
+            assert widget._edit_field.model.get_value_as_string() == (
+                "/home/user/"
+            )
+            assert widget._autocomplete_matches == []
+            assert not widget._autocomplete_window.visible

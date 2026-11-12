@@ -9,7 +9,7 @@ description: >-
 license: "Apache-2.0"
 metadata:
   python-distribution: ovui-widgets-app
-  version: "0.3.0"
+  version: "0.3.1"
 ---
 
 # OVUI Styling
@@ -32,6 +32,8 @@ This skill is the authoritative style guide for ovui and ovui-widgets. It define
    - widget `name` values are variants under a type
    - `style_type_name_override` values define semantic widget types.
 5. Standard widgets inherit complete defaults from `ui.style.default`. Custom widgets override only the properties that differ.
+   - ovui gives every field the style type `Field`, and every slider and drag the style type `Slider`. Put their default look under these keys (see `references/style-mechanics.md`).
+   - Styles give colors, borders, fonts, padding, and margins. The spacing and the alignment of a layout (stack spacing, row heights, label columns, window gutters) come from the layout presets of the `omniverse-ui-apis` skill (`references/layout-presets.md`).
 6. Validate visually when the change affects appearance, and run a content/metadata validation when it does not.
 
 ## Reference map

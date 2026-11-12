@@ -213,6 +213,12 @@ class SaveLayerAsCommand(AbstractLayerCommand):
        :meth:`~ovui_data_adapters.common.LayerStackAdapter.replace_sublayer`.
        The ``(parent_id, position, old_identifier)`` triples are
        captured on first do so undo can restore them.
+    3. **Authoring-layer move** (only when the swap took the source
+       out of the stack and the source was the authoring layer): the
+       edit target moves to the new layer, so later edits go into the
+       file the user just saved. Without it the stage keeps a target
+       on a layer that is no longer in the stack, and the next
+       session-layer edit leaves the session layer as the target.
 
     Undo semantics
     --------------
@@ -223,7 +229,9 @@ class SaveLayerAsCommand(AbstractLayerCommand):
     for it. This matches LAYERS-PLAN finding M5: undoing a save is
     surprising precisely because the file is real data the user
     probably wants to keep. If the user wants the file gone, they
-    delete it through the filesystem.
+    delete it through the filesystem. The authoring layer needs no
+    undo step here: the base class restores the edit target that it
+    saved before the first do.
 
     Failure handling
     ----------------
@@ -266,6 +274,11 @@ class SaveLayerAsCommand(AbstractLayerCommand):
         # reverts cleanly.
         self._parent_swaps: List[Tuple[str, int, str]] = []
 
+        # Set on first ``do`` when the source was the authoring layer
+        # and the parent swap takes it out of the stack. Do and redo
+        # then move the edit target to the new layer.
+        self._moves_edit_target: bool = False
+
         # Guards against a redo re-invoking ``save_layer_as`` (the
         # adapter would fail because the path now resolves to an
         # existing layer). First-do flips this to ``True``.
@@ -294,6 +307,9 @@ class SaveLayerAsCommand(AbstractLayerCommand):
             self._file_written = True
             if self._replace_in_parent:
                 self._collect_parent_swaps()
+                self._moves_edit_target = bool(self._parent_swaps) and (
+                    self._saved_edit_target == self._source_identifier
+                )
 
         if not self._replace_in_parent or self._new_identifier is None:
             return
@@ -301,6 +317,10 @@ class SaveLayerAsCommand(AbstractLayerCommand):
             self._adapter.replace_sublayer(
                 parent_id, position, self._new_identifier,
             )
+        # The new layer is in the stack only after the swap, so the
+        # edit target can move to it only now.
+        if self._moves_edit_target:
+            self._adapter.set_edit_target(self._new_identifier)
 
     def undo_impl(self) -> None:
         if not self._replace_in_parent:

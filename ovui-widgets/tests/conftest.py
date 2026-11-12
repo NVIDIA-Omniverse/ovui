@@ -172,7 +172,7 @@ if not _INSTALLED_RELEASE_TESTS and str(_ovui_widgets_project_root) not in sys.p
     sys.path.insert(0, str(_ovui_widgets_project_root))
 
 # The data-adapters source lives under the dash-form folder
-# ``ovui-data-adapters/`` (the visible-folder naming requirement). After
+# ``ovui-data-adapters/``. After
 # the repo merge, both adapter sub-packages share a single unified
 # Python import-package root:
 #

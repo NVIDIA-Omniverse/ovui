@@ -75,8 +75,18 @@ SimpleListModel::SimpleListModel(std::shared_ptr<AbstractValueModel> rootModel,
                    [this](const std::shared_ptr<AbstractValueModel>& model)
                    {
                        auto item = std::make_shared<SimpleListModel::ListItem>(model);
-                       uint32_t callbackId =
-                           model->addValueChangedFn(std::bind(&SimpleListModel::_itemChanged, this, item));
+                       // The item keeps its value model, and the value model keeps this callback. A callback that
+                       // kept the item would make a cycle: the item, its value model and the callback would stay
+                       // after the removal of the item or the end of this model.
+                       std::weak_ptr<ListItem> weakItem = item;
+                       uint32_t callbackId = model->addValueChangedFn(
+                           [this, weakItem](const AbstractValueModel*)
+                           {
+                               if (auto liveItem = weakItem.lock())
+                               {
+                                   this->_itemChanged(liveItem);
+                               }
+                           });
                        item->setCallbackId(callbackId);
                        return item;
                    });
@@ -118,7 +128,16 @@ std::shared_ptr<const AbstractItemModel::AbstractItem> SimpleListModel::appendCh
 
     m_items.emplace_back(std::make_unique<ListItem>(model));
     auto& emplaced = m_items.back();
-    uint32_t callbackId = model->addValueChangedFn(std::bind(&SimpleListModel::_itemChanged, this, emplaced));
+    // The callback must not keep the item (see the constructor).
+    std::weak_ptr<ListItem> weakItem = emplaced;
+    uint32_t callbackId = model->addValueChangedFn(
+        [this, weakItem](const AbstractValueModel*)
+        {
+            if (auto liveItem = weakItem.lock())
+            {
+                this->_itemChanged(liveItem);
+            }
+        });
     emplaced->setCallbackId(callbackId);
 
     this->_itemChanged(nullptr);

@@ -42,6 +42,13 @@ _LOGO_PROVIDER: Any | None = None
 _MENU_CONTRIBUTIONS: dict[str, "MenuContribution"] = {}
 _CONTRIBUTED_MENUS: dict[tuple[str, ...], Any] = {}
 _GLOBAL_MENU_PROVIDER_ID = "ovui_widgets.app.menu_bar.global_menu_contributions"
+# The OpenUSD data adapter keeps the viewer's own state (camera, render product,
+# fallback light) under this prim of the session layer. The viewport treats the
+# same scope as app-owned.
+_APP_SESSION_ROOT = "/OvGearSession"
+# The adapters name every anonymous layer "anonymous"; File > Exit names the
+# session layer so the user can find it in the Layers panel.
+_SESSION_LAYER_NAME = "session layer"
 
 
 @dataclass(frozen=True)
@@ -159,6 +166,7 @@ def build_menu_bar(app: Any) -> None:
         on_build_fn=lambda: create_menu.build_create_menu(app),
     )
     app._create_menu = create_menu_widget
+    _wire_create_menu_invalidation(app, create_menu_widget)
     _remember_top_level_menu(app, "Create", create_menu_widget)
     with create_menu_widget:
         pass
@@ -465,6 +473,27 @@ def _wire_tools_menu_invalidation(app: Any, tools_menu: Any) -> None:
 def _invalidate_tools_menu(app: Any) -> None:
     tools_menu = getattr(app, "_tools_menu", None)
     invalidate = getattr(tools_menu, "invalidate", None)
+    if callable(invalidate):
+        invalidate()
+
+
+def _wire_create_menu_invalidation(app: Any, create_menu: Any) -> None:
+    """Rebuild the Create menu each time it opens.
+
+    Its items depend on the stage (for example the core materials). A closed
+    menu with dirty children still rebuilds them on the next layout, so the
+    menu providers do not invalidate a closed Create menu at each stage edit
+    (a slider drag edits once per frame); the menu rebuilds when it opens.
+    """
+    set_shown_changed_fn = getattr(create_menu, "set_shown_changed_fn", None)
+    if callable(set_shown_changed_fn):
+        set_shown_changed_fn(lambda shown: _invalidate_create_menu(app) if shown else None)
+        app._create_menu_rebuilds_on_open = True
+
+
+def _invalidate_create_menu(app: Any) -> None:
+    create_menu = getattr(app, "_create_menu", None)
+    invalidate = getattr(create_menu, "invalidate", None)
     if callable(invalidate):
         invalidate()
 
@@ -1343,6 +1372,10 @@ def _build_tools_menu(app: Any) -> None:
 
     def _set_tool(tool: str) -> None:
         app.settings.set(ACTIVE_TOOL_SETTING, tool)
+        # Also when the tool does not change: say why no gizmo is drawn for the selection.
+        report = getattr(app._viewport_window, "report_transform_controls_off", None)
+        if callable(report):
+            report()
 
     ui.MenuItem(
         "Move",
@@ -1433,7 +1466,7 @@ _USD_EXTENSION_TYPES = [
 
 # Save As extension combo. Architecture §22.4 verbatim — USD Binary/Ascii,
 # USD Ascii, USD Crate. Tighter than ``_USD_EXTENSION_TYPES`` because the
-# exporter only writes to formats :meth:`pxr.Usd.Stage.Export` knows how
+# provider only writes to formats :meth:`pxr.Sdf.Layer.Export` knows how
 # to emit; ``.usdz`` (a package format) is intentionally omitted so the
 # user cannot pick it and hit an opaque error at write time.
 _SAVE_EXTENSION_TYPES = [
@@ -1518,22 +1551,28 @@ def _on_open_clicked(app: Any) -> None:
     )
 
 
-def _on_save_clicked(app: Any) -> None:
-    """Export the current composed persistent stage to its document path."""
+def _on_save_clicked(app: Any, on_saved: Callable[[], None] | None = None) -> None:
+    """Save the current stage, with its layer stack, to its document path.
+
+    ``on_saved`` runs only after a successful save (File > Exit uses it).
+    """
     if not _can_save_stage(app):
         _show_save_unavailable_warning()
         return
     current = getattr(app, "_current_file_path", None)
     if current:
-        app.save_stage_to(current)
+        if app.save_stage_to(current) and on_saved is not None:
+            on_saved()
         return
-    _on_save_as_clicked(app)
+    _on_save_as_clicked(app, on_saved)
 
 
-def _on_save_as_clicked(app: Any) -> None:
-    """Export the current composed persistent stage to a selected path.
+def _on_save_as_clicked(app: Any, on_saved: Callable[[], None] | None = None) -> None:
+    """Save the current stage, with its layer stack, to a selected path.
 
-    Layer-specific Save and Save As remain available from the Layer menu.
+    The OpenUSD provider writes the root layer with its sublayer list; it
+    does not flatten the sublayers into the file. Layer-specific Save and
+    Save As remain available from the Layer menu.
     This File-menu action preserves the ovui 0.1 stage-export contract through
     :class:`FileExporterHelper`, whose ``on_export`` closure
     that joins the typed ``filename`` with the combo-selected
@@ -1542,7 +1581,8 @@ def _on_save_as_clicked(app: Any) -> None:
     composed path already exists on disk, spawns a
     :class:`ConfirmOverwriteDialog` in save mode (architecture §23.9)
     and defers the save until the user confirms — matches Kit's
-    ``_show_file_existed_prompt``.
+    ``_show_file_existed_prompt``. ``on_saved`` runs only after a
+    successful save; a closed picker or a failed save never calls it.
     """
     if not _can_save_stage(app):
         _show_save_unavailable_warning()
@@ -1551,6 +1591,10 @@ def _on_save_as_clicked(app: Any) -> None:
     from ovui_widgets.content.widget.confirm_overwrite_dialog import (
         ConfirmOverwriteDialog,
     )
+
+    def save(save_path: str) -> None:
+        if app.save_stage_to(save_path) and on_saved is not None:
+            on_saved()
 
     def on_export(
         filename: str,
@@ -1581,10 +1625,10 @@ def _on_save_as_clicked(app: Any) -> None:
         if os.path.exists(save_path):
             ConfirmOverwriteDialog(
                 path,
-                on_yes=lambda: app.save_stage_to(save_path),
+                on_yes=lambda: save(save_path),
             ).show()
         else:
-            app.save_stage_to(save_path)
+            save(save_path)
 
     FileExporterHelper.instance().show(
         title="Save Stage As",
@@ -1604,9 +1648,13 @@ def _show_save_unavailable_warning() -> None:
 
 
 def _on_exit() -> None:
-    """Request application exit via the public ``request_exit()`` API.
+    """Exit the application; ask first when layers have unsaved edits.
 
-    Issue #35 Step 6 — Codex Round 1 F8.
+    When a layer of the stage has unsaved edits, File > Exit
+    opens the "Save & Exit / Exit Without Saving / Cancel" dialog and
+    exits only through Save & Exit or Exit Without Saving. Without unsaved
+    edits it exits at once. The other exit paths (the inspector shutdown,
+    signals, the window close button) still exit without this question.
 
     Previously called ``ui.shutdown()`` directly, which broke ovui's run
     loop without giving :meth:`Application.shutdown` a chance to fire
@@ -1633,10 +1681,157 @@ def _on_exit() -> None:
         # Application exists, but if a stale callback fires after
         # shutdown has already torn down the singleton, just no-op.
         return
-    inst.request_exit()
+    unsaved = _unsaved_layer_names(inst)
+    if not unsaved:
+        inst.request_exit()
+        return
+    from ovui_widgets.common.dialogs import confirm_unsaved_exit_dialog
+
+    confirm_unsaved_exit_dialog(
+        unsaved,
+        on_save_and_exit=lambda: _save_and_exit(inst),
+        on_exit_without_saving=inst.request_exit,
+    )
 
 
-# ── Issue #35 Step 3: register the lazy-init module global so
+def _unsaved_layer_names(app: Any, session_only: bool = False) -> list[str]:
+    """Return the display names of the layers that have unsaved edits.
+
+    Anonymous layers count: their edits are lost on exit too. The session
+    layer counts only when it holds user data (see
+    :func:`_session_layer_has_user_data`); its sublayers count like any
+    other layer. When the layer state cannot be read, the failure is
+    reported and the stage counts as unsaved, so an exit never drops
+    edits without a question.
+
+    ``session_only`` reads only the session layer and its sublayers that
+    are not in the layer stack of the root layer. File > Save writes the
+    root layer and its sublayers, but not these layers.
+    """
+    adapter = _layer_menu_adapter(app)
+    if adapter is None:
+        return []
+    try:
+        names = []
+        seen = set()
+        for identifier in adapter.get_layer_stack_identifiers(
+            include_session=False,
+            include_anonymous=True,
+        ):
+            seen.add(identifier)
+            if session_only:
+                continue
+            handle = adapter.find_layer(identifier)
+            if handle is not None and adapter.is_dirty(handle):
+                names.append(_layer_display_name(adapter, handle, identifier))
+        session = adapter.get_session_layer()
+        if session is None:
+            return names
+        if adapter.is_dirty(session) and _session_layer_has_user_data(
+            adapter, session
+        ):
+            names.append(_SESSION_LAYER_NAME)
+        pending = list(adapter.get_sublayer_identifiers(session))
+        while pending:
+            identifier = pending.pop(0)
+            if identifier in seen:
+                continue
+            seen.add(identifier)
+            handle = adapter.find_layer(identifier)
+            if handle is None:
+                continue
+            if adapter.is_dirty(handle):
+                names.append(_layer_display_name(adapter, handle, identifier))
+            pending.extend(adapter.get_sublayer_identifiers(handle))
+        return names
+    except Exception as exc:  # noqa: BLE001 — reported; the exit then asks
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        ErrorReporter.log_error(
+            "Exit", "cannot read which layers have unsaved changes", exc
+        )
+        return ["the stage (its layer state cannot be read)"]
+
+
+def _session_layer_has_user_data(adapter: Any, session: Any) -> bool:
+    """``True`` when the session layer holds more than the viewer's state.
+
+    The viewer writes its own state under ``/OvGearSession`` from the first
+    frame (each camera move) and builds it again at each start, so that
+    alone is not a user edit. The session layer holds user data when it is
+    the authoring layer, has a sublayer, or has a prim outside
+    ``/OvGearSession`` (for example a prim made while it was the
+    authoring layer).
+    """
+    if adapter.get_edit_target_identifier() == session.identifier:
+        return True
+    if adapter.get_sublayer_identifiers(session):
+        return True
+    return any(
+        spec.path != _APP_SESSION_ROOT
+        for spec in adapter.get_prim_specs(session.identifier)
+    )
+
+
+def _root_layer_is_temporary(app: Any) -> bool:
+    """``True`` when the root layer is the temporary file of a "New Stage".
+
+    The application deletes that folder at shutdown, so a save to the
+    file keeps nothing after the exit.
+    """
+    temporary_dirs = getattr(app, "_scratch_stage_dirs", None) or []
+    adapter = _layer_menu_adapter(app)
+    if adapter is None or not temporary_dirs:
+        return False
+    root_dir = os.path.dirname(
+        os.path.normcase(os.path.realpath(adapter.get_root_layer().identifier))
+    )
+    return any(
+        root_dir == os.path.normcase(os.path.realpath(path))
+        for path in temporary_dirs
+    )
+
+
+def _save_and_exit(app: Any) -> None:
+    """Save the unsaved layers, then exit when no unsaved edit remains.
+
+    The layers are saved like Ctrl+S (Layer > Save All): each modified
+    layer goes to its own file and loses its modified mark. A "New Stage"
+    has only a temporary file, so it saves like File > Save (a file
+    picker when it has no document path yet), and the exit follows only
+    a successful save. File > Save does not write the session layer, so
+    after it only the session layers are checked again. When edits remain
+    after the save (a failed save, or a layer that has no file, such as
+    the session layer), the application stays open and names those layers.
+    """
+    if _root_layer_is_temporary(app):
+        _on_save_clicked(
+            app, on_saved=lambda: _exit_when_saved(app, session_only=True)
+        )
+        return
+    app.save_stage()
+    _exit_when_saved(app)
+
+
+def _exit_when_saved(app: Any, session_only: bool = False) -> None:
+    """Exit, or stay open and name the layers that still have unsaved edits.
+
+    ``session_only`` is passed to :func:`_unsaved_layer_names`.
+    """
+    remaining = _unsaved_layer_names(app, session_only=session_only)
+    if remaining:
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        ErrorReporter.show_warning(
+            "Exit cancelled: unsaved changes remain in "
+            + ", ".join(remaining)
+            + ". Use Save As, or Exit Without Saving."
+        )
+        return
+    app.request_exit()
+
+
+# ── register the lazy-init module global so
 # Application.shutdown() drops the live ui.RasterImageProvider before
 # omni.ui.shutdown() runs. The registration uses
 # register_singleton with sys.modules[__name__] for stable string-key

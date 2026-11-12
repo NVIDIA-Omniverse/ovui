@@ -25,6 +25,7 @@ Covers the contract:
 
 from __future__ import annotations
 
+import os
 from typing import Any, List
 
 import pytest
@@ -34,7 +35,11 @@ from ovui_widgets.common.selection import SelectionBus
 from ovui_widgets.common.testing.mock_layer_stack import ROOT_LAYER_IDENTIFIER
 from ovui_widgets.common.undo import UndoManager
 from ovui_widgets.layers import LayerModel
-from ovui_widgets.layers.commands import SaveLayerCommand, SetLayerMutenessCommand
+from ovui_widgets.layers.commands import (
+    SaveLayerAsCommand,
+    SaveLayerCommand,
+    SetLayerMutenessCommand,
+)
 
 
 class _App:
@@ -129,7 +134,17 @@ class TestRequestSaveAllCommandPipeline:
         self,
         adapter,
         app,
+        monkeypatch,
+        tmp_path,
     ) -> None:
+        # The root lists the anonymous ``./anon``, so Save-All asks for its
+        # path first. The user answers with a new file.
+        monkeypatch.setattr(
+            "ovui_widgets.common.file_dialogs.save_file_dialog",
+            lambda title, default_name, on_selected, **kw: on_selected(
+                str(tmp_path / "anon.usda")
+            ),
+        )
         events: List[Any] = []
         original_save = adapter.save_layer
 
@@ -306,6 +321,330 @@ class TestRequestSaveAllCommandPipeline:
         model._request_save_all()
 
         assert pushed == []
+
+
+# ─── Anonymous sublayers of the saved layers ────────────
+
+
+class TestSaveAllAnonymousSublayers:
+    """A saved file must never refer to an in-memory ``anon:`` layer."""
+
+    @staticmethod
+    def _answer_dialogs(monkeypatch, answer) -> List[str]:
+        titles: List[str] = []
+
+        def _dialog(title, default_name, on_selected, on_cancelled=None, **kw):
+            titles.append(title)
+            path = answer(len(titles))
+            if path is None:
+                on_cancelled()
+            else:
+                on_selected(path)
+
+        monkeypatch.setattr(
+            "ovui_widgets.common.file_dialogs.save_file_dialog", _dialog,
+        )
+        return titles
+
+    def test_asks_path_for_anonymous_sublayer_before_saving_parent(
+        self, adapter, app, model, monkeypatch, tmp_path,
+    ) -> None:
+        new_path = str(tmp_path / "anon.usda")
+        titles = self._answer_dialogs(monkeypatch, lambda n: new_path)
+        adapter.set_dirty(ROOT_LAYER_IDENTIFIER, True)
+        adapter.set_dirty("./child_a.usda", True)
+
+        model._request_save_all()
+
+        assert len(titles) == 1
+        root = adapter.find_layer(ROOT_LAYER_IDENTIFIER)
+        sublayers = adapter.get_sublayer_identifiers(root)
+        assert "./anon" not in sublayers
+        assert new_path in sublayers
+        assert adapter.is_dirty(root) is False
+        assert adapter.is_dirty(adapter.find_layer("./child_a.usda")) is False
+
+    def test_cancel_keeps_parent_unsaved_and_reports_it(
+        self, adapter, app, model, monkeypatch,
+    ) -> None:
+        self._answer_dialogs(monkeypatch, lambda n: None)
+        warnings: List[str] = []
+        monkeypatch.setattr(
+            "ovui_widgets.common.error_reporter.ErrorReporter.show_warning",
+            lambda message, duration_ms=4000: warnings.append(message),
+        )
+        adapter.set_dirty(ROOT_LAYER_IDENTIFIER, True)
+        adapter.set_dirty("./child_a.usda", True)
+
+        model._request_save_all()
+
+        root = adapter.find_layer(ROOT_LAYER_IDENTIFIER)
+        assert adapter.is_dirty(root) is True
+        assert "./anon" in adapter.get_sublayer_identifiers(root)
+        # Layers that list no anonymous sublayer are still saved.
+        assert adapter.is_dirty(adapter.find_layer("./child_a.usda")) is False
+        root_name = adapter.get_display_name(root)
+        assert len(warnings) == 1
+        assert root_name in warnings[0]
+        assert "anonymous sublayer has no file" in warnings[0]
+
+    def test_nested_anonymous_sublayer_is_saved_before_its_parent(
+        self, adapter, app, model, monkeypatch, tmp_path,
+    ) -> None:
+        adapter.add_sublayer("./anon", "./anon_child")
+        adapter._layers["./anon_child"].anonymous = True
+        self._answer_dialogs(
+            monkeypatch, lambda n: str(tmp_path / f"layer{n}.usda"),
+        )
+        saved_as: List[str] = []
+        original_push = app.undo_manager.push
+
+        def _spy(cmd):
+            if isinstance(cmd, SaveLayerAsCommand):
+                saved_as.append(cmd._source_identifier)
+            return original_push(cmd)
+
+        app.undo_manager.push = _spy
+        adapter.set_dirty(ROOT_LAYER_IDENTIFIER, True)
+
+        model._request_save_all()
+
+        # The child first, so the parent's new file lists the child's file.
+        assert saved_as == ["./anon_child", "./anon"]
+        root = adapter.find_layer(ROOT_LAYER_IDENTIFIER)
+        assert adapter.is_dirty(root) is False
+
+    def test_failed_child_save_keeps_parents_unsaved_and_reports_cause(
+        self, adapter, app, model, monkeypatch, tmp_path,
+    ) -> None:
+        adapter.add_sublayer("./anon", "./anon_child")
+        adapter._layers["./anon_child"].anonymous = True
+        titles = self._answer_dialogs(
+            monkeypatch, lambda n: str(tmp_path / f"layer{n}.usda"),
+        )
+        original_save_as = adapter.save_layer_as
+
+        def save_layer_as(identifier, new_path, replace_in_parent):
+            if identifier == "./anon_child":
+                raise PermissionError("no write permission in the folder")
+            return original_save_as(identifier, new_path, replace_in_parent)
+
+        adapter.save_layer_as = save_layer_as
+        errors: List[str] = []
+        monkeypatch.setattr(
+            "ovui_widgets.common.error_reporter.ErrorReporter.show_error",
+            lambda message, duration_ms=5000: errors.append(message),
+        )
+        adapter.set_dirty(ROOT_LAYER_IDENTIFIER, True)
+        adapter.set_dirty("./child_a.usda", True)
+
+        model._request_save_all()
+
+        # No Save-As of the parent: its file would list the child's anon name.
+        assert len(titles) == 1
+        anon = adapter.find_layer("./anon")
+        assert adapter.is_anonymous(anon) is True
+        assert adapter.get_sublayer_identifiers(anon) == ["./anon_child"]
+        root = adapter.find_layer(ROOT_LAYER_IDENTIFIER)
+        assert adapter.is_dirty(root) is True
+        assert "./anon" in adapter.get_sublayer_identifiers(root)
+        assert adapter.is_dirty(adapter.find_layer("./child_a.usda")) is False
+        assert len(errors) == 1
+        assert adapter.get_display_name(root) in errors[0]
+        assert "no write permission in the folder" in errors[0]
+
+
+class TestSaveAllSeveralAnonymousSublayers:
+    """Each anonymous layer keeps its own edits."""
+
+    @pytest.fixture(autouse=True)
+    def _two_anonymous_layers(self, adapter, monkeypatch, tmp_path) -> None:
+        # The mock root has no folder, so the dialogs start in the working
+        # folder. Both rows show "anonymous", as the USD adapter shows them.
+        monkeypatch.chdir(tmp_path)
+        adapter.add_sublayer(ROOT_LAYER_IDENTIFIER, "./anon_b")
+        adapter._layers["./anon_b"].anonymous = True
+        adapter._layers["./anon"].display_name = "anonymous"
+        adapter._layers["./anon_b"].display_name = "anonymous"
+        adapter.set_dirty(ROOT_LAYER_IDENTIFIER, True)
+
+    @staticmethod
+    def _answer_dialogs(monkeypatch, answer) -> List[dict]:
+        dialogs: List[dict] = []
+
+        def _dialog(title, default_name, on_selected, on_cancelled=None, **kw):
+            dialogs.append(dict(kw, title=title, default_name=default_name))
+            path = answer(dialogs[-1])
+            if path is None:
+                on_cancelled()
+            else:
+                on_selected(path)
+
+        monkeypatch.setattr(
+            "ovui_widgets.common.file_dialogs.save_file_dialog", _dialog,
+        )
+        return dialogs
+
+    @staticmethod
+    def _record_replace_prompts(monkeypatch) -> List[dict]:
+        prompts: List[dict] = []
+        monkeypatch.setattr(
+            "ovui_widgets.common.dialogs.confirm_dialog",
+            lambda **kw: prompts.append(kw),
+        )
+        return prompts
+
+    @staticmethod
+    def _sublayers_of_root(adapter) -> List[str]:
+        return adapter.get_sublayer_identifiers(
+            adapter.find_layer(ROOT_LAYER_IDENTIFIER)
+        )
+
+    def test_each_layer_has_its_own_question_and_a_free_default_name(
+        self, adapter, model, monkeypatch, tmp_path,
+    ) -> None:
+        (tmp_path / "anonymous.usda").write_text("#usda 1.0\n")
+        dialogs = self._answer_dialogs(
+            monkeypatch,
+            lambda d: os.path.join(d["default_dir"], d["default_name"]),
+        )
+
+        model._request_save_all()
+
+        assert [d["title"] for d in dialogs] == [
+            "Save All: save anonymous layer 1 of 2 as...",
+            "Save All: save anonymous layer 2 of 2 as...",
+        ]
+        root_name = adapter.get_display_name(
+            adapter.find_layer(ROOT_LAYER_IDENTIFIER)
+        )
+        assert dialogs[0]["message"] == f"Layer: ./anon, sublayer 4 of {root_name}."
+        assert dialogs[1]["message"] == f"Layer: ./anon_b, sublayer 5 of {root_name}."
+        # The existing file and the file of the first layer are not offered.
+        assert [d["default_name"] for d in dialogs] == [
+            "anonymous_1.usda",
+            "anonymous_2.usda",
+        ]
+        assert self._sublayers_of_root(adapter)[3:] == [
+            str(tmp_path / "anonymous_1.usda"),
+            str(tmp_path / "anonymous_2.usda"),
+        ]
+        assert adapter.is_dirty(adapter.find_layer(ROOT_LAYER_IDENTIFIER)) is False
+
+    def test_file_written_by_this_save_all_is_refused_and_asked_again(
+        self, adapter, model, monkeypatch, tmp_path,
+    ) -> None:
+        first = str(tmp_path / "anonymous.usda")
+        answers = iter([first, first, str(tmp_path / "second.usda")])
+        dialogs = self._answer_dialogs(monkeypatch, lambda d: next(answers))
+        prompts = self._record_replace_prompts(monkeypatch)
+        warnings: List[str] = []
+        monkeypatch.setattr(
+            "ovui_widgets.common.error_reporter.ErrorReporter.show_warning",
+            lambda message, duration_ms=4000: warnings.append(message),
+        )
+
+        model._request_save_all()
+
+        # No Replace prompt: the file holds the edits of the first layer.
+        assert prompts == []
+        assert len(warnings) == 1
+        assert first in warnings[0]
+        assert "Save All saved another anonymous layer to this file" in warnings[0]
+        assert [d["title"] for d in dialogs[1:]] == [
+            "Save All: save anonymous layer 2 of 2 as...",
+        ] * 2
+        assert warnings[0] in dialogs[2]["message"]
+        assert self._sublayers_of_root(adapter)[3:] == [
+            first,
+            str(tmp_path / "second.usda"),
+        ]
+        assert adapter.is_dirty(adapter.find_layer(ROOT_LAYER_IDENTIFIER)) is False
+
+    def test_layer_of_the_open_scene_is_refused(
+        self, adapter, model, monkeypatch, tmp_path,
+    ) -> None:
+        # The file of ``./child_a.usda`` exists, so without the refusal
+        # the Replace prompt would offer to write over that layer.
+        (tmp_path / "child_a.usda").write_text("#usda 1.0\n")
+        answers = iter([
+            str(tmp_path / "child_a.usda"),
+            str(tmp_path / "one.usda"),
+            str(tmp_path / "two.usda"),
+        ])
+        dialogs = self._answer_dialogs(monkeypatch, lambda d: next(answers))
+        prompts = self._record_replace_prompts(monkeypatch)
+
+        model._request_save_all()
+
+        assert prompts == []
+        assert len(dialogs) == 3
+        assert "the open scene uses this file" in dialogs[1]["message"]
+        assert self._sublayers_of_root(adapter)[:1] == ["./child_a.usda"]
+        assert self._sublayers_of_root(adapter)[3:] == [
+            str(tmp_path / "one.usda"),
+            str(tmp_path / "two.usda"),
+        ]
+
+    @pytest.mark.parametrize("button", ["on_confirm", "on_cancel"])
+    def test_existing_file_is_written_only_after_replace(
+        self, adapter, model, monkeypatch, tmp_path, button,
+    ) -> None:
+        old_file = str(tmp_path / "old.usda")
+        (tmp_path / "old.usda").write_text("#usda 1.0\n")
+        answers = iter([old_file, str(tmp_path / "two.usda")])
+        self._answer_dialogs(monkeypatch, lambda d: next(answers))
+        prompts = self._record_replace_prompts(monkeypatch)
+
+        model._request_save_all()
+
+        # Nothing is written while the Replace prompt is open.
+        assert len(prompts) == 1
+        assert prompts[0]["confirm_label"] == "Replace"
+        assert old_file in prompts[0]["message"]
+        assert self._sublayers_of_root(adapter)[3:] == ["./anon", "./anon_b"]
+
+        prompts[0][button]()
+
+        root = adapter.find_layer(ROOT_LAYER_IDENTIFIER)
+        if button == "on_confirm":
+            assert self._sublayers_of_root(adapter)[3:] == [
+                old_file,
+                str(tmp_path / "two.usda"),
+            ]
+            assert adapter.is_dirty(root) is False
+        else:
+            # Cancel asks no more questions and keeps the root unsaved.
+            assert self._sublayers_of_root(adapter)[3:] == ["./anon", "./anon_b"]
+            assert adapter.is_dirty(root) is True
+
+    def test_error_after_the_write_stops_save_all_with_its_cause(
+        self, adapter, model, monkeypatch, tmp_path,
+    ) -> None:
+        dialogs = self._answer_dialogs(
+            monkeypatch, lambda d: str(tmp_path / f"layer{len(dialogs)}.usda"),
+        )
+
+        def replace_sublayer(parent_id, position, new_identifier):
+            raise RuntimeError(f"Duplicate item {new_identifier!r} not allowed")
+
+        adapter.replace_sublayer = replace_sublayer
+        errors: List[str] = []
+        monkeypatch.setattr(
+            "ovui_widgets.common.error_reporter.ErrorReporter.show_error",
+            lambda message, duration_ms=5000: errors.append(message),
+        )
+        adapter.set_dirty("./child_a.usda", True)
+
+        model._request_save_all()
+
+        assert len(dialogs) == 1
+        assert len(errors) == 1
+        root = adapter.find_layer(ROOT_LAYER_IDENTIFIER)
+        assert f"Save All did not save {adapter.get_display_name(root)}" in errors[0]
+        assert "Duplicate item" in errors[0]
+        assert adapter.is_dirty(root) is True
+        assert adapter.is_dirty(adapter.find_layer("./child_a.usda")) is False
 
 
 # ─── Value-model write surface ───────────────────────────────────────

@@ -22,7 +22,7 @@ struct Menu::MenuData : public Stack::StackData
     omni::ui::windowmanager::IWindowCallbackPtr m_uiWindow;
     AppWindowHandle m_appWindow = nullptr;
 
-    Menu* m_parentMenu = nullptr;
+    std::weak_ptr<Menu> m_parentMenu;
 
     // Internal unique name of the popup window. It should never be expanded to the user.
     std::string m_menuUniqueId;

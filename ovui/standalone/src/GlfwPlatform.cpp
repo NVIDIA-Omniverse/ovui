@@ -18,6 +18,8 @@
 #include "ImGuiKeyTranslation.h"
 #include "NativeTiming.h"
 
+#include <omni/ui/ImageProvider/ImageProvider.h>
+#include <omni/ui/ImageProvider/PresentationKeyGuard.h>
 #include <omni/ui/platform/PlatformRegistry.h>
 #include <omni/ui/Font.h>
 
@@ -53,6 +55,75 @@
 namespace omni {
 namespace ui {
 namespace standalone {
+
+// Resize through GLFW so its framebuffer callbacks also observe the change.
+static void resizeGlfwWindow(GLFWwindow* window, int width, int height)
+{
+#ifdef _WIN32
+    // GLFW_DONT_CARE leaves Win32's desktop-sized maximum tracking bounds in
+    // place. Those bounds also clamp programmatic resizes.
+    // Supply explicit bounds for this operation, then restore normal dragging
+    // and maximizing limits. Keep the current size within the temporary bounds
+    // because changing GLFW limits itself asks Windows to revalidate the size.
+    int currentWidth = 0, currentHeight = 0;
+    glfwGetWindowSize(window, &currentWidth, &currentHeight);
+    glfwSetWindowSizeLimits(window, GLFW_DONT_CARE, GLFW_DONT_CARE,
+                            (std::max)(width, currentWidth), (std::max)(height, currentHeight));
+#endif
+    glfwSetWindowSize(window, width, height);
+#ifdef _WIN32
+    // On Win32, clearing all limits does not resize the window again.
+    glfwSetWindowSizeLimits(window, GLFW_DONT_CARE, GLFW_DONT_CARE,
+                            GLFW_DONT_CARE, GLFW_DONT_CARE);
+#endif
+}
+
+// Cursor motion for camera navigation, taken from GLFW's own callback (chained
+// before ImGui's), with the time each event arrives on the steady clock, which
+// is the clock of Python's time.perf_counter.
+struct CursorMotion
+{
+    GLFWwindow* window = nullptr;
+    GLFWcursorposfun next = nullptr;
+    bool haveLast = false;
+    double x = 0.0, y = 0.0, dx = 0.0, dy = 0.0, time = 0.0;
+};
+static CursorMotion s_cursor;
+
+static void onCursorPos(GLFWwindow* window, double x, double y)
+{
+    if (s_cursor.haveLast)
+    {
+        s_cursor.dx += x - s_cursor.x;
+        s_cursor.dy += y - s_cursor.y;
+    }
+    s_cursor.x = x;
+    s_cursor.y = y;
+    s_cursor.haveLast = true;
+    s_cursor.time = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (s_cursor.next)
+        s_cursor.next(window, x, y);
+}
+
+bool readCursorMotion(double* dx, double* dy, double* time)
+{
+    if (!s_cursor.window)
+        return false;
+    *dx = s_cursor.dx;
+    *dy = s_cursor.dy;
+    *time = s_cursor.time;
+    s_cursor.dx = s_cursor.dy = 0.0;
+    return true;
+}
+
+void setCursorCapture(bool captured)
+{
+    if (!s_cursor.window)
+        return;
+    if (glfwRawMouseMotionSupported())
+        glfwSetInputMode(s_cursor.window, GLFW_RAW_MOUSE_MOTION, captured ? GLFW_TRUE : GLFW_FALSE);
+    glfwSetInputMode(s_cursor.window, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+}
 
 // ---------------------------------------------------------------------------
 // Font loading helper
@@ -185,6 +256,12 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
 
     {
         OVUI_PERFORMANCE_PHASE_SCOPE(glfwInitPhase, kGlfwInitPhaseName);
+#if defined(__APPLE__) && defined(VK_VERSION_1_0) && (GLFW_VERSION_MAJOR > 3 || GLFW_VERSION_MINOR >= 4)
+        // GLFW uses the Vulkan loader ovui links: its own search misses a
+        // Homebrew or SDK loader outside the default dyld paths, and the
+        // window then falls back to OpenGL.
+        glfwInitVulkanLoader(vkGetInstanceProcAddr);
+#endif
         if (!glfwInit())
         {
             fprintf(stderr, "GlfwPlatform::createWindow: glfwInit failed\n");
@@ -265,6 +342,12 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
 
     m_title = title ? title : "omni.ui";
 
+#ifdef _WIN32
+    // Creation is subject to the same desktop clamp. Correct it before the
+    // renderer allocates its framebuffer/swapchain, preserving the DPI scale.
+    resizeGlfwWindow(m_window, createW, createH);
+#endif
+
     if (m_backendType == BackendType::eVulkan)
     {
 #ifdef OMNIUI_HAS_VULKAN
@@ -291,6 +374,10 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
             glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
             glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
             glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+            // macOS creates a 3.2+ core context only with forward compatibility.
+            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+#endif
             m_window = glfwCreateWindow(createW, createH, title ? title : "omni.ui", nullptr, nullptr);
             if (!m_window)
             {
@@ -298,6 +385,9 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
                 glfwTerminate();
                 return kInvalidWindowId;
             }
+#ifdef _WIN32
+            resizeGlfwWindow(m_window, createW, createH);
+#endif
         }
 #endif
     }
@@ -443,6 +533,7 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
         ImGui_ImplGlfw_InitForVulkan(m_window, true);
     else
         ImGui_ImplGlfw_InitForOpenGL(m_window, true);
+    s_cursor = CursorMotion{m_window, glfwSetCursorPosCallback(m_window, onCursorPos)};
 
     // Load a body font at all standard sizes so omni.ui font_size works at any value.
     // Noto Sans is the primary UI font; Roboto is a last-resort fallback.
@@ -485,7 +576,7 @@ WindowId GlfwPlatform::createWindow(const char* title, int width, int height)
         m_vulkanBackend->initImGui();
         OVUI_PERFORMANCE_PHASE_STOP(imGuiInitPhase);
         {
-            OVUI_PERFORMANCE_PHASE_SCOPE(ovrtxIntegrationInitPhase, kOvrtxIntegrationInitPhaseName);
+            OVUI_PERFORMANCE_PHASE_SCOPE(framePacingInitPhase, kFramePacingInitPhaseName);
             registerNativeFramePacingBackend(m_vulkanBackend.get());
         }
 #endif
@@ -526,6 +617,7 @@ void GlfwPlatform::destroyWindow(WindowId id)
         ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
     }
+    s_cursor = CursorMotion{};
     glfwDestroyWindow(m_window);
     m_window = nullptr;
     m_mainWindowId = kInvalidWindowId;
@@ -670,7 +762,7 @@ void GlfwPlatform::getWindowSize(WindowId id, int* width, int* height)
 void GlfwPlatform::setWindowSize(WindowId id, int width, int height)
 {
     if (id == m_mainWindowId && m_window)
-        glfwSetWindowSize(m_window, width, height);
+        resizeGlfwWindow(m_window, width, height);
 }
 
 void GlfwPlatform::getWindowPosition(WindowId id, int* x, int* y)
@@ -1067,6 +1159,13 @@ bool GlfwPlatform::tick()
     // 1. Poll events (still needed even in headless mode for GL context pump)
     {
         OVUI_DEVELOPMENT_TIME_SCOPE(pollEventsScope, "GlfwPlatform.pollEvents [ovui debug]");
+        // On X11 the poll reads the connection only while Xlib's queue is
+        // empty. A round trip later in the previous tick (a window size or
+        // focus query) can leave older events queued, and the newest input
+        // then waits a whole tick. A round trip here (XQueryPointer) queues
+        // every event the server has sent, so this poll handles all of them.
+        double cursorX = 0.0, cursorY = 0.0;
+        glfwGetCursorPos(m_window, &cursorX, &cursorY);
         glfwPollEvents();
     }
 
@@ -1108,6 +1207,9 @@ bool GlfwPlatform::tick()
 
     // 3. Draw all omni.ui windows
     {
+        // Image changes given from other threads run on this thread before the draw.
+        omni::ui::ImageProvider::applyPublishedUpdates();
+
         // Compute elapsed time since last frame
         static auto s_lastTime = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();
@@ -1125,6 +1227,8 @@ bool GlfwPlatform::tick()
     // 4. Render ImGui
     {
         ImGui::Render();
+        // A presentation key without a drawable must not reach the renderer back end.
+        omni::ui::dropUnmappedPresentationKeys(ImGui::GetDrawData());
     }
 
     // 5. Render backend-specific
@@ -1159,9 +1263,16 @@ bool GlfwPlatform::tick()
                     }
                 }
             }
+            VulkanBackend::WindowPresentResult presented = VulkanBackend::WindowPresentResult::eDeferred;
+            if (prepared == VulkanBackend::WindowPresentResult::ePrepared)
+            {
+                // Presentation can block on vsync or a slow display. It touches
+                // no Python state, so a host may let other threads run.
+                PresentWaitScope presentWait;
+                presented = m_vulkanBackend->presentWindowFrame(swapchainImage);
+            }
             if (prepared == VulkanBackend::WindowPresentResult::ePrepared &&
-                m_vulkanBackend->presentWindowFrame(swapchainImage) ==
-                    VulkanBackend::WindowPresentResult::eFailed)
+                presented == VulkanBackend::WindowPresentResult::eFailed)
             {
                 fprintf(stderr, "GlfwPlatform: Vulkan window presentation failed\n");
             }
@@ -1257,6 +1368,9 @@ bool GlfwPlatform::tick()
         }
         else
         {
+            // The swap can block for a long time on vsync or a slow display.
+            // It touches no Python state, so a host may let other threads run.
+            PresentWaitScope presentWait;
             glfwSwapBuffers(m_window);
         }
     }
@@ -1359,10 +1473,7 @@ void GlfwPlatform::setAppWindowOsPosition(AppWindowHandle /*window*/, int x, int
 
 void GlfwPlatform::resizeAppWindow(AppWindowHandle /*window*/, int w, int h)
 {
-    if (m_window)
-    {
-        glfwSetWindowSize(m_window, w, h);
-    }
+    setWindowSize(m_mainWindowId, w, h);
 }
 
 void GlfwPlatform::getAppWindowSize(AppWindowHandle /*window*/, int* width, int* height)

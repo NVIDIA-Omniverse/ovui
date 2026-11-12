@@ -212,8 +212,8 @@ cd ~/dev/ovgear && git checkout feature/issue-34-ovstream-demo
 # ovui — headless export branch; HEAD must be 602410b
 cd ~/dev/ovui && git checkout feature/issue-34-headless-export
 
-# ovrtx — commit that matches ovrtx==0.2.0 editable install
-cd ~/dev/ovrtx && git checkout v0.2.0   # or the SHA that pip show reports
+# ovrtx — the newest release tag
+cd ~/dev/ovrtx && git fetch --tags && git checkout "$(git tag --list 'v*' --sort=-v:refname | head -1)"
 
 # ovstream — SDK 0.1.2 release commit
 cd ~/dev/ovstream && git checkout ddedd7b

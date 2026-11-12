@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# B3 — pytest under headless EGL surfaceless (no GPU, no display server).
+# B3 â€” pytest under headless EGL surfaceless (no GPU, no display server).
 # Runs the Python test suite against the EGL-backed standalone build using
 # EGL_MESA_platform_surfaceless on stock ubuntu-22.04. Unlike B1/B2,
 # requires_gl tests CAN run on this leg because EGL provides a real GL
@@ -32,9 +32,14 @@ concurrency:
 
 jobs:
   pytest-egl-surfaceless:
-    name: pytest (B3 EGL-surfaceless)
+    name: pytest (B3 EGL-surfaceless, Python ${{ matrix.python }})
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14", "3.15"]
 
     env:
       OMNIUI_HEADLESS: "1"
@@ -60,6 +65,8 @@ jobs:
             libegl1-mesa-dev \
             libgles2-mesa-dev \
             mesa-utils \
+            libgl1-mesa-dri \
+            xvfb \
             libglfw3-dev \
             libfreetype-dev \
             libfontconfig1-dev \
@@ -68,10 +75,11 @@ jobs:
             pkg-config \
             python3-dev
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
 
       - name: Upgrade pip toolchain
         run: |
@@ -94,6 +102,11 @@ jobs:
           ulimit -c 0
           mkdir -p coverage-reports/b3
           rm -f .coverage
+          # test_standalone_resize_present.py checks the swapchain of the Vulkan
+          # backend after a window size change. This EGL build has no Vulkan
+          # backend, so that test cannot run here: it fails (a build option is
+          # not missing hardware, so it does not skip). The Linux app-wheelhouse
+          # jobs run it against wheels built with Vulkan enabled.
           {
             pytest \
               tests/test_markdown_provider_coverage.py \
@@ -106,6 +119,7 @@ jobs:
             pytest tests/ \
               --ignore=tests/test_markdown_provider_coverage.py \
               --ignore=tests/test_python_utility_coverage.py \
+              --ignore=tests/test_standalone_resize_present.py \
               --forked \
               -m "not requires_cuda" \
               --cov \
@@ -140,7 +154,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-b3-log
+          name: pytest-b3-log-py${{ matrix.python }}
           path: /tmp/pytest-b3.log
           if-no-files-found: warn
 
@@ -148,7 +162,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-b3
+          name: coverage-b3-py${{ matrix.python }}
           path: ovui/coverage-reports/b3/
           if-no-files-found: warn
 
@@ -156,6 +170,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-b3-captured
+          name: pytest-b3-captured-py${{ matrix.python }}
           path: ovui/tests/captured/
           if-no-files-found: ignore

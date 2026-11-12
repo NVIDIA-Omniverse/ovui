@@ -5,13 +5,9 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable
 from types import SimpleNamespace
 
-import pytest
-
-pytest.importorskip("pxr")
 from pxr import Sdf, Usd, UsdGeom, UsdRender  # noqa: E402
 
 from ovui_data_adapters.openusd.renderer_adapter import (  # noqa: E402
@@ -35,17 +31,23 @@ def _make_adapter_for_session_stage(
 ) -> tuple[OvRtxRendererAdapter, list[str], list[object], Callable[[], None]]:
     added_usda: list[str] = []
     removed_handles: list[object] = []
+    resolution_writes: list[tuple[list[str], list[list[int]]]] = []
     clock = {"now": 0.0}
+
+    def _write_attribute(*, prim_paths, attribute_name, tensor, **_kwargs) -> None:
+        if attribute_name == "resolution":
+            resolution_writes.append((list(prim_paths), tensor.tolist()))
 
     adapter = object.__new__(OvRtxRendererAdapter)
     adapter._stage = stage
     adapter._renderer = SimpleNamespace(
-        remove_usd=lambda handle: removed_handles.append(handle)
+        remove_usd=lambda handle: removed_handles.append(handle),
+        write_attribute=_write_attribute,
+        reset=lambda *args, **kwargs: None,
     )
+    adapter.resolution_writes = resolution_writes
     adapter._session_handle = "old-session"
     adapter._last_resolution = (640, 360)
-    adapter._last_big_delta_time = -math.inf
-    adapter._last_reinject_time = -math.inf
     adapter._clock = lambda: clock["now"]
     adapter._scene_has_lights = True
     adapter._render_product_path = _RENDER_PRODUCT_PATH
@@ -74,25 +76,42 @@ def test_openusd_adapter_authors_effective_size_to_session_render_product_only()
     adapter, added_usda, removed_handles, advance_clock = (
         _make_adapter_for_session_stage(stage)
     )
+    adapter._author_owned_session_render_product_resolution((640, 360))
+    previous = (640, 360)
 
-    for target in (
-        (1280, 720),
-        (1920, 1080),
-        (960, 540),
-        (3840, 2160),
-        (800, 600),
+    for index, target in enumerate(
+        (
+            (1280, 720),
+            (1920, 1080),
+            (960, 540),
+            (3840, 2160),
+            (800, 600),
+        )
     ):
         advance_clock()
         adapter._apply_resolution_if_allowed(target)
+        if index:
+            # A new size waits until the viewport asked for it for the settle time.
+            assert adapter._last_resolution == previous
+            assert _session_product_resolution(stage) == previous
+            advance_clock()
+            adapter._apply_resolution_if_allowed(target)
 
         assert adapter._last_resolution == target
         assert _session_product_resolution(stage) == target
-        assert f"resolution = ({target[0]}, {target[1]})" in added_usda[-1]
+        assert adapter.resolution_writes[-1] == (
+            [_RENDER_PRODUCT_PATH],
+            [[target[0], target[1]]],
+        )
         assert stage.GetRootLayer().ExportToString() == root_before
         assert stage.GetRootLayer().GetPrimAtPath(_RENDER_PRODUCT_PATH) is None
+        previous = target
 
-    assert removed_handles[0] == "old-session"
-    assert adapter._session_handle == f"session-{len(added_usda)}"
+    assert len(adapter.resolution_writes) == 5
+    # The ovrtx session layer stays: only the resolution changes.
+    assert removed_handles == []
+    assert added_usda == []
+    assert adapter._session_handle == "old-session"
 
 
 def test_direct_session_resolution_authoring_preserves_root_layer() -> None:

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tier 3 custom-message envelope dispatcher (issue #34, Step 3.7).
+"""Tier 3 custom-message envelope dispatcher.
 
 The ovstream :class:`Server` exposes a generic message channel through
 ``send_message(text)`` and the ``on_message`` callback. Kit-style web

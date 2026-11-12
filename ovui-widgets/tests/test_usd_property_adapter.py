@@ -1,24 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for UsdPropertyAdapter — attribute enumeration, get/set, and undo.
-
-All tests skip gracefully when pxr (OpenUSD) is not available.
-"""
+"""Tests for UsdPropertyAdapter — attribute enumeration, get/set, and undo."""
 
 import pytest
 
-try:
-    from pxr import Gf, Sdf, Usd, UsdGeom
-    HAS_USD = True
-except ImportError:
-    HAS_USD = False
+from pxr import Gf, Sdf, Usd, UsdGeom
 
-pytestmark = pytest.mark.skipif(not HAS_USD, reason="pxr (OpenUSD) not available")
-
+from ovui_data_adapters.common import LayerHandle
 from ovui_data_adapters.openusd import UsdPropertyAdapter
+from ovui_data_adapters.openusd.layer_stack_adapter import UsdLayerStackAdapter
 
 from ovui_widgets.common.undo import UndoManager
+
+
+def _assert_saved_layer_unchanged(stage):
+    """The root layer has the content of its file, and the Layers window
+    (Save All, the modified dot) shows it as not modified."""
+    layer = stage.GetRootLayer()
+    on_disk = Sdf.Layer.OpenAsAnonymous(layer.realPath)
+    assert layer.ExportToString() == on_disk.ExportToString()
+    layers = UsdLayerStackAdapter(stage, UndoManager())
+    assert not layers.is_dirty(LayerHandle(layer.identifier))
+
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -88,6 +92,45 @@ class TestSphereEnumeration:
         assert undo.can_undo()
         assert undo.undo() is True
         assert sphere_stage.GetPrimAtPath("/Sphere").GetAttribute("radius").Get() == pytest.approx(1.0)
+
+    def test_radius_edit_ending_on_start_value_leaves_saved_layer_unchanged(self, tmp_path):
+        path = str(tmp_path / "sphere.usda")
+        stage = Usd.Stage.CreateNew(path)
+        UsdGeom.Sphere.Define(stage, "/Sphere")
+        stage.Save()
+        undo = UndoManager()
+        adapter = UsdPropertyAdapter(stage, ["/Sphere"], undo_manager=undo)
+        attr = stage.GetPrimAtPath("/Sphere").GetAttribute("radius")
+
+        # Typing 9 then Escape: the field writes 9, then the start value.
+        adapter.begin_edit("radius")
+        adapter.set_value("radius", 9.0)
+        assert attr.Get() == pytest.approx(9.0)
+        adapter.set_value("radius", 1.0)
+        adapter.end_edit("radius")
+
+        assert not attr.HasAuthoredValue()
+        assert not undo.can_undo()
+        _assert_saved_layer_unchanged(stage)
+
+    def test_multi_selection_edit_to_first_value_is_committed(self):
+        from ovui_widgets.property.models import AttributeModelBase
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.Sphere.Define(stage, "/A").GetRadiusAttr().Set(1.0)
+        UsdGeom.Sphere.Define(stage, "/B").GetRadiusAttr().Set(2.0)
+        undo = UndoManager()
+        adapter = UsdPropertyAdapter(stage, ["/A", "/B"], undo_manager=undo)
+        model = AttributeModelBase(adapter, "radius", adapter.get_attribute_metadata("radius"))
+
+        model.begin_edit()
+        model.set_value(9.0)
+        model.set_value(1.0)
+        model.end_edit()
+
+        radii = [stage.GetPrimAtPath(p).GetAttribute("radius").Get() for p in ("/A", "/B")]
+        assert radii == [1.0, 1.0]
+        assert undo.can_undo()
 
     def test_array_types_included_step_3_8(self, sphere_stage):
         """Step 3.8 stopped skipping array attributes — ``extent``
@@ -1443,6 +1486,22 @@ class TestDeepQARegressions:
         assert pa.get_attribute_metadata("radius").is_authored is False
         # Value must be back to the schema default.
         assert sphere.GetRadiusAttr().Get() == 1.0
+
+    def test_clear_value_is_one_undo_step(self):
+        stage = Usd.Stage.CreateInMemory()
+        sphere = UsdGeom.Sphere.Define(stage, "/Sphere")
+        sphere.GetRadiusAttr().Set(2.5)
+        layer = stage.GetRootLayer()
+        before = layer.ExportToString()
+        undo = UndoManager()
+        pa = UsdPropertyAdapter(stage, ["/Sphere"], undo)
+        pa.clear_value("radius")
+        after = layer.ExportToString()
+        assert len(undo._undo_stack) == 1
+        assert undo.undo()
+        assert layer.ExportToString() == before
+        assert undo.redo()
+        assert layer.ExportToString() == after
 
 
 class TestDeepQAFormatterRegressions:

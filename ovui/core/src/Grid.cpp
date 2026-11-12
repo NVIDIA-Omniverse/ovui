@@ -78,7 +78,7 @@ static void setSizeOfGridItems(const std::vector<std::shared_ptr<Widget>>& child
 {
     auto it = children.begin();
     auto end = children.end();
-    // OMPE-40877: must force dirty for all children,
+    // must force dirty for all children,
     // otherwise the child size may be wrong if it becomes visible after scrolling.
     while (it < end)
     {
@@ -118,6 +118,9 @@ static void computeGridContentSizeInGrowingDirection(const std::vector<std::shar
                                                      std::vector<float>& offsets)
 {
     OMNIUI_PROFILE_VERBOSE_ZONE("[Grid] computeGridContentSizeInGrowingDirection");
+
+    // Clamp a zero column_count/row_count before it is used as a divisor below.
+    itemsInLine = std::max<size_t>(itemsInLine, 1);
 
     // Skip invisible children.
     size_t visibleChildrenNumber =
@@ -356,7 +359,7 @@ void Grid::setComputedContentWidth(float width)
         auto& data = _getData<GridData>();
         if (data.m_cellSizeMode == CellSizeMode::eSizeFromCount)
         {
-            columnCount = this->getColumnCount();
+            columnCount = std::max(this->getColumnCount(), 1u);
             scaledColumnWidth = width / columnCount;
 
             data.m_internalPropertyChange = true;
@@ -383,7 +386,7 @@ void Grid::setComputedContentWidth(float width)
         {
             // The user set width. We don't compute widths. It's the fastest path.
 
-            size_t rowCount = this->getRowCount();
+            size_t rowCount = std::max<size_t>(this->getRowCount(), 1);
             float scaledColumnWidth = this->getColumnWidth() * dpiScale;
             setSizeOfGridItems(children, true, data.m_lineLower, data.m_lineUpper, rowCount, scaledColumnWidth);
 
@@ -401,7 +404,7 @@ void Grid::setComputedContentWidth(float width)
             // The user didn't set width. We have to compute it. It's the slow path, but every line can have different
             // width.
 
-            size_t rowCount = this->getRowCount();
+            size_t rowCount = std::max<size_t>(this->getRowCount(), 1);
             computeGridContentSizeInGrowingDirection(
                 children, true, width, dpiScale, data.m_lineLower, data.m_lineUpper, rowCount, data.m_lineOffset);
 
@@ -433,7 +436,7 @@ void Grid::setComputedContentHeight(float height)
         auto& data = _getData<GridData>();
         if (data.m_cellSizeMode == CellSizeMode::eSizeFromCount)
         {
-            rowCount = this->getRowCount();
+            rowCount = std::max(this->getRowCount(), 1u);
             scaledRowHeight = height / rowCount;
 
             data.m_internalPropertyChange = true;
@@ -460,7 +463,7 @@ void Grid::setComputedContentHeight(float height)
         {
             // The user set height. We don't compute it. It's the fastest path.
 
-            size_t columnCount = this->getColumnCount();
+            size_t columnCount = std::max<size_t>(this->getColumnCount(), 1);
             float scaledRowHeight = this->getRowHeight() * dpiScale;
             setSizeOfGridItems(children, false, data.m_lineLower, data.m_lineUpper, columnCount, scaledRowHeight);
 
@@ -482,7 +485,7 @@ void Grid::setComputedContentHeight(float height)
             // The user didn't set height. We have to compute it. It's the slow path, but every line can have different
             // height.
 
-            size_t columnCount = this->getColumnCount();
+            size_t columnCount = std::max<size_t>(this->getColumnCount(), 1);
             computeGridContentSizeInGrowingDirection(
                 children, false, height, dpiScale, data.m_lineLower, data.m_lineUpper, columnCount, data.m_lineOffset);
 

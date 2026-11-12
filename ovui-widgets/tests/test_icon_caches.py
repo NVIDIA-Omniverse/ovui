@@ -3,8 +3,8 @@
 
 """Unit tests for :mod:`ovui_widgets.common.icon_caches`.
 
-Issue #35, Step 2.
-Issue #31, Step 5: tests for ``provider()`` added.
+Regression, Step 2.
+Regression, Step 5: tests for ``provider()`` added.
 
 Each test runs in an isolated registry via ``monkeypatch.setattr`` so
 test ordering does not affect outcomes. The autouse fixture below is
@@ -143,7 +143,7 @@ def test_register_classmethod_runs_once_with_dedup() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tests for provider() (Issue #31 Step 5)
+# Tests for provider() (Regression Step 5)
 # ---------------------------------------------------------------------------
 
 class TestProvider:
@@ -218,13 +218,13 @@ class TestProvider:
         assert len(fresh_cache) == 0
 
     def test_provider_importable_from_ovui_widgets_app_icon_caches(self):
-        """Issue #31 Step 5: ``provider`` must be importable directly from
+        """Regression Step 5: ``provider`` must be importable directly from
         ``ovui_widgets.common.icon_caches`` (not only from the shim)."""
         from ovui_widgets.common.icon_caches import provider as shared_provider
         assert callable(shared_provider)
 
     def test_stage_icons_provider_delegates_to_shared(self):
-        """Issue #31 Step 5: ``ovui_widgets.stage.widget.stage_icons.provider`` must
+        """Regression Step 5: ``ovui_widgets.stage.widget.stage_icons.provider`` must
         be the same object as ``ovui_widgets.common.icon_caches.provider`` — it is
         imported, not re-defined locally."""
         from ovui_widgets.common.icon_caches import provider as shared_provider

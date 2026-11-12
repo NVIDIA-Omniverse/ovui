@@ -124,6 +124,13 @@ def ensure_ldr_color_var(
     return var
 
 
+def _set_targets(relationship: Usd.Relationship, targets: list) -> None:
+    """Author ``targets`` on ``relationship`` unless it has exactly them."""
+
+    if list(relationship.GetTargets()) != list(targets):
+        relationship.SetTargets(targets)
+
+
 def ensure_render_product(
     stage: Usd.Stage,
     product_path: str = "/OvGearSession/Render/Viewport",
@@ -139,15 +146,17 @@ def ensure_render_product(
     and :func:`ensure_ldr_color_var`) when they do not exist, then defines
     the render product with ``camera``, ``orderedVars``, and ``resolution``
     (re-)authored on every call — callers can use this helper to respond to
-    window resizes or to re-target the camera rel.
+    window resizes or to re-target the camera rel. A relationship that
+    already has its targets is not authored again: that would notify a stage
+    change with nothing changed (a renderer restart calls this each time).
     """
     if ensure_camera_prim:
         ensure_camera(stage, camera_path)
     ensure_ldr_color_var(stage, ldr_var_path)
     with _session_edit(stage):
         product = UsdRender.Product.Define(stage, product_path)
-        product.CreateCameraRel().SetTargets([Sdf.Path(camera_path)])
-        product.CreateOrderedVarsRel().SetTargets([Sdf.Path(ldr_var_path)])
+        _set_targets(product.CreateCameraRel(), [Sdf.Path(camera_path)])
+        _set_targets(product.CreateOrderedVarsRel(), [Sdf.Path(ldr_var_path)])
         product.CreateResolutionAttr().Set(
             Gf.Vec2i(int(resolution[0]), int(resolution[1]))
         )

@@ -19,13 +19,16 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
+import numpy as np
 import omni.ui as ui
 from omni.ui_scene import scene as sc
 from ovui_data_adapters.common import (
     VIEWPORT_CAMERA_POSE_SOURCE,
     AovCameraState,
     BoundCameraPose,
+    ChangeEventType,
     RendererAdapter,
+    VisibilityState,
     is_viewport_camera_pose_change_event,
 )
 from ovui_data_adapters.common.instrumentation import VIEWPORT_FPS_VALUE, get_instrumentation
@@ -42,11 +45,33 @@ from ovui_widgets.common.menu import (
     unregister_menu_control_callback,
 )
 from ovui_widgets.common.selection import SelectionChangedEvent
+from ovui_widgets.common.settings import (
+    DEFAULT_RENDER_POLICY,
+    DEFAULT_RENDER_SETTLE_FRAMES,
+    RENDER_POLICY_CONTINUOUS,
+    RENDER_POLICY_ON_CHANGE,
+    RENDER_POLICY_SETTING_KEY,
+    RENDER_SETTLE_FRAMES_SETTING_KEY,
+)
 from ovui_widgets.viewport import _livestream_status_overlay as _ls_overlay
-from ovui_widgets.viewport.camera_controller import CameraController
+from ovui_widgets.viewport.camera_controller import (
+    CAMERA_SMOOTHING_HALF_LIFE,
+    ZOOM_GLIDE_HALF_LIFE,
+    CameraController,
+)
 from ovui_widgets.viewport.camera_flight_keyboard import (
     FLY_SPEED_SETTING,
+    FLY_WHEEL_STEP,
     FlightModeKeyboard,
+)
+from ovui_widgets.viewport.camera_gesture import PRESETS as NAVIGATION_PRESETS
+from ovui_widgets.viewport.camera_gesture import (
+    ROTATION_GAIN_MAX,
+    ZOOM_STEP_RATIO,
+    NavigationOptions,
+    SurfaceQuery,
+    parse_bindings,
+    read_bindings_file,
 )
 from ovui_widgets.viewport.camera_inertia import (
     DEFAULT_TIME_CONSTANT as DEFAULT_TUMBLE_INERTIA,
@@ -61,7 +86,11 @@ from ovui_widgets.viewport.camera_manipulator import (
 )
 from ovui_widgets.viewport.camera_navigation_state import CameraNavigationState
 from ovui_widgets.viewport.image_bridge import ImageBridge
-from ovui_widgets.viewport.light_manipulator import LightManipulator
+from ovui_widgets.viewport.light_manipulator import (
+    SUPPORTED_LIGHT_TYPES,
+    LightManipulator,
+)
+from ovui_widgets.viewport.light_pick import NON_POSITIONAL_LIGHT_TYPES, pick_light_path
 from ovui_widgets.viewport.manipulator_registry import ACTIVE_TOOL_SETTING, ToolRegistry
 from ovui_widgets.viewport.pick_gesture import (
     MOD_CTRL,
@@ -169,6 +198,16 @@ _TOOLBAR_CAMERA_MENU_TITLE = "Camera"
 _TOOLBAR_NO_CAMERAS_LABEL = "(no cameras)"
 _DEFAULT_PERSPECTIVE_CAMERA_ID = "ovui:perspective"
 _DEFAULT_ORTHO_CAMERA_ID = "ovui:orthographic"
+# The OpenUSD data adapter adds its own prims under this scope, for example the
+# fallback dome light of a scene that has no light. They are not part of the
+# user's scene, so a viewport click does not pick them as a light.
+_APP_SESSION_PATH_PREFIX = "/OvGearSession/"
+# The render-mode and path-tracing sample-target settings of the active
+# RenderProduct (the ovrtx carb settings /rtx/rendermode and
+# /rtx/pathtracing/totalSpp; 0 is no target).
+_RENDER_MODE_ATTR = "omni:rtx:rendermode"
+_PATH_TRACING_RENDER_MODE = "PathTracing"
+_PATH_TRACING_SAMPLES_ATTR = "omni:rtx:pt:samplesPerPixel"
 _TOOLBAR_ICON_PROVIDERS: dict[str, "ui.RasterImageProvider"] = {}
 FOUNDATION_QA_PRE_TOOLS_PLACEHOLDER_ENV = (
     "OVUI_VIEWPORT_FOUNDATION_QA_PRETOOLS_PLACEHOLDER"
@@ -762,6 +801,27 @@ def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _is_property_value_only_change(event: Any) -> bool:
+    """Return true for value edits of properties, such as a slider drag.
+
+    Such an edit cannot add, remove or retype a prim, so it cannot change
+    which meshes a selection outline holds. Visibility edits keep the
+    outline refresh.
+    """
+    if getattr(event, "event_type", None) is not ChangeEventType.INFO_CHANGE:
+        return False
+    if getattr(event, "resynced_paths", None):
+        return False
+    changed_paths = tuple(getattr(event, "changed_paths", ()) or ())
+    if not changed_paths:
+        return False
+    for path in changed_paths:
+        prim_path, dot, name = str(path).rpartition(".")
+        if not dot or not prim_path or "/" in name or "[" in name or name == "visibility":
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class ViewportChromeOptions:
     """Server-side viewport chrome visibility configuration.
@@ -910,7 +970,6 @@ class ViewportHudState:
 
     scene: str = ""
     fps: Optional[float] = None
-    render_fps: Optional[float] = None
     fps_text: str = ""
     resolution: Optional[tuple[int, int]] = None
     resolution_text: str = ""
@@ -919,6 +978,7 @@ class ViewportHudState:
     stream_last_error: str = ""
     stream_text: str = ""
     stream_tooltip: str = ""
+    render_fps: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -987,6 +1047,18 @@ def _owned_default_scene_view() -> "sc.SceneView":
 
         _owned_default_scene_view._cls = cls
     return cls()
+
+
+class _RenderProductChangeSubscription:
+    """Handle of :meth:`ViewportSurface.subscribe_render_product_change`."""
+
+    def __init__(self, callbacks: dict[int, Callable[[str], None]], token: int) -> None:
+        self._callbacks = callbacks
+        self._token = token
+
+    def remove(self) -> bool:
+        """Stop the calls. Safe to call more than once."""
+        return self._callbacks.pop(self._token, None) is not None
 
 
 class _Generation:
@@ -1205,6 +1277,7 @@ class ViewportSurface:
         self._bridge = ImageBridge(self._width, self._height, state=self._zero_copy_state)
         self._attach_renderer_frame_pacing(renderer)
         self._camera = CameraController()
+        self._camera.clock = time.perf_counter
         self._camera_model = CameraManipulatorModel()
         # Flight-mode keyboard — Step B.3. Constructed here (not in
         # ``_build_ui``) so the application can wire its key dispatcher
@@ -1248,6 +1321,21 @@ class ViewportSurface:
         self._tumble_inertia = TumbleInertia(
             self._camera, model=self._camera_model
         )
+        # The camera evaluates its motions at the time of each matrix it
+        # hands out (see CameraController.get_matrices).
+        self._camera.processes = [self._flight_keyboard, self._tumble_inertia]
+        self._read_navigation_settings()
+        self._surface_query = SurfaceQuery(lambda: self._renderer, self.map_pick_to_render_ndc)
+        self._camera_home: Optional[tuple[Any, ...]] = None
+        self._render_policy_applied: Optional[tuple[int, str, int]] = None
+        self._render_policy_given: Optional[tuple[int, str, int]] = None
+        # The render mode is read from the renderer only after a change and
+        # for each active render product.
+        self._render_mode_dirty = True
+        self._path_tracing_samples: Optional[int] = None
+        self._path_tracing_product: Optional[str] = None
+        self._render_settings_subscription: Any = None
+        self._subscribe_render_settings_changes(renderer)
         self._camera_manipulator: Optional[CameraManipulator] = None
         self._transform_manipulator: Optional[TransformManipulator] = None
         self._transform_manipulator_visible = True
@@ -1337,6 +1425,9 @@ class ViewportSurface:
         self._resolution_label: Optional[Any] = None
         self._resolution_value_label: Optional[Any] = None
         self._fps_res_separator_label: Optional[Any] = None
+        # Shown while the renderer builds the scene again after a stage edit
+        # (``scene_update_pending``): the picture is from before the edit.
+        self._scene_update_row: Optional[Any] = None
         # Step 1.7: livestream status overlay. Top-right HUD block,
         # hidden when the renderer has no livestream tap (i.e.
         # ``OVGEAR_LIVESTREAM`` is unset or the SDK is missing).
@@ -1451,6 +1542,16 @@ class ViewportSurface:
         self._last_authored_camera_signature: Optional[tuple[Any, ...]] = None
         self._committing_active_camera_pose = False
         self._render_target_camera_snapshot: Optional[tuple[Any, ...]] = None
+        self._free_camera_snapshot: Optional[tuple[Any, ...]] = None
+        # Scene camera edits that the stage did not accept when the camera
+        # view was left: path -> (target, distance, azimuth, elevation). An
+        # edit comes back each time its camera is chosen again, and stays
+        # until a write of it is accepted or another scene is loaded.
+        self._unwritten_camera_edits: dict[
+            str, tuple[tuple[float, ...], float, float, float]
+        ] = {}
+        self._render_product_change_callbacks: dict[int, Callable[[str], None]] = {}
+        self._render_product_change_next_token = 0
         self._camera_navigation_state = CameraNavigationState(
             stable_frame_threshold=self.CAMERA_NAVIGATION_SETTLE_FRAMES
         )
@@ -1654,6 +1755,9 @@ class ViewportSurface:
                             flight_keyboard=self._flight_keyboard,
                             tumble_inertia=self._tumble_inertia,
                             generation=generation,
+                            bindings=self._navigation_bindings,
+                            surface=self._surface_query,
+                            options=self._navigation_options,
                         )
                         self._light_manipulator = LightManipulator(
                             type_fn=self._selected_light_type,
@@ -6654,6 +6758,7 @@ class ViewportSurface:
         if activated:
             # An explicit tool choice shows a gizmo hidden by selection mode.
             self.set_transform_manipulator_visible(True)
+            self.report_transform_controls_off()
         return activated
 
     def set_transform_manipulator_visible(self, visible: bool) -> None:
@@ -6668,9 +6773,20 @@ class ViewportSurface:
         if not self._flight_keyboard.rmb_held and self._tool_registry is not None:
             if self._tool_registry.handle_key_event(key, modifiers, pressed):
                 self.set_transform_manipulator_visible(True)
+                self.report_transform_controls_off()
 
     def _on_tool_changed(self, _old_tool: str, _new_tool: str) -> None:
         self._refresh_toolbar_state()
+
+    def report_transform_controls_off(self) -> None:
+        """Show in the status bar why no gizmo is drawn when the selection blocks Move, Rotate and Scale.
+
+        Each request for a transform tool calls this one time: W, E or R, a Tools menu choice (also of the tool that
+        is already active) and ``set_active_tool``. A change of the tool setting alone does not call it.
+        """
+        report = getattr(getattr(self, "_transform_model", None), "report_transform_controls_off", None)
+        if callable(report):
+            report()
 
     def _get_transform_control_state(self) -> tuple[bool, str]:
         transform_controls_enabled = True
@@ -7356,11 +7472,7 @@ class ViewportSurface:
             if item is None:
                 # Population can finish after selection. Retry missing prims.
                 return ""
-            light_type = (
-                str(adapter.get_icon_name(item) or "")
-                if adapter.get_type_category(item) == "Light"
-                else ""
-            )
+            light_type = self._read_light_type(adapter, item)
         except Exception:
             return ""
         # Camera commits advance OVStage's ordinal but cannot change this
@@ -7397,13 +7509,29 @@ class ViewportSurface:
             item = adapter.get_item_at_path(paths[0])
             if item is None or adapter.get_type_category(item) != "Light":
                 return {}
-            geometry = dict(adapter.get_light_shape_attributes(item))
-            geometry["meters_per_unit"] = float(
-                adapter.read_stage_meters_per_unit()
-            )
-            return geometry
+            return self._read_light_geometry(adapter, item)
         except Exception:
             return {}
+
+    @staticmethod
+    def _read_light_type(adapter: Any, item: Any) -> str:
+        """Return the concrete light type of ``item``, or "" for other prims.
+
+        A failed read raises, so that the light pick can report its cause.
+        """
+        if adapter.get_type_category(item) != "Light":
+            return ""
+        return str(adapter.get_icon_name(item) or "")
+
+    @staticmethod
+    def _read_light_geometry(adapter: Any, item: Any) -> dict[str, float]:
+        """Return the authored dimensions of the light ``item`` and the stage units.
+
+        A failed read raises, so that the light pick can report its cause.
+        """
+        geometry = dict(adapter.get_light_shape_attributes(item))
+        geometry["meters_per_unit"] = float(adapter.read_stage_meters_per_unit())
+        return geometry
 
     def _list_camera_choices(self) -> tuple[Any, ...]:
         adapter = self._get_stage_adapter()
@@ -7493,13 +7621,63 @@ class ViewportSurface:
         return menu
 
     def _select_default_camera(self, mode: str) -> bool:
+        return self._go_to_free_camera(mode) is None
+
+    def _go_to_free_camera(self, mode: str) -> Optional[str]:
+        """Bind navigation to the free camera in ``mode``; ``None``, or why the view stays.
+
+        A bound USD camera can be shown through a scene render product: the
+        Render Target menu makes the render product of a camera target
+        active and binds its camera. Only the renderer's own render product
+        shows the free camera. So when a USD camera is bound, the renderer
+        first goes back to its own render product, with the same result as
+        Render Target > Main. When the renderer then refuses its own camera,
+        it gets the earlier render product again, so the view stays as it was.
+        When the render product changed, the subscribers of
+        :meth:`subscribe_render_product_change` get the shown one.
+
+        An edit of the bound camera that the stage did not accept is kept
+        (see :meth:`_keep_camera_edit_if_unwritten`) before the free view
+        comes back.
+        """
         if mode not in {"perspective", "orthographic"}:
-            return False
+            return f"{mode!r} is not a projection of the free camera"
         self._commit_active_camera_pose_if_dirty()
-        if not self._set_renderer_camera_path_if_supported(None):
-            return False
+        bound_path = self._active_camera_path
+        get_product = getattr(self._renderer, "get_active_render_product_path", None)
+        previous_product = None
+        if bound_path is not None and callable(get_product):
+            previous_product = get_product()
+        try:
+            return self._bind_free_camera(mode, previous_product)
+        finally:
+            if previous_product is not None:
+                shown_product = get_product()
+                if shown_product != previous_product:
+                    self._notify_render_product_change(str(shown_product or ""))
+
+    def _bind_free_camera(self, mode: str, previous_product: Optional[str]) -> Optional[str]:
+        """The renderer and navigation steps of :meth:`_go_to_free_camera`."""
+        bound_path = self._active_camera_path
+        if bound_path is not None:
+            refusal = self._renderer_selector_refusal("set_active_render_product_path", None)
+            if refusal is not None:
+                return refusal
+        refusal = self._renderer_selector_refusal("set_active_camera_path", None)
+        if refusal is not None:
+            get_product = getattr(self._renderer, "get_active_render_product_path", None)
+            if previous_product is not None and get_product() != previous_product:
+                undo_refusal = self._renderer_selector_refusal(
+                    "set_active_render_product_path", previous_product
+                )
+                if undo_refusal is not None:
+                    refusal = f"{refusal}; also {undo_refusal}"
+            return refusal
+        if bound_path is not None:
+            self._keep_camera_edit_if_unwritten()
+            self._restore_camera_state_snapshot(self._free_camera_snapshot)
         if not self._camera.set_projection_mode(mode):
-            return False
+            return f"the free camera does not take the {mode} projection"
         self._active_camera_path = None
         self._last_authored_camera_signature = None
         self._render_target_camera_snapshot = None
@@ -7512,19 +7690,64 @@ class ViewportSurface:
                 )
             except Exception:
                 pass
-        return True
+        return None
 
     def _set_renderer_camera_path_if_supported(self, path: Optional[str]) -> bool:
         """Return False only when a concrete renderer selector rejects ``path``."""
-        setter = getattr(self._renderer, "set_active_camera_path", None)
+        return self._renderer_selector_refusal("set_active_camera_path", path) is None
+
+    def _renderer_selector_refusal(self, selector: str, path: Optional[str]) -> Optional[str]:
+        """Why the renderer's ``selector`` does not take ``path``; ``None`` when it does.
+
+        ``selector`` is ``set_active_camera_path`` or
+        ``set_active_render_product_path``; a ``path`` of ``None`` asks for
+        the renderer's own camera or render product. A renderer without the
+        selector, or with only the no-op of the base adapter, has nothing to
+        select, so it takes every path.
+        """
+        setter = getattr(self._renderer, selector, None)
         if not callable(setter):
-            return True
-        if getattr(setter, "__func__", None) is RendererAdapter.set_active_camera_path:
-            return True
+            return None
+        if getattr(setter, "__func__", None) is getattr(RendererAdapter, selector):
+            return None
+        noun = "camera" if selector == "set_active_camera_path" else "render product"
+        wanted = f"its own {noun}" if path is None else f"the {noun} {path}"
         try:
-            return bool(setter(path))
-        except Exception:
-            return False
+            if setter(path):
+                return None
+        except Exception as exc:
+            return f"the renderer failed to take {wanted}: {type(exc).__name__}: {exc}"
+        return f"the renderer did not take {wanted}"
+
+    def subscribe_render_product_change(
+        self, callback: Callable[[str], None]
+    ) -> "_RenderProductChangeSubscription":
+        """Call ``callback(render_product_path)`` when the viewport changes the render product.
+
+        The viewport changes the renderer's render product only when it goes
+        back to its own one, as it leaves a camera render target for the free
+        camera (H, Camera > Perspective or Ortho). A tool that chose that
+        render target, such as the Render Target menu, follows the shown
+        render product with this. Call ``remove()`` on the returned handle to
+        stop the calls.
+        """
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        token = self._render_product_change_next_token
+        self._render_product_change_next_token += 1
+        self._render_product_change_callbacks[token] = callback
+        return _RenderProductChangeSubscription(self._render_product_change_callbacks, token)
+
+    def _notify_render_product_change(self, render_product_path: str) -> None:
+        for callback in tuple(self._render_product_change_callbacks.values()):
+            try:
+                callback(render_product_path)
+            except Exception as exc:
+                ErrorReporter.log_warning(
+                    "Viewport",
+                    f"a tool did not follow the change of the render product to "
+                    f"{render_product_path}: {type(exc).__name__}: {exc}",
+                )
 
     def select_camera_path(self, path: str) -> bool:
         """Bind viewport navigation to the USD camera at ``path``.
@@ -7551,6 +7774,7 @@ class ViewportSurface:
         """
 
         self._commit_active_camera_pose_if_dirty()
+        self._keep_camera_edit_if_unwritten()
         self._render_target_camera_snapshot = self._camera_state_snapshot()
         self._set_renderer_camera_path_if_supported(None)
         self._active_camera_path = None
@@ -7559,17 +7783,101 @@ class ViewportSurface:
         return True
 
     def restore_camera_binding_for_render_target(self) -> bool:
-        """Restore the free camera state saved before a non-camera target."""
+        """Return navigation to the free camera after a render target.
+
+        A non-camera target saved the free camera state before it suspended
+        the binding. A scene camera target bound navigation to its USD camera
+        instead: on the viewport's own session target that binding would keep
+        the scene camera's view, and free navigation would edit that USD
+        camera. Then the free view saved before the binding comes back, as
+        with Camera > Perspective.
+        """
 
         snapshot = self._render_target_camera_snapshot
         if snapshot is None:
-            return False
+            if self._active_camera_path is None:
+                return False
+            return self._release_scene_camera_to_free_view()
         self._restore_camera_state_snapshot(snapshot)
         self._render_target_camera_snapshot = None
         self._active_camera_path = None
         self._last_authored_camera_signature = None
         self._reset_camera_navigation_state()
         return True
+
+    def _release_scene_camera_to_free_view(self) -> bool:
+        """Leave the bound scene camera for the free view, as Camera > Perspective does.
+
+        This is the same step as H and Camera > Perspective or Ortho (see
+        :meth:`_go_to_free_camera`), in the projection of the free view saved
+        before the binding. The Render Target menu already shows its own
+        render product, so that step finds no render product change.
+        """
+        path = self._active_camera_path
+        snapshot = self._free_camera_snapshot
+        mode = str(snapshot[6]) if snapshot is not None else self._camera.projection_mode
+        refusal = self._go_to_free_camera(mode)
+        if refusal is not None:
+            ErrorReporter.log_warning(
+                "Viewport",
+                f"the free camera is not restored, so {path} stays bound: {refusal}",
+            )
+            return False
+        return True
+
+    def _keep_camera_edit_if_unwritten(self) -> None:
+        """Keep the edit of the bound camera if it is not in the stage.
+
+        Call this after the pending edit was written, when the camera view
+        will be replaced: an edit that the stage did not accept is kept.
+        """
+        path = self._active_camera_path
+        if path and (
+            self._camera_author_signature(path) != self._last_authored_camera_signature
+        ):
+            self._keep_unwritten_camera_edit(path)
+
+    def _keep_unwritten_camera_edit(self, path: str) -> None:
+        """Keep the edit of ``path`` that the stage did not accept.
+
+        The edit stays until a write of it is accepted or another scene is
+        loaded. It comes back, not yet written, each time ``path`` is chosen.
+        """
+        state = self._camera.state
+        edit = (
+            tuple(float(v) for v in state.target),
+            float(state.distance),
+            float(state.azimuth),
+            float(state.elevation),
+        )
+        if self._unwritten_camera_edits.get(path) == edit:
+            # Already kept and reported.
+            return
+        self._unwritten_camera_edits[path] = edit
+        ErrorReporter.log_warning(
+            "Viewport",
+            f"the change of {path} is not written: the stage did not accept it. "
+            f"The viewport keeps the change until it is written or another scene "
+            f"is loaded, and shows it again when {path} is chosen",
+        )
+
+    def _restore_unwritten_camera_edit(self, path: str) -> None:
+        """Show the kept edit of ``path`` again, as an edit not yet written.
+
+        The kept copy stays until a write of the edit is accepted.
+        """
+        edit = self._unwritten_camera_edits.get(path)
+        if edit is None:
+            return
+        target, distance, azimuth, elevation = edit
+        state = self._camera.state
+        state.target = [float(v) for v in target]
+        state.distance = distance
+        state.azimuth = azimuth
+        state.elevation = elevation
+        # The navigation state sees the change, so the frame loop or the next
+        # switch writes it, as with any other camera edit.
+        self._tick_camera_navigation_state()
 
     def _camera_state_snapshot(self) -> tuple[Any, ...]:
         state = self._camera.state
@@ -7614,8 +7922,13 @@ class ViewportSurface:
         # tests.
         if not self._set_renderer_camera_path_if_supported(path):
             return False
-        if previous_path and previous_path != path:
+        if previous_path:
+            # Also for the same camera: its view is replaced by the stored
+            # pose below, so its pending edit is written or kept first.
             self._commit_active_camera_pose_if_dirty()
+            self._keep_camera_edit_if_unwritten()
+        if previous_path is None:
+            self._free_camera_snapshot = self._camera_state_snapshot()
         previous_projection = self._camera.projection_mode
         self._camera.set_projection_mode("perspective")
         if not self.apply_camera_pose(pose):
@@ -7626,6 +7939,7 @@ class ViewportSurface:
         self._last_authored_camera_signature = self._camera_author_signature(path)
         self._render_target_camera_snapshot = None
         self._reset_camera_navigation_state()
+        self._restore_unwritten_camera_edit(path)
         return True
 
     def _build_hud_label(
@@ -7667,7 +7981,7 @@ class ViewportSurface:
             if chrome.show_text_hud:
                 with ui.VStack(spacing=0):
                     ui.Spacer(height=self._get_hud_top_padding())
-                    with ui.HStack(height=38):
+                    with ui.HStack(height=54):
                         ui.Spacer(width=14)
                         with ui.VStack(width=430, spacing=0):
                             self._scene_row = ui.HStack(height=16, spacing=0)
@@ -7698,6 +8012,10 @@ class ViewportSurface:
                                     "Viewport.HUD.Value",
                                     width=120,
                                 )
+                            self._scene_update_row = ui.HStack(height=16, spacing=0)
+                            with self._scene_update_row:
+                                status_value_label = self._build_hud_pair("STATUS")
+                                status_value_label.text = "Updating the scene..."
                         ui.Spacer()
                     ui.Spacer()
 
@@ -7788,6 +8106,10 @@ class ViewportSurface:
         self._set_widget_visible(self._resolution_label, bool(res_text))
         self._set_widget_visible(self._resolution_value_label, bool(res_text))
         self._set_widget_visible(self._fps_res_separator_label, bool(fps_text and res_text))
+        pending = getattr(self._renderer, "scene_update_pending", None)
+        self._set_widget_visible(
+            self._scene_update_row, bool(callable(pending) and pending())
+        )
 
         self._refresh_livestream_status()
 
@@ -7836,6 +8158,157 @@ class ViewportSurface:
             getattr(self._renderer, "_frame_pacing_token", None)
         )
         return token or 0
+
+    def _render_policy(self) -> tuple[str, int]:
+        """``(policy, settle frames)`` from ``app.renderer.renderPolicy``.
+
+        ``on_change`` (the default) renders a changed camera or size, a stage
+        edit, a selection change or a render-settings change, then
+        ``app.renderer.renderSettleFrames`` (512) more frames, so the
+        real-time picture becomes sharp, and then a still viewer stops
+        stepping the renderer: ovrtx keeps memory on every step.
+        ``continuous`` renders every frame. Path tracing gathers its samples
+        over still frames, so under ``on_change`` it renders until its sample
+        target, and without a target it renders continuously.
+        """
+        settings = self._resolve_settings()
+        policy = DEFAULT_RENDER_POLICY
+        settle = DEFAULT_RENDER_SETTLE_FRAMES
+        if settings is not None:
+            policy = str(settings.get(RENDER_POLICY_SETTING_KEY, DEFAULT_RENDER_POLICY))
+            value = settings.get(RENDER_SETTLE_FRAMES_SETTING_KEY, DEFAULT_RENDER_SETTLE_FRAMES)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                settle = value
+        if policy == RENDER_POLICY_ON_CHANGE:
+            samples = self._path_tracing_sample_target()
+            if samples is not None:
+                if samples <= 0:
+                    policy = RENDER_POLICY_CONTINUOUS
+                else:
+                    settle = samples
+        return policy, settle
+
+    def _path_tracing_sample_target(self) -> Optional[int]:
+        """Samples per pixel of path tracing; ``None`` when the renderer does not path trace.
+
+        Zero means no target (path tracing accumulates without end). The
+        values come from the adapter's ``read_render_setting_value`` and are
+        read again after a stage, renderer or render-settings change and when
+        another render product becomes active: each product has its own mode.
+        """
+        product = self._render_mode_product_path()
+        if not self._render_mode_dirty and product == self._path_tracing_product:
+            return self._path_tracing_samples
+        self._render_mode_dirty = False
+        self._path_tracing_product = product
+        self._path_tracing_samples = None
+        read = getattr(self._renderer, "read_render_setting_value", None)
+        if not callable(read):
+            return None
+        try:
+            if str(read(_RENDER_MODE_ATTR) or "") != _PATH_TRACING_RENDER_MODE:
+                return None
+            samples = read(_PATH_TRACING_SAMPLES_ATTR)
+        except Exception as exc:
+            # Unknown: render continuously, so no sample is lost.
+            ErrorReporter.log_warning(
+                "Viewport", f"the render mode could not be read; rendering continuously: {exc}"
+            )
+            self._path_tracing_samples = 0
+            return 0
+        if isinstance(samples, bool) or not isinstance(samples, (int, float)):
+            samples = 0
+        self._path_tracing_samples = max(0, int(samples))
+        return self._path_tracing_samples
+
+    def _render_mode_product_path(self) -> Optional[str]:
+        """The renderer's active render product path; ``None`` when it does not say."""
+        get = getattr(self._renderer, "get_active_render_product_path", None)
+        if not callable(get):
+            return None
+        path = get()
+        return None if path is None else str(path)
+
+    def _apply_render_policy(self) -> None:
+        """Give the renderer and its native pacing session the policy of :meth:`_render_policy`.
+
+        The renderer applies it to its synchronous steps
+        (``set_render_policy``), the native render worker to its own. Both
+        are given again when the policy or the settle frames change, for
+        example when the render mode becomes path tracing.
+        """
+        policy, settle = self._render_policy()
+        given = (id(self._renderer), policy, settle)
+        if given != self._render_policy_given:
+            self._render_policy_given = given
+            give = getattr(self._renderer, "set_render_policy", None)
+            if callable(give):
+                give(policy, settle)
+        token = self._owned_pacing_session()
+        if not token:
+            return
+        if policy == RENDER_POLICY_ON_CHANGE:
+            # The native render worker keeps one step in flight and shows a
+            # step only when it submits the next one, so it needs one settle
+            # frame to show the newest camera.
+            settle = max(settle, 1)
+        applied = (token, policy, settle)
+        if applied == self._render_policy_applied:
+            return
+        self._render_policy_applied = applied
+        setter = getattr(getattr(ui, "_ui", None), "_native_frame_pacing_set_render_policy", None)
+        if callable(setter) and not setter(token, policy, settle):
+            ErrorReporter.log_warning("Viewport", f"render policy {policy!r} not applied")
+
+    def _renderer_kept_last_frame(self) -> bool:
+        """Whether the renderer returned its kept picture with no step (``last_frame_unchanged``)."""
+        kept = getattr(self._renderer, "last_frame_unchanged", None)
+        return callable(kept) and kept() is True
+
+    def _request_render(self) -> None:
+        """Render once more under the ``on_change`` policy (a change the camera does not show)."""
+        renderer_request = getattr(self._renderer, "request_render", None)
+        if callable(renderer_request):
+            renderer_request()
+        request = getattr(getattr(ui, "_ui", None), "_native_frame_pacing_request_render", None)
+        token = self._owned_pacing_session()
+        if token and callable(request):
+            request(token)
+
+    def _stage_change_keeps_picture(self, event: Any) -> bool:
+        """Whether the renderer says that the stage change ``event`` cannot change its picture."""
+        keeps = getattr(self._renderer, "stage_change_keeps_picture", None)
+        if not callable(keeps):
+            return False
+        try:
+            return keeps(event) is True
+        except Exception as exc:
+            # Unknown: render, as for every other change.
+            ErrorReporter.log_warning(
+                "Viewport", f"the renderer could not tell whether a stage change keeps its picture; rendering: {exc}"
+            )
+            return False
+
+    def _renderer_changed(self) -> None:
+        """A stage, renderer or render-settings change: read the render mode again and render."""
+        self._render_mode_dirty = True
+        keeps_picture = getattr(self._renderer, "render_settings_change_keeps_picture", None)
+        if callable(keeps_picture) and keeps_picture() is True:
+            # The picture does not show the new value (Eco Mode), or the
+            # renderer shows the picture of the new settings itself (a stored
+            # one, or a new render): no render request.
+            return
+        self._request_render()
+
+    def _subscribe_render_settings_changes(self, renderer: Optional[RendererAdapter]) -> None:
+        """Render again after each render-settings change of ``renderer``."""
+        subscription = self._render_settings_subscription
+        self._render_settings_subscription = None
+        if subscription is not None:
+            subscription.cancel()
+        subscribe = getattr(renderer, "subscribe_render_settings_changes", None)
+        if callable(subscribe):
+            self._render_settings_subscription = subscribe(self._renderer_changed)
 
     def _owned_render_updates(self) -> Optional[tuple[int, int]]:
         """``(epoch/session token, completions)`` for this renderer.
@@ -8151,9 +8624,101 @@ class ViewportSurface:
         render_x, render_y = mapped
         pick(
             render_x, render_y,
-            lambda path, pos: self._on_pick_result(path, mode),
+            lambda path, pos: self._on_pick_result(
+                self.resolve_pick_path(render_x, render_y, path), mode
+            ),
             "viewport_click",
         )
+
+    def resolve_pick_path(self, render_x: float, render_y: float, path: Any) -> Any:
+        """Return the prim a click at render NDC selects.
+
+        The renderer pick reports geometry only. A click on the light gizmo
+        that the viewport draws selects that light, also over the empty
+        background. Only the single selected light draws a gizmo, so a light
+        that is not selected never takes a click. The gizmo of a dome or
+        distant light has no place in the scene, so a mesh under the click
+        stays the answer.
+        """
+        hit = self._pick_light_at(render_x, render_y)
+        if hit is None:
+            return path
+        light_path, light_type = hit
+        if path and light_type in NON_POSITIONAL_LIGHT_TYPES:
+            return path
+        return light_path
+
+    def _report_light_pick_failure(self, operation: str, exc: Exception) -> None:
+        ErrorReporter.log_error(
+            "ViewportWidget",
+            f"Light pick: {operation} failed; the click keeps the renderer pick result "
+            "for this light",
+            exc,
+        )
+
+    @staticmethod
+    def _light_is_visible(adapter: Any, item: Any) -> bool:
+        """Whether the light shows in the scene, also through a hidden parent."""
+        return adapter.compute_visibility(item) is VisibilityState.VISIBLE
+
+    def _pick_light_at(self, render_x: float, render_y: float) -> tuple[str, str] | None:
+        """Return ``(path, light type)`` when the click is on the drawn light gizmo.
+
+        ``LightManipulator`` draws the gizmo of the single selected light from
+        the same light type, dimensions and world matrix that are read here,
+        so the pick target is the gizmo on screen. Hidden lights and lights
+        that the app adds under ``/OvGearSession`` are not picked. When a read
+        fails, the failure is reported and the click keeps the renderer hit.
+        """
+        adapter = self._get_stage_adapter()
+        if adapter is None or self._bus is None:
+            return None
+        path = ""
+        try:
+            snapshot = self._bus.get_snapshot()
+            paths = list(snapshot.paths()) if snapshot is not None else []
+            if len(paths) != 1:
+                return None
+            path = str(paths[0])
+            if path.startswith(_APP_SESSION_PATH_PREFIX):
+                return None
+            item = adapter.get_item_at_path(path)
+            if item is None:
+                return None
+            light_type = self._read_light_type(adapter, item)
+            if light_type not in SUPPORTED_LIGHT_TYPES:
+                return None  # No light gizmo is drawn.
+            if not self._light_is_visible(adapter, item):
+                return None
+            geometry = self._read_light_geometry(adapter, item)
+            world_matrix = self._transform_model.get_first_world_transform(raise_errors=True)
+            if world_matrix is None:
+                return None  # Without a world matrix no gizmo is drawn.
+        except Exception as exc:
+            self._report_light_pick_failure(f"reading the selected light {path}".rstrip(), exc)
+            return None
+        try:
+            sizes = self._interaction_frame_and_render_size()
+            width, height = sizes[1] if sizes is not None else self._get_viewport_size()
+            presented = getattr(self._renderer, "presented_camera_snapshot", None)
+            if presented is not None:
+                view, projection = presented.view, presented.projection
+            else:
+                view, projection = self._camera.get_matrices(width, height)
+        except Exception as exc:
+            self._report_light_pick_failure("reading the camera", exc)
+            return None
+        hit = pick_light_path(
+            [(path, light_type, geometry, world_matrix)],
+            view,
+            projection,
+            (render_x, render_y),
+            (width, height),
+            lambda light, exc: self._report_light_pick_failure(
+                f"testing the gizmo of the light {light}", exc
+            ),
+        )
+        return (hit, light_type) if hit else None
 
     def map_pick_to_render_ndc(self, x: float, y: float) -> tuple[float, float] | None:
         """Map viewport NDC to rendered-image NDC, respecting letterboxing."""
@@ -8359,11 +8924,15 @@ class ViewportSurface:
         self._receiving_from_bus = True
         try:
             paths = event.snapshot.paths()
-            self._profile_ovui_call(
+            outline_may_change = self._profile_ovui_call(
                 "ViewportWidget._set_renderer_selection_highlight",
                 self._set_renderer_selection_highlight, paths,
             )
             self._request_selection_highlight_retry(paths)
+            if outline_may_change is not False:
+                # A selection that outlines nothing, after one that outlined
+                # nothing, does not change the picture: no render.
+                self._request_render()
             if self._manipulator_registry is not None:
                 self._profile_ovui_call(
                     "ViewportWidget.manipulator_registry.on_selection_changed",
@@ -8416,13 +8985,16 @@ class ViewportSurface:
         paths: list,
         *,
         force: bool = False,
-    ) -> None:
+    ) -> bool:
         """Apply selection highlights to renderable mesh targets.
 
         Stage/Property selection remains the user's exact selected paths.
         The renderer outline pass, however, only visibly outlines renderable
         geometry, so Xform/Scope/group selections are expanded to their
         descendant mesh prims before calling the renderer.
+
+        Returns False only when the renderer says that its outline cannot
+        change; True otherwise, also after a failure.
         """
         try:
             highlight_paths = self._profile_ovui_call(
@@ -8438,11 +9010,12 @@ class ViewportSurface:
                 )
                 if callable(refresh_highlight):
                     refresh_highlight(highlight_paths)
-                    return
+                    return True
                 renderer.set_selection_highlight([])  # type: ignore[union-attr]
-            renderer.set_selection_highlight(highlight_paths)  # type: ignore[union-attr]
+            return renderer.set_selection_highlight(highlight_paths) is not False  # type: ignore[union-attr]
         except Exception:
             pass
+        return True
 
     def _resolve_selection_highlight_paths(self, paths: list) -> list[str]:
         selected = [str(path) for path in (paths or []) if path]
@@ -8643,6 +9216,7 @@ class ViewportSurface:
             # Terminal: a late stage load must not rewire model state.
             return
         self._selected_light_type_cache = None
+        self._renderer_changed()
         if self._transform_model is None:
             return
         # Resolve a held drag against the outgoing wiring first.
@@ -8653,6 +9227,8 @@ class ViewportSurface:
         self._commit_active_camera_pose_if_dirty()
         self._active_camera_path = None
         self._last_authored_camera_signature = None
+        # Kept camera edits belong to the cameras of the previous scene.
+        self._unwritten_camera_edits.clear()
         self._camera.set_projection_mode("perspective")
         self._reset_camera_navigation_state()
         # Drop any previously bound camera selection on the renderer so
@@ -8763,6 +9339,90 @@ class ViewportSurface:
         self._camera.focus(center, distance)
         return True
 
+    def mark_camera_home(self) -> None:
+        """Remember the camera as home (H returns to it) and size the fly speed floor to the stage."""
+        self._camera_home = self._camera_state_snapshot()
+        adapter = self._stage_adapter_provider() if self._stage_adapter_provider is not None else None
+        try:
+            low, high = adapter.compute_world_aabb(["/"])
+            self._flight_keyboard.scene_size = float(np.linalg.norm(np.subtract(high, low)))
+        except Exception:
+            self._flight_keyboard.scene_size = 0.0
+
+    def go_camera_home(self) -> bool:
+        """Return the camera to home and stop its motion; frame the stage when there is no home.
+
+        Home is a view command, not an edit. While a USD camera is bound,
+        navigation is written to that camera prim. So the viewport first
+        goes back to the free camera in the projection of home, and to the
+        renderer's own render product, the same way as the Camera menu does,
+        and only then moves to home. Home never moves the USD camera. The
+        Camera menu then checks Perspective or Ortho, and the Render Target
+        menu the viewport's own target.
+        """
+        bound_path = self._active_camera_path
+        if bound_path is not None:
+            # The last item of a camera snapshot is its projection mode.
+            mode = self._camera_home[-1] if self._camera_home is not None else "perspective"
+            refusal = self._go_to_free_camera(mode)
+            if refusal is not None:
+                ErrorReporter.log_warning(
+                    "Viewport",
+                    f"home: the view stays on camera {bound_path}: the viewport could not "
+                    f"go back to the free {mode} camera, because {refusal}",
+                )
+                return False
+        if self._camera_home is None:
+            return self.frame_paths(["/"])
+        self._camera.stop_motion()
+        self._restore_camera_state_snapshot(self._camera_home)
+        return True
+
+    def _read_navigation_settings(self) -> None:
+        """Camera buttons and feel from the ``viewport.navigation.*`` settings.
+
+        ``preset`` (kit, review or web) and ``bindings`` (comma-separated
+        ``MODE=BUTTON[+MODIFIER]`` changes, also read from the JSON list of
+        ``bindings_file``) set the buttons; ``invert_look``,
+        ``invert_orbit``, ``raw_cursor``, ``smoothing_ms``, ``zoom_glide_ms``,
+        ``wheel_step``, ``fly_wheel_step`` and ``rotation_gain_max`` the feel.
+        """
+        try:
+            from ovui_widgets.common.settings import Settings
+            settings = Settings._instance
+        except ImportError:
+            settings = None
+
+        def get(key: str, default: Any) -> Any:
+            value = settings.get("viewport.navigation." + key, None) if settings is not None else None
+            return default if value is None else value
+
+        preset = str(get("preset", "kit"))
+        try:
+            changes = read_bindings_file(str(get("bindings_file", ""))) if get("bindings_file", "") else []
+            extra = get("bindings", [])
+            changes += [part for part in extra.split(",") if part.strip()] if isinstance(extra, str) else list(extra)
+            self._navigation_bindings = parse_bindings(preset, changes)
+        except (OSError, ValueError) as exc:
+            from ovui_widgets.common.error_reporter import ErrorReporter
+            ErrorReporter.log_warning("Viewport", f"navigation bindings ignored: {exc}")
+            self._navigation_bindings = parse_bindings(preset if preset in NAVIGATION_PRESETS else "kit")
+        try:
+            self._navigation_options = NavigationOptions(
+                invert_look=bool(get("invert_look", False)),
+                invert_orbit=bool(get("invert_orbit", False)),
+                raw_cursor=bool(get("raw_cursor", False)),
+                rotation_gain_max=float(get("rotation_gain_max", ROTATION_GAIN_MAX)),
+                wheel_step=max(1.001, float(get("wheel_step", ZOOM_STEP_RATIO))),
+            )
+            self._camera.smoothing_half_life = float(get("smoothing_ms", CAMERA_SMOOTHING_HALF_LIFE * 1000.0)) / 1000.0
+            self._camera.zoom_glide_half_life = float(get("zoom_glide_ms", ZOOM_GLIDE_HALF_LIFE * 1000.0)) / 1000.0
+            self._flight_keyboard.wheel_step = float(get("fly_wheel_step", FLY_WHEEL_STEP if preset == "kit" else 1.2))
+        except (TypeError, ValueError):
+            self._navigation_options = NavigationOptions()
+            self._camera.smoothing_half_life = CAMERA_SMOOTHING_HALF_LIFE
+            self._camera.zoom_glide_half_life = ZOOM_GLIDE_HALF_LIFE
+
     def apply_camera_pose(self, pose: Optional[BoundCameraPose]) -> bool:
         """Apply ``pose`` to the viewport camera.
 
@@ -8846,13 +9506,17 @@ class ViewportSurface:
                 kwargs["source"] = VIEWPORT_CAMERA_POSE_SOURCE
             if self._callable_accepts_keyword(writer, "undoable"):
                 kwargs["undoable"] = undoable
-            return bool(
+            accepted = bool(
                 writer(path, view_matrix, proj_matrix, width, height, target, **kwargs)
             )
         except Exception:
             return False
         finally:
             self._committing_active_camera_pose = False
+        if accepted:
+            # The edit is in the stage now: a kept copy of it is not needed.
+            self._unwritten_camera_edits.pop(path, None)
+        return accepted
 
     @staticmethod
     def _callable_accepts_keyword(callable_obj: Any, keyword: str) -> bool:
@@ -8994,30 +9658,13 @@ class ViewportSurface:
             self._camera_navigation_state.clear_dirty()
         return accepted
 
-    # Camera-physics dt clamps. ``TumbleInertia.tick`` already clamps
-    # internally (see ``camera_inertia.py:DT_CLAMP_MIN/MAX``); flight mode
-    # has no built-in clamp and would otherwise launch the camera across
-    # the scene if the loop ever produces a multi-second tick (debugger
-    # pause, GC stall, first-frame clock bug). Mirror tumble's bounds.
-    _UPDATE_DT_MIN = 0.001
-    _UPDATE_DT_MAX = 0.1
-
     def update(self, tick_dt: float) -> None:
-        """Per-tick wall-clock physics — flight + tumble inertia.
+        """Per-tick work of the viewport that does not render.
 
-        Runs every outer-loop tick regardless of whether the render gate
-        fires this frame. ``tick_dt`` is the time since the previous tick.
-        Non-positive values (``None``, ``0.0``, negative) short-circuit
-        the whole method: ``FlightModeKeyboard.integrate()`` documents
-        non-positive dt as a no-op (camera_flight_keyboard.py:248-252)
-        and ``TumbleInertia.tick()`` does the same — there is nothing
-        useful for either subsystem to do at a zero or negative interval.
-
-        Positive values are clamped to ``[_UPDATE_DT_MIN, _UPDATE_DT_MAX]``
-        before reaching flight integration so a long stall cannot teleport
-        the camera. Tumble inertia clamps the same range internally; we
-        pass it the original (positive) value so its own bounds remain
-        authoritative.
+        The camera's motions (flight, inertia, smoothing) are not advanced
+        here: the camera evaluates them at the time of each matrix it hands
+        out (``CameraController.get_matrices``). Non-positive ``tick_dt``
+        values (``None``, ``0.0``, negative) short-circuit the method.
         """
         if self._resolution_sync_is_disposed():
             return
@@ -9026,13 +9673,6 @@ class ViewportSurface:
             self._dismiss_settings_toolbar_menu()
         if tick_dt is None or tick_dt <= 0.0:
             return
-        # Flight integration is speed × seconds; clamp before forwarding so
-        # a multi-second stall can't propel the camera through the scene.
-        if self._flight_keyboard.is_flying:
-            dt = max(self._UPDATE_DT_MIN, min(self._UPDATE_DT_MAX, float(tick_dt)))
-            self._flight_keyboard.integrate(dt)
-        if self._tumble_inertia.is_active:
-            self._tumble_inertia.tick(tick_dt)
         self._maybe_request_viewport_resize_effective_recompute()
 
     def _viewport_mode_resize_needs_effective_recompute(self) -> bool:
@@ -9255,7 +9895,7 @@ class ViewportSurface:
             self._async_resize_refresh_was_pending = resize_refresh
             self._refresh_hud()
             self._refresh_resolution_render_qa_window()
-            view, proj = self._camera.get_matrices(w, h)
+            view, proj = self._camera.get_matrices(w, h, np.float64)
             self._tick_camera_navigation_state()
             self._author_active_camera_pose(view, proj, w, h)
             self._renderer.enqueue_render_frame(
@@ -9266,6 +9906,7 @@ class ViewportSurface:
                 view,
                 proj,
             )
+            self._apply_render_policy()
             return True
         finally:
             self._resolution_render_in_progress = False
@@ -9294,26 +9935,55 @@ class ViewportSurface:
             if callable(release):
                 release(metadata)
             return False
-        self._present_async_render_frame(result.image, metadata)
-        return True
+        # False means ovui refused the pixels: nothing new was presented. None
+        # (no GPU backend, or a subclass that returns nothing) counts as
+        # presented, as before.
+        return self._present_async_render_frame(result.image, metadata) is not False
 
-    def _present_async_render_frame(self, frame: Any, metadata: Any) -> None:
-        """Publish a completed image using its exact submission camera."""
-        self._present_async_render_frame_impl(frame, metadata)
+    def _present_async_render_frame(self, frame: Any, metadata: Any) -> Optional[bool]:
+        """Publish a completed image using its exact submission camera.
 
-    def _present_async_render_frame_impl(self, frame: Any, metadata: Any) -> None:
+        Returns False when ovui refused the pixels, so that nothing counts as presented.
+        """
+        return self._present_async_render_frame_impl(frame, metadata)
+
+    def _present_async_render_frame_impl(self, frame: Any, metadata: Any) -> bool:
         w, h = metadata.extent
         view = metadata.view_matrix
         proj = metadata.projection_matrix
-        self._last_presented_frame_metadata = metadata
-        self._last_image_frame = frame
         try:
-            self._bridge.update(frame)
+            accepted = self._bridge.update(frame)
         except BaseException:
+            # The upload failed, so the screen and the presentation keep the
+            # previous image. Give the frame back to the renderer. A failed
+            # release is reported on its own: the upload error that propagates
+            # keeps its cause.
+            release = getattr(self._renderer, "release_render_frame", None)
+            if callable(release):
+                try:
+                    release(metadata)
+                except BaseException as release_error:
+                    _shielded_report(
+                        "ViewportWidget",
+                        "the renderer did not take back the frame of a failed upload",
+                        release_error,
+                    )
+            raise
+        if accepted is False:
+            # ovui refused the pixels and still shows the previous frame. This
+            # frame was not presented: do not mark it, count it, or move the
+            # overlay camera to its matrices. Give the frame back to the
+            # renderer. A GPU frame has already switched the bridge to the CPU
+            # path, so the next frames arrive. The public presentation (image
+            # and metadata) stays the last accepted one, or none when the first
+            # upload was refused. With no GPU backend ovui answers None, not
+            # False, and the frame is presented as before.
             release = getattr(self._renderer, "release_render_frame", None)
             if callable(release):
                 release(metadata)
-            raise
+            return False
+        self._last_image_frame = frame
+        self._last_presented_frame_metadata = metadata
         mark_presented = getattr(self._renderer, "mark_render_frame_presented", None)
         if callable(mark_presented):
             mark_presented(metadata)
@@ -9362,6 +10032,7 @@ class ViewportSurface:
         if self._async_resize_refresh_was_pending:
             self._request_settings_menu_reshow()
             self._async_resize_refresh_was_pending = False
+        return True
 
     def get_presentation_image(self):
         """Return an owned, immutable CPU image of the last presentation, if any.
@@ -9421,56 +10092,66 @@ class ViewportSurface:
                 return False
             if self._renderer is None:
                 return False
-            visible_frame_size = self._visible_viewport_frame_size_for_render()
-            if visible_frame_size is None:
-                return False
-            if self._resolution_state.is_viewport_mode:
-                effective = self._compute_viewport_mode_effective_resolution(
-                    visible_frame_size
-                )
-                self._last_viewport_mode_effective_resolution = effective
-                self._last_viewport_mode_visible_frame_size = visible_frame_size
-                self._last_fixed_mode_effective_resolution = None
-                self._last_fill_viewport_visible_frame_size = None
-                w, h = self._commit_resolution_effective_size(
-                    effective.effective_size
-                )
-                self._viewport_resize_render_refresh_pending = False
-            elif self._resolution_state.is_fixed_mode:
-                effective = self._compute_fixed_mode_effective_resolution(
-                    visible_frame_size
-                )
-                self._last_fixed_mode_effective_resolution = effective
-                self._last_viewport_mode_effective_resolution = None
-                self._last_viewport_mode_visible_frame_size = None
-                self._last_fill_viewport_visible_frame_size = (
-                    visible_frame_size if self._resolution_state.fill_viewport else None
-                )
-                w, h = self._commit_resolution_effective_size(
-                    effective.effective_size
-                )
-                self._viewport_resize_render_refresh_pending = False
+            native_pacing_active = self._owned_pacing_session() != 0
+            use_cached_native_resolution = (
+                native_pacing_active
+                and not self._viewport_resize_render_refresh_pending
+                and self._resolution_state.effective_size is not None
+                and self._last_resolution is not None
+            )
+            if use_cached_native_resolution:
+                w, h = ensure_safe_renderer_request_size(self._last_resolution)
             else:
-                frame_width, frame_height = visible_frame_size
-                w = max(
-                    self.MIN_RENDER_WIDTH,
-                    min(self.MAX_RENDER_WIDTH, frame_width),
-                )
-                h = max(
-                    self.MIN_RENDER_HEIGHT,
-                    min(self.MAX_RENDER_HEIGHT, frame_height),
-                )
-                self._last_viewport_mode_effective_resolution = None
-                self._last_viewport_mode_visible_frame_size = None
-                self._last_fixed_mode_effective_resolution = None
-                self._last_fill_viewport_visible_frame_size = None
-                self._viewport_resize_render_refresh_pending = False
+                visible_frame_size = self._visible_viewport_frame_size_for_render()
+                if visible_frame_size is None:
+                    return False
+                if self._resolution_state.is_viewport_mode:
+                    effective = self._compute_viewport_mode_effective_resolution(
+                        visible_frame_size
+                    )
+                    self._last_viewport_mode_effective_resolution = effective
+                    self._last_viewport_mode_visible_frame_size = visible_frame_size
+                    self._last_fixed_mode_effective_resolution = None
+                    self._last_fill_viewport_visible_frame_size = None
+                    w, h = self._commit_resolution_effective_size(
+                        effective.effective_size
+                    )
+                    self._viewport_resize_render_refresh_pending = False
+                elif self._resolution_state.is_fixed_mode:
+                    effective = self._compute_fixed_mode_effective_resolution(
+                        visible_frame_size
+                    )
+                    self._last_fixed_mode_effective_resolution = effective
+                    self._last_viewport_mode_effective_resolution = None
+                    self._last_viewport_mode_visible_frame_size = None
+                    self._last_fill_viewport_visible_frame_size = None
+                    if self._resolution_state.fill_viewport:
+                        self._last_fill_viewport_visible_frame_size = visible_frame_size
+                    w, h = self._commit_resolution_effective_size(
+                        effective.effective_size
+                    )
+                    self._viewport_resize_render_refresh_pending = False
+                else:
+                    frame_width, frame_height = visible_frame_size
+                    w = max(
+                        self.MIN_RENDER_WIDTH,
+                        min(self.MAX_RENDER_WIDTH, frame_width),
+                    )
+                    h = max(
+                        self.MIN_RENDER_HEIGHT,
+                        min(self.MAX_RENDER_HEIGHT, frame_height),
+                    )
+                    self._last_viewport_mode_effective_resolution = None
+                    self._last_viewport_mode_visible_frame_size = None
+                    self._last_fixed_mode_effective_resolution = None
+                    self._last_fill_viewport_visible_frame_size = None
+                    self._viewport_resize_render_refresh_pending = False
             w, h = ensure_safe_renderer_request_size((w, h))
             resolution_changed = self._last_resolution != (w, h)
             self._last_resolution = (w, h)
             if resolution_changed or resize_render_refresh_was_pending:
                 self._refresh_resolution_render_qa_window()
-            view, proj = self._camera.get_matrices(w, h)
+            view, proj = self._camera.get_matrices(w, h, np.float64)
             self._tick_camera_navigation_state()
             self._profile_ovui_call(
                 "ViewportWidget._author_active_camera_pose",
@@ -9484,21 +10165,34 @@ class ViewportSurface:
                 view,
                 proj,
             )
+            self._apply_render_policy()
+            previous_image_frame = self._last_image_frame
             self._last_image_frame = frame
-            if frame is not None:
+            # The same object again is the picture already on screen only
+            # when the renderer says so (no step for a still camera, on_change
+            # policy). Another renderer can fill one array again with a new
+            # picture, so its frames are always shown.
+            kept = frame is previous_image_frame and self._renderer_kept_last_frame()
+            if frame is not None and not kept:
                 record_completion = getattr(
                     ui, "_record_synchronous_renderer_completion", None
                 )
                 if callable(record_completion):
                     record_completion()
-                self._profile_ovui_call(
+                accepted = self._profile_ovui_call(
                     "ViewportWidget.image_bridge.update", self._bridge.update, frame
                 )
-                record_selection = getattr(
-                    ui, "_record_synchronous_content_selection", None
-                )
-                if callable(record_selection):
-                    record_selection()
+                if accepted is False:
+                    # ovui refused the pixels: the old frame stays on screen.
+                    # Do not count the frame as selected content. With no GPU
+                    # backend ovui answers None, not False.
+                    self._last_image_frame = previous_image_frame
+                else:
+                    record_selection = getattr(
+                        ui, "_record_synchronous_content_selection", None
+                    )
+                    if callable(record_selection):
+                        record_selection()
             self._profile_ovui_call(
                 "ViewportWidget._retry_selection_highlight_after_render",
                 self._retry_selection_highlight_after_render,
@@ -9665,8 +10359,10 @@ class ViewportSurface:
 
         Compares the current ``_get_gizmo_world_scale`` against the
         value at the last rebuild; only invalidates when the relative
-        change is ≥ 10 % or the baseline is zero (first build). Skipped
-        while a drag is active — see :meth:`_is_gizmo_drag_active`.
+        change is ≥ 10 % or the baseline is zero (first build), and once
+        more when the camera comes to rest, so the gizmo at rest does not
+        depend on which frames the motion passed through. Skipped while a
+        drag is active — see :meth:`_is_gizmo_drag_active`.
         """
         mani = self._transform_manipulator
         if mani is None or not mani.has_selection():
@@ -9681,7 +10377,8 @@ class ViewportSurface:
         if current <= 0.0:
             return
         last = self._last_gizmo_scale
-        if last <= 0.0 or abs(current - last) / max(last, 1e-6) >= 0.10:
+        at_rest = not self._camera_navigation_state.is_active
+        if last <= 0.0 or abs(current - last) / max(last, 1e-6) >= 0.10 or (at_rest and current != last):
             try:
                 mani.invalidate()
             except Exception:
@@ -9714,8 +10411,18 @@ class ViewportSurface:
         without requiring a re-click. Active USD camera changes are also re-read
         through the stage adapter so Properties edits to the selected camera
         immediately update the viewport's controller pose.
+
+        A change that the renderer says cannot change its picture
+        (``stage_change_keeps_picture``) asks for no render: the renderer keeps
+        memory on every step, so renders of an unchanged picture would add
+        memory each time the change repeats.
         """
         self._invalidate_selected_light_type(event)
+        if self._stage_change_keeps_picture(event):
+            # The render mode is read again; it changes no picture.
+            self._render_mode_dirty = True
+        else:
+            self._renderer_changed()
         if not self._is_self_authored_active_camera_pose_event(event):
             self._sync_active_camera_from_stage_change(event)
         if self._renderer is not None:
@@ -9761,7 +10468,13 @@ class ViewportSurface:
         # populated. Reuse the renderer's production refresh seam so missing
         # outline work converges on the topology event without fabricating an
         # applied member. Stable applied paths remain a no-op in native mode.
-        self._set_renderer_selection_highlight(selected, force=True)
+        # A value edit of a property (a drag on a Translate field, for
+        # example) is not such an event. The refresh walked every mesh of the
+        # selection and wrote the outline again, at each edit of the drag: on
+        # a selection of thousands of meshes this stalled the UI. A renderer
+        # that reloads its scene for an edit writes the outline again itself.
+        if not _is_property_value_only_change(event):
+            self._set_renderer_selection_highlight(selected, force=True)
         if self._transform_manipulator is not None:
             try:
                 self._transform_manipulator.invalidate()
@@ -9910,6 +10623,10 @@ class ViewportSurface:
             except BaseException:
                 pass
 
+    def clear_image(self) -> None:
+        """Stop showing the last rendered image; only the background shows."""
+        self._bridge.clear()
+
     def set_renderer(self, renderer: Optional[RendererAdapter]) -> bool:
         """Swap or clear the active renderer. ``True`` iff the request
         is now the published surface renderer (or a clear completed) —
@@ -9926,6 +10643,7 @@ class ViewportSurface:
                 return False
             old = self._renderer
             if old is renderer:
+                self._renderer_changed()
                 self._reapply_selection_highlight(renderer, cleanup)
                 cleanup.run(
                     "resolution availability refresh",
@@ -9981,6 +10699,10 @@ class ViewportSurface:
                     self._refuse_renderer(rejected, cleanup,
                                           "courtesy shutdown of rejected renderer")
             self._renderer = published
+            cleanup.run(
+                "render-settings subscription",
+                lambda: self._subscribe_render_settings_changes(published))
+            self._renderer_changed()
             reset_throughput = getattr(ui, "_reset_frame_throughput_metrics", None)
             if callable(reset_throughput):
                 reset_throughput()
@@ -10030,6 +10752,9 @@ class ViewportSurface:
             self._detach_model_renderer(cleanup)
             renderer = getattr(self, "_renderer", None)
             self._renderer = None
+            cleanup.run(
+                "render-settings subscription release",
+                lambda: self._subscribe_render_settings_changes(None))
             if renderer is not None:
                 if not cleanup.run(
                         "renderer shutdown during teardown",
@@ -10075,6 +10800,8 @@ class ViewportSurface:
                 ("pre-tools toolbar hooks", self._pre_tools_toolbar_hooks.clear),
                 ("toolbar hooks", self._toolbar_hooks.clear),
                 ("viewport hooks", self._viewport_hooks.clear),
+                ("render product change subscriptions",
+                 self._render_product_change_callbacks.clear),
             ):
                 cleanup.run(label, step)
         finally:
@@ -10156,7 +10883,7 @@ class ViewportWidget(ViewportSurface, ManagedWindow):
             ManagedWindow.destroy(self)
 
 
-# ── Issue #35 Step 3: register the module-scope provider cache so
+# ── register the module-scope provider cache so
 # Application.shutdown() drops every ui.RasterImageProvider it holds
 # before omni.ui.shutdown() runs.
 from ovui_widgets.common.icon_caches import register_dict as _register_dict_for_shutdown

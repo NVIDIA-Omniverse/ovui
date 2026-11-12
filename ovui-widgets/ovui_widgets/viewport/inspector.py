@@ -93,6 +93,7 @@ class ViewportInspector:
 
         def complete(path, position):
             if not future.done():
+                path = surface.resolve_pick_path(*ndc, path)
                 surface.apply_pick_selection(path, mode)
                 future.set_result(
                     {

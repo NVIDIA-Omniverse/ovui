@@ -255,8 +255,8 @@ class ContentBrowserWindow(ManagedWindow):
     def delete_selected(self) -> None:
         """Forward Del to the widget's confirm-delete dialog (Step 34).
 
-        The application-level key dispatcher calls this on every Del
-        press; the widget resolves the current selection across grid
+        The application-level key dispatcher calls this on a Del press
+        only while this window has focus; the widget resolves the current selection across grid
         / detail-tree / tree panes and spawns a
         :class:`ConfirmDeleteDialog`. No-op before :meth:`_build_ui`
         fires or after :meth:`destroy`, and silently skips when the
@@ -455,8 +455,10 @@ class ContentBrowserWindow(ManagedWindow):
         routing. Mirrors the Step-53 pattern the top-level dispatcher
         uses for viewport-only keys.
 
-        Handles only the Step-58 additions (Alt+Up, F5, Ctrl+F,
-        Ctrl+Home, Escape); existing shortcuts (Ctrl+C / X / V / D,
+        Handles the Step-58 additions (Alt+Up, F5, Ctrl+F,
+        Ctrl+Home, Escape) and, first, the keys of the path bar while it
+        edits (Down, Up and Enter for the folder suggestions, see
+        :meth:`PathField.handle_window_key`); existing shortcuts (Ctrl+C / X / V / D,
         Del, F2, Alt+Left / Right) continue to dispatch directly from
         :meth:`Application._on_key_pressed` via the matching proxy
         methods on this class. Splitting the two keeps the historic
@@ -473,6 +475,13 @@ class ContentBrowserWindow(ManagedWindow):
         if not pressed:
             return False
         modifiers &= _REAL_MODS_MASK
+        # While the path bar edits, it uses Down / Up and Enter for its
+        # folder suggestions. The window gets these keys on
+        # focus, before the path field draws.
+        if self._widget is not None and self._widget.handle_path_bar_key(
+            key, modifiers,
+        ):
+            return True
         ctrl = bool(modifiers & _MOD_CTRL)
         shift = bool(modifiers & _MOD_SHIFT)
         alt = bool(modifiers & _MOD_ALT)

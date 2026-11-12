@@ -9,6 +9,7 @@ import math
 import contextlib
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 import pytest
@@ -74,6 +75,11 @@ def Xform "World"
     def Camera "CameraB"
     {
         float focalLength = 50
+    }
+    def Camera "ShutterCamera"
+    {
+        double shutter:close = 0.4
+        double shutter:open = -0.1
     }
     def RenderVar "Beauty"
     {
@@ -328,6 +334,87 @@ def test_representative_numeric_fixed_and_token_array_layouts_round_trip(
     assert camera.get_value("clippingRange") == pytest.approx((0.5, 5000.0))
     assert product.get_value("resolution") == (800, 450)
     assert product.get_value("dataWindowNDC") == pytest.approx((0.1, 0.2, 0.9, 0.8))
+
+
+@pytest.mark.parametrize(
+    ("path", "start"),
+    (
+        # CameraA authors no shutter: both rows show the schema fallback.
+        ("/World/CameraA", {"shutter:open": 0.0, "shutter:close": 0.0}),
+        ("/World/ShutterCamera", {"shutter:open": -0.1, "shutter:close": 0.4}),
+    ),
+)
+def test_camera_shutter_edits_read_back_and_undo_to_the_start_value(
+    opened: tuple[Any, Any, Any, UndoManager],
+    path: str,
+    start: dict[str, float],
+) -> None:
+    """A newer ovstage publishes the shutter only when a selector asks for it.
+
+    Without the shutter rows, the shutter:open edit of the representative
+    contract raised the scaffold error "property value write is not
+    implemented yet" (issue 502). Each row must be listed as writable,
+    take the edit, return to its start value on undo and take the edit
+    again on redo.
+    """
+    _session, scene, stage, undo = opened
+    camera = _property(scene, stage, undo, path)
+    edits = {"shutter:open": 0.25, "shutter:close": 0.75}
+    for name, value in edits.items():
+        assert name in camera.get_attribute_names()
+        assert camera.get_attribute_metadata(name).is_locked is False
+        assert camera.get_value(name) == pytest.approx(start[name])
+        _edit(camera, name, value)
+        assert camera.get_value(name) == pytest.approx(value)
+
+    assert undo.undo() is True
+    assert camera.get_value("shutter:close") == pytest.approx(start["shutter:close"])
+    assert camera.get_value("shutter:open") == pytest.approx(0.25)
+    assert undo.undo() is True
+    assert camera.get_value("shutter:open") == pytest.approx(start["shutter:open"])
+    assert undo.redo() is True
+    assert undo.redo() is True
+    for name, value in edits.items():
+        assert camera.get_value(name) == pytest.approx(value)
+
+
+def test_cancelled_channel_edit_restores_the_start_value_and_keeps_redo(
+    opened: tuple[Any, Any, Any, UndoManager],
+) -> None:
+    """Escape in a Property Inspector number field cancels its edit (issue 557).
+
+    The field writes each typed value while the edit is open. The cancel must
+    put back the start value, record no undo step and keep the Redo step of
+    an earlier undone edit.
+    """
+    _session, scene, stage, undo = opened
+    camera = _property(scene, stage, undo, "/World/CameraA")
+    _edit(camera, "focalLength", 35.0)
+    assert undo.undo() is True
+    assert undo.can_undo() is False and undo.can_redo() is True
+
+    camera.begin_edit("clippingRange")
+    camera.set_component_value("clippingRange", 0, 50.0)
+    assert camera.get_value("clippingRange") == pytest.approx((50.0, 1000000.0))
+    camera.cancel_edit("clippingRange")
+
+    assert camera.get_value("clippingRange") == pytest.approx((1.0, 1000000.0))
+    assert undo.can_undo() is False
+    assert undo.redo() is True
+    assert camera.get_value("focalLength") == pytest.approx(35.0)
+
+
+def test_cancelled_edit_without_undo_manager_writes_the_start_value_back(
+    opened: tuple[Any, Any, Any, UndoManager],
+) -> None:
+    _session, scene, stage, _undo = opened
+    camera = create_property_adapter(scene, ["/World/CameraA"], None, stage)
+
+    camera.begin_edit("clippingRange")
+    camera.set_component_value("clippingRange", 0, 50.0)
+    camera.cancel_edit("clippingRange")
+
+    assert camera.get_value("clippingRange") == pytest.approx((1.0, 1000000.0))
 
 
 def test_multi_selection_write_is_atomic_and_restores_mixed_values(
@@ -1130,6 +1217,25 @@ def test_native_purpose_value_refreshes_bounds_and_undo(
     assert stage.compute_world_aabb([path]) is None
 
 
+def test_rejected_purpose_edit_leaves_no_row_above_the_write_floor(
+    opened: tuple[Any, Any, Any, UndoManager],
+) -> None:
+    """ovrtx refuses to render while the rollback row stays above the floor."""
+
+    _session, scene, stage, undo = opened
+    native = scene._stage
+    prop = _property(scene, stage, undo, "/World/Parent/MeshA")
+    with pytest.raises(RuntimeError, match="failed to author"):
+        _edit(prop, "purpose", "")
+    assert prop.get_value("purpose") == "geometry"
+
+    query = native.get_attribute_write_floor()
+    try:
+        assert query.fetch() == native._ovui_next_ordinal
+    finally:
+        query.release().wait()
+
+
 def test_transform_command_is_exact_notified_and_rejects_nonfinite(
     opened: tuple[Any, Any, Any, UndoManager],
 ) -> None:
@@ -1546,3 +1652,42 @@ def test_no_renderer_or_forbidden_adapter_is_loaded(
     )
     assert not any(name == "ovrtx" or name.startswith("ovrtx.") for name in sys.modules)
     assert getattr(scene, "_attached_renderers", set()) == set()
+
+
+def test_create_material_with_an_incompatible_binding_column_creates_the_material(
+    opened: tuple[Any, Any, Any, UndoManager],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ovui_data_adapters.ovstage.property_adapter import OvstagePropertyAdapter
+
+    session, scene, stage, undo = opened
+    mesh_path = "/World/Parent/MeshB"
+    get_metadata = OvstagePropertyAdapter.get_attribute_metadata
+
+    def _token_binding_column(self: Any, name: str) -> Any:
+        if name == "material:binding":
+            return SimpleNamespace(type_name="token")
+        return get_metadata(self, name)
+
+    monkeypatch.setattr(OvstagePropertyAdapter, "get_attribute_metadata", _token_binding_column)
+    published: list[list[str]] = []
+    snapshot = SimpleNamespace(paths=lambda: (mesh_path,))
+    bus = SimpleNamespace(
+        get_snapshot=lambda: snapshot,
+        publish=lambda paths, **_kwargs: published.append(paths),
+    )
+    app = SimpleNamespace(stage_adapter=stage, selection_bus=bus)
+    binding_before = _property(scene, stage, undo, mesh_path).get_value("material:binding")
+
+    material_path = session.create_usd_preview_surface_material(app)
+    monkeypatch.undo()
+
+    assert material_path is not None
+    assert stage.get_item_at_path(material_path) is not None
+    assert published == [[material_path]]
+    assert _property(scene, stage, undo, mesh_path).get_value("material:binding") == binding_before
+    error = capsys.readouterr().err
+    assert "create.material.usd-preview-surface.bind was refused" in error
+    assert f"incompatible column: {mesh_path}" in error
+    assert "Creating the material without a binding" in error

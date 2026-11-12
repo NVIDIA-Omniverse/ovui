@@ -625,17 +625,23 @@ class MockLayerStackAdapter(LayerStackAdapter):
         return identifier
 
     def transfer_layer_content(
-        self, src_identifier: str, dst_identifier: str
+        self,
+        src_identifier: str,
+        dst_identifier: str,
+        *,
+        dst_is_stronger: bool = False,
     ) -> None:
         src = self._require(src_identifier)
         dst = self._require(dst_identifier)
         if not src.prim_specs:
             return
-        # Source wins on overlap — mirrors the USD adapter where the
-        # source layer in a "merge down" is stronger than the
-        # destination. The destination layer is marked dirty so
-        # subscribers repaint.
+        # The stronger layer wins on overlap — mirrors the USD adapter.
+        # By default the source is stronger (a "merge down"); a flatten
+        # into the parent passes ``dst_is_stronger``. The destination
+        # layer is marked dirty so subscribers repaint.
         for path, blob in src.prim_specs.items():
+            if dst_is_stronger and path in dst.prim_specs:
+                continue
             dst.prim_specs[path] = blob
         if not dst.dirty:
             dst.dirty = True

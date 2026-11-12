@@ -23,6 +23,13 @@ The browser is backend-oriented, so storage behavior can be replaced behind the
 same visible widget surface.
 """}
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
 
 [tool.setuptools.packages.find]
 namespaces = true

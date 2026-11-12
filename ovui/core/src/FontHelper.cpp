@@ -208,7 +208,9 @@ void FontHelper::_updateFont(const char* font, float fontSize, float scale, bool
     {
         if (m_prv->m_atlas)
         {
+            // m_font is a raw ImFont* that lives inside the atlas; null it when the atlas drops.
             m_prv->m_atlas.reset();
+            m_prv->m_font = nullptr;
         }
     }
 

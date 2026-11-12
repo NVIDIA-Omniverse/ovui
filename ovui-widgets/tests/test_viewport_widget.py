@@ -4,6 +4,7 @@
 """Tests for ViewportWidget ZStack layout (Step 40)."""
 
 import asyncio
+import gc
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,9 +35,71 @@ from ovui_widgets.viewport.viewport_hooks import (
 )
 from ovui_widgets.viewport.viewport_widget import (
     ViewportChromeOptions,
+    ViewportHudState,
     ViewportSurface,
     ViewportWidget,
 )
+
+
+def test_hud_text_from_the_0_2_0_positional_order_is_shown(tmp_path, monkeypatch):
+    # A 0.2.0 status panel builds the state from all ten 0.2.0 fields in
+    # order and shows every field. Each value differs, so a field in another
+    # place draws another frame.
+    from omni.ui import standalone
+    from omni.ui.testing import capture_screenshot
+    from PIL import Image
+
+    from tests._vulkan_device import use_headless_vulkan
+
+    use_headless_vulkan(monkeypatch)
+
+    def shown(texts):
+        for label, text in zip(labels, texts):
+            label.text = text
+        for _ in range(3):
+            standalone._tick_one_frame()
+        path = tmp_path / f"frame_{len(list(tmp_path.iterdir()))}.png"
+        assert capture_screenshot(str(path))
+        return Image.open(path).tobytes()
+
+    fields = (
+        "scene", "fps", "fps_text", "resolution", "resolution_text",
+        "stream_state", "stream_clients", "stream_last_error", "stream_text",
+        "stream_tooltip", "render_fps",
+    )
+    # An earlier test can leave the backend running with its own windows
+    # (and an ImGui error tooltip) over the labels. Start a new backend.
+    # Earlier tests can also leave unreachable viewports whose image
+    # providers hold textures of that backend. Free them first: freed after
+    # the shutdown, they release their textures into a backend that is gone,
+    # and the process crashes.
+    gc.collect()
+    standalone.shutdown()
+    standalone.init("_test_viewport_hud_positional", 320, 240)
+    window = ui.Window(
+        "_test_viewport_hud_positional", width=320, height=240,
+        position_x=0, position_y=0, flags=ui.WINDOW_FLAGS_NO_TITLE_BAR,
+    )
+    try:
+        with window.frame:
+            with ui.VStack():
+                labels = [ui.Label("", height=18) for _ in fields]
+        waiting = shown(["waiting for status"] * len(fields))
+        state = ViewportHudState(
+            "Factory", 60.0, "60 FPS", (1280, 720), "1280x720",
+            "live", 3, "no error", "Streaming", "3 clients",
+        )
+        published = shown([str(getattr(state, field)) for field in fields])
+        expected = shown([
+            "Factory", "60.0", "60 FPS", "(1280, 720)", "1280x720",
+            "live", "3", "no error", "Streaming", "3 clients", "None",
+        ])
+
+        assert published == expected
+        assert published != waiting
+    finally:
+        window.destroy()
+        standalone.shutdown()
 
 
 def test_selection_mode_survives_lazy_build_and_layout_rebuild():
@@ -240,6 +303,22 @@ class _LiveTransformRenderer(MockRendererAdapter):
         self.cleared_live_paths.append(list(paths))
         for path in paths:
             self.live_transforms.pop(path, None)
+
+
+class _RebuildingRenderer(MockRendererAdapter):
+    """Builds the scene again after a stage edit: no new picture until it is done."""
+
+    def __init__(self):
+        super().__init__()
+        self.rebuilding = False
+
+    def scene_update_pending(self):
+        return self.rebuilding
+
+    def render_frame(self, width, height, view_matrix, proj_matrix):
+        if self.rebuilding:
+            return None
+        return super().render_frame(width, height, view_matrix, proj_matrix)
 
 
 class _UnsupportedFixedResolutionRenderer(MockRendererAdapter):
@@ -1802,6 +1881,23 @@ class TestViewportWidgetDestroy:
 # ---------------------------------------------------------------------------
 
 class TestViewportHUDOverlay:
+    def test_status_row_shows_while_the_renderer_builds_the_scene_again(self):
+        renderer = _RebuildingRenderer()
+        vp = ViewportWidget(services=None, renderer=renderer)
+        vp._build_ui()
+        vp._image = _VisibleViewportImage()
+        try:
+            assert vp.render(0.1) is True
+            assert vp._scene_update_row.visible is False
+            renderer.rebuilding = True
+            assert vp.render(0.1) is True
+            assert vp._scene_update_row.visible is True
+            renderer.rebuilding = False
+            assert vp.render(0.1) is True
+            assert vp._scene_update_row.visible is False
+        finally:
+            vp.destroy()
+
     def test_scene_label_created_after_build(self):
         renderer = MockRendererAdapter()
         vp = ViewportWidget(services=None, renderer=renderer)
@@ -8101,7 +8197,7 @@ class TestViewportToolbar:
             _RENDER_PRODUCT_PATH,
             OvRtxRendererAdapter,
         )
-        from pxr import Usd, UsdGeom, UsdRender
+        from pxr import Sdf, Usd, UsdGeom, UsdRender
 
         from ovui_widgets.common.settings import Settings
         from ovui_widgets.viewport.resolution_settings import viewport_resolution_scale_key
@@ -8118,15 +8214,21 @@ class TestViewportToolbar:
                 self._clock_value = 0.0
                 self.session_adapter = object.__new__(OvRtxRendererAdapter)
                 self.session_adapter._stage = stage
+                self.resolution_writes = []
+
+                def _write_attribute(*, prim_paths, attribute_name, tensor, **_kwargs):
+                    if attribute_name == "resolution":
+                        self.resolution_writes.append((list(prim_paths), tensor.tolist()))
+
                 self.session_adapter._renderer = SimpleNamespace(
                     remove_usd=lambda handle: self.removed_session_handles.append(
                         handle,
                     ),
+                    write_attribute=_write_attribute,
+                    reset=lambda *args, **kwargs: None,
                 )
                 self.session_adapter._session_handle = "initial-session"
                 self.session_adapter._last_resolution = (640, 360)
-                self.session_adapter._last_big_delta_time = float("-inf")
-                self.session_adapter._last_reinject_time = float("-inf")
                 self.session_adapter._clock = lambda: self._clock_value
                 self.session_adapter._scene_has_lights = True
                 self.session_adapter._render_product_path = _RENDER_PRODUCT_PATH
@@ -8171,8 +8273,9 @@ class TestViewportToolbar:
             assert stage.GetSessionLayer().GetPrimAtPath(_RENDER_PRODUCT_PATH) is not None
             assert stage.GetRootLayer().GetPrimAtPath(_RENDER_PRODUCT_PATH) is None
             assert stage.GetRootLayer().ExportToString() == root_before
-            assert f"resolution = ({target[0]}, {target[1]})" in (
-                renderer.added_session_usda[-1]
+            assert renderer.resolution_writes[-1] == (
+                [_RENDER_PRODUCT_PATH],
+                [[target[0], target[1]]],
             )
 
         settings = Settings()
@@ -8222,8 +8325,13 @@ class TestViewportToolbar:
             assert vp._last_resolution == (1920, 1080)
             assert getattr(vp._last_image_frame, "shape", None) == (1080, 1920, 4)
             assert vp._resolution_value_label.text == "1920×1080"
+            # The new size reaches the session render product when it has settled:
+            # the next frame comes after the settle time.
+            assert vp.render(1.0 / 60.0) is True
             assert_layer_report((1920, 1080))
-            assert renderer.removed_session_handles == ["initial-session", "a8-t06-session-1"]
+            # Only the resolution changes: the ovrtx session layer stays.
+            assert renderer.removed_session_handles == []
+            assert renderer.session_adapter._session_handle == "initial-session"
 
             latest_render_menu = self._open_render_resolution_menu(vp)
             latest_viewport_menu = self._latest_viewport_menu()
@@ -8245,6 +8353,7 @@ class TestViewportToolbar:
             assert vp._last_resolution == (960, 540)
             assert getattr(vp._last_image_frame, "shape", None) == (540, 960, 4)
             assert vp._resolution_value_label.text == "960×540"
+            assert vp.render(1.0 / 60.0) is True
             assert_layer_report((960, 540))
 
             refreshed_render_menu = self._open_render_resolution_menu(vp)
@@ -8261,9 +8370,11 @@ class TestViewportToolbar:
             assert stage.GetRootLayer().GetPrimAtPath(_RENDER_PRODUCT_PATH) is None
             assert stage.GetSessionLayer().GetPrimAtPath(_RENDER_PRODUCT_PATH) is not None
             assert session_render_product_resolution() == (960, 540)
-            assert len(renderer.added_session_usda) == 3
-            assert "resolution = (960, 540)" in renderer.added_session_usda[-1]
-            assert _LDR_VAR_PATH in renderer.added_session_usda[-1]
+            assert renderer.added_session_usda == []
+            assert len(renderer.resolution_writes) == 3
+            assert UsdRender.Product(
+                stage.GetPrimAtPath(_RENDER_PRODUCT_PATH)
+            ).GetOrderedVarsRel().GetTargets() == [Sdf.Path(_LDR_VAR_PATH)]
             assert vp._resolution_render_qa_window is None
             assert vp._resolution_catalog_qa_window is None
             assert vp._resolution_settings_schema_qa_window is None
@@ -9971,6 +10082,95 @@ class TestViewportToolbar:
         assert menu.items[2].kwargs.get("checked") is True
         vp.destroy()
 
+    def test_camera_menu_perspective_restores_free_camera_after_stage_camera(
+        self, fake_camera_menu
+    ):
+        pose = BoundCameraPose(
+            eye=(1.0, 2.0, 3.0),
+            target=(4.0, 5.0, 6.0),
+            up_axis="Y",
+            fov_degrees=15.0,
+            prim_path="/World/TeleCam",
+        )
+        adapter = _FakeCameraStageAdapter(
+            choices=(StageChoice("/World/TeleCam", "TeleCam"),),
+            poses={"/World/TeleCam": pose},
+        )
+        vp = ViewportWidget(
+            services=None,
+            renderer=MockRendererAdapter(),
+            stage_adapter_provider=lambda: adapter,
+        )
+        free_view = vp._camera_state_snapshot()
+        assert vp._show_camera_menu_at(0, 0).items[2].trigger() is True
+        assert vp._camera.fov_degrees == pytest.approx(15.0)
+
+        assert vp._show_camera_menu_at(0, 0).items[0].trigger() is True
+
+        assert vp._active_camera_path is None
+        assert vp._camera_state_snapshot() == free_view
+        vp.destroy()
+
+
+    @pytest.mark.parametrize(
+        ("refusal", "cause"),
+        [
+            (False, "the renderer did not take its own camera"),
+            (
+                RuntimeError("ovrtx device lost"),
+                "the renderer failed to take its own camera: RuntimeError: ovrtx device lost",
+            ),
+        ],
+        ids=["rejected", "error"],
+    )
+    def test_render_target_free_view_keeps_camera_when_renderer_refuses_it(
+        self, capsys, refusal, cause
+    ):
+        pose = BoundCameraPose(
+            eye=(8.0, 2.0, 10.0),
+            target=(0.0, 0.0, 0.0),
+            up_axis="Y",
+            fov_degrees=30.0,
+            prim_path="/World/Cameras/Workcell_Cam",
+        )
+        adapter = _FakeCameraStageAdapter(
+            poses={"/World/Cameras/Workcell_Cam": pose},
+        )
+
+        class _NoFreeCameraRenderer(MockRendererAdapter):
+            def __init__(self):
+                super().__init__()
+                self.camera_path = None
+
+            def set_active_camera_path(self, path):
+                if path is None:
+                    if isinstance(refusal, Exception):
+                        raise refusal
+                    return refusal
+                self.camera_path = path
+                return True
+
+        renderer = _NoFreeCameraRenderer()
+        vp = ViewportWidget(
+            services=None,
+            renderer=renderer,
+            stage_adapter_provider=lambda: adapter,
+        )
+        assert vp.select_camera_path("/World/Cameras/Workcell_Cam") is True
+        camera_view = vp._camera_state_snapshot()
+        capsys.readouterr()
+
+        assert vp.restore_camera_binding_for_render_target() is False
+
+        assert vp.active_camera_path == "/World/Cameras/Workcell_Cam"
+        assert renderer.camera_path == "/World/Cameras/Workcell_Cam"
+        assert vp._camera_state_snapshot() == camera_view
+        assert capsys.readouterr().err == (
+            "[WARNING] [Viewport] the free camera is not restored, so "
+            f"/World/Cameras/Workcell_Cam stays bound: {cause}\n"
+        )
+        vp.destroy()
+
     def test_stage_up_axis_and_restored_camera_sync_manipulator_model(self):
         vp = ViewportWidget(services=None, renderer=MockRendererAdapter())
 
@@ -10268,6 +10468,116 @@ class TestViewportToolbar:
         assert not vp.is_camera_navigation_active()
         assert not vp.has_dirty_camera_navigation()
         vp.destroy()
+
+    @staticmethod
+    def _stage_with_workcell_camera():
+        from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
+        from pxr import Gf, Sdf, Usd, UsdGeom
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+        UsdGeom.Xform.Define(stage, "/World")
+        camera = UsdGeom.Camera.Define(stage, "/World/Cameras/Workcell_Cam")
+        UsdGeom.Xformable(camera.GetPrim()).AddTranslateOp().Set(
+            Gf.Vec3d(0.0, 3.0, 12.0)
+        )
+        camera.GetPrim().CreateAttribute(
+            "omni:kit:centerOfInterest",
+            Sdf.ValueTypeNames.Double3,
+        ).Set(Gf.Vec3d(0.0, -3.0, -12.0))
+        return stage, UsdStageAdapter(stage)
+
+    @pytest.mark.parametrize(
+        ("home_projection", "menu_label", "tooltip"),
+        [
+            ("perspective", "Perspective", "Camera: Perspective"),
+            ("orthographic", "Ortho", "Camera: Ortho"),
+        ],
+    )
+    def test_home_with_a_usd_camera_goes_to_the_free_camera_and_leaves_the_scene(
+        self, fake_camera_menu, home_projection, menu_label, tooltip
+    ):
+        stage, adapter = self._stage_with_workcell_camera()
+        camera_path = "/World/Cameras/Workcell_Cam"
+        vp = ViewportWidget(
+            services=None,
+            renderer=MockRendererAdapter(),
+            stage_adapter_provider=lambda: adapter,
+        )
+        vp._build_ui()
+        vp._image = _VisibleViewportImage()
+        vp._camera.focus([0.0, 0.0, 0.0], 40.0)
+        vp._camera.set_projection_mode(home_projection)
+        vp.mark_camera_home()
+        home = vp._camera_state_snapshot()
+
+        assert vp._select_camera_path(camera_path) is True
+        camera_eye = adapter.read_camera_pose(camera_path).eye
+        for _ in range(vp.CAMERA_NAVIGATION_SETTLE_FRAMES + 1):
+            assert vp.render(0.1) is True
+        root_layer = stage.GetRootLayer().ExportToString()
+        session_layer = stage.GetSessionLayer().ExportToString()
+
+        assert vp.go_camera_home() is True
+        for _ in range(vp.CAMERA_NAVIGATION_SETTLE_FRAMES + 1):
+            assert vp.render(0.1) is True
+
+        # The view is home, through the free camera of the home projection.
+        assert vp.active_camera_path is None
+        assert vp._camera_state_snapshot() == home
+        menu = vp._show_camera_menu_at(0, 0)
+        checked = [item.label for item in menu.items if item.kwargs.get("checked")]
+        assert checked == [menu_label]
+        assert vp._toolbar_buttons["camera"].tooltip == tooltip
+        # The scene and the USD camera did not change.
+        assert stage.GetRootLayer().ExportToString() == root_layer
+        assert stage.GetSessionLayer().ExportToString() == session_layer
+        assert adapter.read_camera_pose(camera_path).eye == pytest.approx(camera_eye)
+        # The USD camera still shows its own view when it is chosen again.
+        assert vp._select_camera_path(camera_path) is True
+        assert tuple(float(v) for v in vp._camera._get_eye()) == pytest.approx(
+            camera_eye, rel=1e-5, abs=1e-5
+        )
+        vp.destroy()
+
+    def test_home_that_cannot_leave_a_usd_camera_reports_it_and_leaves_the_scene(
+        self, capsys
+    ):
+        stage, adapter = self._stage_with_workcell_camera()
+        camera_path = "/World/Cameras/Workcell_Cam"
+
+        class _KeepsBoundCameraRenderer(MockRendererAdapter):
+            def set_active_camera_path(self, path):
+                return path is not None
+
+        vp = ViewportWidget(
+            services=None,
+            renderer=_KeepsBoundCameraRenderer(),
+            stage_adapter_provider=lambda: adapter,
+        )
+        vp._image = _VisibleViewportImage()
+        vp._camera.focus([0.0, 0.0, 0.0], 40.0)
+        vp.mark_camera_home()
+        assert vp._select_camera_path(camera_path) is True
+        camera_view = vp._camera_state_snapshot()
+        for _ in range(vp.CAMERA_NAVIGATION_SETTLE_FRAMES + 1):
+            assert vp.render(0.1) is True
+        root_layer = stage.GetRootLayer().ExportToString()
+        capsys.readouterr()
+
+        assert vp.go_camera_home() is False
+        for _ in range(vp.CAMERA_NAVIGATION_SETTLE_FRAMES + 1):
+            assert vp.render(0.1) is True
+
+        assert vp.active_camera_path == camera_path
+        assert vp._camera_state_snapshot() == camera_view
+        assert stage.GetRootLayer().ExportToString() == root_layer
+        warning = capsys.readouterr().err
+        assert "[WARNING] [Viewport] home:" in warning
+        assert camera_path in warning
+        assert "because the renderer did not take its own camera" in warning
+        vp.destroy()
+
 
     def test_selected_usd_camera_self_authored_notice_does_not_resync(self):
         pytest.importorskip("pxr")
@@ -10909,6 +11219,61 @@ class TestViewportNotifyStageChanged:
         renderer.refresh_selection_highlight.assert_called_once_with(
             ["/World/LaterCube"]
         )
+        vp.destroy()
+
+    @pytest.mark.parametrize(
+        ("changed_paths", "resynced_paths", "event_type", "refreshes"),
+        [
+            # A drag on a Translate or an Intensity field of the selection.
+            (("/World/Cell.xformOp:translate",), (), "INFO_CHANGE", False),
+            (("/World/Cell/Light.inputs:intensity",), (), "INFO_CHANGE", False),
+            # Edits that can change the outline members, or its native state.
+            (("/World/Cell.visibility",), (), "INFO_CHANGE", True),
+            (("/World/Cell",), (), "INFO_CHANGE", True),
+            (("/World/Cell.xformOp:translate",), ("/World/Cell/New",), "RESYNC", True),
+        ],
+    )
+    def test_a_property_value_edit_keeps_the_outline_and_moves_the_gizmo(
+        self, changed_paths, resynced_paths, event_type, refreshes
+    ):
+        from unittest.mock import MagicMock
+
+        from ovui_data_adapters.common import ChangeEvent, ChangeEventType
+
+        from ovui_widgets.common.selection import SelectionBus
+
+        renderer = MagicMock(
+            spec=[
+                "render_frame",
+                "shutdown",
+                "notify_stage_changed",
+                "set_selection_highlight",
+                "refresh_selection_highlight",
+                "set_resolution",
+                "load_stage",
+                "pick",
+                "pick_rect",
+                "cancel_pick",
+            ]
+        )
+        bus = SelectionBus()
+        vp = ViewportWidget(services=None, renderer=renderer, bus=bus)
+        bus.publish(["/World/Cell"], source="test")
+        renderer.refresh_selection_highlight.reset_mock()
+        manipulator = MagicMock()
+        vp._transform_manipulator = manipulator
+
+        event = ChangeEvent(
+            changed_paths=changed_paths,
+            resynced_paths=resynced_paths,
+            event_type=getattr(ChangeEventType, event_type),
+        )
+        vp.notify_stage_changed(event)
+
+        renderer.notify_stage_changed.assert_called_once_with(event)
+        assert renderer.refresh_selection_highlight.called is refreshes
+        manipulator.invalidate.assert_called_once_with()
+        vp._transform_manipulator = None
         vp.destroy()
 
 

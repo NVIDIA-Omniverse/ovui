@@ -16,9 +16,6 @@ from ovui_data_adapters.common import (
 )
 
 
-pytest.importorskip("pxr", reason="OpenUSD runtime is unavailable")
-
-
 def test_openusd_entry_point_metadata_uses_common_adapter_group() -> None:
     candidates = {
         entry_point.name: entry_point

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Status overlay widget for the livestream tap — issue #34 Step 1.7.
+"""Status overlay widget for the livestream tap.
 
 Pure presentation logic: takes a status snapshot from
 ``LivestreamTap`` (state + client count + last error + the static

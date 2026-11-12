@@ -269,8 +269,8 @@ class OmniUiTest(unittest.IsolatedAsyncioTestCase):
         On AArch64, reads prefer an architecture override and fall back to the
         shared backend baseline. Reads also tolerate a legacy untagged golden
         at ``tests/golden/<ImageName>.png`` as a transitional fallback when no
-        tagged baseline exists yet. Writes (first-run promotion or
-        ``OMNI_UI_GENERATE_GOLDEN=1`` regeneration) target the architecture
+        tagged baseline exists yet. A missing golden fails the test. Writes
+        (only under ``OMNI_UI_GENERATE_GOLDEN=1``) target the architecture
         override on AArch64 and the backend-tagged path on other architectures,
         never the legacy root.
         """
@@ -278,14 +278,6 @@ class OmniUiTest(unittest.IsolatedAsyncioTestCase):
 
         # Pump a few frames to ensure all layout is settled.
         await self.wait_n_updates(4)
-
-        # OMNI_UI_SKIP_GOLDEN_TESTS=1 disables image-comparison entirely.
-        # This is only for temporary diagnostics; PR CI should use strict
-        # golden comparison so missing or drifted baselines fail.
-        if os.environ.get("OMNI_UI_SKIP_GOLDEN_TESTS", "").strip() == "1":
-            import pytest
-            await self.finalize_test_no_image()
-            pytest.skip("golden comparison disabled by OMNI_UI_SKIP_GOLDEN_TESTS=1")
 
         if threshold is None:
             threshold = self.MEAN_ERROR_THRESHOLD
@@ -385,7 +377,6 @@ class OmniUiTest(unittest.IsolatedAsyncioTestCase):
         from compare_utils import compare
 
         generate = os.environ.get("OMNI_UI_GENERATE_GOLDEN", "").strip() == "1"
-        strict = os.environ.get("OMNI_UI_GOLDEN_STRICT", "").strip() == "1"
 
         captured_path.parent.mkdir(parents=True, exist_ok=True)
         captured_path.unlink(missing_ok=True)
@@ -412,16 +403,13 @@ class OmniUiTest(unittest.IsolatedAsyncioTestCase):
             # PNG down to the test's requested area so it can be compared
             # against goldens generated at that size.
             if captured_ok and captured_path.exists():
-                try:
-                    from PIL import Image
-                    img = Image.open(str(captured_path))
-                    req_w = getattr(self, "_area_width", width)
-                    req_h = getattr(self, "_area_height", height)
-                    if img.size != (req_w, req_h):
-                        cropped = img.crop((0, 0, req_w, req_h))
-                        cropped.save(str(captured_path))
-                except Exception:
-                    pass
+                from PIL import Image
+                img = Image.open(str(captured_path))
+                req_w = getattr(self, "_area_width", width)
+                req_h = getattr(self, "_area_height", height)
+                if img.size != (req_w, req_h):
+                    cropped = img.crop((0, 0, req_w, req_h))
+                    cropped.save(str(captured_path))
         else:
             rgba = _try_read_pixels(width, height)
             if rgba is not None:
@@ -429,24 +417,14 @@ class OmniUiTest(unittest.IsolatedAsyncioTestCase):
                 captured_ok = captured_path.exists()
 
         if not captured_ok:
-            if strict or generate:
-                raise AssertionError(
-                    f"Golden image capture failed for {self._test_name}: {captured_path}"
-                )
-            return
+            raise AssertionError(
+                f"Golden image capture failed for {self._test_name}: {captured_path}"
+            )
 
-        if not golden_read_path.exists():
-            # CI sets OMNI_UI_GOLDEN_STRICT=1 to forbid silent baseline
-            # generation; OMNI_UI_GENERATE_GOLDEN=1 is the explicit opt-in
-            # to (re)create the golden even under strict mode.
-            if strict and not generate:
-                raise AssertionError(
-                    f"Golden reference missing in strict mode: {golden_write_path}"
-                )
-            golden_write_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(captured_path), str(golden_write_path))
-            print(f"[golden] Generated: {golden_write_path}")
-        elif generate:
+        if not golden_read_path.exists() and not generate:
+            # OMNI_UI_GENERATE_GOLDEN=1 is the only way to create a golden.
+            raise AssertionError(f"Golden reference missing: {golden_write_path}")
+        if generate:
             golden_write_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(captured_path), str(golden_write_path))
             print(f"[golden] Regenerated: {golden_write_path}")

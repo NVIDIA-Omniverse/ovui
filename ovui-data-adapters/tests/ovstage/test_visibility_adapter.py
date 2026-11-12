@@ -123,6 +123,176 @@ def test_runtime_visibility_toggle_writes_raw_and_recomputes_inherited_children(
     subscription.cancel()
 
 
+def test_a_hide_reads_again_only_the_edited_prim_and_descendants_without_own_value(
+    stage_adapter: OvstageStageAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect #501: each hide or unhide read the type and the visibility of every prim again.
+
+    A hide does not change the own visibility value of a descendant, so the
+    descendant keeps it and its eye shows the same state without a new read.
+    """
+    from ovui_data_adapters.ovstage import stage_adapter as stage_adapter_module
+
+    parent = _require_item(stage_adapter, _VISIBLE_PARENT)
+    inherited_child = _require_item(stage_adapter, _INHERITED_VISIBLE_CHILD)
+    hidden_child = _require_item(stage_adapter, _EXPLICIT_HIDDEN_CHILD)
+    other = _require_item(stage_adapter, _HIDDEN_PARENT)
+    assert stage_adapter.compute_visibility(parent) is VisibilityState.VISIBLE
+    assert stage_adapter.compute_visibility(inherited_child) is VisibilityState.VISIBLE
+    assert stage_adapter.compute_visibility(hidden_child) is VisibilityState.INVISIBLE
+    assert stage_adapter.compute_visibility(other) is VisibilityState.INVISIBLE
+
+    type_reads: list[int] = []
+    visibility_reads: list[str] = []
+    read_types = stage_adapter_module._kit_type_records
+    read_visibility = stage_adapter_module._read_visibility_value
+
+    def counted_types(stage: Any, ordinal: int) -> Any:
+        type_reads.append(ordinal)
+        return read_types(stage, ordinal)
+
+    def counted_visibility(stage: Any, path: str) -> Any:
+        visibility_reads.append(path)
+        return read_visibility(stage, path)
+
+    monkeypatch.setattr(stage_adapter_module, "_kit_type_records", counted_types)
+    monkeypatch.setattr(stage_adapter_module, "_read_visibility_value", counted_visibility)
+
+    for visible, child_state in (
+        (False, VisibilityState.INHERITED_INVISIBLE),
+        (True, VisibilityState.VISIBLE),
+    ):
+        visibility_reads.clear()
+        stage_adapter.set_visibility(parent, visible)
+
+        assert stage_adapter.get_item_at_path(_VISIBLE_PARENT) is parent
+        assert stage_adapter.compute_visibility(parent) is (
+            VisibilityState.VISIBLE if visible else VisibilityState.INVISIBLE
+        )
+        assert stage_adapter.compute_visibility(inherited_child) is child_state
+        assert stage_adapter.compute_visibility(hidden_child) is VisibilityState.INVISIBLE
+        assert stage_adapter.compute_visibility(other) is VisibilityState.INVISIBLE
+        assert _VISIBLE_PARENT in visibility_reads
+        assert _INHERITED_VISIBLE_CHILD not in visibility_reads
+        assert _EXPLICIT_HIDDEN_CHILD not in visibility_reads
+        assert _HIDDEN_PARENT not in visibility_reads
+    assert type_reads == []
+
+
+def test_writes_of_another_writer_read_again_only_the_prims_that_they_hid(
+    stage_adapter: OvstageStageAdapter,
+    ovstage_scene: OvstageScene,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect #501: each result write of a solver made the next hide read every prim again."""
+    from ovui_data_adapters.ovstage import stage_adapter as stage_adapter_module
+
+    parent = _require_item(stage_adapter, _VISIBLE_PARENT)
+    inherited_child = _require_item(stage_adapter, _INHERITED_VISIBLE_CHILD)
+    other = _require_item(stage_adapter, _HIDDEN_PARENT)
+    assert stage_adapter.compute_visibility(parent) is VisibilityState.VISIBLE
+    assert stage_adapter.compute_visibility(inherited_child) is VisibilityState.VISIBLE
+    assert stage_adapter.compute_visibility(other) is VisibilityState.INVISIBLE
+
+    type_reads: list[int] = []
+    visibility_reads: list[str] = []
+    read_types = stage_adapter_module._kit_type_records
+    read_visibility = stage_adapter_module._read_visibility_value
+    monkeypatch.setattr(
+        stage_adapter_module,
+        "_kit_type_records",
+        lambda stage, ordinal: type_reads.append(ordinal) or read_types(stage, ordinal),
+    )
+    monkeypatch.setattr(
+        stage_adapter_module,
+        "_read_visibility_value",
+        lambda stage, path: visibility_reads.append(path) or read_visibility(stage, path),
+    )
+    stage = ovstage_scene._stage
+    # Another writer, through the native Stage only: results, then a hide. The
+    # application polls the change stream at 30 Hz, faster than such a writer.
+    for step in range(3):
+        _native_write(stage, (_VISIBLE_PARENT, _HIDDEN_PARENT), "cae:solverStep", [step, step])
+        ovstage_scene.change_stream.poll()
+    _native_write(stage, (_VISIBLE_PARENT,), "visibility", ["invisible"])
+    ovstage_scene.change_stream.poll()
+
+    assert stage_adapter.compute_visibility(parent) is VisibilityState.INVISIBLE
+    assert stage_adapter.compute_visibility(inherited_child) is VisibilityState.INHERITED_INVISIBLE
+    assert stage_adapter.compute_visibility(other) is VisibilityState.INVISIBLE
+    assert _VISIBLE_PARENT in visibility_reads
+    assert _INHERITED_VISIBLE_CHILD not in visibility_reads
+    assert _HIDDEN_PARENT not in visibility_reads
+    assert type_reads == []
+
+    # A burst of frames that the stage no longer keeps when the poll comes is
+    # read again in full: the values stay right.
+    for step in range(6):
+        _native_write(stage, (_HIDDEN_PARENT,), "cae:solverStep", [step])
+    _native_write(stage, (_VISIBLE_PARENT,), "visibility", ["inherited"])
+    ovstage_scene.change_stream.poll()
+    assert stage_adapter.compute_visibility(parent) is VisibilityState.VISIBLE
+    assert stage_adapter.compute_visibility(inherited_child) is VisibilityState.VISIBLE
+    assert stage_adapter.compute_visibility(other) is VisibilityState.INVISIBLE
+    type_reads.clear()
+
+    # A structure change of that writer still makes the adapter read the types
+    # again, also a create and a delete that keep the prim count.
+    created = f"{_VISIBLE_PARENT}/CreatedByOtherWriter"
+    ordinal = stage.begin_frame()
+    stage.create_prims(ordinal, [created], "Xform")
+    stage.end_frame(ordinal)
+    ordinal = stage.begin_frame()
+    stage.delete_prims(ordinal, [_INHERITED_VISIBLE_CHILD])
+    stage.end_frame(ordinal)
+    ovstage_scene.change_stream.poll()
+
+    assert stage_adapter.get_item_at_path(_INHERITED_VISIBLE_CHILD) is None
+    assert stage_adapter.get_item_at_path(created) is not None
+    assert type_reads
+
+
+def test_outside_visibility_write_during_native_camera_session_refreshes_cached_values(
+    stage_adapter: OvstageStageAdapter,
+    ovstage_scene: OvstageScene,
+) -> None:
+    """A camera interval does not give its publisher exclusive native Stage access."""
+    from ovui_data_adapters.ovstage._scene import (
+        begin_native_camera_writes,
+        end_native_camera_writes,
+    )
+
+    parent = _require_item(stage_adapter, _VISIBLE_PARENT)
+    child = _require_item(stage_adapter, _INHERITED_VISIBLE_CHILD)
+    properties = OvstagePropertyAdapter(ovstage_scene, [_VISIBLE_PARENT])
+    assert stage_adapter.compute_visibility(parent) is VisibilityState.VISIBLE
+    assert stage_adapter.compute_visibility(child) is VisibilityState.VISIBLE
+    assert properties.get_value("visibility") == "inherited"
+    events: list[ChangeEvent] = []
+    subscription = stage_adapter.subscribe_changes(events.append)
+    stage = ovstage_scene.native_stage
+    begin_native_camera_writes(stage, ovstage_scene.current_ordinal)
+    try:
+        for token, parent_state, child_state in (
+            ("invisible", VisibilityState.INVISIBLE, VisibilityState.INHERITED_INVISIBLE),
+            ("inherited", VisibilityState.VISIBLE, VisibilityState.VISIBLE),
+            ("invisible", VisibilityState.INVISIBLE, VisibilityState.INHERITED_INVISIBLE),
+        ):
+            events.clear()
+            _native_write(stage, (_VISIBLE_PARENT,), "visibility", [token])
+            ovstage_scene.change_stream.poll()
+
+            assert events
+            assert all(event.event_type is not ChangeEventType.RESYNC for event in events)
+            assert stage_adapter.compute_visibility(parent) is parent_state
+            assert stage_adapter.compute_visibility(child) is child_state
+            assert properties.get_value("visibility") == token
+    finally:
+        end_native_camera_writes(stage)
+        subscription.cancel()
+
+
 def test_non_imageable_paths_cannot_edit_visibility(
     stage_adapter: OvstageStageAdapter,
     ovstage_scene: OvstageScene,
@@ -182,3 +352,30 @@ def _require_item(adapter: OvstageStageAdapter, path: str) -> Any:
 
 def _raw_visibility(stage: Any, path: str) -> str:
     return read_token_attribute(stage, path, "visibility") or "inherited"
+
+
+def _native_write(stage: Any, paths: tuple[str, ...], name: str, values: list[Any]) -> None:
+    """Commit one frame through the public native Stage API, as a writer that is not OVUI."""
+    import numpy as np
+    import ovstage
+
+    with ovstage.PathDictionary(stage) as dictionary:
+        if all(isinstance(value, str) for value in values):
+            array = np.asarray([dictionary.intern_token(value) for value in values], dtype=np.uint64)
+            semantic = int(ovstage.AttributeSemantic.TOKEN_ID)
+        else:
+            array = np.asarray(values, dtype=np.int32)
+            semantic = 0
+        tensor = ovstage.make_dltensor(
+            array, dtype=ovstage.numpy_to_dldatatype(array.dtype), shape=[len(paths)]
+        )
+        path_list = dictionary.create_path_list_from_strings(list(paths))
+        query = stage.query_from_path_list(path_list)
+        ordinal = stage.begin_frame()
+        try:
+            write = ovstage.WriteDesc(name, tensor, is_array=False, semantic=semantic)
+            stage.write_attributes(query, (write,), ordinal, prim_mode=ovstage.PrimMode.UPSERT).wait()
+        finally:
+            query.release().wait()
+            dictionary.destroy_path_list(path_list)
+        stage.end_frame(ordinal)

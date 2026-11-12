@@ -9,6 +9,7 @@
 
 #include "StandaloneInit.h"
 #include "NativeFramePacing.h"
+#include "NativeFramePacingHooks.h"
 #include "NativeTiming.h"
 
 #include <omni/ui/ImageProvider/ByteImageProvider.h>
@@ -29,30 +30,6 @@ namespace omni
 {
 namespace ui
 {
-namespace
-{
-
-std::string g_testClipboard;
-
-const char* getTestClipboard(ImGuiContext*)
-{
-    return g_testClipboard.c_str();
-}
-
-void setTestClipboard(ImGuiContext*, const char* text)
-{
-    g_testClipboard = text ? text : "";
-}
-
-void installTestClipboard()
-{
-    ImGuiPlatformIO& platformIO = ImGui::GetPlatformIO();
-    platformIO.Platform_GetClipboardTextFn = getTestClipboard;
-    platformIO.Platform_SetClipboardTextFn = setTestClipboard;
-}
-
-} // namespace
-
 namespace
 {
 
@@ -87,8 +64,39 @@ void registerStandaloneBindings(PyObject* module)
         {
             throw pybind11::error_already_set();
         }
-        standalone::setNativeTimingHooks(hooks);
+        if (!standalone::setNativeTimingHooks(hooks))
+        {
+            throw pybind11::value_error(
+                "the native timing table was refused: its version or size does not match this ovui");
+        }
     });
+
+    // Optional native frame pacing: a package passes a capsule that holds a
+    // NativeFramePacingHooks table, or None to remove the hooks. Without a
+    // table the coordinator reports supported = False and the application
+    // presents its viewport on the ordinary UI tick.
+    m.def("_set_native_frame_pacing_hooks", [](pybind11::object capsule) {
+        if (capsule.is_none())
+        {
+            standalone::setNativeFramePacingHooks(nullptr);
+            return;
+        }
+        auto* hooks = static_cast<const standalone::NativeFramePacingHooks*>(
+            PyCapsule_GetPointer(capsule.ptr(), standalone::kNativeFramePacingHooksCapsuleName));
+        if (hooks == nullptr)
+        {
+            throw pybind11::error_already_set();
+        }
+        if (!standalone::setNativeFramePacingHooks(hooks))
+        {
+            throw pybind11::value_error(
+                "the native frame pacing table was refused: its version, size or functions do not match this ovui");
+        }
+    });
+    m.def("_native_frame_pacing_cancel", [](uint64_t token) {
+        return standalone::sendNativeFramePacingCancel(token);
+    }, "Send a cancel for a session to the installed frame source, from any thread",
+       pybind11::arg("token"));
 
     auto windowManagerModule = m.def_submodule("_window_manager");
     windowmanager::definePythonModule(
@@ -99,7 +107,35 @@ void registerStandaloneBindings(PyObject* module)
     // Standalone entry points
     m.def("_standalone_init", &standalone::init, "Initialize standalone backend",
           pybind11::arg("title") = "omni.ui", pybind11::arg("width") = 1280, pybind11::arg("height") = 720);
-    m.def("_standalone_tick", &standalone::tick, "Process one frame");
+    m.def("_standalone_tick",
+          []() {
+              // Python callbacks inside the frame keep the GIL. Only the wait in
+              // native presentation lets other Python threads run. The hooks live
+              // for this call and this thread only, so native callers of tick()
+              // are not changed.
+              struct HookScope
+              {
+                  HookScope()
+                  {
+                      standalone::setPresentWaitHooks(
+                          []() -> void* { return PyEval_SaveThread(); },
+                          [](void* state) { PyEval_RestoreThread(static_cast<PyThreadState*>(state)); });
+                  }
+                  ~HookScope() { standalone::setPresentWaitHooks(nullptr, nullptr); }
+              } hookScope;
+              return standalone::tick();
+          },
+          "Process one frame");
+    m.def("_standalone_test_set_present_wait_delay_ms", &standalone::setPresentWaitTestDelayMs,
+          "Test seam: make each native present wait last at least this many ms (0 = off)",
+          pybind11::arg("ms"));
+    m.def("_standalone_test_present_wait_window",
+          []() {
+              double begin = 0.0, end = 0.0;
+              standalone::getPresentWaitTestWindow(&begin, &end);
+              return pybind11::make_tuple(begin, end);
+          },
+          "Test seam: (begin, end) of the last present wait in time.perf_counter() seconds; end is 0 while it runs");
     m.def("_standalone_should_close", &standalone::shouldClose, "Check if window should close");
     m.def("_standalone_shutdown", &standalone::shutdown, "Shut down standalone backend");
     m.def("_standalone_set_window_size", &standalone::setWindowSize,
@@ -119,6 +155,27 @@ void registerStandaloneBindings(PyObject* module)
           "Set the main OS window title", pybind11::arg("title"));
     m.def("_standalone_get_window_title", &standalone::getWindowTitle,
           "Return the main OS window title");
+    m.def("_standalone_set_clear_color",
+          [](float red, float green, float blue, float alpha) {
+              std::string error;
+              if (standalone::setClearColor(red, green, blue, alpha, &error))
+                  return;
+              // With a headless Vulkan backend, only a bad value is refused.
+              float current[4];
+              if (standalone::getClearColor(&current[0], &current[1], &current[2], &current[3]))
+                  throw pybind11::value_error("set_clear_color: " + error);
+              throw std::runtime_error("set_clear_color: " + error);
+          },
+          "Set the premultiplied RGBA clear color of the headless Vulkan frame",
+          pybind11::arg("red"), pybind11::arg("green"), pybind11::arg("blue"), pybind11::arg("alpha"));
+    m.def("_standalone_get_clear_color",
+          []() -> pybind11::object {
+              float rgba[4];
+              if (!standalone::getClearColor(&rgba[0], &rgba[1], &rgba[2], &rgba[3]))
+                  return pybind11::none();
+              return pybind11::make_tuple(rgba[0], rgba[1], rgba[2], rgba[3]);
+          },
+          "Return the clear color of the headless Vulkan frame, or None without that backend");
 
     // Native Vulkan frame pacing. The renderer handle is borrowed: the Python
     // adapter remains its sole owner and must stop/join before destruction.
@@ -144,7 +201,7 @@ void registerStandaloneBindings(PyObject* module)
                   renderVarNameOffset, renderVarHandleOffset, provider,
                   renderProduct.c_str(), cameraPath.c_str(), width, height);
           },
-          "Start a capability-checked native coordinator borrowing an ovrtx renderer",
+          "Start a capability-checked native coordinator borrowing a renderer",
           pybind11::arg("renderer_ptr"), pybind11::arg("library_path"),
           pybind11::arg("render_var_stride"), pybind11::arg("render_var_name_offset"),
           pybind11::arg("render_var_handle_offset"),
@@ -195,12 +252,18 @@ void registerStandaloneBindings(PyObject* module)
           "Drain the render worker while keeping native presentation active",
           pybind11::arg("token"));
     m.def("_native_frame_pacing_resume_render",
-          [](uint64_t token) {
+          [](uint64_t token, bool render) {
               pybind11::gil_scoped_release release;
-              return standalone::resumeNativeFramePacingRender(token);
+              return standalone::resumeNativeFramePacingRender(token, render);
           },
-          "Resume the render worker under the existing presentation token",
-          pybind11::arg("token"));
+          "Resume the render worker under the existing presentation token; "
+          "render=False: the resume does not render under on_change",
+          pybind11::arg("token"), pybind11::arg("render") = true);
+    m.def("_native_frame_pacing_set_render_policy", &standalone::setNativeFramePacingRenderPolicy,
+          "Render continuously or on change (\"continuous\" or \"on_change\")",
+          pybind11::arg("token"), pybind11::arg("policy"), pybind11::arg("settle_frames") = 8);
+    m.def("_native_frame_pacing_request_render", &standalone::requestNativeFramePacingRender,
+          "Under the on_change policy, render once more", pybind11::arg("token"));
     m.def("_get_native_frame_pacing_status", []() {
         const standalone::NativeFramePacingStats stats = standalone::getNativeFramePacingStats();
         pybind11::dict result;
@@ -208,8 +271,11 @@ void registerStandaloneBindings(PyObject* module)
         result["active"] = stats.active;
         result["status_reason"] = stats.statusReason;
         result["present_rate"] = stats.presentRate;
-        result["ovrtx_version"] = pybind11::make_tuple(
-            stats.ovrtxVersionMajor, stats.ovrtxVersionMinor, stats.ovrtxVersionPatch);
+        result["renderer_version"] = pybind11::make_tuple(
+            stats.rendererVersionMajor, stats.rendererVersionMinor, stats.rendererVersionPatch);
+        // The old name of renderer_version, kept so that existing code keeps
+        // working. Announced for removal in CHANGELOG.md.
+        result["ovrtx_version"] = result["renderer_version"];
         result["session_token"] = stats.sessionToken;
         result["ui_geometry_generations"] = stats.uiGeometryGenerations;
         result["real_render_completions"] = stats.realRenderCompletions;
@@ -222,6 +288,8 @@ void registerStandaloneBindings(PyObject* module)
         result["selected_renderer_frames"] = stats.selectedRendererFrames;
         result["last_selected_renderer_frame_serial"] = stats.lastSelectedRendererFrameSerial;
         result["presented_renderer_frames"] = stats.presentedRendererFrames;
+        result["render_worker_thread"] = stats.renderWorkerThread;
+        result["present_worker_thread"] = stats.presentWorkerThread;
         result["last_presented_renderer_frame_serial"] = stats.lastPresentedRendererFrameSerial;
         result["renderer_frame_order_violations"] = stats.rendererFrameOrderViolations;
         result["present_submit_calls"] = stats.presentSubmitCalls;
@@ -279,6 +347,7 @@ void registerStandaloneBindings(PyObject* module)
         result["camera_integrations"] = stats.cameraIntegrations;
         result["maximum_prediction_offset"] = stats.maximumPredictionOffset;
         result["render_loop_exited"] = stats.renderLoopExited;
+        result["render_idle"] = stats.renderIdle;
         result["render_loop_fatal"] = stats.renderLoopFatal;
         result["render_paused"] = stats.renderPaused;
         result["fetch_polls"] = stats.fetchPolls;
@@ -332,18 +401,37 @@ void registerStandaloneBindings(PyObject* module)
           pybind11::arg("enabled"));
     m.def("_is_software_cursor_enabled", &standalone::isSoftwareCursorEnabled,
           "Return True when ImGui is rendering a software mouse cursor");
+    m.def("_is_svg_rasterizer_built_in", &standalone::isSvgRasterizerBuiltIn,
+          "Return True when the build used OMNIUI_ENABLE_SVG=ON (ui.init registers the SVG rasterizer)");
+    m.def("_read_cursor_motion", []() -> pybind11::object {
+        double dx = 0.0, dy = 0.0, time = 0.0;
+        if (!standalone::readCursorMotion(&dx, &dy, &time))
+            return pybind11::none();
+        return pybind11::make_tuple(dx, dy, time);
+    }, "Cursor motion (px) since the previous call and the time of the newest cursor event, or None");
+    m.def("_set_cursor_capture", &standalone::setCursorCapture,
+          "Hide and lock the cursor for a navigation drag, or give it back", pybind11::arg("captured"));
+    m.def("_get_present_timings", &standalone::takePresentTimings,
+          "Present timing records (tag, submitted, completed) since the previous call (OMNIUI_PRESENT_TIMING=1)");
+    m.def("_set_present_timing_tag", &standalone::setPresentTimingTag,
+          "Tag the next window presents for present timing", pybind11::arg("tag"));
     m.def("_is_text_input_active", &standalone::isTextInputActive,
           "Return True while a text input owns the keyboard (ImGui io.WantTextInput)");
+    m.def("_end_text_input", &standalone::endTextInput,
+          "End the text input in typing mode as a click outside it does (a commit); return False when none is in typing mode");
 
     // Clipboard helpers for standalone interaction tests.
     m.def("_get_clipboard_text", []() {
-        installTestClipboard();
-        return g_testClipboard;
-    }, "Return current standalone clipboard text");
+        const char* text = ImGui::GetClipboardText();
+        return std::string(text ? text : "");
+    }, "Return current clipboard text from the platform clipboard");
     m.def("_set_clipboard_text", [](const char* text) {
-        installTestClipboard();
-        g_testClipboard = text ? text : "";
-    }, "Set standalone clipboard text", pybind11::arg("text"));
+        ImGui::SetClipboardText(text ? text : "");
+    }, "Set clipboard text on the platform clipboard", pybind11::arg("text"));
+
+    m.def("_is_clipboard_process_private", &standalone::isClipboardProcessPrivate,
+          "Return True when the clipboard helpers use a clipboard inside this "
+          "process (headless) and not the OS clipboard");
 
     // Screenshot capture
     m.def("_capture_screenshot", &standalone::captureScreenshot,

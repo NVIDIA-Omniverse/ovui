@@ -33,6 +33,9 @@ struct Widget::WidgetData
     // True when we need to recompute content height
     SizeDirtyReason m_dirtyHeight = SizeDirtyReason::eSizeChanged;
 
+    // Guards forceRasterDirty against a cyclic parent chain recursing forever.
+    bool m_forceRasterDirtyGuard = false;
+
 
     // unit: pixels
     float m_computedContentWidth = 0.0f;

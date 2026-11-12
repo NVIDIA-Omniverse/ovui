@@ -118,9 +118,6 @@ class TestRecentFileListPromotion:
 
 
 class TestRecentFileListCap:
-    def test_max_is_10(self):
-        assert RecentFileList.MAX == 10
-
     def test_add_11_keeps_10(self):
         r = RecentFileList()
         for i in range(11):

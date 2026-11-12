@@ -573,6 +573,39 @@ class TestVisibilityIconRendering:
         assert images[-1].args == (delegate_mod.stage_icons.eye_on_icon(),)
         assert images[-1].kwargs["name"] == "visible"
 
+    def test_row_under_hidden_parent_keeps_open_eye_and_click_toggles_own_state(
+        self, monkeypatch
+    ):
+        # Regression: the row of an item hidden only through its parent is
+        # not drawn as explicitly hidden, and its eye toggles only itself.
+        delegate_mod, images, frames = self._patch_visibility_ui(monkeypatch)
+        adapter = MockStageAdapter()
+        model = HierarchyModel(adapter)
+        geometry = self._item(model, "/World/Geometry")
+        sphere = self._item(model, "/World/Geometry/Sphere")
+        adapter.set_visibility(geometry.adapter_item, False)
+
+        delegate = StageDelegate()
+        delegate._build_visibility_column(model, sphere)
+        frame = frames[-1]
+        assert images[-1].args == (delegate_mod.stage_icons.eye_on_icon(),)
+        assert images[-1].kwargs["name"] == "inherited"
+
+        frame.mouse_pressed_fn(0, 0, 0, 0)
+        assert adapter.compute_visibility(sphere.adapter_item) == VisibilityState.INVISIBLE
+        assert adapter.compute_visibility(geometry.adapter_item) == VisibilityState.INVISIBLE
+        assert images[-1].args == (delegate_mod.stage_icons.eye_off_icon(),)
+        assert images[-1].kwargs["name"] == "hidden"
+
+        frame.mouse_pressed_fn(0, 0, 0, 0)
+        assert (
+            adapter.compute_visibility(sphere.adapter_item)
+            == VisibilityState.INHERITED_INVISIBLE
+        )
+        assert adapter.compute_visibility(geometry.adapter_item) == VisibilityState.INVISIBLE
+        assert images[-1].args == (delegate_mod.stage_icons.eye_on_icon(),)
+        assert images[-1].kwargs["name"] == "inherited"
+
     def test_selected_item_click_group_toggles_selection(self, monkeypatch):
         _, _, frames = self._patch_visibility_ui(monkeypatch)
         adapter = MockStageAdapter()

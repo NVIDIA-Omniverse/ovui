@@ -8,6 +8,7 @@
 #include <omni/ui/scene/DragGesture.h>
 #include <omni/ui/scene/GestureManager.h>
 
+#include "DragFollow.h"
 #include "ShapeGestureData.h"
 
 OMNIUI_SCENE_NAMESPACE_OPEN_SCOPE
@@ -17,7 +18,42 @@ struct DragGesture::DragGestureData : public ShapeGesture::ShapeGestureData
     Vector3 m_itemLastPoint = Vector3{ 0.0 };
     Vector3 m_rayLastPoint = Vector3{ 0.0 };
     Vector2 m_mouseLast = Vector3{ 0.0 };
+
+    // What the callbacks of the drag wrote: see DragFollow. A callback can destroy the gesture, so the window keeps it alive.
+    std::shared_ptr<DragFollow::Tracker> m_follow = std::make_shared<DragFollow::Tracker>();
 };
+
+namespace
+{
+DragFollow::Report getReport(const AbstractShape* shape)
+{
+    DragFollow::Report report;
+    report.valid = shape && shape->_getFollowReport(report.moved);
+    return report;
+}
+
+// Runs a callback of the gesture as a window of the tracker, also when the callback throws.
+class FollowWindow
+{
+public:
+    FollowWindow(std::shared_ptr<DragFollow::Tracker> tracker, const AbstractShape* sender, bool callback)
+        : m_tracker(std::move(tracker))
+    {
+        m_tracker->enter(sender, getReport(sender), callback);
+    }
+
+    ~FollowWindow()
+    {
+        m_tracker->leave();
+    }
+
+    FollowWindow(const FollowWindow&) = delete;
+    FollowWindow& operator=(const FollowWindow&) = delete;
+
+private:
+    std::shared_ptr<DragFollow::Tracker> m_tracker;
+};
+} // namespace
 
 DragGesture::DragGesture()
     : ShapeGesture(new DragGestureData)
@@ -26,12 +62,34 @@ DragGesture::DragGesture()
 
 DragGesture::~DragGesture() = default;
 
+void DragGesture::beginFollowing()
+{
+    _getData<DragGestureData>().m_follow->enterDeclared();
+}
+
+void DragGesture::endFollowing()
+{
+    _getData<DragGestureData>().m_follow->leaveDeclared();
+}
+
 void DragGesture::preProcess(const Matrix44& projection, const Matrix44& view)
 {
     GestureButtonEditor mouseButtons(m_mouseButtons);
 
     auto& data = _getData<DragGestureData>();
     const auto gestureState = this->getState();
+
+    // The pointer and the camera of this frame.
+    auto getPointer = [&]() {
+        DragFollow::Pointer pointer;
+        pointer.mouse = data.m_input.mouse;
+        pointer.origin = data.m_input.mouseOrigin;
+        pointer.direction = data.m_input.mouseDirection;
+        pointer.projection = projection;
+        pointer.view = view;
+        pointer.frameSize = data.m_frameSize;
+        return pointer;
+    };
     switch (gestureState)
     {
     case GestureState::ePossible:
@@ -72,6 +130,11 @@ void DragGesture::preProcess(const Matrix44& projection, const Matrix44& view)
                 data.m_rayLastPoint = gesturePayload->rayClosestPoint;
                 data.m_mouseLast = data.m_input.mouse;
                 mouseButtons.setStateBit(false);
+                // The first call is measured from the payload of this frame.
+                const AbstractShape* sender = this->getSender();
+                data.m_follow->reset();
+                data.m_follow->setPointer(getPointer());
+                sender->_captureBaseline();
                 this->setState(GestureState::eBegan);
                 return;
             }
@@ -97,8 +160,26 @@ void DragGesture::preProcess(const Matrix44& projection, const Matrix44& view)
                     data.m_itemLastPoint = gesturePayload->itemClosestPoint;
                     data.m_rayLastPoint = gesturePayload->rayClosestPoint;
                     data.m_mouseLast = data.m_input.mouse;
-                    this->setState(GestureState::eChanged);
+                    const AbstractShape* sender = this->getSender();
+                    const auto pointer = getPointer();
+                    if (data.m_follow->isFollow(sender, pointer))
+                    {
+                        // Under the same pointer and camera, the shape changed only by what the callback of the last call
+                        // wrote: this is the movement that was already reported. Its own movement stays in the next call.
+                        data.m_follow->setBaselinePending(true);
+                    }
+                    else
+                    {
+                        data.m_follow->setPointer(pointer);
+                        data.m_follow->setBaselinePending(false);
+                        sender->_captureBaseline();
+                        this->setState(GestureState::eChanged);
+                    }
                 }
+            }
+            if (data.m_follow->isBaselinePending())
+            {
+                this->getSender()->_holdPayloadBaseline();
             }
         }
         else
@@ -121,7 +202,8 @@ void DragGesture::process()
 {
     switch (this->getState())
     {
-    case GestureState::eBegan:
+    case GestureState::eBegan: {
+        FollowWindow window(_getData<DragGestureData>().m_follow, this->getSender(), true);
         if (this->hasOnBeganFn())
         {
             this->callOnBeganFn(this->getSender());
@@ -131,8 +213,11 @@ void DragGesture::process()
             this->onBegan();
         }
         break;
+    }
 
-    case GestureState::eChanged:
+    case GestureState::eChanged: {
+        auto follow = _getData<DragGestureData>().m_follow;
+        FollowWindow window(follow, this->getSender(), true);
         if (this->hasOnChangedFn())
         {
             this->callOnChangedFn(this->getSender());
@@ -142,6 +227,7 @@ void DragGesture::process()
             this->onChanged();
         }
         break;
+    }
 
     case GestureState::ePrevented:
     case GestureState::eCanceled:
@@ -151,16 +237,27 @@ void DragGesture::process()
             break;
         }
 
-    case GestureState::eEnded:
+    case GestureState::eEnded: {
+        // The callback can destroy the gesture and the shape: what is used after it is kept alive here.
+        auto follow = _getData<DragGestureData>().m_follow;
+        const AbstractShape* sender = this->getSender();
+        const std::shared_ptr<const AbstractItem> keepSender = sender ? sender->weak_from_this().lock() : nullptr;
         if (this->hasOnEndedFn())
         {
-            this->callOnEndedFn(this->getSender());
+            this->callOnEndedFn(sender);
         }
         else
         {
             this->onEnded();
         }
+        follow->reset();
+        if (keepSender)
+        {
+            // A frame that was held back must not leave its baseline for the next drag.
+            sender->_holdPayloadBaseline(false);
+        }
         break;
+    }
 
     default:
         break;

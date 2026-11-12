@@ -158,6 +158,17 @@ class TestSetLayerMutenessCommand:
         cmd.redo()
         assert adapter.is_muted(adapter.find_layer("./sub.usda")) is True
 
+    def test_mute_authoring_layer_moves_and_restores_authoring_layer(
+        self, adapter, bus
+    ) -> None:
+        adapter.set_edit_target("./sub.usda")
+        cmd = SetLayerMutenessCommand(adapter, bus, "./sub.usda", True)
+        cmd.do()
+        assert adapter.get_edit_target_identifier() == ROOT_LAYER_IDENTIFIER
+        cmd.undo()
+        assert adapter.is_muted(adapter.find_layer("./sub.usda")) is False
+        assert adapter.get_edit_target_identifier() == "./sub.usda"
+
     def test_stores_target_state_as_bool(self, adapter, bus) -> None:
         # Truthy non-bool inputs (legacy callers) should still land as
         # a genuine bool so the adapter's ``==`` no-op check lines up.
@@ -213,6 +224,17 @@ class TestSetLayerLockCommand:
         cmd.undo()
         cmd.redo()
         assert adapter.is_locked(adapter.find_layer("./sub.usda")) is True
+
+    def test_lock_authoring_layer_moves_and_restores_authoring_layer(
+        self, adapter, bus
+    ) -> None:
+        adapter.set_edit_target("./sub.usda")
+        cmd = SetLayerLockCommand(adapter, bus, "./sub.usda", True)
+        cmd.do()
+        assert adapter.get_edit_target_identifier() == ROOT_LAYER_IDENTIFIER
+        cmd.undo()
+        assert adapter.is_locked(adapter.find_layer("./sub.usda")) is False
+        assert adapter.get_edit_target_identifier() == "./sub.usda"
 
     def test_stores_target_state_as_bool(self, adapter, bus) -> None:
         cmd = SetLayerLockCommand(adapter, bus, "./sub.usda", 1)

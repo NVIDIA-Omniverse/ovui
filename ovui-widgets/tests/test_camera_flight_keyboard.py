@@ -14,12 +14,11 @@ Coverage groups:
 * construction — defaults match the plan, gate wiring.
 * key tracking — CHAR/KEY_UP-style semantics via handle_key_event.
 * is_flying gate — RMB × motion-key × disable_fly truth table.
-* velocity direction — each of W/A/S/D/Space/C produces the right
-  camera-basis axis.
+* velocity direction — each of W/A/S/D produces the right camera-basis
+  axis, Q/E and C/Space the world vertical.
 * speed modifiers — Shift 2×, Ctrl 0.5×, default 1×.
-* integration math — velocity × base_speed × dt scales linearly.
-* Q/E roll keys — tracked but inactive (no CameraController roll
-  axis yet).
+* integration math — at the keys' full speed, velocity × base_speed × dt
+  scales linearly; the heavy fly eases in and coasts to a stop.
 * lifecycle — release clears keys, gesture-backed RMB state.
 """
 
@@ -50,6 +49,18 @@ KEY_Q = ord("Q")
 KEY_E = ord("E")
 KEY_C = ord("C")
 KEY_SPACE = ord(" ")
+
+
+def _fly_steady(f: FlightModeKeyboard, dt: float) -> None:
+    """Fly for ``dt`` seconds at the keys' full speed, starting at the origin.
+
+    The heavy fly first eases to that speed (3 s); the target then goes back
+    to the origin, so only the move of ``dt`` is measured.
+    """
+    for _ in range(300):
+        f.integrate(0.01)
+    f._camera.state.target = [0.0, 0.0, 0.0]
+    f.integrate(dt)
 
 
 def _make_flight(base_speed: float = 1.0, model=None) -> FlightModeKeyboard:
@@ -202,14 +213,12 @@ class TestIsFlying:
         f.handle_key_event(key, 0, pressed=True)
         assert f.is_flying is True
 
-    def test_roll_only_does_not_activate(self):
-        # Q/E are roll placeholders. Holding only Q+E with RMB must
-        # NOT be considered "flying" — there's no motion without W/A/S/D.
+    @pytest.mark.parametrize("key", [KEY_Q, KEY_E])
+    def test_q_and_e_activate_flying(self, key):
         f = _make_flight()
         f.notify_rmb_press()
-        f.handle_key_event(KEY_Q, 0, pressed=True)
-        f.handle_key_event(KEY_E, 0, pressed=True)
-        assert f.is_flying is False
+        f.handle_key_event(key, 0, pressed=True)
+        assert f.is_flying is True
 
     def test_disable_fly_gate_blocks(self):
         model = CameraManipulatorModel()
@@ -333,7 +342,7 @@ class TestIntegrationDirection:
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_W, 0, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         expected = forward * 1.0
         np.testing.assert_allclose(
             cam.state.target, expected.tolist(), atol=1e-5
@@ -344,7 +353,7 @@ class TestIntegrationDirection:
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_S, 0, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         expected = -forward * 1.0
         np.testing.assert_allclose(
             cam.state.target, expected.tolist(), atol=1e-5
@@ -355,7 +364,7 @@ class TestIntegrationDirection:
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_D, 0, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         expected = right * 1.0
         np.testing.assert_allclose(
             cam.state.target, expected.tolist(), atol=1e-5
@@ -366,29 +375,31 @@ class TestIntegrationDirection:
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_A, 0, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         expected = -right * 1.0
         np.testing.assert_allclose(
             cam.state.target, expected.tolist(), atol=1e-5
         )
 
     def test_space_moves_up(self):
-        cam, (_r, up, _f) = _setup_camera_for_math()
+        cam, _ = _setup_camera_for_math()
+        up = np.asarray(cam.up_axis)  # the world vertical, not the camera's up
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_SPACE, 0, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         expected = up * 1.0
         np.testing.assert_allclose(
             cam.state.target, expected.tolist(), atol=1e-5
         )
 
     def test_c_moves_down(self):
-        cam, (_r, up, _f) = _setup_camera_for_math()
+        cam, _ = _setup_camera_for_math()
+        up = np.asarray(cam.up_axis)  # the world vertical, not the camera's up
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_C, 0, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         expected = -up * 1.0
         np.testing.assert_allclose(
             cam.state.target, expected.tolist(), atol=1e-5
@@ -401,17 +412,17 @@ class TestIntegrationDirection:
         f.notify_rmb_press()
         f.handle_key_event(KEY_W, 0, pressed=True)
         f.handle_key_event(KEY_S, 0, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         assert cam.state.target == target0
 
-    def test_diagonal_w_plus_d(self):
+    def test_diagonal_w_plus_d_is_not_faster(self):
         cam, (right, _u, forward) = _setup_camera_for_math()
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_W, 0, pressed=True)
         f.handle_key_event(KEY_D, 0, pressed=True)
-        f.integrate(dt=1.0)
-        expected = (forward + right) * 1.0
+        _fly_steady(f, 1.0)
+        expected = (forward + right) / np.sqrt(2.0)
         np.testing.assert_allclose(
             cam.state.target, expected.tolist(), atol=1e-5
         )
@@ -423,7 +434,7 @@ class TestIntegrationDirection:
         f.notify_rmb_press()
         f.handle_key_event(KEY_Q, 0, pressed=True)
         f.handle_key_event(KEY_E, 0, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         assert cam.state.target == target0
 
 
@@ -438,7 +449,7 @@ class TestSpeedModifiers:
         f = FlightModeKeyboard(cam, base_speed=2.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_W, 0, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         _r, _u, forward = CameraController()._get_basis()
         np.testing.assert_allclose(
             cam.state.target,
@@ -451,7 +462,7 @@ class TestSpeedModifiers:
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_W, MOD_SHIFT, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         _r, _u, forward = CameraController()._get_basis()
         expected = forward * SPEED_SHIFT  # 2×
         np.testing.assert_allclose(
@@ -463,7 +474,7 @@ class TestSpeedModifiers:
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_W, MOD_CTRL, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         _r, _u, forward = CameraController()._get_basis()
         expected = forward * SPEED_CTRL  # 0.5×
         np.testing.assert_allclose(
@@ -475,7 +486,7 @@ class TestSpeedModifiers:
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_W, MOD_SHIFT | MOD_CTRL, pressed=True)
-        f.integrate(dt=1.0)
+        _fly_steady(f, 1.0)
         _r, _u, forward = CameraController()._get_basis()
         expected = forward * SPEED_SHIFT  # 2× (shift wins)
         np.testing.assert_allclose(
@@ -497,8 +508,8 @@ class TestIntegrationMath:
         for f in (fa, fb):
             f.notify_rmb_press()
             f.handle_key_event(KEY_W, 0, pressed=True)
-        fa.integrate(dt=0.5)
-        fb.integrate(dt=1.0)
+        _fly_steady(fa, 0.5)
+        _fly_steady(fb, 1.0)
         a = np.asarray(cam_a.state.target, dtype=np.float32)
         b = np.asarray(cam_b.state.target, dtype=np.float32)
         # Half the dt → half the displacement.
@@ -512,8 +523,8 @@ class TestIntegrationMath:
         for f in (fa, fb):
             f.notify_rmb_press()
             f.handle_key_event(KEY_W, 0, pressed=True)
-        fa.integrate(dt=1.0)
-        fb.integrate(dt=1.0)
+        _fly_steady(fa, 1.0)
+        _fly_steady(fb, 1.0)
         a = np.asarray(cam_a.state.target, dtype=np.float32)
         b = np.asarray(cam_b.state.target, dtype=np.float32)
         np.testing.assert_allclose(a * 3.0, b, atol=1e-5)
@@ -523,6 +534,7 @@ class TestIntegrationMath:
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
         f.handle_key_event(KEY_W, 0, pressed=True)
+        _fly_steady(f, 0.0)
         for _ in range(10):
             f.integrate(dt=0.1)
         _r, _u, forward = CameraController()._get_basis()
@@ -561,14 +573,29 @@ class TestIntegrationMath:
         assert cam.state.target == target0
 
     def test_no_motion_keys_held_is_noop(self):
-        # RMB held + only Q pressed → not flying (Q is roll-reserved).
+        # RMB held + only a key flight mode does not watch → not flying.
         cam = CameraController()
         target0 = list(cam.state.target)
         f = FlightModeKeyboard(cam, base_speed=1.0)
         f.notify_rmb_press()
-        f.handle_key_event(KEY_Q, 0, pressed=True)
+        f.handle_key_event(ord("X"), 0, pressed=True)
         f.integrate(dt=1.0)
         assert cam.state.target == target0
+
+
+    def test_heavy_fly_eases_in_and_coasts_to_a_stop(self):
+        cam = CameraController()
+        f = FlightModeKeyboard(cam, base_speed=1.0)
+        f.notify_rmb_press()
+        f.handle_key_event(KEY_W, 0, pressed=True)
+        f.integrate(dt=0.016)
+        # One frame reaches only a few percent of the keys' speed (1 unit/s).
+        assert 0.0 < np.linalg.norm(f._velocity) < 0.1
+        f.notify_rmb_release()
+        assert f.is_flying is True  # coasting
+        for _ in range(200):
+            f.integrate(dt=0.016)
+        assert f.is_flying is False
 
 
 # ---------------------------------------------------------------------------

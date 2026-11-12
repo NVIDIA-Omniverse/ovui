@@ -102,3 +102,117 @@ def test_preview_surface_material_connects_surface_and_displacement_outputs():
 
     assert surface.HasConnectedSource()
     assert displacement.HasConnectedSource()
+
+
+def test_preview_surface_material_binds_to_selected_prim():
+    stage = _stage()
+    cube = create_menu.create_mesh_prim(_app(stage), "Cube")
+    snapshot = SimpleNamespace(paths=lambda: (str(cube.GetPath()),))
+    app = SimpleNamespace(_stage=stage, selection_bus=SimpleNamespace(get_snapshot=lambda: snapshot, publish=lambda *a, **k: None))
+
+    material_prim = create_menu.create_usd_preview_surface_material(app)
+    bound, _relationship = UsdShade.MaterialBindingAPI(cube).ComputeBoundMaterial()
+
+    assert bound.GetPrim().GetPath() == material_prim.GetPath()
+
+
+def _selection_app(stage, *paths):
+    snapshot = SimpleNamespace(paths=lambda: paths)
+    published = []
+    bus = SimpleNamespace(get_snapshot=lambda: snapshot, publish=lambda paths, **_k: published.append(list(paths)))
+    return SimpleNamespace(_stage=stage, selection_bus=bus), published
+
+
+def _instance_proxy(stage):
+    UsdGeom.Cube.Define(stage, "/World/Proto/Cube")
+    instance = UsdGeom.Xform.Define(stage, "/World/Instance").GetPrim()
+    instance.GetReferences().AddInternalReference("/World/Proto")
+    instance.SetInstanceable(True)
+    proxy = stage.GetPrimAtPath("/World/Instance/Cube")
+    assert proxy.IsInstanceProxy()
+    return proxy
+
+
+def _materials(stage):
+    return [str(prim.GetPath()) for prim in stage.Traverse() if prim.IsA(UsdShade.Material)]
+
+
+def test_preview_surface_material_with_an_instance_proxy_selected_creates_the_material(capsys):
+    stage = _stage()
+    proxy = _instance_proxy(stage)
+    app, published = _selection_app(stage, str(proxy.GetPath()))
+
+    material_prim = create_menu.create_usd_preview_surface_material(app)
+
+    assert material_prim is not None
+    assert _materials(stage) == [str(material_prim.GetPath())]
+    assert not UsdShade.MaterialBindingAPI(proxy).ComputeBoundMaterial()[0]
+    assert published == [[str(material_prim.GetPath())]]
+    error = capsys.readouterr().err
+    assert "Create and bind material core_material.usd_preview_surface was refused" in error
+    assert "instance proxy" in error
+    assert "Creating the material without a binding" in error
+
+
+def test_preview_surface_material_binds_the_selected_prims_that_are_not_instance_proxies(capsys):
+    stage = _stage()
+    proxy = _instance_proxy(stage)
+    cube = create_menu.create_mesh_prim(_app(stage), "Cube")
+    app, _published = _selection_app(stage, str(proxy.GetPath()), str(cube.GetPath()))
+
+    material_prim = create_menu.create_usd_preview_surface_material(app)
+
+    bound, _relationship = UsdShade.MaterialBindingAPI(cube).ComputeBoundMaterial()
+    assert bound.GetPrim().GetPath() == material_prim.GetPath()
+    assert not UsdShade.MaterialBindingAPI(proxy).ComputeBoundMaterial()[0]
+    error = capsys.readouterr().err
+    assert "Create and bind material core_material.usd_preview_surface did not bind 1 selected prim(s)" in error
+    assert f"instance proxy, which cannot take a material binding, and was skipped: {proxy.GetPath()}" in error
+    assert str(cube.GetPath()) not in error
+
+
+def test_preview_surface_material_creates_the_material_after_a_failed_bind(monkeypatch, capsys):
+    from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter
+
+    def _fail_bind(self, material_prim, targets, binding_strength):
+        raise RuntimeError("forced bind failure")
+
+    monkeypatch.setattr(UsdStageAdapter, "_bind_core_material_to_targets", _fail_bind)
+    stage = _stage()
+    cube = create_menu.create_mesh_prim(_app(stage), "Cube")
+    app, published = _selection_app(stage, str(cube.GetPath()))
+
+    material_prim = create_menu.create_usd_preview_surface_material(app)
+
+    assert material_prim is not None
+    assert _materials(stage) == [str(material_prim.GetPath())]
+    assert not UsdShade.MaterialBindingAPI(cube).ComputeBoundMaterial()[0]
+    assert published == [[str(material_prim.GetPath())]]
+    error = capsys.readouterr().err
+    assert "Create and bind material core_material.usd_preview_surface was refused" in error
+    assert "forced bind failure" in error
+    assert "Creating the material without a binding" in error
+
+
+def test_preview_surface_material_reports_a_rejected_bind_target(monkeypatch, capsys):
+    from ovui_data_adapters.openusd import stage_adapter
+
+    monkeypatch.setattr(
+        stage_adapter,
+        "_core_material_resolve_scope_path",
+        lambda *_args: (None, "forced scope error", False),
+    )
+    stage = _stage()
+    cube = create_menu.create_mesh_prim(_app(stage), "Cube")
+    snapshot = SimpleNamespace(paths=lambda: (str(cube.GetPath()),))
+    published = []
+    bus = SimpleNamespace(get_snapshot=lambda: snapshot, publish=lambda paths, **_k: published.append(paths))
+    app = SimpleNamespace(_stage=stage, selection_bus=bus)
+
+    assert create_menu.create_usd_preview_surface_material(app) is None
+
+    assert not [prim for prim in stage.Traverse() if prim.IsA(UsdShade.Material)]
+    assert published == []
+    error = capsys.readouterr().err
+    assert "Create material core_material.usd_preview_surface failed" in error
+    assert "forced scope error" in error

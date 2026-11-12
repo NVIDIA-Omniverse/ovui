@@ -586,6 +586,107 @@ def test_empty_column_read_is_only_empty_when_the_hierarchy_agrees(
     assert emptied.path_order == ()
 
 
+_SCENE_WITH_STAGE_METADATA = '''#usda 1.0
+(
+    customLayerData = {
+        dictionary renderSettings = {
+            int "rtx:post:tonemap:op" = 7
+        }
+    }
+    metersPerUnit = 0.01
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    def Scope "Cameras"
+    {
+        def Camera "Shot"
+        {
+            float shutter:close = 0.25
+            float shutter:open = -0.25
+        }
+        def Xform "NotACamera" {}
+    }
+    def Cube "Sampled"
+    {
+        custom float b29:sampled = 3.5
+        custom float b29:sampled.timeSamples = {
+            -10: 1,
+            90: 2,
+        }
+    }
+    def Xform "Plain" {}
+    def Xform "Instance" (
+        instanceable = true
+        references = </Proto>
+    )
+    {
+    }
+}
+
+class Xform "Proto"
+{
+    def Cube "Child"
+    {
+        custom float sampled = 8.5
+        custom float sampled.timeSamples = {
+            0: 8,
+            1: 9,
+        }
+    }
+}
+'''
+
+
+def test_failed_read_of_a_scene_with_stage_metadata_is_not_an_empty_stage(
+    tmp_path: Path,
+    ovstage_runtime: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Stage metadata and inspected attributes must not hide the hierarchy.
+
+    Population reads render settings, units and the attributes that the
+    Property Inspector shows.  The native hierarchy must still list every
+    prim, because it is what tells a failed read from an empty stage.  The
+    failed read must also be reported.
+    """
+
+    path = _write_scene(tmp_path, "metadata.usda", _SCENE_WITH_STAGE_METADATA)
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(path))
+    try:
+        stage = scene._stage
+        ordinal = int(stage.current_ordinal)
+        populated = scene_module._kit_topology_snapshot(stage, ordinal).path_order
+        assert "/World/Cameras/NotACamera" in populated
+        assert "/World/Instance/Child" in populated
+        walked = scene_module._hierarchy_kit_path_order(stage, ordinal)
+        assert walked is not None
+        assert set(walked) == set(populated)
+
+        monkeypatch.setattr(
+            scene_module,
+            "_merge_kit_read_groups",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(stage, "fetch_read_next", lambda *_a, **_k: None)
+        stage._ovui_kit_stage_bridge_cache = None
+        with caplog.at_level("WARNING", logger=scene_module.__name__):
+            unreadable = scene_module._kit_topology_snapshot(stage, ordinal + 1)
+        assert unreadable.readable is False
+        assert unreadable.path_order == populated
+        assert [record.getMessage() for record in caplog.records] == [
+            f"ovstage stage topology read failed at ordinal {ordinal + 1}: the "
+            "whole-stage usd-path read returned no prims, but the native "
+            "hierarchy still lists 1 root prim(s). The Stage Browser keeps "
+            "the last topology that was read, and the read is retried."
+        ]
+    finally:
+        session.shutdown_scene()
+
+
 _BLOCKED_SUBPROCESS = r'''
 import importlib.abc
 import sys
@@ -639,3 +740,156 @@ def test_exact_runtime_hierarchy_and_selection_do_not_attempt_forbidden_imports(
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_failed_type_read_after_an_edit_keeps_the_stage_browser_items(
+    opened_a: tuple[Any, Any, Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A read outage after an edit must not replace the rows the browser holds.
+
+    The Stage Browser keeps the items that the stage adapter gave it.  When
+    the type read answers nothing, the adapter must keep those items and
+    report the failed read, not rebuild them as untyped rows.
+    """
+
+    _session, scene, adapter, _selection = opened_a
+    item = adapter.get_item_at_path("/World/Group_Unicode/PlainShape")
+    assert adapter.get_type_name(item) == "Cube"
+    # A native create changes structure without eagerly reading the new types.
+    # A value-only edit intentionally keeps the existing type snapshot.
+    from ovui_data_adapters.ovstage._structural import create_native_prims
+
+    stage = scene.native_stage
+    ordinal = scene.current_ordinal + 1
+    create_native_prims(stage, (("/World/Added", "Xform"),), ordinal=ordinal)
+    scene_module.wait_operation(stage.advance_write_floor(ordinal))
+    scene.change_stream.poll()
+    monkeypatch.setattr(
+        scene_module,
+        "_merge_kit_read_groups",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(stage, "fetch_read_next", lambda *_a, **_k: None)
+    stage._ovui_kit_stage_bridge_cache = None
+    with caplog.at_level("WARNING", logger=scene_module.__name__):
+        adapter.get_root()
+
+    assert adapter.get_item_path(item) == "/World/Group_Unicode/PlainShape"
+    assert adapter.get_type_name(item) == "Cube"
+    assert any(
+        record.getMessage().startswith(
+            f"ovstage prim type read failed at ordinal {int(stage.current_ordinal)}: "
+        )
+        for record in caplog.records
+    )
+
+
+def test_unrecorded_native_camera_frame_reuses_cache_until_an_outside_value_edit(
+    opened_a: tuple[Any, Any, Any, Any],
+) -> None:
+    """Native camera publication must not rebuild the scene value snapshot."""
+    import numpy as np
+    import ovstage
+
+    _session, scene, _adapter, _selection = opened_a
+    stage = scene.native_stage
+    camera = "/World/Cameras/RealCamera"
+
+    def write(name: str, array: Any, semantic: int) -> None:
+        with ovstage.PathDictionary(stage) as paths:
+            path_list = paths.create_path_list_from_strings([camera])
+            query = stage.query_from_path_list(path_list)
+            ordinal = stage.begin_frame()
+            try:
+                scene_module.wait_operation(query)
+                tensor = ovstage.make_dltensor(
+                    array, dtype=ovstage.numpy_to_dldatatype(array.dtype), shape=list(array.shape)
+                )
+                scene_module.wait_operation(stage.write_attributes(
+                    query, (ovstage.WriteDesc(name, tensor, is_array=False, semantic=semantic),),
+                    ordinal, prim_mode=ovstage.PrimMode.UPSERT,
+                ))
+            finally:
+                scene_module.wait_operation(query.release())
+                paths.destroy_path_list(path_list)
+            scene_module.wait_operation(stage.end_frame(ordinal))
+
+    cache = scene_module._kit_stage_cache(stage, scene.current_ordinal)
+    scene_module.begin_native_camera_writes(stage, scene.current_ordinal)
+    try:
+        transform = np.eye(4, dtype=np.float64).reshape(1, 16)
+        transform[0, 12] = 9
+        write("xformOp:transform", transform, int(ovstage.AttributeSemantic.MATRIX))
+        scene.change_stream.poll()
+        assert scene_module._kit_stage_cache(stage, scene.current_ordinal) is cache
+    finally:
+        scene_module.end_native_camera_writes(stage)
+    assert scene_module._kit_stage_cache(stage, scene.current_ordinal) is cache
+
+    # A different writer after camera ownership ends must invalidate values.
+    write("focalLength", np.asarray([61], dtype=np.float32), 0)
+    scene.change_stream.poll()
+    refreshed = scene_module._kit_stage_cache(stage, scene.current_ordinal)
+    assert refreshed is not cache
+    assert np.frombuffer(refreshed.attrs[camera, "focalLength"], dtype=np.float32)[0] == 61
+
+
+@pytest.mark.parametrize("failure", ["query.wait", "read.wait", "copy", "read.release"])
+def test_written_rows_release_native_handles_when_a_read_fails(
+    opened_a: tuple[Any, Any, Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """Every acquired handle is released even if a later native operation fails."""
+    _session, scene, adapter, _selection = opened_a
+    stage = scene.native_stage
+    since = scene.current_ordinal
+    adapter.set_visibility(adapter.get_item_at_path("/World/BoxPretender"), False)
+    current = scene.current_ordinal
+    events: list[str] = []
+    query = stage.query
+    read = stage.read_attributes
+    release_group = stage.release_group
+    path_strings = scene_module.path_strings
+
+    class FailingHandle(_HandleProxy):
+        def wait(self, *args: Any, **kwargs: Any) -> Any:
+            result = super().wait(*args, **kwargs)
+            if failure == f"{self._label}.wait":
+                raise RuntimeError(failure)
+            return result
+
+        def release(self) -> Any:
+            result = super().release()
+            if failure == f"{self._label}.release":
+                result.wait()
+                raise RuntimeError(failure)
+            return result
+
+    monkeypatch.setattr(stage, "query", lambda *a, **k: FailingHandle(query(*a, **k), events, "query"))
+    monkeypatch.setattr(stage, "read_attributes", lambda *a, **k: FailingHandle(read(*a, **k), events, "read"))
+
+    def copy(*args: Any, **kwargs: Any) -> Any:
+        if failure == "copy":
+            raise RuntimeError(failure)
+        return path_strings(*args, **kwargs)
+
+    def release(group: Any) -> Any:
+        events.append("group.release")
+        return release_group(group)
+
+    monkeypatch.setattr(scene_module, "path_strings", copy)
+    monkeypatch.setattr(stage, "release_group", release)
+    with pytest.raises(RuntimeError, match=failure):
+        scene_module._read_written_rows(stage, since, current)
+    assert events.count("query.release") == 1
+    assert events.count("query.release_op.wait") == 1
+    if failure != "query.wait":
+        assert events.count("read.release") == 1
+        assert events.count("read.release_op.wait") == 1
+        assert events.index("read.release") < events.index("query.release")
+    if failure == "copy":
+        assert events.count("group.release") == 1
+        assert events.index("group.release") < events.index("read.release")

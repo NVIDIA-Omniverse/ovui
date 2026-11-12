@@ -243,6 +243,13 @@ def test_public_population_stage_info_drives_up_axis_and_bound_camera(
     assert pose.up_axis == "Z"
 
 
+def test_population_stage_metadata_drives_stage_units(
+    opened_scene: tuple[Any, Any, Any, Any],
+) -> None:
+    _session, _scene, stage, _transform = opened_scene
+    assert stage.read_stage_meters_per_unit() == 0.5
+
+
 def test_spatial_tokens_are_copied_once_per_native_ordinal(
     opened_scene: tuple[Any, Any, Any, Any],
     monkeypatch: pytest.MonkeyPatch,

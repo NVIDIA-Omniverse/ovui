@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tier 3 server-callback registration tests (issue #34, Step 3.6).
+"""Tier 3 server-callback registration tests (the regression, Step 3.6).
 
 The :class:`ovui_data_adapters.openusd._livestream_tap.LivestreamTap` is the only
 place ovui_widgets.app creates an :class:`ovstream.Server`. Step 3.6 wires the

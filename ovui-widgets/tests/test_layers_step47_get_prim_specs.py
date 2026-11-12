@@ -25,12 +25,7 @@ from ovui_data_adapters.common import LayerStackAdapter, PrimSpecDescriptor, Pri
 from ovui_widgets.app.testing import MockLayerStackAdapter
 from ovui_widgets.common.testing.mock_layer_stack import ROOT_LAYER_IDENTIFIER
 
-try:
-    from pxr import Sdf, Usd, UsdGeom
-
-    HAS_USD = True
-except ImportError:
-    HAS_USD = False
+from pxr import Sdf, Usd, UsdGeom
 
 
 # ─── ABC conformance ─────────────────────────────────────────────────────────
@@ -163,54 +158,48 @@ class TestMockHasPrimSpec:
 
 # ─── USD adapter ─────────────────────────────────────────────────────────────
 
-_SKIP_WITHOUT_USD = pytest.mark.skipif(
-    not HAS_USD, reason="pxr (OpenUSD) not available"
-)
+
+from ovui_data_adapters.openusd.layer_stack_adapter import UsdLayerStackAdapter
+
+from ovui_widgets.common.undo import UndoManager
 
 
-if HAS_USD:  # Fixtures only make sense when pxr is importable.
+@pytest.fixture
+def populated_adapter(tmp_path):
+    """Stage with /World/Cube(def), /World/Sphere(over), /Overrides(class).
 
-    from ovui_data_adapters.openusd.layer_stack_adapter import UsdLayerStackAdapter
+    /World/Cube carries an explicit reference; /World/Sphere carries an
+    explicit payload. Exercises every field of :class:`PrimSpecDescriptor`
+    so the USD adapter's projection is verified end-to-end.
+    """
+    stage = Usd.Stage.CreateInMemory("root.usda")
+    UsdGeom.Xform.Define(stage, "/World")
+    cube = UsdGeom.Cube.Define(stage, "/World/Cube")
+    sphere_prim = stage.OverridePrim("/World/Sphere")
+    stage.OverridePrim("/Overrides").SetSpecifier(Sdf.SpecifierClass)
 
-    from ovui_widgets.common.undo import UndoManager
+    # Reference + payload on the root layer (author via Sdf.Layer API
+    # rather than Usd.Prim so the edit lands on root unconditionally).
+    root_layer = stage.GetRootLayer()
+    cube_spec = root_layer.GetPrimAtPath("/World/Cube")
+    cube_spec.referenceList.explicitItems.append(
+        Sdf.Reference("./asset.usda", "/Asset")
+    )
+    sphere_spec = root_layer.GetPrimAtPath("/World/Sphere")
+    sphere_spec.payloadList.explicitItems.append(
+        Sdf.Payload("./asset.usda", "/Asset")
+    )
+    cube.GetPrim().SetInstanceable(True)
+    del cube, sphere_prim
 
-    @pytest.fixture
-    def populated_adapter(tmp_path):
-        """Stage with /World/Cube(def), /World/Sphere(over), /Overrides(class).
+    return UsdLayerStackAdapter(stage, UndoManager())
 
-        /World/Cube carries an explicit reference; /World/Sphere carries an
-        explicit payload. Exercises every field of :class:`PrimSpecDescriptor`
-        so the USD adapter's projection is verified end-to-end.
-        """
-        stage = Usd.Stage.CreateInMemory("root.usda")
-        UsdGeom.Xform.Define(stage, "/World")
-        cube = UsdGeom.Cube.Define(stage, "/World/Cube")
-        sphere_prim = stage.OverridePrim("/World/Sphere")
-        stage.OverridePrim("/Overrides").SetSpecifier(Sdf.SpecifierClass)
-
-        # Reference + payload on the root layer (author via Sdf.Layer API
-        # rather than Usd.Prim so the edit lands on root unconditionally).
-        root_layer = stage.GetRootLayer()
-        cube_spec = root_layer.GetPrimAtPath("/World/Cube")
-        cube_spec.referenceList.explicitItems.append(
-            Sdf.Reference("./asset.usda", "/Asset")
-        )
-        sphere_spec = root_layer.GetPrimAtPath("/World/Sphere")
-        sphere_spec.payloadList.explicitItems.append(
-            Sdf.Payload("./asset.usda", "/Asset")
-        )
-        cube.GetPrim().SetInstanceable(True)
-        del cube, sphere_prim
-
-        return UsdLayerStackAdapter(stage, UndoManager())
-
-    @pytest.fixture
-    def empty_adapter():
-        stage = Usd.Stage.CreateInMemory("root.usda")
-        return UsdLayerStackAdapter(stage, UndoManager())
+@pytest.fixture
+def empty_adapter():
+    stage = Usd.Stage.CreateInMemory("root.usda")
+    return UsdLayerStackAdapter(stage, UndoManager())
 
 
-@_SKIP_WITHOUT_USD
 class TestUsdGetPrimSpecs:
     def test_empty_layer_returns_empty_list(self, empty_adapter) -> None:
         root_id = empty_adapter.get_root_layer().identifier
@@ -315,7 +304,6 @@ class TestUsdGetPrimSpecs:
         )
 
 
-@_SKIP_WITHOUT_USD
 class TestUsdHasPrimSpec:
     def test_root_path_true_on_empty_layer(self, empty_adapter) -> None:
         root_id = empty_adapter.get_root_layer().identifier

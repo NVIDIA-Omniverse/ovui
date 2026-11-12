@@ -27,6 +27,16 @@ class TestGestures(OmniUiTest):
         self._golden_img_dir = None
         await super().asyncTearDown()
 
+    async def test_gesture_name_is_empty_until_set_and_after_clear(self):
+        for gesture_type in (sc.ClickGesture, sc.DragGesture, sc.HoverGesture):
+            kind = gesture_type.__name__
+            gesture = gesture_type()
+            self.assertEqual(gesture.name, "", f"{kind}: an unnamed gesture has an empty name")
+            gesture.name = "select"
+            self.assertEqual(gesture.name, "select", kind)
+            gesture.name = ""
+            self.assertEqual(gesture.name, "", f"{kind}: a cleared name reads back empty")
+
     async def test_gesture_select(self):
         def _on_shape_clicked(shape):
             """Called when the user clicks the point"""

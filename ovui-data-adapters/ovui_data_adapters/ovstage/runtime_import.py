@@ -30,6 +30,12 @@ _RUNTIME_LIBRARY_ENVS = (
     OVHIERARCHY_LIBRARY_PATH_ENV,
 )
 _OVSTAGE_DLL_HANDLES: list[Any] = []
+# One open Windows DLL-directory registration per directory, keyed by the
+# directory, so repeated resolution does not add a second one.
+_OVSTAGE_DLL_DIRECTORIES: dict[str, Any] = {}
+# The module each runtime name was last resolved to from a root, with the root
+# value it came from. Repeated resolution of the same root reuses it.
+_OVSTAGE_ROOT_MODULES: dict[str, tuple[str, ModuleType, str]] = {}
 
 ImportModuleFn = Callable[..., ModuleType]
 
@@ -117,24 +123,12 @@ def configure_ovstage_root_environment(raw_root: str) -> tuple[Path, ...]:
     return runtime_dirs
 
 
-def _load_ovui_imgui() -> None:
-    """Load ovui's ImGui library before the OVStage runtime loads its own."""
-    try:
-        from ovui_data_adapters.common.ovrtx_import import _load_ovui_imgui as load
-    except Exception:
-        return
-    try:
-        load()
-    except Exception:
-        pass
-
-
 def resolve_ovstage_runtime_module(
     module_name: str,
     *,
     import_module_fn: ImportModuleFn | None = None,
 ) -> OvstageRuntimeImportResult:
-    """Resolve an ovstage runtime module from active env, then OVSTAGE_ROOT."""
+    """Resolve an ovstage runtime module from OVSTAGE_ROOT when set, else the active env."""
     if module_name not in _RUNTIME_MODULE_NAMES:
         return OvstageRuntimeImportResult(
             module=None,
@@ -142,26 +136,34 @@ def resolve_ovstage_runtime_module(
                 f"unsupported OVStage runtime module: {module_name!r}"
             ),
         )
-    # ovui's ImGui must be the one a process loads: the OVStage runtime bundles
-    # an older copy under the same library name, and whichever loads first wins.
-    # ovui's startup preload only knows the renderer it is built against, so the
-    # OVStage adapter arranges this for OVStage itself.
-    _load_ovui_imgui()
     importer = import_module_fn or importlib.import_module
-    try:
-        module = importer(module_name)
-    except (ImportError, RuntimeError, OSError) as exc:
-        active_error = exc
-    else:
-        return OvstageRuntimeImportResult(
-            module=module,
-            error=None,
-            source="active environment",
-        )
-
     raw_root = os.environ.get(OVSTAGE_ROOT_ENV, "").strip()
+    active_error: BaseException | None = None
+    # A set OVSTAGE_ROOT selects ovstage and its parts, with no fallback to the
+    # active environment. ovphysx is a separate product: the active
+    # environment still comes first for it.
+    if not raw_root or module_name == "ovphysx":
+        try:
+            module = importer(module_name)
+        except (ImportError, RuntimeError, OSError) as exc:
+            active_error = exc
+        else:
+            return OvstageRuntimeImportResult(
+                module=module,
+                error=None,
+                source="active environment",
+            )
+
     root_errors: list[str] = []
     if raw_root:
+        selected = _selected_root_module(module_name, raw_root)
+        if selected is not None:
+            module, source = selected
+            return OvstageRuntimeImportResult(
+                module=module,
+                error=None,
+                source=source,
+            )
         _clear_module(module_name)
         runtime_dirs = configure_ovstage_root_environment(raw_root)
         candidates = ovstage_python_path_candidates(raw_root)
@@ -172,27 +174,55 @@ def resolve_ovstage_runtime_module(
         handles = _add_windows_dll_directories(runtime_dirs)
         try:
             module = _import_from_paths(module_name, candidates, importer)
+            source = _source_for_module(module, candidates)
+            if getattr(module, "__file__", None) and source == module.__file__:
+                raise ImportError(
+                    f"{module_name} was imported from {source}, which is outside "
+                    f"{OVSTAGE_ROOT_ENV}"
+                )
         except (ImportError, RuntimeError, OSError) as root_exc:
             _clear_module(module_name)
             _close_dll_handles(handles)
-            root_errors.append(
-                f"{OVSTAGE_ROOT_ENV}={raw_root!r}: "
-                f"{type(root_exc).__name__}: {root_exc}"
-            )
+            root_errors.append(f"{type(root_exc).__name__}: {root_exc}")
         else:
             _OVSTAGE_DLL_HANDLES.extend(handles)
+            _OVSTAGE_ROOT_MODULES[module_name] = (raw_root, module, source)
             return OvstageRuntimeImportResult(
                 module=module,
                 error=None,
-                source=_source_for_module(module, candidates),
+                source=source,
             )
 
+    _OVSTAGE_ROOT_MODULES.pop(module_name, None)
     _clear_module(module_name)
     return OvstageRuntimeImportResult(
         module=None,
         error=_compose_import_error(module_name, active_error, raw_root, root_errors),
         source="",
     )
+
+
+def _selected_root_module(module_name: str, raw_root: str) -> tuple[ModuleType, str] | None:
+    """Return the module already selected for this root, if it is still loaded.
+
+    A root is resolved once per process. Resolving it again would import the
+    package a second time and register its directories again, and on Windows
+    each registration is kept for the life of the process.
+    """
+    selected = _OVSTAGE_ROOT_MODULES.get(module_name)
+    if selected is None:
+        return None
+    selected_root, module, source = selected
+    if selected_root != raw_root or sys.modules.get(module_name) is not module:
+        return None
+    return module, source
+
+
+def reset_ovstage_import_cache() -> None:
+    """Forget the resolved modules and close the directory registrations."""
+    _OVSTAGE_ROOT_MODULES.clear()
+    _close_dll_handles(list(_OVSTAGE_DLL_HANDLES))
+    _OVSTAGE_DLL_HANDLES.clear()
 
 
 def import_ovstage_runtime_module(
@@ -237,15 +267,25 @@ def _add_windows_dll_directories(runtime_dirs: tuple[Path, ...]) -> list[Any]:
         return []
     handles: list[Any] = []
     for runtime_dir in runtime_dirs:
+        # Windows keeps one registration per call. Add each directory once, so
+        # resolving the same root again does not add another registration.
+        key = os.path.normcase(os.path.abspath(str(runtime_dir)))
+        if key in _OVSTAGE_DLL_DIRECTORIES:
+            continue
         try:
-            handles.append(add_dll_directory(str(runtime_dir)))
+            handle = add_dll_directory(str(runtime_dir))
         except OSError:
             continue
+        _OVSTAGE_DLL_DIRECTORIES[key] = handle
+        handles.append(handle)
     return handles
 
 
 def _close_dll_handles(handles: list[Any]) -> None:
     for handle in handles:
+        for key, registered in list(_OVSTAGE_DLL_DIRECTORIES.items()):
+            if registered is handle:
+                del _OVSTAGE_DLL_DIRECTORIES[key]
         close = getattr(handle, "close", None)
         if callable(close):
             try:
@@ -278,35 +318,26 @@ def _import_from_paths(
 ) -> ModuleType:
     if not candidates:
         raise ImportError("no OVSTAGE_ROOT Python path candidates")
-    inserted: list[str] = []
-    for candidate in reversed(candidates):
-        candidate_str = str(candidate)
-        if candidate_str not in sys.path:
-            sys.path.insert(0, candidate_str)
-            inserted.append(candidate_str)
+    # Lead sys.path with the candidates, even ones already on the path later,
+    # so a copy earlier on the path does not win. The path order is restored.
+    candidate_strs = [str(candidate) for candidate in candidates]
+    original = list(sys.path)
+    sys.path[:] = candidate_strs + [p for p in original if p not in candidate_strs]
     try:
         return importer(module_name)
     finally:
-        for candidate_str in inserted:
-            try:
-                sys.path.remove(candidate_str)
-            except ValueError:
-                pass
+        sys.path[:] = original
 
 
 def _source_for_module(module: ModuleType, candidates: tuple[Path, ...]) -> str:
     module_file = getattr(module, "__file__", None)
     if module_file:
-        try:
-            resolved_file = Path(module_file).resolve()
-        except OSError:
-            resolved_file = Path(module_file)
+        # Compare without following symbolic links, so a module that a
+        # candidate supplies through a link still counts as that candidate's.
+        found = Path(os.path.abspath(module_file))
         for candidate in candidates:
-            try:
-                resolved_candidate = candidate.resolve()
-            except OSError:
-                resolved_candidate = candidate
-            if resolved_candidate in resolved_file.parents:
+            root = Path(os.path.abspath(str(candidate)))
+            if root == found or root in found.parents:
                 return str(candidate)
         return str(module_file)
     return OVSTAGE_ROOT_ENV
@@ -314,17 +345,20 @@ def _source_for_module(module: ModuleType, candidates: tuple[Path, ...]) -> str:
 
 def _compose_import_error(
     module_name: str,
-    active_error: BaseException,
+    active_error: BaseException | None,
     raw_root: str,
     root_errors: list[str],
 ) -> ImportError:
-    message = (
-        f"Could not import {module_name} from the active environment "
-        f"({type(active_error).__name__}: {active_error})."
-    )
+    message = f"Could not import {module_name}"
+    if active_error is not None:
+        message = (
+            f"{message} from the active environment "
+            f"({type(active_error).__name__}: {active_error})."
+        )
     if raw_root:
         detail = "; ".join(root_errors) if root_errors else "no import attempts were made"
-        message = f"{message} {OVSTAGE_ROOT_ENV}={raw_root!r} also failed: {detail}"
+        prefix = f"{message} Also failed:" if active_error is not None else f"{message}:"
+        message = f"{prefix} {OVSTAGE_ROOT_ENV}={raw_root!r}: {detail}"
     else:
         message = f"{message} {OVSTAGE_ROOT_ENV} is not set."
     return ImportError(message)

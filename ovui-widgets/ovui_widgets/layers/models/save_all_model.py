@@ -83,6 +83,10 @@ class SaveAllValueModel(ui.AbstractValueModel):
     def get_dirty_identifiers(self) -> List[str]:
         """The layers Save-All would actually save, in discovery order.
 
+        A layer in this list that lists an anonymous sublayer is saved
+        only after that sublayer has a file; see
+        :meth:`~ovui_widgets.layers.layer_model.LayerModel._request_save_all`.
+
         One source of truth for the click handler and the badge so a
         future rule change (e.g. "skip read-only-on-disk layers") lands
         in one place. Returns an empty list when the adapter is

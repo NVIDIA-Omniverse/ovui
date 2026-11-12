@@ -6,7 +6,7 @@
 This is a *full integration* test, not a unit test. It exercises the exact
 path a user takes and that unit tests cannot cover:
 
-1. The *installed* ``ovui_widgets`` application (from compiled wheels) is
+1. The *installed* ``ovui_widgets`` application (from the CI-built wheels) is
    launched headless — ``python -m ovui_widgets.app.headless --width 1000
    --height 720`` — with the real ovrtx renderer **required**
    (``OVUI_WIDGETS_REQUIRE_OVRTX=1``), so a renderer that fails to load, e.g.
@@ -64,8 +64,8 @@ def test_wheel_app_viewport_selection_golden(tmp_path):
     # 1. Skip-vs-fail gate. A renderer that cannot initialize is only an
     #    *environment* limit (honest skip) when there is genuinely no GPU. If a
     #    GPU is present but the renderer fails, that is the real break this test
-    #    exists to catch -> FAIL. In a required GPU run
-    #    (OVUI_E2E_REQUIRE_RENDER=1), a non-run always fails.
+    #    exists to catch -> FAIL. And in the dedicated GPU workflow
+    #    (OVUI_E2E_REQUIRE_RENDER=1) a non-run always fails the job.
     require_render = os.environ.get("OVUI_E2E_REQUIRE_RENDER", "").strip() == "1"
     gpu_present, gpu_detail = driver.nvidia_gpu_present()
     ovrtx_ok, ovrtx_detail = driver.ovrtx_device_available()

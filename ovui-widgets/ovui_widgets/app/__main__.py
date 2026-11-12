@@ -67,15 +67,23 @@ def main(argv: Optional[List[str]] = None) -> None:
         raise SystemExit(str(exc)) from exc
     from ovui_widgets.app.native_runtime_bootstrap import (
         install_preconstructed_renderer,
+        limit_openusd_work_threads,
         preconstruct_selected_native_renderer,
     )
 
+    limit_openusd_work_threads()
     bootstrap = preconstruct_selected_native_renderer(args.settings_overrides)
+    from ovui_data_adapters.common import RendererStageMismatchError
+
     from ovui_widgets.app.application import Application
 
     app = Application(settings_overrides=args.settings_overrides)
     install_preconstructed_renderer(app, bootstrap)
-    app.run(usd_path=args.usd_file)
+    try:
+        app.run(usd_path=args.usd_file)
+    except RendererStageMismatchError as exc:
+        # The message names the cause and what to install: no traceback.
+        raise SystemExit(str(exc)) from None
 
 
 def main_sync() -> None:

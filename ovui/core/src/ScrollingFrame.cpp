@@ -203,8 +203,7 @@ void ScrollingFrame::_drawContent(float elapsedTime)
 
     // If this ScrollingFrame is rasterized, Frame::_drawContent may draw the
     // cached draw list without iterating the child. ImGui still needs the
-    // child's full content size here so scroll bounds stay correct. Non-rasterized
-    // frames let ImGui measure submitted content, which can extend beyond the canvas.
+    // child's full content size here so scroll bounds stay correct.
     ImVec2 childContentSize{ 0.0f, 0.0f };
     if (data.m_canvas && data.m_canvas->isVisible())
     {
@@ -212,9 +211,8 @@ void ScrollingFrame::_drawContent(float elapsedTime)
         childContentSize.y = data.m_canvas->getComputedContentHeight();
     }
 
-    if (this->getRasterPolicy() != RasterPolicy::eNever &&
-        (horizontalPolicy != ScrollBarPolicy::eScrollBarAlwaysOff ||
-         verticalPolicy != ScrollBarPolicy::eScrollBarAlwaysOff))
+    if (horizontalPolicy != ScrollBarPolicy::eScrollBarAlwaysOff ||
+        verticalPolicy != ScrollBarPolicy::eScrollBarAlwaysOff)
     {
         ImGui::SetNextWindowContentSize(
             { horizontalPolicy == ScrollBarPolicy::eScrollBarAlwaysOff ? 0.0f : childContentSize.x,

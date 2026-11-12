@@ -25,11 +25,25 @@ def test_native_glfw_and_ascii_keys_are_unchanged() -> None:
     assert _normalize_printable_key(ord("Z")) == ord("Z")
 
 
-def test_reference_viewer_contributes_the_shared_selection_command():
+def test_reference_viewer_contributes_the_shared_selection_command(monkeypatch, request):
+    import sys
+    from pathlib import Path
     from types import SimpleNamespace
-    import pytest
 
-    pytest.importorskip("ovuiinspect")
+    # ovuiinspect ships in the inspector skill, not on the default import
+    # path. Load it from the checkout without starting its HTTP server, and
+    # unload it afterwards so later tests see a normal launch again.
+    monkeypatch.setenv("OVUIINSPECT_ENABLED", "0")
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[2] / "skills" / "omniverse-ui-inspector")
+    )
+
+    def _unload():
+        for name in [name for name in sys.modules if name.split(".")[0] == "ovuiinspect"]:
+            del sys.modules[name]
+
+    request.addfinalizer(_unload)
+    import ovuiinspect  # noqa: F401
     from ovui_widgets.app.application import Application
 
     app = Application.__new__(Application)

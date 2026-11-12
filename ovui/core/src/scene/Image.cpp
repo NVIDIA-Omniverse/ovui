@@ -72,7 +72,8 @@ void Image::_preDrawContent(
     const MouseInput& input, const Matrix44& projection, const Matrix44& view, float width, float height)
 {
     Rectangle::_preDrawContent(input, projection, view, width, height);
-    this->forceDirty(DirtyReason::kDirtyReasonContentChanged);
+    // Redrawn in every frame: that is not a write that can change the payload of a gesture.
+    this->_dirtyAppearance();
 }
 
 void Image::_drawContent(const Matrix44& projection, const Matrix44& view)

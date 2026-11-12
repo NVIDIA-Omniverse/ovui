@@ -5,6 +5,7 @@
 
 #include "VulkanByteImageGpu.h"
 
+#include "NativeTiming.h"
 #include "VulkanBackend.h"
 
 #if OMNIUI_HAS_CUDA
@@ -18,6 +19,7 @@
 #include <imgui/imgui.h>
 #include <imgui/backends/imgui_impl_vulkan.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cstdio>
@@ -40,6 +42,7 @@ struct VkTextureState
     bool            descriptorNeedsUpdate = true;
     uint32_t        width        = 0;
     uint32_t        height       = 0;
+    uint32_t        mipLevels    = 0;
     PixelFormat     format       = PixelFormat::eRGBA8_UNORM;
     bool            imageInitialized = false;
     VkBuffer        cpuUploadBuffer = VK_NULL_HANDLE;
@@ -48,6 +51,14 @@ struct VkTextureState
     void*           cpuUploadMapped = nullptr;
     VkCommandBuffer cpuUploadCommand = VK_NULL_HANDLE;
     VkFence         cpuUploadFence = VK_NULL_HANDLE;
+    bool            cpuUploadInFlight = false;  // a submitted copy signals cpuUploadFence
+    // CPU copies are numbered. The shared CPU upload state keeps the number of
+    // the newest copy that was submitted and of the newest one that is proven
+    // finished. A slot keeps the number of the copy that wrote its image, or 0
+    // when no CPU copy wrote it.
+    uint64_t        cpuUploadSubmitted = 0;
+    uint64_t        cpuUploadFinished = 0;
+    uint64_t        cpuUploadTicket = 0;
     bool            cpuUploadTerminal = false;
     bool            uploadPending = false;
     uint64_t        uploadSerial = 0;
@@ -186,7 +197,26 @@ IByteImageGpu::UpdateResult publishSubmittedUpload(
     return result;
 }
 
-void destroyTexture(VulkanBackend* backend, VkTextureState* s, bool keepDescriptorSet = false)
+// Fills the checked result of an upload that was submitted. A publish that
+// returned no texture reference is a failure.
+void reportUpload(UploadResult* checked,
+                  const IByteImageGpu::UpdateResult& published,
+                  const VkTextureState& slot,
+                  bool finished)
+{
+    if (checked == nullptr)
+        return;
+    if (published.imGuiReference == nullptr)
+    {
+        checked->cause = "the upload was submitted, but no texture was published";
+        return;
+    }
+    checked->status = finished ? UploadStatus::eComplete : UploadStatus::eEnqueued;
+    checked->uploadId = slot.uploadSerial;
+    checked->uploadedDeviceMask = checked->requestedDeviceMask;
+}
+
+void destroyTexture(VulkanBackend* backend, VkTextureState* s, bool keepDescriptorSet = false, bool deviceIdle = false)
 {
     if (!backend || !s) return;
     VkDevice device = backend->getDevice();
@@ -200,8 +230,11 @@ void destroyTexture(VulkanBackend* backend, VkTextureState* s, bool keepDescript
         cudaStreamSynchronize(/*stream=*/nullptr);
     }
 #endif
+    // Only an image or a descriptor set can be in use by the GPU.
+    if (!deviceIdle && (s->image != VK_NULL_HANDLE || s->descriptorSet != VK_NULL_HANDLE))
     {
         std::lock_guard<std::mutex> presentLock(backend->getPresentQueueMutex());
+        OVUI_DEVELOPMENT_TIME_SCOPE(waitScope, "VulkanByteImageGpu.vkDeviceWaitIdle [ovui debug]");
         vkDeviceWaitIdle(device);
     }
     if (s->descriptorSet != VK_NULL_HANDLE && !keepDescriptorSet)
@@ -209,7 +242,8 @@ void destroyTexture(VulkanBackend* backend, VkTextureState* s, bool keepDescript
         ImGui_ImplVulkan_RemoveTexture(s->descriptorSet);
         s->descriptorSet = VK_NULL_HANDLE;
     }
-    if (!keepDescriptorSet)
+    // A slot only borrows the shared upload objects; it owns none (no memory).
+    if (!keepDescriptorSet && s->cpuUploadMemory != VK_NULL_HANDLE)
     {
         if (s->cpuUploadMapped)
         {
@@ -320,8 +354,37 @@ bool updateTextureDescriptor(VkDevice device, VkTextureState* s)
     return true;
 }
 
-bool ensureCpuUploadResources(VulkanBackend* backend, VkTextureState* s, VkDeviceSize requiredSize)
+bool ensureCpuUploadResources(VulkanBackend* backend, VkTextureState* s, VkDeviceSize requiredSize,
+                              VkTextureState* shared = nullptr)
 {
+    if (shared)
+    {
+        // Each upload waits for the previous copy under the queue lock, so all
+        // slots can use one staging buffer, command buffer and fence. Creating
+        // and destroying these for each image took most of a gallery rebuild.
+        // A failed upload can leave the shared fence reset with no copy to
+        // signal it. After a whole-GPU wait such a fence is unused: replace it.
+        VkDevice device = backend->getDevice();
+        if (shared->cpuUploadFence != VK_NULL_HANDLE && !shared->cpuUploadInFlight &&
+            vkGetFenceStatus(device, shared->cpuUploadFence) != VK_SUCCESS)
+        {
+            std::lock_guard<std::mutex> presentLock(backend->getPresentQueueMutex());
+            OVUI_DEVELOPMENT_TIME_SCOPE(waitScope, "VulkanByteImageGpu.vkDeviceWaitIdle [ovui debug]");
+            if (vkDeviceWaitIdle(device) != VK_SUCCESS)
+                shared->cpuUploadTerminal = true;
+            else if (vkGetFenceStatus(device, shared->cpuUploadFence) != VK_SUCCESS)
+            {
+                vkDestroyFence(device, shared->cpuUploadFence, nullptr);
+                shared->cpuUploadFence = VK_NULL_HANDLE;
+            }
+        }
+        const bool ready = ensureCpuUploadResources(backend, shared, requiredSize);
+        s->cpuUploadBuffer = shared->cpuUploadBuffer;
+        s->cpuUploadMapped = shared->cpuUploadMapped;
+        s->cpuUploadCommand = shared->cpuUploadCommand;
+        s->cpuUploadFence = shared->cpuUploadFence;
+        return ready;
+    }
     if (!backend || !s || requiredSize == 0 || s->cpuUploadTerminal)
         return false;
     VkDevice device = backend->getDevice();
@@ -653,6 +716,7 @@ struct VulkanByteImageGpu::DeferredDestruction
 {
     std::mutex mutex;
     std::vector<VkTripleTextureState*> states;
+    VkTextureState cpuUpload; // shared by the CPU uploads of all images
 };
 
 VulkanByteImageGpu::VulkanByteImageGpu(VulkanBackend* backend)
@@ -711,6 +775,7 @@ bool VulkanByteImageGpu::supportsFromGpu() const
 VulkanByteImageGpu::~VulkanByteImageGpu()
 {
     drainDeferredDestructions();
+    destroyTexture(m_backend, &m_deferredDestruction->cpuUpload);
 }
 
 IByteImageGpu::Handle VulkanByteImageGpu::createState()
@@ -746,13 +811,15 @@ void VulkanByteImageGpu::drainDeferredDestructions()
     if (device != VK_NULL_HANDLE)
     {
         std::lock_guard<std::mutex> presentLock(m_backend->getPresentQueueMutex());
+        OVUI_DEVELOPMENT_TIME_SCOPE(waitScope, "VulkanByteImageGpu.vkDeviceWaitIdle [ovui debug]");
         vkDeviceWaitIdle(device);
     }
     for (VkTripleTextureState* state : states)
     {
         for (VkTextureState& slot : state->slots)
         {
-            destroyTexture(m_backend, &slot);
+            // The wait above covers every slot: the queue lock is still held.
+            destroyTexture(m_backend, &slot, false, true);
         }
         delete state;
     }
@@ -786,6 +853,19 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageFromGpuAsync(
     return updateImageImpl(h, buffers, &rowStride, 1, size, format, true, 0, 0, 0, true);
 }
 
+UploadResult VulkanByteImageGpu::updateImageFromGpuAsyncChecked(
+    Handle h,
+    const uint8_t* devicePixels,
+    size_t rowStride,
+    UInt2 size,
+    PixelFormat format)
+{
+    UploadResult out;
+    const uint8_t* buffers[] = {devicePixels};
+    out.update = updateImageImpl(h, buffers, &rowStride, 1, size, format, true, 0, 0, 0, true, &out);
+    return out;
+}
+
 IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
     Handle h,
     const uint8_t* const* mipMapBuffers,
@@ -797,12 +877,19 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
     uint32_t /*gpuDeviceMask*/,
     uint32_t /*textureUsageFlags*/,
     uint32_t /*resourceUsageFlags*/,
-    bool asynchronousGpuSource)
+    bool asynchronousGpuSource,
+    UploadResult* checked)
 {
     UpdateResult result;
+    // A failed upload returns this. The checked result also gets the cause.
+    auto refuse = [&](const char* cause) -> UpdateResult {
+        if (checked)
+            checked->cause = cause;
+        return result;
+    };
     VkTripleTextureState* state = static_cast<VkTripleTextureState*>(h);
     if (!state || !m_backend || !mipMapBuffers || mipMapCount == 0 || size.x == 0 || size.y == 0)
-        return result;
+        return refuse("the upload has no state, no backend, no pixels or a zero size");
     std::lock_guard<std::mutex> queueLock(m_backend->getQueueMutex());
 #if !OMNIUI_HAS_CUDA
     if (fromGpu)
@@ -810,7 +897,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true, std::memory_order_relaxed))
             fprintf(stderr, "VulkanByteImageGpu: fromGpu requires CUDA support (not compiled in)\n");
-        return result;
+        return refuse("a GPU source needs CUDA, and this build has no CUDA support");
     }
 #endif
 
@@ -838,14 +925,44 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         case PixelFormat::eRGBA32_FLOAT:vkFormat = VK_FORMAT_R32G32B32A32_SFLOAT;bytesPerPixel = 16; break;
         default:
             fprintf(stderr, "VulkanByteImageGpu: unsupported pixel format %d\n", (int)format);
-            return result;
+            return refuse("the pixel format is not supported");
+    }
+    // Most GPUs cannot sample 3-channel float images, so add alpha 1 and
+    // upload host pixels as RGBA, like GL_RGB16F and GL_RGB32F on OpenGL.
+    std::vector<uint8_t> rgbaPixels;
+    const uint8_t* rgbaBuffer = nullptr;
+    size_t rgbaStride = 0;
+    if (imageChannelCount == 3 && !fromGpu)
+    {
+        const size_t channelBytes = bytesPerPixel / 3;
+        const size_t srcStride = mipMapStrides != nullptr && mipMapStrides[0] != 0 ? mipMapStrides[0] : size.x * bytesPerPixel;
+        const uint16_t halfOne = 0x3C00;
+        const float floatOne = 1.0f;
+        const void* one = channelBytes == 2 ? static_cast<const void*>(&halfOne) : static_cast<const void*>(&floatOne);
+        vkFormat = channelBytes == 2 ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        bytesPerPixel = channelBytes * 4;
+        rgbaStride = size.x * bytesPerPixel;
+        rgbaPixels.resize(rgbaStride * size.y);
+        for (uint32_t y = 0; y < size.y; ++y)
+        {
+            for (uint32_t x = 0; x < size.x; ++x)
+            {
+                uint8_t* dst = rgbaPixels.data() + y * rgbaStride + x * bytesPerPixel;
+                std::memcpy(dst, mipMapBuffers[0] + y * srcStride + x * channelBytes * 3, channelBytes * 3);
+                std::memcpy(dst + channelBytes * 3, one, channelBytes);
+            }
+        }
+        rgbaBuffer = rgbaPixels.data();
+        mipMapBuffers = &rgbaBuffer;
+        mipMapStrides = &rgbaStride;
+        mipMapCount = 1;
     }
 
     VkDevice device = m_backend->getDevice();
     VkPhysicalDevice phys = m_backend->getPhysicalDevice();
     VkQueue queue = m_backend->getQueue();
     VkCommandPool cmdPool = m_backend->getCommandPool();
-    if (device == VK_NULL_HANDLE || queue == VK_NULL_HANDLE || cmdPool == VK_NULL_HANDLE) return result;
+    if (device == VK_NULL_HANDLE || queue == VK_NULL_HANDLE || cmdPool == VK_NULL_HANDLE) return refuse("the Vulkan device, queue or command pool is missing");
     uint32_t uploadSlot = kInvalidPresentationSlot;
     {
         uploadSlot = acquireUploadSlot(device, state);
@@ -854,13 +971,13 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
     {
         if (state->frontSlot != kInvalidPresentationSlot)
             result.imGuiReference = reinterpret_cast<void*>(state->slots[state->frontSlot].descriptorSet);
-        return result;
+        return refuse("all upload slots are busy");
     }
     VkTextureState* s = &state->slots[uploadSlot];
     if (s->cpuUploadTerminal)
     {
         fprintf(stderr, "VulkanByteImageGpu: slot upload state is terminal after a Vulkan synchronization failure\n");
-        return result;
+        return refuse("the upload slot stopped after a Vulkan synchronization failure");
     }
 
     // Vulkan does not require implementations to support all
@@ -884,7 +1001,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
                         "optimal tiling for sampled/transfer-dst (features=0x%x). "
                         "Pad to a 4-channel format on the producer side.\n",
                         (int)vkFormat, (unsigned)fp.optimalTilingFeatures);
-            return result;
+            return refuse("the Vulkan device cannot sample this format");
         }
     }
 
@@ -902,19 +1019,19 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
             fprintf(stderr,
                     "VulkanByteImageGpu: fromGpu=true with 3-channel "
                     "format is not supported (pad to RGBA on the producer side)\n");
-        return result;
+        return refuse("a GPU source with 3 channels is not supported");
     }
 
-    // Recreate if size changed or first time (we only use mip 0; mip chain is
-    // dropped in this backend because combining mips with arbitrary strides on
-    // Vulkan would need per-mip staging copies; the visual difference at
-    // tested render sizes is negligible).
+    // Recreate if size, format or mip count changed, or first time. The CPU
+    // path uploads the whole mip chain so small icons stay smooth like OpenGL.
     const uint32_t width = size.x;
     const uint32_t height = size.y;
+    const uint32_t mipLevels = static_cast<uint32_t>(mipMapCount);
     if (s->image == VK_NULL_HANDLE
         || s->width != width
         || s->height != height
-        || s->format != format)
+        || s->format != format
+        || s->mipLevels != mipLevels)
     {
         const bool keepDescriptorSet = s->descriptorSet != VK_NULL_HANDLE;
         destroyTexture(m_backend, s, keepDescriptorSet);
@@ -924,7 +1041,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
         imageInfo.format = vkFormat;
         imageInfo.extent = { width, height, 1 };
-        imageInfo.mipLevels = 1;
+        imageInfo.mipLevels = mipLevels;
         imageInfo.arrayLayers = 1;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -934,7 +1051,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (vkCreateImage(device, &imageInfo, nullptr, &s->image) != VK_SUCCESS)
-            return result;
+            return refuse("vkCreateImage failed");
 
         VkMemoryRequirements memReq;
         vkGetImageMemoryRequirements(device, s->image, &memReq);
@@ -944,7 +1061,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         allocInfo.memoryTypeIndex = findMemoryType(phys, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (vkAllocateMemory(device, &allocInfo, nullptr, &s->memory) != VK_SUCCESS)
         {
-            destroyTexture(m_backend, s); return result;
+            destroyTexture(m_backend, s); return refuse("vkAllocateMemory failed for the texture");
         }
         vkBindImageMemory(device, s->image, s->memory, 0);
 #if OMNIUI_HAS_CUDA
@@ -959,10 +1076,10 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         viewInfo.format = vkFormat;
         if (isR8)
         {
-            // Font texture (R channel is alpha). Swizzle so that (1,1,1,R)
-            // matches the OpenGL swizzle path.
+            // Font texture. The upload stores R in alpha, so (1,1,1,A)
+            // matches the OpenGL (1,1,1,R) swizzle path.
             viewInfo.components = { VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_ONE,
-                                    VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R };
+                                    VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_A };
         }
         else if (imageChannelCount == 1)
         {
@@ -984,11 +1101,11 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
                                     VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_ONE };
         }
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.levelCount = mipLevels;
         viewInfo.subresourceRange.layerCount = 1;
         if (vkCreateImageView(device, &viewInfo, nullptr, &s->view) != VK_SUCCESS)
         {
-            destroyTexture(m_backend, s); return result;
+            destroyTexture(m_backend, s); return refuse("vkCreateImageView failed");
         }
 
         VkSamplerCreateInfo samplerInfo = {};
@@ -1000,7 +1117,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerInfo.minLod = 0.0f;
-        samplerInfo.maxLod = 1.0f;
+        samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
         samplerInfo.maxAnisotropy = 1.0f;
         // NOTE: ImGui's descriptor set layout has an immutable sampler, so the
         // one passed to AddTexture is ignored — we keep this object alive
@@ -1008,12 +1125,13 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         // ends up bound.
         if (vkCreateSampler(device, &samplerInfo, nullptr, &s->sampler) != VK_SUCCESS)
         {
-            destroyTexture(m_backend, s); return result;
+            destroyTexture(m_backend, s); return refuse("vkCreateSampler failed");
         }
 
         s->width = width;
         s->height = height;
         s->format = format;
+        s->mipLevels = mipLevels;
     }
 
 #if OMNIUI_HAS_CUDA
@@ -1030,7 +1148,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
             static std::atomic<bool> warned{false};
             if (!warned.exchange(true, std::memory_order_relaxed))
                 fprintf(stderr, "VulkanByteImageGpu: fromGpu=true with R8 format is not supported (caller must pass RGBA8)\n");
-            return result;
+            return refuse("a GPU source with the R8 format is not supported");
         }
         const void* srcDev = static_cast<const void*>(mipMapBuffers[0]);
         size_t srcPitch = static_cast<size_t>(width) * bytesPerPixel;
@@ -1048,7 +1166,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         if (!uploadBufferReady)
         {
             fprintf(stderr, "VulkanByteImageGpu: CUDA upload buffer unavailable; fromGpu disabled\n");
-            return result;
+            return refuse("the CUDA upload buffer is not available");
         }
 
         // Reuse is slot-scoped. The fence proves that Vulkan consumed the
@@ -1065,7 +1183,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         {
             fprintf(stderr, "VulkanByteImageGpu: CUDA upload slot synchronization failed\n");
             s->cudaUploadTerminal = true;
-            return result;
+            return refuse("the CUDA upload slot could not be synchronized");
         }
 
         cudaError_t cuErr = cudaSuccess;
@@ -1084,7 +1202,19 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         {
             fprintf(stderr, "VulkanByteImageGpu: cudaMemcpy2DAsync(upload buffer) failed: %s\n",
                     cudaGetErrorString(cuErr));
-            return result;
+            // The fence was reset above and no submit will signal it. Signal
+            // it with an empty submit, or the next upload of this slot waits
+            // for it forever. This failure is not terminal: the caller can
+            // fall back, or try again.
+            VkSubmitInfo rearm = {};
+            rearm.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            if (vkQueueSubmit(queue, 1, &rearm, s->cudaUploadFence) != VK_SUCCESS)
+            {
+                // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+                fprintf(stderr, "VulkanByteImageGpu: could not re-arm the CUDA upload fence\n");
+                s->cudaUploadTerminal = true;
+            }
+            return refuse("cudaMemcpy2DAsync to the upload buffer failed");
         }
         uint64_t signalValue = 0;
         if (asynchronousGpuSource)
@@ -1105,7 +1235,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
                 fprintf(stderr, "VulkanByteImageGpu: CUDA upload semaphore signal failed: %s\n",
                         cudaGetErrorString(cuErr));
                 s->cudaUploadTerminal = true;
-                return result;
+                return refuse("the CUDA upload semaphore could not be signaled");
             }
         }
         else
@@ -1117,7 +1247,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
             {
                 fprintf(stderr, "VulkanByteImageGpu: synchronous CUDA upload copy failed\n");
                 s->cudaUploadTerminal = true;
-                return result;
+                return refuse("the synchronous CUDA upload copy failed");
             }
         }
 
@@ -1205,7 +1335,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         {
             fprintf(stderr, "VulkanByteImageGpu: vkQueueSubmit (fromGpu upload) failed\n");
             s->cudaUploadTerminal = true;
-            return result;
+            return refuse("vkQueueSubmit of the GPU-source upload failed");
         }
         s->imageInitialized = true;
         if (!asynchronousGpuSource)
@@ -1219,7 +1349,7 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
             {
                 fprintf(stderr, "VulkanByteImageGpu: synchronous Vulkan upload completion wait failed\n");
                 s->cudaUploadTerminal = true;
-                return result;
+                return refuse("waiting for the GPU-source upload failed");
             }
         }
 
@@ -1243,46 +1373,77 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         {
             completionFence = s->cudaUploadFence;
         }
-        return publishSubmittedUpload(device, state, uploadSlot, asynchronousGpuSource, completionFence);
+        s->cpuUploadTicket = 0;
+        result = publishSubmittedUpload(device, state, uploadSlot, asynchronousGpuSource, completionFence);
+        reportUpload(checked, result, state->slots[uploadSlot],
+                     !(asynchronousGpuSource && state->slots[uploadSlot].uploadPending));
+        return result;
     }
 #endif // OMNIUI_HAS_CUDA
 
-    // --- Upload pixels via a host-visible staging buffer ---
-    const uint8_t* srcPixels = mipMapBuffers[0];
+    // --- Upload pixels (every mip level) via a host-visible staging buffer ---
     size_t sourceBytesPerPixel = bytesPerPixel;
     if (isR8)
     {
         sourceBytesPerPixel = 1;
     }
-    size_t srcStride = static_cast<size_t>(width) * sourceBytesPerPixel;
-    if (mipMapStrides != nullptr && mipMapStrides[0] != 0)
+    // The staging buffer holds every level, so one copy and one submit upload
+    // the whole image. An image with one level asks for the bytes it always
+    // asked for.
+    VkDeviceSize uploadSize = 0;
+    for (uint32_t level = 0; level < mipLevels; ++level)
     {
-        srcStride = mipMapStrides[0];
+        const uint32_t levelWidth = (std::max)(width >> level, 1u);
+        const uint32_t levelHeight = (std::max)(height >> level, 1u);
+        uploadSize += (VkDeviceSize)levelWidth * levelHeight * bytesPerPixel;
     }
-    const size_t uploadRowBytes = (size_t)width * bytesPerPixel;
-    const VkDeviceSize uploadSize = uploadRowBytes * height;
 
     bool cpuUploadResourcesReady = false;
     {
-        cpuUploadResourcesReady = ensureCpuUploadResources(m_backend, s, uploadSize);
+        cpuUploadResourcesReady = ensureCpuUploadResources(m_backend, s, uploadSize, &m_deferredDestruction->cpuUpload);
     }
     if (!cpuUploadResourcesReady)
     {
+        // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
         fprintf(stderr, "VulkanByteImageGpu: persistent CPU upload resources unavailable\n");
-        return result;
+        return refuse("the CPU upload resources are not available");
     }
-    void* mapped = s->cpuUploadMapped;
+    // The previous copy reads the staging buffer until its fence signals:
+    // wait for it before any new pixels are written there.
+    if (vkWaitForFences(device, 1, &s->cpuUploadFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
     {
+        // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+        fprintf(stderr, "VulkanByteImageGpu: persistent CPU upload fence wait failed\n");
+        s->cpuUploadTerminal = true;
+        return refuse("waiting for the previous CPU upload failed");
+    }
+    m_deferredDestruction->cpuUpload.cpuUploadInFlight = false;
+    m_deferredDestruction->cpuUpload.cpuUploadFinished = m_deferredDestruction->cpuUpload.cpuUploadSubmitted;
+    // Fill the staging buffer with every level, one after the other.
+    std::vector<VkBufferImageCopy> regions;
+    regions.reserve(mipLevels);
+    VkDeviceSize uploadOffset = 0;
+    for (uint32_t mip = 0; mip < mipLevels; ++mip)
+    {
+        const uint32_t mipWidth = (std::max)(width >> mip, 1u);
+        const uint32_t mipHeight = (std::max)(height >> mip, 1u);
+        const size_t uploadRowBytes = (size_t)mipWidth * bytesPerPixel;
+        size_t srcStride = static_cast<size_t>(mipWidth) * sourceBytesPerPixel;
+        if (mipMapStrides != nullptr && mipMapStrides[mip] != 0)
+        {
+            srcStride = mipMapStrides[mip];
+        }
+        const uint8_t* srcPixels = mipMapBuffers[mip];
+        uint8_t* dst = static_cast<uint8_t*>(s->cpuUploadMapped) + uploadOffset;
         if (isR8)
         {
             // Expand R8 -> RGBA8 (rgb=0, a=R) so the shader's color*texel.a term
             // produces the font glyph. Matches the GL swizzle.
-            uint8_t* dst = static_cast<uint8_t*>(mapped);
-            for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t y = 0; y < mipHeight; ++y)
             {
                 const uint8_t* srcRow = srcPixels + y * srcStride;
                 uint8_t* dstRow = dst + (size_t)y * uploadRowBytes;
-                for (uint32_t x = 0; x < width; ++x)
+                for (uint32_t x = 0; x < mipWidth; ++x)
                 {
                     dstRow[x * 4 + 0] = 255;
                     dstRow[x * 4 + 1] = 255;
@@ -1293,48 +1454,52 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         }
         else if (srcStride == uploadRowBytes)
         {
-            std::memcpy(mapped, srcPixels, uploadSize);
+            std::memcpy(dst, srcPixels, uploadRowBytes * mipHeight);
         }
         else
         {
-            uint8_t* dst = static_cast<uint8_t*>(mapped);
-            for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t y = 0; y < mipHeight; ++y)
             {
                 std::memcpy(dst + (size_t)y * uploadRowBytes, srcPixels + (size_t)y * srcStride, uploadRowBytes);
             }
         }
+        VkBufferImageCopy region = {};
+        region.bufferOffset = uploadOffset;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = mip;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = { mipWidth, mipHeight, 1 };
+        regions.push_back(region);
+        uploadOffset += uploadRowBytes * mipHeight;
     }
 
     // Re-record the slot-owned command buffer. No Vulkan object or descriptor
     // is allocated on the steady-state frame path.
     VkCommandBuffer cmd = s->cpuUploadCommand;
     {
-        if (vkWaitForFences(device, 1, &s->cpuUploadFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-        {
-            fprintf(stderr, "VulkanByteImageGpu: persistent CPU upload fence wait failed\n");
-            s->cpuUploadTerminal = true;
-            return result;
-        }
         if (vkResetFences(device, 1, &s->cpuUploadFence) != VK_SUCCESS)
         {
+            // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
             fprintf(stderr, "VulkanByteImageGpu: persistent CPU upload fence reset failed\n");
             s->cpuUploadTerminal = true;
-            return result;
+            return refuse("resetting the CPU upload fence failed");
         }
         if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS)
         {
+            // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
             fprintf(stderr, "VulkanByteImageGpu: persistent CPU upload command reset failed\n");
             s->cpuUploadTerminal = true;
-            return result;
+            return refuse("resetting the CPU upload command buffer failed");
         }
         VkCommandBufferBeginInfo beginInfo = {};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS)
         {
+            // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
             fprintf(stderr, "VulkanByteImageGpu: persistent CPU upload command begin failed\n");
             s->cpuUploadTerminal = true;
-            return result;
+            return refuse("beginning the CPU upload command buffer failed");
         }
 
         VkImageMemoryBarrier toTransfer = {};
@@ -1360,19 +1525,16 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransfer.image = s->image;
         toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        toTransfer.subresourceRange.levelCount = 1;
+        toTransfer.subresourceRange.levelCount = mipLevels;
         toTransfer.subresourceRange.layerCount = 1;
         vkCmdPipelineBarrier(cmd,
             sourceStage,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &toTransfer);
 
-        VkBufferImageCopy region = {};
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = { width, height, 1 };
         vkCmdCopyBufferToImage(cmd, s->cpuUploadBuffer, s->image,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               (uint32_t)regions.size(), regions.data());
 
         VkImageMemoryBarrier toRead = toTransfer;
         toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1386,9 +1548,10 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
 
         if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
         {
+            // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
             fprintf(stderr, "VulkanByteImageGpu: persistent CPU upload command end failed\n");
             s->cpuUploadTerminal = true;
-            return result;
+            return refuse("ending the CPU upload command buffer failed");
         }
 
         VkSubmitInfo submit = {};
@@ -1401,16 +1564,17 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         }
         if (submitResult != VK_SUCCESS)
         {
+            // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
             fprintf(stderr, "VulkanByteImageGpu: persistent CPU upload submit failed\n");
             s->cpuUploadTerminal = true;
-            return result;
+            return refuse("vkQueueSubmit of the CPU upload failed");
         }
-        if (vkWaitForFences(device, 1, &s->cpuUploadFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-        {
-            fprintf(stderr, "VulkanByteImageGpu: persistent CPU upload completion wait failed\n");
-            s->cpuUploadTerminal = true;
-            return result;
-        }
+        // Not waited: later draws that sample the image are submitted on the
+        // same queue after this copy and its barrier, and the next upload
+        // waits for this fence before it rewrites the staging buffer.
+        VkTextureState& shared = m_deferredDestruction->cpuUpload;
+        shared.cpuUploadInFlight = true;
+        s->cpuUploadTicket = ++shared.cpuUploadSubmitted;
         s->imageInitialized = true;
     }
 
@@ -1428,7 +1592,65 @@ IByteImageGpu::UpdateResult VulkanByteImageGpu::updateImageImpl(
         }
     }
 
-    return publishSubmittedUpload(device, state, uploadSlot, false, VK_NULL_HANDLE);
+    result = publishSubmittedUpload(device, state, uploadSlot, false, VK_NULL_HANDLE);
+    // The copy was submitted and not waited for, so it is only enqueued.
+    // getCompletedUploadId() reports its end when its fence has signalled.
+    reportUpload(checked, result, state->slots[uploadSlot], false);
+    return result;
+}
+
+UploadResult VulkanByteImageGpu::updateImageChecked(
+    Handle h,
+    const uint8_t* const* mipMapBuffers,
+    size_t* mipMapStrides,
+    size_t mipMapCount,
+    UInt2 size,
+    PixelFormat format,
+    bool fromGpu,
+    uint32_t gpuDeviceMask,
+    uint32_t textureUsageFlags,
+    uint32_t resourceUsageFlags)
+{
+    UploadResult out;
+    out.requestedDeviceMask = gpuDeviceMask;
+    if (!isSingleDeviceMaskSupported(gpuDeviceMask))
+    {
+        // This backend has one device. A request for another device cannot be
+        // met, and nothing is uploaded.
+        // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+        fprintf(stderr, "VulkanByteImageGpu: device mask 0x%x asks for devices this backend does not have\n",
+                (unsigned)gpuDeviceMask);
+        out.cause = "the device mask asks for a device that the Vulkan backend does not have";
+        return out;
+    }
+    out.update = updateImageImpl(h, mipMapBuffers, mipMapStrides, mipMapCount, size, format, fromGpu,
+                                 gpuDeviceMask, textureUsageFlags, resourceUsageFlags, false, &out);
+    return out;
+}
+
+uint64_t VulkanByteImageGpu::getCompletedUploadId(Handle h)
+{
+    VkTripleTextureState* state = static_cast<VkTripleTextureState*>(h);
+    if (!state || !m_backend)
+        return 0;
+    std::lock_guard<std::mutex> queueLock(m_backend->getQueueMutex());
+    VkDevice device = m_backend->getDevice();
+    if (device == VK_NULL_HANDLE)
+        return 0;
+    pollCompletedUploads(device, state);
+    VkTextureState& shared = m_deferredDestruction->cpuUpload;
+    if (shared.cpuUploadInFlight && shared.cpuUploadFence != VK_NULL_HANDLE &&
+        vkGetFenceStatus(device, shared.cpuUploadFence) == VK_SUCCESS)
+        shared.cpuUploadFinished = shared.cpuUploadSubmitted;
+    uint64_t completed = 0;
+    for (const VkTextureState& slot : state->slots)
+    {
+        // An image that a CPU copy wrote is complete only when that copy has finished.
+        if (slot.image != VK_NULL_HANDLE && !slot.uploadPending && slot.cpuUploadTicket <= shared.cpuUploadFinished &&
+            slot.uploadSerial > completed)
+            completed = slot.uploadSerial;
+    }
+    return completed;
 }
 
 VkImage VulkanByteImageGpu::getVkImageForState(Handle h) const
@@ -1451,6 +1673,12 @@ void VulkanByteImageGpu::releaseImage(Handle h)
     // is released later, and leave the state empty for the next upload.
     auto* retired = new VkTripleTextureState(*state);
     *state = VkTripleTextureState{};
+    if (m_backend->frameReleasesDeferred())
+    {
+        // Inside a frame, the end-of-frame drain releases all copies after one device wait.
+        destroyState(retired);
+        return;
+    }
     VulkanBackend* backend = m_backend;
     backend->deferRelease([backend, retired]() {
         for (VkTextureState& slot : retired->slots)

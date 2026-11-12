@@ -14,6 +14,10 @@ cancel" prompts for destructive gestures:
   Remove**) lets the user rescue the edits without aborting the remove.
 - :func:`confirm_reload_dialog` — thin wrapper around
   :func:`confirm_dialog` with Reload/Cancel labels.
+- :func:`confirm_unsaved_exit_dialog` — three-button variant used before
+  File > Exit closes an application whose layers have unsaved edits.
+- :func:`message_dialog` — one-button modal that tells the user about a
+  fallback that needs no choice (a settings file that did not load).
 
 All dialogs follow the same async-callback pattern
 :mod:`ovui_widgets.common.file_dialogs` introduced in Step 36: ovui does not ship a
@@ -100,6 +104,7 @@ def confirm_dirty_remove_dialog(
     on_save_and_remove: Callable[[], None],
     on_remove_without_saving: Callable[[], None],
     on_cancel: Optional[Callable[[], None]] = None,
+    dirty_layer_names: Optional[List[str]] = None,
 ) -> Optional["_ConfirmDirtyRemoveDialog"]:
     """Open a three-button modal before removing a dirty layer.
 
@@ -115,7 +120,10 @@ def confirm_dirty_remove_dialog(
       remains in the parent stack.
 
     ``layer_name`` is interpolated into the message text so the user
-    sees *which* layer is at risk.
+    sees *which* layer is at risk. ``dirty_layer_names`` lists the
+    layers of the removed tree that have unsaved changes; when it
+    names a layer other than ``layer_name`` (a nested sublayer), the
+    message lists them all.
 
     The dialog closes before any callback fires so a slow save path
     does not race the window tear-down.
@@ -127,6 +135,7 @@ def confirm_dirty_remove_dialog(
             on_save_and_remove=on_save_and_remove,
             on_remove_without_saving=on_remove_without_saving,
             on_cancel=on_cancel_effective,
+            dirty_layer_names=dirty_layer_names,
         )
     except Exception:
         on_cancel_effective()
@@ -159,6 +168,70 @@ def confirm_reload_dialog(
         confirm_label="Reload",
         cancel_label="Cancel",
     )
+
+
+def confirm_unsaved_exit_dialog(
+    layer_names: List[str],
+    on_save_and_exit: Callable[[], None],
+    on_exit_without_saving: Callable[[], None],
+    on_cancel: Optional[Callable[[], None]] = None,
+) -> Optional["_ConfirmUnsavedExitDialog"]:
+    """Open a three-button modal before an exit drops unsaved edits.
+
+    - **Save & Exit** → ``on_save_and_exit`` — save, then exit.
+    - **Exit Without Saving** → ``on_exit_without_saving`` — discard the
+      in-memory edits and exit.
+    - **Cancel** → ``on_cancel`` — the application stays open with its
+      edits. A title-bar close of the dialog is also Cancel.
+
+    ``layer_names`` are the modified layers; the message names them so
+    the user sees which files are at risk.
+
+    When ovui cannot build the window, the failure is reported and
+    ``on_cancel`` fires: the application stays open, so no edit is lost.
+    """
+    on_cancel_effective = on_cancel or (lambda: None)
+    try:
+        dialog = _ConfirmUnsavedExitDialog(
+            layer_names=layer_names,
+            on_save_and_exit=on_save_and_exit,
+            on_exit_without_saving=on_exit_without_saving,
+            on_cancel=on_cancel_effective,
+        )
+    except Exception as exc:
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        ErrorReporter.log_error("Exit", "cannot show the unsaved changes dialog", exc)
+        ErrorReporter.show_error(
+            f"Cannot show the unsaved changes dialog: {type(exc).__name__}: {exc}"
+        )
+        on_cancel_effective()
+        return None
+    _OPEN_DIALOGS.append(dialog)
+    return dialog
+
+
+def message_dialog(title: str, message: str) -> Optional["_MessageDialog"]:
+    """Open a one-button modal that tells the user something.
+
+    The **OK** button, Enter, keypad Enter, Escape and a title-bar close all
+    close the dialog. A long message scrolls; the OK button stays visible.
+    When ovui cannot build the window, the failure and the full message go to
+    stderr, and the message goes to the status bar (which shows only its
+    start), so the user still sees it.
+    """
+    try:
+        dialog = _MessageDialog(title=title, message=message)
+    except Exception as exc:
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        ErrorReporter.log_error(
+            "Dialog", f"cannot show the dialog {title!r}: {message}", exc
+        )
+        ErrorReporter.show_warning(message, duration_ms=0)
+        return None
+    _OPEN_DIALOGS.append(dialog)
+    return dialog
 
 
 def confirm_merge_down_dialog(
@@ -388,19 +461,26 @@ class _ConfirmDirtyRemoveDialog(_ConfirmDialogBase):
         on_save_and_remove: Callable[[], None],
         on_remove_without_saving: Callable[[], None],
         on_cancel: Callable[[], None],
+        dirty_layer_names: Optional[List[str]] = None,
     ) -> None:
         super().__init__(title="Remove Layer", width=560, height=180)
         self._on_save_and_remove = on_save_and_remove
         self._on_remove_without_saving = on_remove_without_saving
         self._on_cancel = on_cancel
         self._layer_name = layer_name
+        self._dirty_layer_names = list(dirty_layer_names or [])
         self._build_body()
 
     def _build_body(self) -> None:
-        message = (
-            f"Layer {self._layer_name!r} has unsaved changes.\n"
-            f"Save before removing?"
-        )
+        if self._dirty_layer_names in ([], [self._layer_name]):
+            unsaved = f"Layer {self._layer_name!r} has unsaved changes."
+        else:
+            names = ", ".join(repr(name) for name in self._dirty_layer_names)
+            unsaved = (
+                f"Layer {self._layer_name!r} contains unsaved changes "
+                f"in: {names}."
+            )
+        message = f"{unsaved}\nSave before removing?"
         with self._window.frame:
             with ui.VStack(spacing=8):
                 ui.Spacer(height=4)
@@ -464,7 +544,173 @@ class _ConfirmDirtyRemoveDialog(_ConfirmDialogBase):
         self._on_cancel()
 
 
-# ── Issue #35 Step 4: registry-driven shutdown cleanup ────────────────
+# Key codes that ovui passes to a window key handler (GLFW key codes).
+_KEY_ESCAPE = 256
+_KEY_ENTER = 257
+_KEY_KEYPAD_ENTER = 335
+
+
+class _MessageDialog(_ConfirmDialogBase):
+    """Private helper — one-button ``ui.Window``-backed message modal.
+
+    The message is in a scrolling area and the OK row is below it, so the
+    OK button stays visible for any message length. Enter, keypad Enter and
+    Escape act as OK, because OK is the only choice.
+    """
+
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__(title=title, width=640, height=240)
+        self._message = message
+        self._build_body()
+        if hasattr(self._window, "set_key_pressed_fn"):
+            self._window.set_key_pressed_fn(self._on_key_pressed)
+
+    def _build_body(self) -> None:
+        with self._window.frame:
+            with ui.VStack(spacing=8):
+                ui.Spacer(height=4)
+                with ui.HStack():
+                    ui.Spacer(width=12)
+                    with ui.ScrollingFrame(
+                        horizontal_scrollbar_policy=(
+                            ui.ScrollBarPolicy.SCROLLBAR_ALWAYS_OFF
+                        ),
+                        vertical_scrollbar_policy=(
+                            ui.ScrollBarPolicy.SCROLLBAR_AS_NEEDED
+                        ),
+                    ):
+                        ui.Label(
+                            self._message,
+                            word_wrap=True,
+                            height=0,
+                            alignment=ui.Alignment.LEFT_TOP,
+                            style_type_name_override="Dialog.Message",
+                        )
+                    ui.Spacer(width=12)
+                with ui.HStack(height=28):
+                    ui.Spacer()
+                    ui.Button(
+                        "OK",
+                        width=96,
+                        clicked_fn=self._on_ok_clicked,
+                        style_type_name_override="OKButton",
+                    )
+                    ui.Spacer(width=12)
+                ui.Spacer(height=8)
+
+    def _on_key_pressed(self, key: int, modifiers: int, pressed: bool) -> None:
+        # Act on the key release, as the content browser dialogs do.
+        if not pressed and key in (_KEY_ENTER, _KEY_KEYPAD_ENTER, _KEY_ESCAPE):
+            self._on_ok_clicked()
+
+    def _on_ok_clicked(self) -> None:
+        self._close_with_callback(lambda: None)
+
+
+# The exit dialog names at most this many layers and counts the rest, so a
+# large layer stack cannot push the buttons out of the window.
+_EXIT_DIALOG_MAX_NAMES = 4
+
+
+class _ConfirmUnsavedExitDialog(_ConfirmDialogBase):
+    """Private helper — three-button "Save / Discard / Cancel" exit modal.
+
+    Shown by File > Exit when layers have unsaved edits. The message names
+    the modified layers; the three buttons map to save-then-exit, exit
+    without saving, and stay open.
+    """
+
+    def __init__(
+        self,
+        layer_names: List[str],
+        on_save_and_exit: Callable[[], None],
+        on_exit_without_saving: Callable[[], None],
+        on_cancel: Callable[[], None],
+    ) -> None:
+        super().__init__(title="Exit", width=560, height=180)
+        self._on_save_and_exit = on_save_and_exit
+        self._on_exit_without_saving = on_exit_without_saving
+        self._on_cancel = on_cancel
+        self._layer_names = list(layer_names)
+        self._build_body()
+
+    def _message(self) -> str:
+        names = ", ".join(
+            repr(name) for name in self._layer_names[:_EXIT_DIALOG_MAX_NAMES]
+        )
+        hidden = len(self._layer_names) - _EXIT_DIALOG_MAX_NAMES
+        if hidden > 0:
+            names += f" and {hidden} more"
+        return (
+            f"The stage has unsaved changes in {names}.\n"
+            f"Save the changes before you exit?"
+        )
+
+    def _build_body(self) -> None:
+        with self._window.frame:
+            with ui.VStack(spacing=8):
+                ui.Spacer(height=4)
+                with ui.HStack(height=0):
+                    ui.Spacer(width=12)
+                    ui.Label(
+                        self._message(),
+                        word_wrap=True,
+                        style_type_name_override="Dialog.Message",
+                    )
+                    ui.Spacer(width=12)
+                ui.Spacer()
+                with ui.HStack(height=28):
+                    ui.Spacer()
+                    ui.Button(
+                        "Save & Exit",
+                        width=112,
+                        clicked_fn=self._on_save_and_exit_clicked,
+                        style_type_name_override="OKButton",
+                    )
+                    ui.Spacer(width=6)
+                    ui.Button(
+                        "Exit Without Saving",
+                        width=152,
+                        clicked_fn=self._on_exit_without_saving_clicked,
+                        style_type_name_override="DestructiveButton",
+                    )
+                    ui.Spacer(width=6)
+                    ui.Button(
+                        "Cancel",
+                        width=96,
+                        clicked_fn=self._on_cancel_clicked,
+                        style_type_name_override="CancelButton",
+                    )
+                    ui.Spacer(width=12)
+                ui.Spacer(height=8)
+
+    def save_and_exit(self) -> None:
+        """Simulate a Save & Exit click (test helper)."""
+        self._on_save_and_exit_clicked()
+
+    def exit_without_saving(self) -> None:
+        """Simulate an Exit Without Saving click (test helper)."""
+        self._on_exit_without_saving_clicked()
+
+    def cancel(self) -> None:
+        """Simulate a Cancel click (test helper)."""
+        self._on_cancel_clicked()
+
+    def _on_save_and_exit_clicked(self) -> None:
+        self._close_with_callback(self._on_save_and_exit)
+
+    def _on_exit_without_saving_clicked(self) -> None:
+        self._close_with_callback(self._on_exit_without_saving)
+
+    def _on_cancel_clicked(self) -> None:
+        self._close_with_callback(self._on_cancel)
+
+    def _on_window_closed(self) -> None:
+        # Title-bar close = Cancel, same as the explicit button.
+        self._on_cancel()
+
+
+# ── registry-driven shutdown cleanup ────────────────
 # Application.shutdown() invokes icon_caches.clear_all() while ovui's
 # standalone backend is still alive. The hook below destroys every
 # live ui.Window in _OPEN_DIALOGS and clears the list. Round 6 F2:

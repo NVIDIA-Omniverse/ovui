@@ -22,7 +22,6 @@ import math
 import numpy as np
 import pytest
 
-pxr = pytest.importorskip("pxr")
 from ovui_data_adapters.openusd._camera_writer import (  # noqa: E402
     _decompose_perspective,
     compute_camera_intrinsics,
@@ -288,7 +287,7 @@ class TestIntrinsics:
         assert camera.GetProjectionAttr().Get() == UsdGeom.Tokens.perspective
 
 
-# ── compute_camera_intrinsics (Issue #22) ─────────────────────────────────
+# ── compute_camera_intrinsics ─────────────────────────────────
 
 
 class TestComputeCameraIntrinsics:

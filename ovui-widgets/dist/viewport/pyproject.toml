@@ -23,6 +23,13 @@ objects from the application, so rendering and scene data can be swapped behind
 the same visible interaction model.
 """}
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
 
 [tool.setuptools.packages.find]
 namespaces = true

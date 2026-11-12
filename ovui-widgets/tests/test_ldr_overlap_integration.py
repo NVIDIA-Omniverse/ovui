@@ -15,7 +15,6 @@ clean successor state.
 from __future__ import annotations
 
 import collections
-import math
 
 import numpy as np
 import pytest
@@ -26,7 +25,6 @@ from ovui_data_adapters.common.render_vars import RenderVarOutputRequest
 from ovui_widgets.common.testing.mock_renderer import MockRendererAdapter
 from ovui_widgets.viewport.viewport_widget import ViewportWidget
 
-pytest.importorskip("pxr")
 from pxr import Usd  # noqa: E402
 
 
@@ -144,8 +142,6 @@ def _live_adapter() -> mod.OvRtxRendererAdapter:
     adapter._pending_resolution = (4, 3)
     adapter._dt_clock = 0.0
     adapter._clock = lambda: 0.0
-    adapter._last_big_delta_time = -math.inf
-    adapter._last_reinject_time = -math.inf
     adapter._scene_has_lights = True
     adapter._zero_copy_state = None
     adapter._livestream = None

@@ -399,7 +399,10 @@ bool WindowHandle::isDockTabBarVisible() const
 {
     _GET_WINDOW(window, m_windowId, false);
 
-    ImGuiDockNode* node = ImGui::DockBuilderGetNode(window->DockId);
+    // prefer window->DockNode over DockBuilderGetNode here —
+    // DockBuilderGetNode reads ctx->DockContext.Nodes storage that can be
+    // freed during shutdown/teardown while DockId is still set.
+    ImGuiDockNode* node = window->DockNode;
     if (!node)
     {
         return false;
@@ -412,6 +415,9 @@ void WindowHandle::setDockTabBarVisible(const bool& visible)
 {
     _GET_WINDOW(window, m_windowId, );
 
+    // Writers keep DockBuilderGetNode: window->DockNode is null between
+    // DockBuilderDockWindow and the next ImGui::Begin, so the same-frame
+    // `dock_in(...); dock_tab_bar_visible = False` sequence would no-op.
     ImGuiDockNode* node = ImGui::DockBuilderGetNode(window->DockId);
     if (!node)
     {
@@ -437,7 +443,7 @@ bool WindowHandle::isDockTabBarEnabled() const
 {
     _GET_WINDOW(window, m_windowId, false);
 
-    ImGuiDockNode* node = ImGui::DockBuilderGetNode(window->DockId);
+    ImGuiDockNode* node = window->DockNode;
     if (!node)
     {
         return false;
@@ -450,6 +456,7 @@ void WindowHandle::setDockTabBarEnabled(const bool& enabled)
 {
     _GET_WINDOW(window, m_windowId, );
 
+    // Same same-frame rationale as setDockTabBarVisible.
     ImGuiDockNode* node = ImGui::DockBuilderGetNode(window->DockId);
     if (!node)
     {
@@ -478,7 +485,7 @@ void WindowHandle::focus()
 
     if (this->isDocked())
     {
-        ImGuiDockNode* node = ImGui::DockBuilderGetNode(window->DockId);
+        ImGuiDockNode* node = window->DockNode;
 
         if (!node)
         {
@@ -522,7 +529,7 @@ bool WindowHandle::isSelectedInDock()
 bool WindowHandle::_isWindowSelectedInDock(void* window)
 {
     ImGuiWindow* imguiWindow = reinterpret_cast<ImGuiWindow*>(window);
-    ImGuiDockNode* node = ImGui::DockBuilderGetNode(imguiWindow->DockId);
+    ImGuiDockNode* node = imguiWindow->DockNode;
     // ImGui 1.92.7 stores window->TabId (window->GetID("#TAB")) in SelectedTabId,
     // whereas older ImGui stored window->ID directly.
     return node && node->SelectedTabId == imguiWindow->TabId;

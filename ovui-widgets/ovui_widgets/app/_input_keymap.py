@@ -3,7 +3,7 @@
 
 """NVST key code → ImGui key translation for the Tier 3 input bridge.
 
-The Tier 3 livestream input bridge (issue #34) receives keyboard events
+The Tier 3 livestream input bridge receives keyboard events
 from the ovstream SDK as ``ovstream.KeyboardEvent`` instances whose
 ``key_code`` field carries an ``NvstKeyCode_t`` value (see
 ``kit-livestream/.../nvst/common/KeyDefs.h``). Those events are

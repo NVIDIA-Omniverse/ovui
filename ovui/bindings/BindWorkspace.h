@@ -93,5 +93,17 @@ void wrapWorkspace(module& m)
                     arg("fn"), OMNIUI_PYBIND_DOC_Workspace_setWindowVisibilityChangedCallback)
         .def_static("remove_window_visibility_changed_callback", &Workspace::removeWindowVisibilityChangedCallback, arg("fn"),
                     OMNIUI_PYBIND_DOC_Workspace_removeWindowVisibilityChangedCallback)
+        .def_static("set_window_first_interaction_callback",
+                    [](std::function<void(const std::string& title, const std::string& ownerModule)> fn)
+                    {
+                        Workspace::setWindowFirstInteractionCallback(
+                            fn ? wrapPythonCallback(fn)
+                               : std::function<void(const std::string&, const std::string&)>{});
+                    },
+                    arg("fn"),
+                    "Register a callback fired the first time the user clicks inside any ui.Window. "
+                    "The callback receives (window_title, owner_module). Invoked at most once per "
+                    "Window lifetime. Used by the omni.ui extension-usage telemetry hook; pass None "
+                    "to disable.")
         /* */;
 }

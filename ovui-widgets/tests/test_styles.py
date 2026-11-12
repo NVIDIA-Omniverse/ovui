@@ -910,7 +910,7 @@ class TestLayersStyles:
         "layers_row_edit_target",
         "layers_row_hover",
         # Group D consolidated the selected-row colour onto the shared
-        # ``treeview_selection`` token (audit issue #5); the former
+        # ``treeview_selection`` token (audit the regression); the former
         # ``layers_row_selected`` was removed from the palette.
         "layers_label_missing",
         "layers_label_disabled",

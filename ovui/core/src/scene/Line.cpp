@@ -14,6 +14,9 @@
 #include <omni/ui/scene/Math.h>
 
 #include "AbstractShapeData.h"
+#include "DragFollow.h"
+
+#include <utility>
 
 OMNIUI_SCENE_NAMESPACE_OPEN_SCOPE
 
@@ -46,12 +49,38 @@ Line::Line()
 {
 }
 
+// The ends are written by hand, not by the property macro, so that a gesture that is running its callback is told what an
+// end was and what it is (see DragGesture).
+void Line::setStart(Vector3 const& value)
+{
+    if (checkIfEqual(m_start, value))
+    {
+        return;
+    }
+    DragFollow::Write write(this);
+    write.noteLineEnd(this, true, m_start, value);
+    m_start = value;
+    m__setStartChangedFnCallbacks(value);
+}
+
+void Line::setEnd(Vector3 const& value)
+{
+    if (checkIfEqual(m_end, value))
+    {
+        return;
+    }
+    DragFollow::Write write(this);
+    write.noteLineEnd(this, false, m_end, value);
+    m_end = value;
+    m__setEndChangedFnCallbacks(value);
+}
+
 void Line::_setChangedFn()
 {
     this->_setStartChangedFn(std::bind(&This::_dirty, this));
     this->_setEndChangedFn(std::bind(&This::_dirty, this));
-    this->_setColorChangedFn(std::bind(&This::_dirty, this));
-    this->_setThicknessChangedFn(std::bind(&This::_dirty, this));
+    this->_setColorChangedFn(std::bind(&This::_dirtyAppearance, this));
+    this->_setThicknessChangedFn(std::bind(&This::_dirtyAppearance, this));
 }
 
 Line::~Line() = default;
@@ -93,8 +122,9 @@ void Line::intersect(const Vector3 origin,
     auto transform = this->getParent()->getAccumulatedTransform();
     Vector4 start = transform * Vector4{ this->getStart(), 1.0 };
     Vector4 end = transform * Vector4{ this->getEnd(), 1.0 };
-    Vector3 lastClosestPoint = gesturePayload.lineClosestPoint;
-    Float lastDistance = gesturePayload.lineDistance;
+    const bool held = std::exchange(data.m_baselineHeld, false);
+    Vector3 lastClosestPoint = held ? data.m_baselinePoint : gesturePayload.lineClosestPoint;
+    Float lastDistance = held ? data.m_baselineA : gesturePayload.lineDistance;
 
     // Get two points, one on the line, another on the ray
     raySegFindClosestPoints(origin, direction, { start.x, start.y, start.z }, { end.x, end.y, end.z },
@@ -110,6 +140,20 @@ void Line::intersect(const Vector3 origin,
 
     // Copy
     *stateGesturePayload = gesturePayload;
+}
+
+bool Line::_getFollowReport(Vector3& moved) const
+{
+    const auto& payload = _getData<LineData>().m_lastGesturePayload;
+    moved = payload.moved;
+    return true;
+}
+
+void Line::_captureBaseline() const
+{
+    auto& data = _getData<LineData>();
+    data.m_baselinePoint = data.m_lastGesturePayload.lineClosestPoint;
+    data.m_baselineA = data.m_lastGesturePayload.lineDistance;
 }
 
 const Line::LineGesturePayload* Line::getGesturePayload() const

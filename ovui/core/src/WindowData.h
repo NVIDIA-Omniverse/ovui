@@ -25,8 +25,9 @@ struct Window::WindowData
     // Observer handle for app window close event (cancels when released)
     DeferHandle m_windowCloseObserverHandle;
 
-    Int2 m_mouseDragPoint = {};
-    Int2 m_mouseDelta = {};
+    // Where inside the OS window the title bar drag was grabbed, in window-relative coordinates.
+    // Only meaningful while m_osWindowMoving is set. See Window::_updateOSWindowDrag().
+    Int2 m_osWindowGrabOffset = {};
 
     uint32_t m_pushedColorCount = { 0 };
     uint32_t m_pushedFloatCount = { 0 };
@@ -42,9 +43,14 @@ struct Window::WindowData
     bool m_multiOSWindowSupport = false;
     bool m_enableWindowDetach = false;
 
-    // we have some marker to tack os window move and timing
+    // True while a title bar drag is moving the detached OS window.
     bool m_osWindowMoving = false;
-    bool m_mouseWasDragging = false;
+
+    // True when the detached OS window this Window drives was created with window manager
+    // decorations, i.e. /exts/omni.ui/Window/detachedDecorations was set at detach time. The WM
+    // then owns move and resize, and omni.ui must not drive them itself. Reset by
+    // Window::notifyAppWindowChange() whenever the Window changes app window.
+    bool m_osWindowDecorated = false;
 
     bool m_positionExplicitlyChanged = false;
     bool m_sizeExplicitlyChanged = false;
@@ -62,6 +68,14 @@ struct Window::WindowData
 
     // True if the previous frame is visible
     bool m_wasPreviousShowItems = false;
+
+    // Python module name that constructed this Window, captured at Python binding time
+    // (e.g. "omni.kit.window.console"). Empty when created from C++ or unattributable.
+    std::string m_ownerModule;
+
+    // First-interaction telemetry latch. Set once a user mouse-click is observed inside this
+    // Window so we only fire onWindowFirstInteraction once per Window lifetime.
+    bool m_firstInteractionReported = false;
 };
 
 OMNIUI_NAMESPACE_CLOSE_SCOPE

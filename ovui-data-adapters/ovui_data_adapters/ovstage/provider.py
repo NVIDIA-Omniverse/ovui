@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import importlib
+import inspect
 import os
 import struct
 import sys
@@ -21,6 +23,7 @@ from ovui_data_adapters.common import (
     CreateRequest,
     StageCapabilities,
 )
+from ovui_data_adapters.common.ovrtx_import import import_ovrtx, loaded_module_version
 from ovui_data_adapters.ovstage._constants import (
     PROVIDER_ENTRY_POINT_VALUE,
     PROVIDER_NAME,
@@ -30,6 +33,10 @@ from ovui_data_adapters.ovstage._scene import (
     OvstagePopulationFailure,
     OvstageScene,
     _add_cleanup_note,
+    _destroy_stage,
+    _kit_stage_cache,
+    _load_population_module,
+    physics_schema_failure,
     _native_path_exists,
     open_scene_from_file,
 )
@@ -280,15 +287,34 @@ class OvstagePhysicsControls:
             physx_module = self._runtime_module("ovphysx")
             physx_type = getattr(physx_module, "PhysX")
             try:
-                physx = physx_type(device="gpu")
+                # A newer ovphysx has no device argument and uses the GPU by default.
+                parameters = inspect.signature(physx_type).parameters.values()
+                physx = (
+                    physx_type(device="gpu")
+                    if any(p.name == "device" or p.kind is p.VAR_KEYWORD for p in parameters)
+                    else physx_type()
+                )
             except Exception as exc:
                 raise self._control_error(PHYSICS_CREATE_OPERATION, scene, exc) from exc
 
-            usd_handle, op_index = physx.add_usd(scene.source_path)
-            wait_op = getattr(physx, "wait_op", None)
-            if callable(wait_op):
-                wait_op(op_index)
-            rigid_paths = _discover_rigid_body_paths(scene)
+            add_usd = getattr(physx, "add_usd", None)
+            if callable(add_usd):
+                usd_handle, op_index = add_usd(scene.source_path)
+                wait_op = getattr(physx, "wait_op", None)
+                if callable(wait_op):
+                    wait_op(op_index)
+            else:
+                # A newer ovphysx simulates an ovstage stage and does not load the
+                # file. It gets a stage of its own from the same file, so the
+                # scene stage stays as it is.
+                usd_handle = _attach_physics_stage(
+                    self._runtime_module("ovstage"), physx, scene.source_path
+                )
+            rigid_paths = (
+                _discover_rigid_body_paths(scene)
+                if callable(add_usd)
+                else _physics_stage_rigid_body_paths(usd_handle)
+            )
             pose_binding = _create_pose_binding(physx_module, physx, rigid_paths)
             pose_paths = _pose_binding_paths(pose_binding, rigid_paths)
             pose_buffer = np.zeros(tuple(pose_binding.shape), dtype=np.float32)
@@ -307,7 +333,7 @@ class OvstagePhysicsControls:
             raise error from exc
 
         self._physx = physx
-        self._usd_handle = int(usd_handle)
+        self._usd_handle = usd_handle
         self._pose_binding = pose_binding
         self._pose_buffer = pose_buffer
         self._pose_paths = tuple(pose_paths)
@@ -433,13 +459,21 @@ class OvstagePhysicsControls:
                 except Exception as exc:
                     if first_error is None:
                         first_error = exc
+            elif callable(getattr(physx, "detach_ovstage", None)):
+                try:
+                    physx.wait_task(physx.detach_ovstage())
+                    _destroy_stage(usd_handle)
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
         try:
             _wait_for_physx_idle(physx)
         except Exception as exc:
             if first_error is None:
                 first_error = exc
 
-        release = getattr(physx, "release", None)
+        # A newer ovphysx names the release of an instance destroy.
+        release = getattr(physx, "release", None) or getattr(physx, "destroy", None)
         if callable(release):
             try:
                 release()
@@ -527,7 +561,11 @@ class OvstagePhysicsControls:
         try:
             step_sync = getattr(physx, "step_sync", None)
             if callable(step_sync):
-                step_sync(step_dt, sim_time)
+                # A newer ovphysx keeps the simulation time itself.
+                if len(inspect.signature(step_sync).parameters) == 1:
+                    step_sync(step_dt)
+                else:
+                    step_sync(step_dt, sim_time)
             else:
                 step = getattr(physx, "step", None)
                 if not callable(step):
@@ -634,6 +672,9 @@ class OvstagePhysicsControls:
                     wait_op = getattr(physx, "wait_op", None)
                     if callable(wait_op):
                         wait_op(op_index)
+                elif callable(getattr(physx, "detach_ovstage", None)):
+                    physx.wait_task(physx.detach_ovstage())
+                    _destroy_stage(usd_handle)
             except Exception as exc:
                 cleanup_errors.append(exc)
         try:
@@ -641,7 +682,7 @@ class OvstagePhysicsControls:
         except Exception as exc:
             cleanup_errors.append(exc)
         try:
-            release = getattr(physx, "release", None)
+            release = getattr(physx, "release", None) or getattr(physx, "destroy", None)
             if callable(release):
                 release()
         except Exception as exc:
@@ -678,6 +719,13 @@ class OvstageProviderSession:
                 module_name=PROVIDER_NAME,
                 entry_point_value=PROVIDER_ENTRY_POINT_VALUE,
             )
+
+    def runtime_component_versions(self) -> tuple[tuple[str, str], ...]:
+        """Return the versions of the ovstage and ovrtx this session uses."""
+        self.prepare_runtime_imports()
+        modules = (("ovstage", self._runtime.module("ovstage")), ("ovrtx", import_ovrtx().module))
+        versions = ((label, loaded_module_version(module, label)) for label, module in modules)
+        return tuple((label, version) for label, version in versions if version)
 
     @property
     def current_scene(self) -> OvstageScene | None:
@@ -974,10 +1022,27 @@ class OvstageProviderSession:
         return self._create_prim_action(app, "create.xform")
 
     def create_usd_preview_surface_material(self, app: Any) -> Any | None:
-        return self._create_prim_action(
-            app,
-            "create.material.usd-preview-surface",
-        )
+        action_id = "create.material.usd-preview-surface.bind"
+        result = self._create_prim_result(app, action_id)
+        if not getattr(result, "accepted", False):
+            # A refused bind still creates the material, without a binding,
+            # as Create > Material did before it could bind.
+            if _selection_paths_from_app(app):
+                print(
+                    f"[OvstageProviderSession] {action_id} was refused: "
+                    f"{getattr(result, 'message', '')} Creating the material without a binding.",
+                    file=sys.stderr,
+                )
+            action_id = "create.material.usd-preview-surface"
+            result = self._create_prim_result(app, action_id)
+            if not getattr(result, "accepted", False):
+                print(
+                    f"[OvstageProviderSession] {action_id} failed: "
+                    f"{getattr(result, 'message', '')}",
+                    file=sys.stderr,
+                )
+                return None
+        return self._accepted_create(app, result)
 
     def get_geometry_standard_prim_attrs(self, stage: Any) -> dict[str, dict[Any, Any]]:
         del stage
@@ -1014,16 +1079,25 @@ class OvstageProviderSession:
         call_later = getattr(app, "call_later", None) if app is not None else None
         return create_stage_adapter(scene, undo_manager, call_later)
 
-    def _create_prim_action(self, app: Any, action_id: str) -> Any | None:
+    def _create_prim_result(self, app: Any, action_id: str) -> Any:
         adapter = self._stage_adapter_for_authoring(app)
-        result = adapter.create_prim(
+        return adapter.create_prim(
             CreateRequest(
                 action_id,
                 selection_paths=_selection_paths_from_app(app),
             )
         )
+
+    def _create_prim_action(self, app: Any, action_id: str) -> Any | None:
+        result = self._create_prim_result(app, action_id)
         if not getattr(result, "accepted", False):
             return None
+        return self._accepted_create(app, result)
+
+    def _accepted_create(self, app: Any, result: Any) -> Any | None:
+        bus = getattr(app, "selection_bus", None)
+        if bus is not None:
+            bus.publish(list(result.selection_paths), source="create_menu")
         return self._authoring_prim(getattr(result, "primary_path", ""))
 
     def _authoring_prim(self, path: str) -> Any | None:
@@ -1122,6 +1196,58 @@ def _discover_rigid_body_paths(scene: OvstageScene) -> tuple[str, ...]:
     if not paths:
         raise RuntimeError("no PhysicsRigidBodyAPI prims were discovered in ovstage")
     return tuple(paths)
+
+
+def _attach_physics_stage(ovstage_module: Any, physx: Any, source_path: str) -> Any:
+    """Populate an ovstage stage with the physics of ``source_path`` and attach ``physx``.
+
+    The physics population description of the ovphysx is used when it has
+    one; otherwise the physics population domain of ovstage.
+    """
+
+    schema_failure = physics_schema_failure()
+    if schema_failure is not None:
+        raise RuntimeError(schema_failure)
+    population = _load_population_module(ovstage_module)
+    physics_population = importlib.import_module("ovphysx.population")
+    stage = ovstage_module.Stage()
+    try:
+        physics_descs = getattr(physics_population, "physics_population_descs", None)
+        if callable(physics_descs):
+            population.open_usd_with_desc(
+                stage,
+                source_path,
+                ordinal=1,
+                time=population.DEFAULT_TIME,
+                descs=physics_descs(),
+            )
+        else:
+            population.open_usd(
+                stage,
+                source_path,
+                ordinal=1,
+                domains=ovstage_module.PopulationDomain.PHYSICS,
+            )
+        stage.advance_write_floor(ordinal=1).wait()
+        physx.wait_task(physx.attach_ovstage(stage, read_ordinal=1))
+    except BaseException:
+        _destroy_stage(stage)
+        raise
+    return stage
+
+
+def _physics_stage_rigid_body_paths(stage: Any) -> tuple[str, ...]:
+    """Return the prims of ``stage`` that have the rigid-body attribute of PhysicsRigidBodyAPI."""
+
+    cache = _kit_stage_cache(stage, 1)
+    paths = tuple(
+        str(path)
+        for path in cache.path_order
+        if "physics:rigidBodyEnabled" in cache.attribute_names_for_path(path)
+    )
+    if not paths:
+        raise RuntimeError("no PhysicsRigidBodyAPI prims were discovered in ovstage")
+    return paths
 
 
 def _create_pose_binding(

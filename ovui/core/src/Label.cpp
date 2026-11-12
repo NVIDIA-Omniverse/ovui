@@ -270,12 +270,10 @@ void Label::_drawContent(float elapsedTime)
                     }
                 }
 
-                // font->FontSize is the size of the font on startup of the application
-                // ctx->FontSize is the current size of the font
-                // It's important to correct width to the units when it was on startup, otherwise the word wrap is
-                // broken when moving window to the second monitor.
-                const char* textWrap = font->CalcWordWrapPosition(
-                    font->LegacySize, textBegin, textEnd, data.m_textMinimalWidth * font->LegacySize / ctx->FontSize);
+                // Measure at ctx->FontSize, the size used for m_textMinimalWidth. Hinted glyph widths do not scale
+                // exactly, so a width converted to font->LegacySize can break the widest line.
+                const char* textWrap =
+                    font->CalcWordWrapPosition(ctx->FontSize, textBegin, textEnd, data.m_textMinimalWidth);
 
                 // if no text-wrapping and \n in string, break into lines
                 const char* newLine = strchr(textBegin, '\n');
@@ -387,7 +385,9 @@ void Label::_computeTextSize(float width)
     ImVec2 textSize;
     if (this->isWordWrap())
     {
-        textSize = ImGui::CalcTextSize(this->getText().c_str(), nullptr, false, width);
+        // Spaces at the end never wrap, so they must not make the text wider than the given width.
+        const std::string& text = this->getText();
+        textSize = ImGui::CalcTextSize(text.c_str(), text.c_str() + text.find_last_not_of(' ') + 1, false, width);
 
         if (this->isElidedText())
         {

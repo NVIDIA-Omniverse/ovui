@@ -36,8 +36,11 @@ struct NativeTimingHooks
     void (*endPhase)(const char* name);
 };
 
-/** Install `hooks` (or remove them with nullptr). The table must stay alive. */
-OMNIUI_API void setNativeTimingHooks(const NativeTimingHooks* hooks);
+/**
+ * Install `hooks` (or remove them with nullptr). The table must stay alive.
+ * Returns false, and leaves the hooks empty, when the table is unreadable.
+ */
+OMNIUI_API bool setNativeTimingHooks(const NativeTimingHooks* hooks);
 OMNIUI_API const NativeTimingHooks* getNativeTimingHooks();
 
 inline constexpr char kOvuiInitPhaseName[] = "OVUI Init";
@@ -45,7 +48,7 @@ inline constexpr char kGlfwInitPhaseName[] = "GLFW Init";
 inline constexpr char kVulkanInitPhaseName[] = "Vulkan Init";
 inline constexpr char kOpenGlInitPhaseName[] = "OpenGL Init";
 inline constexpr char kImGuiInitPhaseName[] = "ImGui Init";
-inline constexpr char kOvrtxIntegrationInitPhaseName[] = "OVRTX Integration Init";
+inline constexpr char kFramePacingInitPhaseName[] = "Frame Pacing Init";
 
 class NativeTimingScope final
 {

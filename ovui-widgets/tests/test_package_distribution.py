@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for Issue #31 Step 2 — ovui-widgets packaging distribution metadata.
+"""Tests for Regression Step 2 — ovui-widgets packaging distribution metadata.
 
 Verifies that:
 - The installed distribution is named ``ovui-widgets-app``

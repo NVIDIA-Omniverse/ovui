@@ -9,18 +9,36 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from importlib import import_module
+from importlib import metadata as importlib_metadata
+import logging
 import math
 import os
 from pathlib import Path
 import struct
 import threading
+import time
 from types import MethodType
 from types import ModuleType
 from typing import Any
 
+import numpy as np
+
+from ovui_data_adapters.ovstage._handles import (
+    handle_number,
+    native_prim_path,
+    native_token,
+    read_groups,
+    release_read_group,
+)
 from ovui_data_adapters.ovstage._constants import (
     PROVIDER_ENTRY_POINT_VALUE,
     PROVIDER_NAME,
+)
+from ovui_data_adapters.ovstage._native import (
+    element_lanes,
+    NativePathAttributeRecord,
+    _copy_path_attribute_group,
+    path_strings,
 )
 from ovui_data_adapters.ovstage.runtime_import import import_ovstage_runtime_module
 from ovui_data_adapters.ovstage.runtime_preflight import LoadedRuntimes
@@ -37,6 +55,8 @@ from ovui_data_adapters.ovstage._structural import (
     restore_native_snapshot,
 )
 
+
+_LOGGER = logging.getLogger(__name__)
 
 POPULATION_OPERATION = "ovstage.populate_from_file"
 _KIT_MATRIX_ALIASES = {
@@ -96,19 +116,24 @@ _KIT_INTERNAL_ATTRS = frozenset(
 _NUMPY_KIND_TO_DLPACK_CODE = {"i": 0, "u": 1, "f": 2, "b": 6}
 
 
-def _kit_exposed_attr_name(stored_name: str) -> str | None:
+def _kit_exposed_attr_name(
+    stored_name: str,
+    inspected: frozenset[str] = frozenset(),
+) -> str | None:
     """Map a cached (stored) attribute name to the name surfaced to ovui.
 
     Returns ``None`` for native-internal attributes that must stay hidden. The
     fabric ``omni:fabric:{local,world}Matrix`` columns surface under their common
     ``localMatrix`` / ``worldMatrix`` names (the read bridge maps them back).
+    ``inspected`` names authored properties that population copied in for the
+    Property Inspector; they stay visible in the ``omni:`` namespace too.
     """
     if stored_name in _KIT_INTERNAL_ATTRS or stored_name.startswith("_"):
         return None
     for common, fabric in _KIT_MATRIX_ALIASES.items():
         if stored_name == fabric:
             return common
-    if stored_name.startswith("omni:"):
+    if stored_name.startswith("omni:") and stored_name not in inspected:
         return None
     return stored_name
 
@@ -235,14 +260,12 @@ class OvstageScene:
     def stored_render_settings(self) -> dict[str, Any]:
         """The scene's stored ``customLayerData['renderSettings']``.
 
-        Read from the stage metadata that population put on ``/``, keyed as
-        Kit serializes them (``rtx:post:tonemap:op``). Empty when the scene
-        stores none or this ovstage cannot populate stage metadata.
+        Read from the stage metadata that population read with the scene,
+        keyed as Kit serializes them (``rtx:post:tonemap:op``). Empty when the
+        scene stores none or this ovstage cannot populate stage metadata.
         """
 
-        from ovui_data_adapters.ovstage._native import read_path_attribute_records
-
-        records = read_path_attribute_records(self.native_stage, "/")
+        records = getattr(self.native_stage, "_ovui_stage_metadata", None) or {}
         prefix = STORED_RENDER_SETTINGS_PREFIX
         return {
             name[len(prefix):]: record.value
@@ -983,11 +1006,17 @@ def _populate_from_file(
     raise RuntimeError("ovstage population module exposes no supported open function")
 
 
-#: Stage metadata populated onto the root prim ``/`` with the scene. A scene
-#: saved by Kit stores its render settings here, and Kit applies them when it
-#: opens the scene. ovstage publishes each value as
-#: ``usd-metadata:customLayerData:renderSettings:<key>``.
-POPULATED_STAGE_METADATA_PATHS: tuple[str, ...] = ("customLayerData:renderSettings",)
+#: Stage metadata populated with the scene. A scene saved by Kit stores its
+#: render settings here, and Kit applies them when it opens the scene (NVBug
+#: 6605532). ovstage publishes each value on ``/`` as ``usd-metadata:<path>``,
+#: for example ``usd-metadata:customLayerData:renderSettings:<key>``. ovstage
+#: 0.2 populates ``upAxis`` and ``metersPerUnit`` only when asked.
+POPULATED_STAGE_METADATA_PATHS: tuple[str, ...] = (
+    "customLayerData:renderSettings",
+    "upAxis",
+    "metersPerUnit",
+)
+STAGE_METADATA_PREFIX = "usd-metadata:"
 STORED_RENDER_SETTINGS_PREFIX = "usd-metadata:customLayerData:renderSettings:"
 
 
@@ -999,11 +1028,21 @@ def _populate_with_stage_metadata(
     *,
     population_domains: int | None = None,
 ) -> bool:
-    """Populate through a description that also asks for the stage metadata.
+    """Populate the scene, its stage metadata and the inspected properties.
 
-    A description carrying only ``domains`` is exactly ``open_usd``, so the
-    domains stay the ones the plain call would use. Returns ``False`` without
-    touching the stage when this ovstage has no description API.
+    The scene stage gets a description carrying only ``domains``, which is
+    exactly ``open_usd``. ovstage 0.2 lists no other children of a prim that a
+    selector or the stage metadata reached, and the native hierarchy is what
+    tells a failed read from an empty stage. So a second stage populates the
+    rest at the same time. It evaluates at a numeric time, because population
+    at the default time omits a sampled property that has no default value.
+    Each copied property takes its authored default from the ``default``
+    metadata. The second stage is read and destroyed before the scene
+    population ends, so the scene stage reuses its memory. Its properties are
+    then written into the scene stage at the population ordinal, and its
+    stage metadata is kept on the scene stage as ``_ovui_stage_metadata``.
+    Returns ``False`` without touching the stage when this ovstage has no
+    description API.
     """
 
     desc_type = getattr(population_module, "Desc", None)
@@ -1020,12 +1059,464 @@ def _populate_with_stage_metadata(
         domains = int(domain_type.RENDERING)
     else:
         return False
-    desc = desc_type(
-        domains=domains,
+    # ovstage 0.1 populated time-sampled custom attributes and the camera
+    # shutter, which the Property Inspector shows. ovstage 0.2 populates them
+    # only when a selector asks.
+    predicate = population_module.PropertyPredicate
+    sampled_custom = predicate.and_(
+        predicate.is_custom(),
+        predicate.has_metadata("timeSamples"),
+    )
+    extras = desc_type(
+        selectors=(
+            population_module.Selector(
+                prim_predicate=population_module.PrimPredicate.has_property(
+                    sampled_custom
+                ),
+                property_predicate=sampled_custom,
+                property_metadata_paths=("typeName", "default"),
+            ),
+            population_module.Selector(
+                prim_predicate=population_module.PrimPredicate.is_a_type("Camera"),
+                property_predicate=predicate.has_name("shutter:open", "shutter:close"),
+                property_metadata_paths=("default",),
+            ),
+        ),
         stage_metadata_paths=POPULATED_STAGE_METADATA_PATHS,
     )
-    wait_operation(open_with_desc(stage, scene_path, ordinal, math.nan, [desc]))
+    _register_physics_schemas(population_module)
+    extras_stage = import_module("ovstage").Stage()
+    operations = [
+        open_with_desc(stage, scene_path, ordinal, math.nan, [desc_type(domains=domains)])
+    ]
+    try:
+        try:
+            operations.append(
+                open_with_desc(extras_stage, scene_path, ordinal, _EXTRAS_TIME, [extras])
+            )
+            _wait_operations(operations[1:], "populate the stage metadata")
+            wait_operation(extras_stage.advance_write_floor(ordinal))
+            populated = _read_populated_extras(extras_stage, ordinal)
+        finally:
+            _destroy_stage(extras_stage)
+    finally:
+        _wait_operations(operations[:1], "populate the scene")
+    stage._ovui_stage_metadata = _write_populated_extras(stage, ordinal, populated)
     return True
+
+
+#: Time in seconds at which the second population evaluates. Any numeric time
+#: makes a sampled property without a default value appear; its value there is
+#: not used.
+_EXTRAS_TIME = 0.0
+
+
+_PHYSICS_SCHEMA_FAILURE: str | None = None
+
+
+def physics_schema_failure() -> str | None:
+    """The failed registration of the PhysX schemas, with its cause, or ``None``."""
+
+    return _PHYSICS_SCHEMA_FAILURE
+
+
+def _register_physics_schemas(population_module: ModuleType) -> None:
+    """Register the PhysX schemas of an installed ``physx-usd-schemas`` for ovphysx.
+
+    A newer ovphysx needs them before the first population of the process,
+    which is the population of the first scene. Without ovphysx or without
+    ``physx-usd-schemas`` nothing is registered; the scene opens, and the
+    enabling of physics reports the failure. When the installed schemas
+    cannot be found or registered, the scene also opens: the failure and its
+    cause are logged once and kept for the enabling of physics.
+    """
+
+    global _PHYSICS_SCHEMA_FAILURE
+    register = getattr(population_module, "register_usd_schemas", None)
+    if not callable(register):
+        return
+    try:
+        import_module("ovphysx")
+        importlib_metadata.distribution("physx-usd-schemas")
+    except ImportError:
+        # Physics is optional: ovphysx or physx-usd-schemas is not installed.
+        return
+    try:
+        schema_support = import_module("ovphysx.samples.python_samples.schema_support")
+        register([str(path) for path in schema_support.physx_schema_paths()])
+    except Exception as exc:
+        failure = (
+            "registering the PhysX schemas of physx-usd-schemas failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        if failure != _PHYSICS_SCHEMA_FAILURE:
+            _LOGGER.warning("%s", failure)
+        _PHYSICS_SCHEMA_FAILURE = failure
+        return
+    _PHYSICS_SCHEMA_FAILURE = None
+
+
+def _wait_operations(operations: Iterable[Any], action: str) -> None:
+    """Wait for every operation, then raise the first failure."""
+
+    failure: BaseException | None = None
+    for operation in operations:
+        try:
+            wait_operation(operation)
+        except Exception as exc:
+            if failure is None:
+                failure = exc
+            else:
+                _add_cleanup_note(failure, action, exc)
+    if failure is not None:
+        raise failure
+
+
+@dataclass
+class _PopulatedExtras:
+    """What the second population read, held after its stage is destroyed."""
+
+    metadata: dict[str, NativePathAttributeRecord]
+    columns: list["_PopulatedColumn"]
+    type_names: dict[tuple[str, str], str]
+    defaults: dict[str, dict[str, Any]]
+    instances: dict[str, list[str]]
+    #: Text of each token id found in a default. A token id of a destroyed
+    #: stage cannot be resolved, so the text is copied while the stage that
+    #: holds it is alive.
+    token_text: dict[int, str]
+
+
+def _read_populated_extras(source: Any, ordinal: int) -> _PopulatedExtras:
+    """Copy the stage metadata and the properties that ``source`` populated."""
+
+    ovstage_module = import_module("ovstage")
+    extras = _PopulatedExtras({}, [], {}, defaultdict(dict), defaultdict(list), {})
+    token_id_semantic = int(ovstage_module.AttributeSemantic.TOKEN_ID)
+    # Default columns that could hold token ids. The type name of a property
+    # may be read after its default, so the type is checked after the loop.
+    maybe_token_defaults: list[tuple[str, _PopulatedColumn]] = []
+    # Paths and tokens copy as they are, except the text of a token default,
+    # which is kept below because its id need not resolve in another stage.
+    with ovstage_module.PathDictionary(source) as paths:
+        with source.query() as query:
+            query.wait()
+            tokens = [native_token(source, token) for token in query.result().attributes]
+            if not tokens:
+                return extras
+            with source.read_attributes(
+                query,
+                tokens,
+                ovstage_module.OrdinalRange.latest(int(ordinal)),
+            ) as read:
+                read.wait()
+                for group in read_groups(read.groups()):
+                    try:
+                        name = str(paths.token_to_string(native_token(paths, group.attribute)))
+                        if name.startswith(STAGE_METADATA_PREFIX):
+                            record = _copy_path_attribute_group(paths, group, "/", name)
+                            if record is not None:
+                                extras.metadata[name] = record
+                        elif name.endswith(_TYPE_NAME_SUFFIX):
+                            column = _PopulatedColumn.copy(paths, group, name)
+                            for path, values in column.rows.items():
+                                extras.type_names[
+                                    (path, name[: -len(_TYPE_NAME_SUFFIX)])
+                                ] = str(paths.token_to_string(native_token(paths, values[0])))
+                        elif name.endswith(_DEFAULT_SUFFIX):
+                            column = _PopulatedColumn.copy(paths, group, name)
+                            extras.defaults[name[: -len(_DEFAULT_SUFFIX)]].update(column.rows)
+                            if not column.is_array and column.semantic in (0, token_id_semantic) and column.code == 1:
+                                # Only an unsigned integer default can be a token id;
+                                # a number such as -2 or NaN is not one.
+                                maybe_token_defaults.append((name[: -len(_DEFAULT_SUFFIX)], column))
+                        else:
+                            extras.columns.append(_PopulatedColumn.copy(paths, group, name))
+                    finally:
+                        release_read_group(source, group)
+        # A string or token default is a token id. A default of another type,
+        # such as uint, uchar or uint64, is a number and is not looked up.
+        for name, column in maybe_token_defaults:
+            for path, values in column.rows.items():
+                if extras.type_names.get((path, name)) not in {"string", "token"}:
+                    continue
+                token_id = int(values[0])
+                if token_id and token_id not in extras.token_text:
+                    extras.token_text[token_id] = str(paths.token_to_string(native_token(paths, token_id)))
+        # An array of tokens: copy the text of each token while the stage that
+        # holds it is alive.
+        for (path, name), type_name in extras.type_names.items():
+            if type_name != "token[]":
+                continue
+            default = extras.defaults.get(name, {}).get(path)
+            for token_id in () if default is None else np.asarray(default).reshape(-1):
+                token_id = int(token_id)
+                if token_id and token_id not in extras.token_text:
+                    extras.token_text[token_id] = str(paths.token_to_string(native_token(paths, token_id)))
+        for column in extras.columns:
+            if column.name == "_protoPath":
+                for path, values in column.rows.items():
+                    extras.instances[str(paths.path_to_string(native_prim_path(paths, values[0])))].append(path)
+    return extras
+
+
+def _write_populated_extras(
+    target: Any,
+    ordinal: int,
+    extras: _PopulatedExtras,
+) -> dict[str, NativePathAttributeRecord]:
+    """Write the populated properties into ``target`` at ``ordinal``.
+
+    A property goes only to a prim that ``target`` has and that does not have
+    the property yet. A USD prototype has another path in each stage, so a
+    property of a prototype prim goes to the same prim under each instance.
+    Returns the stage metadata.
+    """
+
+    ovstage_module = import_module("ovstage")
+    with ovstage_module.PathDictionary(target) as paths:
+        target._ovui_inspected_property_names = frozenset(
+            column.name
+            for column in extras.columns
+            if _write_populated_column(
+                ovstage_module,
+                paths,
+                column,
+                extras.type_names,
+                extras.defaults.get(column.name, {}),
+                extras.instances,
+                extras.token_text,
+                target,
+                ordinal,
+            )
+        )
+    return extras.metadata
+
+
+#: Suffix of the column that holds the USD type name of a populated property.
+_TYPE_NAME_SUFFIX = ":usd-metadata:typeName"
+#: Suffix of the column that holds the authored default of a populated property.
+_DEFAULT_SUFFIX = ":usd-metadata:default"
+
+
+@dataclass
+class _PopulatedColumn:
+    """One populated attribute, copied out of its read group."""
+
+    name: str
+    is_array: bool
+    semantic: int
+    lanes: int
+    rows: dict[str, Any]
+    #: DLPack type code of the values (1 is an unsigned integer, as a token id).
+    code: int = 0
+
+    @classmethod
+    def copy(cls, paths: Any, group: Any, name: str) -> "_PopulatedColumn":
+        group_paths = path_strings(paths, group.prim_list)
+        rows: dict[str, Any] = {}
+        if group.is_array:
+            lanes = element_lanes(group.tensor(0)) if group.tensor_count else 1
+            for local in range(group.prim_count):
+                row = group.data_row_index(local)
+                lanes = element_lanes(group.tensor(row))
+                rows[str(group_paths[group.prim_index(local)])] = np.array(group.array(row)).reshape(-1)
+        else:
+            lanes = element_lanes(group.tensor(0))
+            table = np.array(group.array(0)).reshape(-1, lanes)
+            for local in range(group.prim_count):
+                rows[str(group_paths[group.prim_index(local)])] = table[
+                    group.data_row_index(local)
+                ]
+        code = int(group.tensor(0).dtype.code) if group.tensor_count else 0
+        return cls(name, bool(group.is_array), int(group.raw.semantic), lanes, rows, code)
+
+
+def _write_populated_column(
+    ovstage_module: ModuleType,
+    paths: Any,
+    column: _PopulatedColumn,
+    type_names: dict[tuple[str, str], str],
+    defaults: dict[str, Any],
+    instances: dict[str, list[str]],
+    token_text: dict[int, str],
+    target: Any,
+    ordinal: int,
+) -> bool:
+    """Write one populated column to the prims of ``target`` that lack it.
+
+    Each prim gets the authored default of the property. A property with no
+    default gets the fallback of its type, as the OpenUSD adapter shows it.
+    Rows that end up with different encodings, such as a string and a token
+    of the same name, are written separately. Returns whether any prim got
+    the column.
+    """
+
+    # (is_array, semantic) -> {target path: values}
+    encoded: dict[tuple[bool, int], dict[str, Any]] = defaultdict(dict)
+    for path, sample in column.rows.items():
+        type_name = type_names.get((path, column.name))
+        values = defaults.get(path)
+        if values is None:
+            values = sample[:0] if column.is_array else _no_default_value(type_name, sample)
+        semantic = column.semantic
+        is_array = column.is_array
+        # Population writes a string or token as a token id with no semantic.
+        if (
+            type_name in {"string", "token"}
+            and column.semantic in (0, int(ovstage_module.AttributeSemantic.TOKEN_ID))
+            and not column.is_array
+        ):
+            if type_name == "token":
+                semantic = int(ovstage_module.AttributeSemantic.TOKEN_ID)
+                # Intern the text in the target: a token id of a destroyed
+                # stage cannot be resolved.
+                token_id = int(values[0])
+                text = _copied_token_text(token_text, token_id, path, column.name)
+                values = np.array(
+                    [handle_number(paths.intern_token(text)) if text else 0],
+                    dtype=np.asarray(values).dtype,
+                )
+            else:
+                # The adapter reads a USD string as UTF-8 bytes in an array row.
+                semantic = int(ovstage_module.AttributeSemantic.STRING)
+                is_array = True
+                token_id = int(values[0])
+                text = _copied_token_text(token_text, token_id, path, column.name)
+                values = np.frombuffer(text.encode("utf-8"), dtype=np.uint8).copy()
+        elif type_name == "token[]" and column.is_array:
+            semantic = int(ovstage_module.AttributeSemantic.TOKEN_ID)
+            values = np.array(
+                [
+                    handle_number(paths.intern_token(text)) if text else 0
+                    for text in (
+                        _copied_token_text(token_text, int(token_id), path, column.name)
+                        for token_id in np.asarray(values).reshape(-1)
+                    )
+                ],
+                dtype=np.asarray(values).dtype,
+            )
+        targets = [path]
+        for prototype, roots in instances.items():
+            if path == prototype or path.startswith(prototype + "/"):
+                targets = [root + path[len(prototype):] for root in roots]
+                break
+        for target_path in targets:
+            encoded[(is_array, semantic)][target_path] = values
+    lacking = _paths_without_attribute(
+        ovstage_module,
+        paths,
+        target,
+        [path for rows in encoded.values() for path in rows],
+        column.name,
+        ordinal,
+    )
+
+    def tensor(values: Any, count: int) -> Any:
+        values = np.ascontiguousarray(values).reshape(-1)
+        return ovstage_module.make_dltensor(
+            values,
+            dtype=ovstage_module.numpy_to_dldatatype(values.dtype, lanes=column.lanes),
+            shape=[count],
+            ndim=1,
+        )
+
+    written = False
+    for (is_array, semantic), rows in encoded.items():
+        rows = {path: values for path, values in rows.items() if path in lacking}
+        if not rows:
+            continue
+        if is_array:
+            values = [tensor(row, row.size // column.lanes) for row in rows.values()]
+        else:
+            values = tensor(np.stack(list(rows.values())), len(rows))
+        path_list = paths.create_path_list_from_strings(list(rows))
+        try:
+            with target.query_from_path_list(path_list) as query:
+                query.wait()
+                wait_operation(
+                    target.write_attribute(
+                        query,
+                        column.name,
+                        int(ordinal),
+                        values,
+                        is_array=is_array,
+                        semantic=semantic,
+                    )
+                )
+        finally:
+            paths.destroy_path_list(path_list)
+        written = True
+    return written
+
+
+def _copied_token_text(token_text: dict[int, str], token_id: int, path: str, name: str) -> str:
+    """Return the copied text of ``token_id``; id 0 is no token and has no text.
+
+    An id with no copied text is an error: it must not show as empty text.
+    """
+
+    if not token_id:
+        return ""
+    try:
+        return token_text[token_id]
+    except KeyError:
+        raise RuntimeError(
+            f"no text was copied for token id {token_id} of {path}.{name}"
+        ) from None
+
+
+def _no_default_value(type_name: str | None, sample: Any) -> Any:
+    """Return the value shown for a sampled property with no default.
+
+    It is zero, except that a matrix is the identity and a four-component
+    color is opaque black, as the OpenUSD adapter shows them.
+    """
+
+    value = np.zeros_like(sample)
+    if type_name in {"matrix2d", "matrix3d", "matrix4d"}:
+        size = int(type_name[6])
+        value = np.eye(size, dtype=value.dtype).reshape(value.shape)
+    elif type_name in {"color4f", "color4d", "color4h"}:
+        value[-1] = 1
+    return value
+
+
+def _paths_without_attribute(
+    ovstage_module: ModuleType,
+    paths: Any,
+    target: Any,
+    candidates: list[str],
+    name: str,
+    ordinal: int,
+) -> set[str]:
+    """Return the candidate prims that ``target`` has, without ``name``."""
+
+    path_list = paths.create_path_list_from_strings(candidates)
+    try:
+        result = target.get_hierarchy(
+            path_list,
+            int(ordinal),
+            ovstage_module.HierarchyRelation.PARENT,
+        )
+        existing = [path for path, item in zip(candidates, result.items) if item.ok]
+    finally:
+        paths.destroy_path_list(path_list)
+    token = handle_number(paths.intern_token(name))
+
+    def has_attribute(prims: list[str]) -> bool:
+        path_list = paths.create_path_list_from_strings(prims)
+        try:
+            with target.query_from_path_list(path_list) as query:
+                query.wait()
+                return token in {handle_number(value) for value in query.result().attributes}
+        finally:
+            paths.destroy_path_list(path_list)
+
+    # One query answers for all prims when none of them has the attribute.
+    if not existing or not has_attribute(existing):
+        return set(existing)
+    return {path for path in existing if not has_attribute([path])}
 
 
 def _release_scene_resource(resource: Any, label: str) -> None:
@@ -1147,12 +1638,10 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
                     if snapshot is not None:
                         _restore_recorded_path_metadata(self, snapshot)
             finally:
-                frame_lock = getattr(self, "_ovui_frame_lock", None)
-                if frame_lock is not None:
-                    try:
-                        frame_lock.release()
-                    except RuntimeError:
-                        pass
+                # Rows already written at this ordinal (such as a rollback)
+                # stay in the Stage, and ovrtx refuses to step over unsealed
+                # rows. Seal them and release the frame lock.
+                self.end_frame(ordinal)
 
         stage.abort_frame = MethodType(abort_frame, stage)
 
@@ -1257,7 +1746,7 @@ def _install_frame_lifecycle_compat(stage: Any) -> None:
     if not callable(getattr(stage, "get_topology_version", None)):
         def get_topology_version(self: Any) -> int:
             try:
-                return _reconcile_native_write_floor(self)
+                return _topology_version(self)
             except Exception:
                 return 0
 
@@ -1304,6 +1793,450 @@ def _reconcile_native_write_floor(stage: Any) -> int:
     if committed > current:
         stage.current_ordinal = committed
     return committed
+
+
+_CAMERA_ORDINALS_LIMIT = 4096
+_VALUE_WRITES_LIMIT = 4096
+# Columns that hold the prims, their parents, types and applied schemas.
+_STRUCTURE_ATTRIBUTE_NAMES = frozenset(
+    {"usd-path", "usd-parent", "usd-prim-type", "usd-schemas"}
+)
+# Value columns whose written prims the write log keeps: the columns of the
+# visibility and purpose tokens that the stage adapter caches.
+_TRACKED_VALUE_NAMES = frozenset(
+    {"visibility", "_worldVisibility", "worldVisibility", "purpose"}
+)
+
+
+@dataclass(frozen=True)
+class _ValueWrite:
+    """The prims that one ordinal wrote, by column, when it wrote only values.
+
+    The key ``""`` names prims of which any column can be written. When
+    ``attributes`` is set, the ordinal can also have written other columns,
+    and ``paths`` is exact only for the columns in ``attributes``.
+    """
+
+    paths: dict[str, frozenset[str]]
+    attributes: frozenset[str] | None = None
+
+
+@dataclass
+class _WriteLog:
+    """What the processed ordinals of a stage changed.
+
+    Each ordinal up to ``seen`` is processed once: a recorded camera or value
+    write, a value-only write of another writer that a native read found, or
+    else a possible structure change.
+    """
+
+    seen: int
+    structure: int
+    # The last ordinal that can have changed any value of any prim.
+    values_reset: int
+    # Column ("" for any column) -> prim -> the last ordinal that wrote it.
+    changed: dict[str, dict[str, int]]
+
+
+def _structure_ordinal(stage: Any, upto: int) -> int:
+    """Return the last ordinal up to ``upto`` that may have changed the structure.
+
+    Every camera write commits an ordinal of its own, but a camera move is not
+    a structure change. The camera ordinals are the ones noted by
+    :func:`note_camera_ordinal`, and every ordinal after the one a native frame
+    pacing session started or resumed at, while that session writes the camera
+    (:func:`begin_native_camera_writes`); Python stops or pauses the session
+    before it writes anything else. A value edit of OVUI, such as a hide or a
+    transform, also is not a structure change (:func:`note_value_edit_ordinal`),
+    and neither is a write of another writer that wrote only values
+    (:func:`classify_native_writes`).
+    Every other ordinal counts as a structure change.
+    """
+
+    upto = int(upto)
+    log = getattr(stage, "_ovui_write_log", None)
+    if log is None:
+        # The first prim count: later writes of other writers are compared with it.
+        classify_native_writes(stage)
+        stage._ovui_write_log = _WriteLog(upto, upto, upto, {})
+        _drop_value_writes_through(stage, upto)
+        return upto
+    if upto < log.seen:
+        # Asked about an ordinal before the ones already read: no answer.
+        return upto
+    _process_writes(stage, log, upto)
+    return log.structure
+
+
+def _process_writes(stage: Any, log: _WriteLog, upto: int) -> None:
+    span = range(log.seen + 1, upto + 1)
+    if not span:
+        return
+    cameras = getattr(stage, "_ovui_camera_ordinals", set())
+    native_from = getattr(stage, "_ovui_native_camera_from", None)
+    writes = getattr(stage, "_ovui_value_writes", None) or {}
+    if any(ordinal not in writes and ordinal not in cameras for ordinal in span):
+        # Another writer committed: find out now whether it wrote only values.
+        classify_native_writes(stage)
+        writes = getattr(stage, "_ovui_value_writes", None) or {}
+    for ordinal in span:
+        write = writes.pop(ordinal, None)
+        if write is not None:
+            covered = write.attributes is None or _TRACKED_VALUE_NAMES <= write.attributes
+            if not covered:
+                log.values_reset = ordinal
+            for name, paths in write.paths.items():
+                if covered and (not name or name in _TRACKED_VALUE_NAMES):
+                    changed = log.changed.setdefault(name, {})
+                    for path in paths:
+                        changed[path] = ordinal
+            continue
+        # Without recorded paths, another native writer may have changed
+        # values even while the camera session runs. Read the tokens again.
+        log.values_reset = ordinal
+        if native_from is not None and ordinal > native_from:
+            continue
+        if ordinal in cameras:
+            continue
+        log.structure = ordinal
+    cameras.difference_update(span)
+    log.seen = upto
+
+
+def _same_structure(stage: Any, cached_ordinal: int, ordinal: int) -> bool:
+    """Whether a reading of the structure at ``cached_ordinal`` holds at ``ordinal``."""
+
+    cached_ordinal = int(cached_ordinal)
+    ordinal = int(ordinal)
+    if cached_ordinal == ordinal:
+        return True
+    return cached_ordinal < ordinal and _structure_ordinal(stage, ordinal) <= cached_ordinal
+
+
+#: How long a write-floor read stands for the structure version.
+_FLOOR_READ_REUSE_SECONDS = 0.005
+
+
+def _topology_version(stage: Any) -> int:
+    """The write floor, not counting ordinals that only moved a camera.
+
+    The stage tree asks for it once for every row it reads. A floor read is
+    a round trip through the stage's operation queue, and it waits there
+    behind the renderer's stage reads. Within a few milliseconds only Python
+    can have changed the structure, and its writes raise ``current_ordinal``
+    at once, so a floor read that recent stands.
+    """
+
+    now = time.perf_counter()
+    read_at = getattr(stage, "_ovui_floor_read_at", None)
+    if read_at is None or now - read_at > _FLOOR_READ_REUSE_SECONDS:
+        floor = _reconcile_native_write_floor(stage)
+        stage._ovui_floor_read_at = time.perf_counter()
+    else:
+        floor = int(getattr(stage, "current_ordinal", 0) or 0)
+    return _structure_ordinal(stage, floor)
+
+
+def note_camera_ordinal(
+    stage: Any,
+    ordinal: int | None,
+    camera_paths: Iterable[str] | None = None,
+) -> None:
+    """Record that ``ordinal`` only writes camera state.
+
+    With ``camera_paths``, :func:`value_edit_paths` also names the cameras
+    that ``ordinal`` writes.
+    """
+
+    if stage is None or ordinal is None:
+        return
+    cameras = getattr(stage, "_ovui_camera_ordinals", None)
+    if cameras is None:
+        cameras = set()
+        stage._ovui_camera_ordinals = cameras
+    if len(cameras) >= _CAMERA_ORDINALS_LIMIT:
+        # Unread for long: the forgotten ordinals count as structure changes.
+        cameras.clear()
+    cameras.add(int(ordinal))
+    if camera_paths is not None:
+        _record_value_write(
+            stage,
+            int(ordinal),
+            _ValueWrite({"": frozenset(str(path) for path in camera_paths)}),
+        )
+
+
+def note_value_edit_ordinal(
+    stage: Any,
+    ordinal: int | None,
+    attribute_name: str,
+    paths: Iterable[str],
+) -> None:
+    """Record that ``ordinal`` only writes ``attribute_name`` of the existing ``paths``.
+
+    Such an ordinal is not a structure change, and :func:`value_edit_paths`
+    names the prims whose values it changed. A write of a structure column
+    is not recorded, so it stays a structure change.
+    """
+
+    if stage is None or ordinal is None:
+        return
+    if str(attribute_name) in _STRUCTURE_ATTRIBUTE_NAMES:
+        return
+    _record_value_write(
+        stage,
+        int(ordinal),
+        _ValueWrite({str(attribute_name): frozenset(str(path) for path in paths)}),
+    )
+    _note_values_changed(stage, int(ordinal))
+
+
+def _note_values_changed(stage: Any, ordinal: int) -> None:
+    # The whole-scene cache holds values: see _kit_stage_cache.
+    stage._ovui_last_value_edit_ordinal = max(
+        int(ordinal),
+        int(getattr(stage, "_ovui_last_value_edit_ordinal", 0) or 0),
+    )
+
+
+def _record_value_write(stage: Any, ordinal: int, write: _ValueWrite) -> None:
+    writes = getattr(stage, "_ovui_value_writes", None)
+    if writes is None:
+        writes = {}
+        stage._ovui_value_writes = writes
+    writes[ordinal] = write
+    if len(writes) <= _VALUE_WRITES_LIMIT or getattr(stage, "_ovui_folding_writes", False):
+        return
+    # Unread for long: fold what is due into the write log.
+    stage._ovui_folding_writes = True
+    try:
+        if getattr(stage, "_ovui_write_log", None) is not None:
+            _structure_ordinal(stage, int(getattr(stage, "current_ordinal", 0) or 0))
+    finally:
+        stage._ovui_folding_writes = False
+    if len(writes) > _VALUE_WRITES_LIMIT:
+        # The forgotten ordinals count as structure changes.
+        for forgotten in sorted(writes)[: len(writes) - _VALUE_WRITES_LIMIT // 2]:
+            del writes[forgotten]
+
+
+def _drop_value_writes_through(stage: Any, ordinal: int) -> None:
+    writes = getattr(stage, "_ovui_value_writes", None) or {}
+    for recorded in [o for o in writes if o <= ordinal]:
+        del writes[recorded]
+
+
+def value_edit_paths(
+    stage: Any,
+    since_ordinal: int,
+    ordinal: int,
+    attribute_names: Iterable[str],
+) -> frozenset[str] | None:
+    """Return the prims whose ``attribute_names`` changed in ``(since, ordinal]``.
+
+    The result also names the prims of a camera write, and it can name prims
+    that changed after ``ordinal``. Return None when a write in that range can
+    have changed any prim: the caller then reads all values again.
+    """
+
+    since_ordinal, ordinal = int(since_ordinal), int(ordinal)
+    names = frozenset(attribute_names)
+    if ordinal < since_ordinal or not names <= _TRACKED_VALUE_NAMES:
+        return None
+    _structure_ordinal(stage, ordinal)
+    log = getattr(stage, "_ovui_write_log", None)
+    if log is None or log.seen < ordinal or log.values_reset > since_ordinal:
+        return None
+    paths: set[str] = set()
+    for name in names | {""}:
+        paths.update(
+            path
+            for path, changed_at in log.changed.get(name, {}).items()
+            if changed_at > since_ordinal
+        )
+    return frozenset(paths)
+
+
+def classify_native_writes(stage: Any) -> None:
+    """Record the ordinals of other native writers that wrote only values.
+
+    A writer that is not OVUI (a solver that writes results, or a script that
+    uses ``native_stage``) commits ordinals that OVUI did not record. Without
+    a record, each one is a structure change, and the stage adapter reads the
+    type and the visibility of every prim again. One narrow read of the rows
+    that these ordinals wrote tells more: when no structure column was written
+    and the prim count is the same as at the last count, they wrote only
+    values, and the read names the prims whose visibility or purpose changed.
+    The ordinals between the last count and them are recorded ones, which do
+    not change the prim count. When the read fails, or the stage no longer
+    keeps those ordinals, nothing is recorded: they stay structure changes.
+    The stage keeps a short history, so the change stream calls this at each
+    poll.
+    """
+
+    if getattr(stage, "_ovui_classifying_writes", False) or not all(
+        callable(getattr(stage, name, None))
+        for name in ("query", "read_attributes", "release_group")
+    ):
+        return
+    current = int(getattr(stage, "current_ordinal", 0) or 0)
+    sample = getattr(stage, "_ovui_prim_count_sample", None)
+    since = None
+    if isinstance(sample, tuple) and int(sample[0]) <= current:
+        since, count = int(sample[0]), int(sample[1])
+    writes = getattr(stage, "_ovui_value_writes", None) or {}
+    cameras = getattr(stage, "_ovui_camera_ordinals", set())
+    log = getattr(stage, "_ovui_write_log", None)
+    native_from = getattr(stage, "_ovui_native_camera_from", None)
+    first = since if since is None or log is None else max(since, log.seen)
+    unknown = (
+        ()
+        if first is None
+        else tuple(
+            o for o in range(first + 1, current + 1)
+            if o not in writes and o not in cameras
+            and (native_from is None or o <= native_from)
+        )
+    )
+    if since is not None and not unknown:
+        # Only recorded writes since the last count: the count holds.
+        stage._ovui_prim_count_sample = (current, count)
+        return
+    stage._ovui_classifying_writes = True
+    try:
+        rows = _read_written_rows(stage, None if since is None else unknown[0] - 1, current)
+    except Exception as exc:
+        rows = None
+        _report_classification_fallback(
+            stage, f"the native read failed ({type(exc).__name__}: {exc})"
+        )
+    finally:
+        stage._ovui_classifying_writes = False
+    if rows is None:
+        if unknown:
+            _report_classification_fallback(
+                stage, f"OVStage no longer keeps ordinals {unknown[0]}-{unknown[-1]}"
+            )
+        stage._ovui_prim_count_sample = None
+        return
+    count_now, written = rows
+    stage._ovui_prim_count_sample = (current, count_now)
+    if since is None or count_now != count:
+        return
+    if any(written.get(name) for name in _STRUCTURE_ATTRIBUTE_NAMES):
+        return
+    write = _ValueWrite(
+        {name: frozenset(written.get(name, ())) for name in _TRACKED_VALUE_NAMES},
+        _TRACKED_VALUE_NAMES | _STRUCTURE_ATTRIBUTE_NAMES,
+    )
+    for ordinal in unknown:
+        _record_value_write(stage, ordinal, write)
+    _note_values_changed(stage, current)
+
+
+def _report_classification_fallback(stage: Any, cause: str) -> None:
+    # Once for each stage: the fallback is safe, but it is the slow path.
+    if getattr(stage, "_ovui_classification_fallback_reported", False):
+        return
+    stage._ovui_classification_fallback_reported = True
+    _LOGGER.warning(
+        "ovstage cannot tell whether some writes changed the prims: %s. Such "
+        "writes count as structure changes, so the stage tree reads all prims "
+        "again after them (the safe, slower path). Reported once for this stage.",
+        cause,
+    )
+
+
+def _read_written_rows(
+    stage: Any,
+    since: int | None,
+    current: int,
+) -> tuple[int, dict[str, set[str]]] | None:
+    """Return the prim count and the tracked rows written in ``(since, current]``.
+
+    Return None when the stage no longer keeps the whole range.
+    """
+
+    ovstage_module = import_module("ovstage")
+    names = _STRUCTURE_ATTRIBUTE_NAMES | _TRACKED_VALUE_NAMES
+    written: dict[str, set[str]] = {}
+    query = None
+    read = None
+    with ovstage_module.PathDictionary(stage) as paths:
+        tokens = {handle_number(paths.intern_token(name)): name for name in names}
+        try:
+            query = stage.query(None, None)
+            wait_operation(query)
+            count = int(query.result().total_prim_count)
+            if since is None or since >= current:
+                return count, written
+            oldest = _oldest_preserved_ordinal(stage)
+            if oldest is not None and since + 1 < oldest:
+                return None
+            read = stage.read_attributes(
+                query,
+                [native_token(stage, token) for token in tokens],
+                ovstage_module.OrdinalRange.between(since + 1, current),
+            )
+            wait_operation(read)
+            for group in read_groups(iter(lambda: stage.fetch_read_next(read), None)):
+                try:
+                    name = tokens.get(int(group.attribute))
+                    if name is None:
+                        continue
+                    group_paths = path_strings(paths, group.prim_list)
+                    written.setdefault(name, set()).update(
+                        str(group_paths[int(group.prim_index(index))])
+                        for index in range(int(group.prim_count))
+                    )
+                finally:
+                    wait_operation(release_read_group(stage, group))
+        finally:
+            # A failed read or release must still release the query. Keep the
+            # path dictionary alive until both native handles are released.
+            try:
+                if read is not None:
+                    release = getattr(read, "release", None)
+                    wait_operation(release() if callable(release) else stage.release_read(read))
+            finally:
+                if query is not None:
+                    release = getattr(query, "release", None)
+                    wait_operation(release() if callable(release) else stage.release_query(query))
+    return count, written
+
+
+def _oldest_preserved_ordinal(stage: Any) -> int | None:
+    getter = getattr(stage, "get_oldest_preserved_ordinal", None)
+    if not callable(getter):
+        return None
+    query = getter()
+    try:
+        wait_operation(query)
+        return int(query.fetch())
+    finally:
+        release = getattr(query, "release", None)
+        if callable(release):
+            wait_operation(release())
+
+
+def begin_native_camera_writes(stage: Any, from_ordinal: int) -> None:
+    """A native session writes the camera at the ordinals after ``from_ordinal``."""
+
+    if stage is None:
+        return
+    _structure_ordinal(stage, int(from_ordinal))
+    stage._ovui_native_camera_from = int(from_ordinal)
+
+
+def end_native_camera_writes(stage: Any) -> None:
+    """The native session has stopped writing; its ordinals were camera ones."""
+
+    if stage is None or getattr(stage, "_ovui_native_camera_from", None) is None:
+        return
+    try:
+        _structure_ordinal(stage, _reconcile_native_write_floor(stage))
+    finally:
+        stage._ovui_native_camera_from = None
 
 
 def _native_child_paths(stage: Any, parent_path: str) -> tuple[str, ...]:
@@ -1546,6 +2479,15 @@ class _KitStageBridgeCache:
                 return b"inherited"
         return b""
 
+    def has_attribute_value(self, path: str, attr_name: str) -> bool:
+        """True when the stage gave ``attr_name`` for ``path`` itself.
+
+        ``read_attribute`` answers 'visibility' from the effective
+        '_worldVisibility' when the stage gave no 'visibility' value.
+        """
+        key_name = _KIT_MATRIX_ALIASES.get(attr_name, attr_name)
+        return self.attrs.get((path, key_name)) is not None
+
     def read_path_targets(
         self,
         path: str,
@@ -1572,7 +2514,7 @@ class _KitStageBridgeCache:
                 )
             identifiers = struct.unpack(f"<{len(payload) // 8}Q", payload)
             return tuple(
-                str(path_dictionary.path_to_string(identifier))
+                str(path_dictionary.path_to_string(native_prim_path(path_dictionary, identifier)))
                 for identifier in identifiers
             )
         if len(payload) % 16:
@@ -1582,9 +2524,9 @@ class _KitStageBridgeCache:
         identifiers = struct.unpack(f"<{len(payload) // 8}Q", payload)
         targets: list[str] = []
         for index in range(0, len(identifiers), 2):
-            prim_path = str(path_dictionary.path_to_string(identifiers[index]))
+            prim_path = str(path_dictionary.path_to_string(native_prim_path(path_dictionary, identifiers[index])))
             property_name = str(
-                path_dictionary.token_to_string(identifiers[index + 1])
+                path_dictionary.token_to_string(native_token(path_dictionary, identifiers[index + 1]))
             )
             targets.append(
                 f"{prim_path}.{property_name}" if property_name else prim_path
@@ -1644,7 +2586,7 @@ class _KitTypeRecordsSnapshot:
 
 def _kit_topology_snapshot(stage: Any, ordinal: int) -> _KitTopologySnapshot:
     cached = getattr(stage, "_ovui_kit_topology_snapshot", None)
-    if isinstance(cached, _KitTopologySnapshot) and cached.ordinal == int(ordinal):
+    if isinstance(cached, _KitTopologySnapshot) and _same_structure(stage, cached.ordinal, ordinal):
         return cached
     # This ordinal has already been probed and no whole-stage surface answered.
     # Probing again for every consumer repeats that same failed whole-stage
@@ -1652,7 +2594,7 @@ def _kit_topology_snapshot(stage: Any, ordinal: int) -> _KitTopologySnapshot:
     # back what the failed probe concluded.  The poll owns the retry and drops
     # this held result before asking again.
     held = getattr(stage, "_ovui_kit_topology_unreadable", None)
-    if isinstance(held, _KitTopologySnapshot) and held.ordinal == int(ordinal):
+    if isinstance(held, _KitTopologySnapshot) and _same_structure(stage, held.ordinal, ordinal):
         return held
 
     ovstage_module = import_module("ovstage")
@@ -1673,19 +2615,16 @@ def _kit_topology_snapshot(stage: Any, ordinal: int) -> _KitTopologySnapshot:
                 ordinal_range_type.latest(int(ordinal)),
             )
             wait_operation(read)
-            while True:
-                group = stage.fetch_read_next(read)
-                if group is None:
-                    break
+            for group in read_groups(iter(lambda: stage.fetch_read_next(read), None)):
                 try:
                     group_paths = tuple(
                         str(path)
-                        for path in paths.get_path_strings(group.prim_list)
+                        for path in path_strings(paths, group.prim_list)
                     )
                     _remember_paths(path_order, seen_paths, group_paths)
                 finally:
                     try:
-                        stage.release_group(group)
+                        release_read_group(stage, group)
                     except Exception:
                         pass
         finally:
@@ -1718,9 +2657,10 @@ def _kit_topology_snapshot(stage: Any, ordinal: int) -> _KitTopologySnapshot:
         # bridge cache — this adapter's pre-``usd-path`` topology source — is
         # the only remaining whole-stage authority.
         walked = None
-        if int(ordinal) == int(
+        hierarchy_ordinal = int(
             getattr(stage, "_ovui_hierarchy_child_paths_ordinal", -1)
-        ):
+        )
+        if hierarchy_ordinal >= 0 and _same_structure(stage, hierarchy_ordinal, ordinal):
             walked = _hierarchy_kit_path_order(stage, int(ordinal))
         if walked is None:
             walked = list(_kit_stage_cache(stage, int(ordinal)).path_order)
@@ -1758,6 +2698,20 @@ def _kit_topology_snapshot(stage: Any, ordinal: int) -> _KitTopologySnapshot:
                     readable=False,
                 )
                 stage._ovui_kit_topology_unreadable = unreadable
+                if getattr(stage, "_ovui_kit_topology_failure_ordinal", None) != int(
+                    ordinal
+                ):
+                    stage._ovui_kit_topology_failure_ordinal = int(ordinal)
+                    _LOGGER.warning(
+                        "ovstage stage topology read failed at ordinal %d: the "
+                        "whole-stage usd-path read returned no prims, but the "
+                        "native hierarchy %s. The Stage Browser keeps the last "
+                        "topology that was read, and the read is retried.",
+                        int(ordinal),
+                        "did not answer"
+                        if roots is None
+                        else f"still lists {len(roots)} root prim(s)",
+                    )
                 return unreadable
         path_order = walked
 
@@ -1778,7 +2732,7 @@ def _kit_type_records(
     """Copy only hierarchy type/schema metadata from a Kit OVStage."""
 
     cached = getattr(stage, "_ovui_kit_type_records_snapshot", None)
-    if isinstance(cached, _KitTypeRecordsSnapshot) and cached.ordinal == int(ordinal):
+    if isinstance(cached, _KitTypeRecordsSnapshot) and _same_structure(stage, cached.ordinal, ordinal):
         return dict(cached.records)
 
     ovstage_module = import_module("ovstage")
@@ -1807,6 +2761,24 @@ def _kit_type_records(
         types = _copy_kit_prim_types(paths, path_order, attrs)
         schemas = _copy_kit_applied_schemas(paths, path_order, attrs)
 
+    if not path_order:
+        # A read that answers nothing is only an empty stage when the stage
+        # topology agrees. Otherwise keep the last types, so the Stage
+        # Browser keeps its rows, and do not hold the failure for the ordinal.
+        topology = _kit_topology_snapshot(stage, int(ordinal))
+        if topology.path_order:
+            if getattr(stage, "_ovui_kit_type_failure_ordinal", None) != int(ordinal):
+                stage._ovui_kit_type_failure_ordinal = int(ordinal)
+                _LOGGER.warning(
+                    "ovstage prim type read failed at ordinal %d: the "
+                    "usd-prim-type read returned no prims, but the stage "
+                    "topology has %d prim(s). The Stage Browser keeps the "
+                    "last types that were read, and the read is retried.",
+                    int(ordinal),
+                    len(topology.path_order),
+                )
+            return dict(cached.records) if isinstance(cached, _KitTypeRecordsSnapshot) else {}
+
     records = {
         path: (types.get(path, ""), schemas.get(path, ()))
         for path in path_order
@@ -1821,7 +2793,13 @@ def _kit_type_records(
 
 def _kit_stage_cache(stage: Any, ordinal: int) -> _KitStageBridgeCache:
     cache = getattr(stage, "_ovui_kit_stage_bridge_cache", None)
-    if isinstance(cache, _KitStageBridgeCache) and cache.ordinal == int(ordinal):
+    # The cache holds values: a value edit after it was read makes it stale,
+    # although the structure is the same.
+    if (
+        isinstance(cache, _KitStageBridgeCache)
+        and _same_structure(stage, cache.ordinal, ordinal)
+        and int(getattr(stage, "_ovui_last_value_edit_ordinal", 0) or 0) <= cache.ordinal
+    ):
         return cache
     cache = _build_kit_stage_cache(stage, int(ordinal))
     # A build that found no prim is either an empty stage or a read that did
@@ -1831,6 +2809,17 @@ def _kit_stage_cache(stage: Any, ordinal: int) -> _KitStageBridgeCache:
     if cache.path_order:
         stage._ovui_kit_stage_bridge_cache = cache
     return cache
+
+
+def kit_stage_has_attribute_value(stage: Any, path: str, attr_name: str) -> bool:
+    """True when the Kit bridge cache of ``stage`` has ``attr_name`` of ``path`` itself.
+
+    The bridge ``read_attribute`` keeps that cache, so call this after it.
+    """
+    cache = getattr(stage, "_ovui_kit_stage_bridge_cache", None)
+    return isinstance(cache, _KitStageBridgeCache) and cache.has_attribute_value(
+        str(path), str(attr_name)
+    )
 
 
 def _merge_kit_read_groups(
@@ -1861,15 +2850,12 @@ def _merge_kit_read_groups(
         wait_operation(query)
         read = stage.read_attributes(query, attr_tokens, ordinal_range)
         wait_operation(read)
-        while True:
-            group = stage.fetch_read_next(read)
-            if group is None:
-                break
+        for group in read_groups(iter(lambda: stage.fetch_read_next(read), None)):
             try:
-                attr_name = paths.token_to_string(int(group.attribute))
+                attr_name = paths.token_to_string(native_token(paths, group.attribute))
                 group_paths = tuple(
                     str(path)
-                    for path in paths.get_path_strings(group.prim_list)
+                    for path in path_strings(paths, group.prim_list)
                 )
                 _remember_paths(path_order, seen_paths, group_paths)
                 _copy_group_values(
@@ -1880,10 +2866,11 @@ def _merge_kit_read_groups(
                     dtypes,
                     semantics,
                     arrays,
+                    inspected=getattr(stage, "_ovui_inspected_property_names", frozenset()),
                 )
             finally:
                 try:
-                    stage.release_group(group)
+                    release_read_group(stage, group)
                 except Exception:
                     pass
     finally:
@@ -2038,7 +3025,7 @@ def _copy_kit_prim_types(
             result[path] = ""
             continue
         try:
-            result[path] = str(paths.token_to_string(token_id))
+            result[path] = str(paths.token_to_string(native_token(paths, token_id)))
         except Exception:
             # Missing/malformed native metadata has a truthful unknown type;
             # do not guess from its path or incidental property columns.
@@ -2063,7 +3050,7 @@ def _copy_kit_applied_schemas(
             if token_id == 0:
                 continue
             try:
-                schema = str(paths.token_to_string(token_id))
+                schema = str(paths.token_to_string(native_token(paths, token_id)))
             except Exception:
                 continue
             if schema and schema not in schemas:
@@ -2089,7 +3076,7 @@ def _discover_kit_attr_names(
             wait_operation(query)
             result = query.result()
             return tuple(
-                paths.token_to_string(int(token))
+                paths.token_to_string(native_token(paths, token))
                 for token in getattr(result, "attributes", ())
             )
         finally:
@@ -2137,6 +3124,8 @@ def _copy_group_values(
     dtypes: dict[tuple[str, str], tuple[int, int, int]] | None = None,
     semantics: dict[tuple[str, str], int] | None = None,
     array_kinds: dict[tuple[str, str], bool] | None = None,
+    *,
+    inspected: frozenset[str] = frozenset(),
 ) -> None:
     if not group_paths:
         return
@@ -2154,7 +3143,7 @@ def _copy_group_values(
     is_array = bool(getattr(getattr(group, "raw", None), "is_array", False))
     semantic = int(getattr(getattr(group, "raw", None), "semantic", 0) or 0)
     if is_array:
-        exposed = _kit_exposed_attr_name(attr_name)
+        exposed = _kit_exposed_attr_name(attr_name, inspected)
         for local_index in range(prim_count):
             try:
                 prim_index = int(group.prim_index(local_index))
@@ -2180,7 +3169,7 @@ def _copy_group_values(
         return
     # Single-tensor columns have an unambiguous element dtype we can surface to
     # the Property Inspector; skip dtype capture for multi-tensor concatenations.
-    exposed = _kit_exposed_attr_name(attr_name)
+    exposed = _kit_exposed_attr_name(attr_name, inspected)
     column_dtype = (
         _kit_row_dtype(tensors[0], data_count, attr_name)
         if dtypes is not None and exposed is not None and tensor_count == 1
@@ -2252,10 +3241,11 @@ def _read_group_tensor_dtype(
     attr_name: str,
 ) -> tuple[int, int, int] | None:
     try:
-        dtype = group.tensor(int(tensor_index)).dtype
+        tensor = group.tensor(int(tensor_index))
+        dtype = tensor.dtype
         code = int(dtype.code)
         bits = int(dtype.bits)
-        lanes = int(dtype.lanes)
+        lanes = element_lanes(tensor)
         if attr_name in _KIT_FLOAT32_CAST_ATTRS:
             code = _NUMPY_KIND_TO_DLPACK_CODE["f"]
             bits = 32
@@ -2361,7 +3351,7 @@ def _hierarchy_kit_child_paths(
                 if isinstance(raw_path, str):
                     value = raw_path
                 else:
-                    value = str(paths.path_to_string(int(raw_path)))
+                    value = str(paths.path_to_string(native_prim_path(paths, raw_path)))
                 if _is_user_scene_path(value):
                     children.append(value)
             return tuple(sorted(dict.fromkeys(children)))
@@ -2444,19 +3434,16 @@ def _filtered_kit_child_paths(
                 ordinal_range_type.latest(int(ordinal)),
             )
             wait_operation(read)
-            while True:
-                group = stage.fetch_read_next(read)
-                if group is None:
-                    break
+            for group in read_groups(iter(lambda: stage.fetch_read_next(read), None)):
                 try:
                     children.extend(
                         str(path)
-                        for path in paths.get_path_strings(group.prim_list)
+                        for path in path_strings(paths, group.prim_list)
                         if _is_user_scene_path(str(path))
                     )
                 finally:
                     try:
-                        stage.release_group(group)
+                        release_read_group(stage, group)
                     except Exception:
                         pass
         finally:
@@ -2524,13 +3511,13 @@ def _kit_child_paths(stage: Any, parent_path: str) -> tuple[str, ...]:
     if not (
         isinstance(child_cache, tuple)
         and len(child_cache) == 2
-        and child_cache[0] == ordinal
+        and _same_structure(stage, child_cache[0], ordinal)
         and isinstance(child_cache[1], dict)
     ):
         child_cache = (ordinal, {})
         stage._ovui_kit_child_paths_cache = child_cache
 
-    if isinstance(topology, _KitTopologySnapshot) and topology.ordinal == ordinal:
+    if isinstance(topology, _KitTopologySnapshot) and _same_structure(stage, topology.ordinal, ordinal):
         result = _merge_authored_kit_child_paths(
             stage,
             parent,
@@ -2542,7 +3529,7 @@ def _kit_child_paths(stage: Any, parent_path: str) -> tuple[str, ...]:
 
     if (
         isinstance(bridge_cache, _KitStageBridgeCache)
-        and bridge_cache.ordinal == ordinal
+        and _same_structure(stage, bridge_cache.ordinal, ordinal)
     ):
         result = _merge_authored_kit_child_paths(
             stage,
@@ -2561,7 +3548,7 @@ def _kit_child_paths(stage: Any, parent_path: str) -> tuple[str, ...]:
     )
     native_lookups = (
         (_hierarchy_kit_child_paths, _filtered_kit_child_paths)
-        if ordinal == hierarchy_ordinal
+        if _same_structure(stage, hierarchy_ordinal, ordinal)
         else (_filtered_kit_child_paths, _hierarchy_kit_child_paths)
     )
     if int(getattr(stage, "_ovui_kit_parent_filter_silent_ordinal", -1)) == ordinal:

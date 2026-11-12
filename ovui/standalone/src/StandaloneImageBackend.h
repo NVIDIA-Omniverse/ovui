@@ -14,6 +14,9 @@
 
 namespace omni {
 namespace ui {
+
+class ISvgRasterizer;
+
 namespace standalone {
 
 class StandaloneRasterImageLoader;
@@ -22,15 +25,24 @@ class StandaloneRasterImageLoader;
 ///
 /// Loads local raster files (PNG/JPG/BMP/TGA/etc.) through the registered
 /// StandaloneRasterImageLoader, so ui.Image and RasterImageProvider share one
-/// decoder and one GPU texture cache. Accepts plain paths and file:// URLs.
-/// Logs an error once per URL when the image cannot be loaded.
+/// decoder and one GPU texture cache. Draws a local .svg file through the SVG
+/// rasterizer that VectorImageProvider uses, at the content size of the
+/// widget, so ui.Image and ui.ImageWithProvider show the same picture of the
+/// file and share its texture. Accepts plain paths and file:// URLs. Logs an
+/// error once per URL when the image cannot be loaded; for an .svg file the
+/// SVG rasterizer logs the cause, and a warning names the parts of the file
+/// that are not drawn.
 class StandaloneImageBackend final : public IImageBackend
 {
 public:
-    /// @param loader The raster loader, or nullptr when no GPU texture upload is
-    ///               available. Held weakly: the loader is released at shutdown
-    ///               before Python drops its last Image.
-    explicit StandaloneImageBackend(std::shared_ptr<StandaloneRasterImageLoader> loader);
+    /// @param loader        The raster loader, or nullptr when no GPU texture
+    ///                      upload is available.
+    /// @param svgRasterizer The SVG rasterizer that is registered for
+    ///                      VectorImageProvider, or nullptr.
+    /// Both are held weakly: they are released at shutdown before Python drops
+    /// its last Image.
+    StandaloneImageBackend(std::shared_ptr<StandaloneRasterImageLoader> loader,
+                           std::shared_ptr<ISvgRasterizer> svgRasterizer);
 
     LoadResult loadTexture(const std::string& sourceUrl,
                            float contentWidth,
@@ -46,7 +58,13 @@ public:
 private:
     void _logFailure(const std::string& sourceUrl, const char* reason);
 
+    LoadResult _loadSvg(const std::string& sourceUrl,
+                        float contentWidth,
+                        float contentHeight,
+                        const SetTextureDataFn& setTextureData);
+
     std::weak_ptr<StandaloneRasterImageLoader> m_loader;
+    std::weak_ptr<ISvgRasterizer> m_svgRasterizer;
     std::mutex m_loggedMutex;
     std::unordered_set<std::string> m_loggedUrls;
 };

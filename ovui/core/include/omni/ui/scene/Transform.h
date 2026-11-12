@@ -47,23 +47,28 @@ public:
                     Matrix44{ (Float)1.0 },
                     READ,
                     getTransform,
-                    WRITE,
-                    setTransform,
                     PROTECTED,
                     NOTIFY,
                     _setTransformChangedFn);
+
+    /**
+     * @brief Sets the single transformation matrix. It is written by hand, not by the property macro, so that a gesture
+     * that is running its callback is told what the matrix was and what it is (see DragGesture).
+     */
+    OMNIUI_SCENE_API
+    virtual void setTransform(Matrix44 const& value);
 
     /**
      * @brief Which space the current transform will be rescaled before applying
      * the matrix. It's useful to make the object the same size regardless the
      * distance to the camera.
      */
-    OMNIUI_PROPERTY(Space, scaleTo, DEFAULT, Space::eCurrent, READ, getScaleTo, WRITE, setScaleTo);
+    OMNIUI_PROPERTY(Space, scaleTo, DEFAULT, Space::eCurrent, READ, getScaleTo, WRITE, setScaleTo, PROTECTED, NOTIFY, _setScaleToChangedFn);
 
     /**
      * @brief Rotates this transform to align the direction with the camera.
      */
-    OMNIUI_PROPERTY(LookAt, lookAt, DEFAULT, LookAt::eNone, READ, getLookAt, WRITE, setLookAt);
+    OMNIUI_PROPERTY(LookAt, lookAt, DEFAULT, LookAt::eNone, READ, getLookAt, WRITE, setLookAt, PROTECTED, NOTIFY, _setLookAtChangedFn);
 
     /**
      * @brief Set a basis to this transform. A basis defines a different/new transform space for thisTransform,

@@ -16,13 +16,7 @@ Covers:
 
 import pytest
 
-try:
-    from pxr import Sdf, Usd, UsdGeom
-    HAS_USD = True
-except ImportError:
-    HAS_USD = False
-
-pytestmark = pytest.mark.skipif(not HAS_USD, reason="pxr (OpenUSD) not available")
+from pxr import Sdf, Usd, UsdGeom
 
 from ovui_data_adapters.common import BadgeFlags, ChangeEventType, ItemFlags
 from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter

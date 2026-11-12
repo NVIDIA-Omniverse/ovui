@@ -51,7 +51,7 @@ WINDOW_MENU = [
 
 class TestMenuItemLabels:
     def test_reports_entries_in_order_and_drops_separators(self, monkeypatch):
-        ui = pytest.importorskip("omni.ui")
+        import omni.ui as ui
         menu = object()
         # ui.Separator is a text-less MenuItem; it draws no row of its own.
         children = [SimpleNamespace(text=label) for label in WINDOW_MENU]
@@ -64,7 +64,7 @@ class TestMenuItemLabels:
         assert _menu_item_labels(menu) == WINDOW_MENU
 
     def test_unreadable_menu_reports_no_entries(self, monkeypatch):
-        ui = pytest.importorskip("omni.ui")
+        import omni.ui as ui
 
         def _raise(widget):
             raise RuntimeError("no widget tree")

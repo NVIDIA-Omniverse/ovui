@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for ovui_widgets.app._input_bridge.RemoteInputBridge (issue #34, Step 3.2).
+"""Tests for ovui_widgets.app._input_bridge.RemoteInputBridge (the regression, Step 3.2).
 
 Skeleton-level coverage: clamp + one-time WARN, MOVE coalescing,
 discrete-event append, wheel-delta accumulation, basic concurrent

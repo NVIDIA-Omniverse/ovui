@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 if(NOT TARGET pybind11::module)
-    find_package(pybind11 2.11.1 EXACT REQUIRED)
+    find_package(pybind11 2.11.1 CONFIG REQUIRED)
 endif()
 
 # The shared `_ui` module: the same binary in the wheel and in every host's

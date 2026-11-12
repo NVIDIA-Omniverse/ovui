@@ -327,6 +327,13 @@ class TestPrimScaleChangedGestureConstruction:
 # -- PrimScaleChangedGesture lifecycle ------------------------------------
 
 
+def _scale_10() -> float:
+    return 10.0
+
+
+_STALE = SimpleNamespace(effective=False)
+
+
 class TestPrimScaleChangedGestureLifecycle:
     def test_began_without_selection_stays_inert(self, empty_model):
         g = PrimScaleChangedGesture(model=empty_model, axis=(1.0, 0.0, 0.0))
@@ -412,6 +419,48 @@ class TestPrimScaleChangedGestureLifecycle:
 
         assert g.current_factor == pytest.approx(0.9)
         assert g.cancel_active_drag() is True
+
+    @pytest.mark.parametrize(
+        "args, kwargs, button, modifiers, factor",
+        [
+            ((_scale_10,), {}, 0, 0, 1.1),
+            ((_scale_10, 2), {}, 2, 0, 1.1),
+            ((_scale_10, 2, 1), {}, 2, 1, 1.1),
+            ((_scale_10,), {"mouse_button": 2}, 2, 0, 1.1),
+            ((_scale_10,), {"modifiers": 1}, 0, 1, 1.1),
+            ((_scale_10, 2), {"modifiers": 1}, 2, 1, 1.1),
+            ((None, 2), {}, 2, 0, 2.0),
+            ((2.0, 2), {}, 2, 0, 2.0),
+            ((True,), {}, 0, 0, 2.0),
+            ((2,), {"mouse_button": 1}, 1, 0, 2.0),
+            ((2, 1, 0, None), {}, 1, 0, 2.0),
+            # 0.2.0 took mouse_button fifth; v0.3.0 reads it as world_scale_fn.
+            ((2,), {}, 0, 0, 2.0),
+            ((True, 1), {}, 1, 0, 2.0),
+        ],
+    )
+    def test_v0_3_0_argument_order(self, wired_model, args, kwargs, button, modifiers, factor):
+        # v0.3.0 order after ``uniform``: world_scale_fn, mouse_button, modifiers, generation.
+        g = PrimScaleChangedGesture(wired_model, (1.0, 0.0, 0.0), None, False, *args, **kwargs)
+        g._on_began(_fake_sender_with_closest(0.0, 0.0, 0.0))
+        g._on_changed(_fake_sender_with_closest(1.0, 0.0, 0.0))
+
+        assert (g.mouse_button, g.modifiers) == (button, modifiers)
+        assert g.current_factor == pytest.approx(factor)
+        assert g.cancel_active_drag() is True
+
+    @pytest.mark.parametrize(
+        "args, kwargs",
+        [
+            ((_scale_10, 0, 0, _STALE), {}),
+            ((_scale_10,), {"generation": _STALE}),
+            ((_scale_10, 2), {"generation": _STALE}),
+        ],
+    )
+    def test_generation_by_order_or_name_blocks_stale_drag(self, wired_model, args, kwargs):
+        g = PrimScaleChangedGesture(wired_model, (1.0, 0.0, 0.0), None, False, *args, **kwargs)
+        g._on_began(_fake_sender_with_closest(0.0, 0.0, 0.0))
+        assert g.is_active is False
 
     def test_changed_while_inactive_is_noop(self, wired_model):
         g = PrimScaleChangedGesture(model=wired_model, axis=(1.0, 0.0, 0.0))

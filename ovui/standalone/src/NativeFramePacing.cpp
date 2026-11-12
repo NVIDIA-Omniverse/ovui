@@ -9,6 +9,9 @@
 
 #include "NativeFramePacing.h"
 
+#include "NativeFramePacingHooks.h"
+#include "NativeFrameReady.h"
+#include "NativeTiming.h"
 #include "VulkanBackend.h"
 #include "VulkanByteImageGpu.h"
 
@@ -35,15 +38,6 @@
 #include <utility>
 #include <vector>
 
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-#  include <ovrtx/ovrtx.h>
-#  if defined(_WIN32)
-#    include <windows.h>
-#  else
-#    include <dlfcn.h>
-#  endif
-#endif
-
 namespace omni {
 namespace ui {
 namespace standalone {
@@ -51,37 +45,18 @@ namespace standalone {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-constexpr uint64_t kBoundedWaitNanoseconds = 5'000'000;
 constexpr size_t kSlotCount = 12; // three complete maximum-size ordered groups
-constexpr size_t kMaxOrderedFrames = 4;
 constexpr uint64_t kMaxFramePixels = 16'777'216; // bounded 4K-class slot-ring allocation
-constexpr double kPredictionFullResponseSeconds = 0.100;
-constexpr double kPredictionDecaySeconds = 0.150;
-constexpr char kDlssgSupportedSetting[] =
-    "/rtx-transient/hashed/995bcbda752ace40e33a4d131067d270";
-constexpr char kDlssgX3X4SupportedSetting[] =
-    "/rtx-transient/dlssg/x3x4supported";
-constexpr char kDlssgEnabledSetting[] = "/rtx-transient/dlssg/enabled";
-constexpr char kDlssgRequestedCountSetting[] =
-    "/rtx-transient/hashed/410cea6f0e51aa5e9f232895a3a4f74a";
-constexpr char kDlssgActiveCountSetting[] =
-    "/rtx-transient/hashed/b0438cc64f2f9de5ac1b749deedffd9a";
 
-// Must share an epoch with Python's `time.perf_counter`, which produces
-// `CameraPublication::timestamp` (see `writeCamera`).
-double monotonicSeconds()
-{
-    return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
-}
-
-uint64_t rgbaFingerprint(const std::vector<uint8_t>& pixels)
+uint64_t rgbaFingerprint(const uint8_t* pixels, uint64_t size)
 {
     // FNV-1a over the bounded mapped RGBA result. Hashing happens once while
     // the CPU copy is already hot and proves pixel-content change separately
     // from slot/group identity.
     uint64_t hash = 1469598103934665603ull;
-    for (uint8_t value : pixels)
+    for (uint64_t index = 0; pixels && index < size; ++index)
     {
+        const uint8_t value = pixels[index];
         hash ^= value;
         hash *= 1099511628211ull;
     }
@@ -284,6 +259,33 @@ private:
     bool m_unsafeCallback = false;
 };
 
+/// Point a provider at an externally owned ImGui texture reference without
+/// releasing its byte-image GPU storage.
+///
+/// ImageProvider::setImageData() calls _releaseImage(), but an ImGui draw list
+/// assembled earlier in the same UI frame can still contain one of this
+/// provider's Vulkan descriptor sets. The retained GPU state is reused by the
+/// next synchronous byte upload and is released normally with the provider.
+/// ByteImageProvider is shared with Kit, so the standalone backend reaches the
+/// protected fields through this derived type instead of adding a method there.
+struct PresentationKeyAccess : ByteImageProvider
+{
+    static void install(ByteImageProvider& provider, void* imGuiReference, UInt2 size, PixelFormat format)
+    {
+        if (provider.*(&PresentationKeyAccess::m_isShutdown))
+            return;
+        provider.*(&PresentationKeyAccess::m_imGuiReference) = imGuiReference;
+        provider.*(&PresentationKeyAccess::m_imageSize) = size;
+        provider.*(&PresentationKeyAccess::m_imageFormat) = format;
+        provider.*(&PresentationKeyAccess::m_imageMipCount) = 1;
+    }
+};
+
+void installPresentationKey(ByteImageProvider& provider, void* imGuiReference, UInt2 size, PixelFormat format)
+{
+    PresentationKeyAccess::install(provider, imGuiReference, size, format);
+}
+
 bool patchViewportImage(ImDrawData* drawData, void* presentationKey, void* descriptor)
 {
     if (!drawData || !presentationKey || !descriptor)
@@ -314,24 +316,26 @@ struct CameraPublication
     uint32_t width = 0;
     uint32_t height = 0;
     std::array<double, 16> world{};
-    std::array<double, 3> velocity{};
-    double timestamp = 0.0;
-    double maximumPredictionDistance = 0.0;
     uint64_t serial = 0;
 };
 
-/// One extracted LdrColor image, either GPU-resident or copied to host.
-///
-/// A GPU-resident entry keeps its ovrtx mapping live so the device pointer
-/// stays valid until the Vulkan upload has consumed it. The upload path
-/// queues its device-to-device copy and CUDA-to-Vulkan semaphore signal on
-/// the legacy default stream. releaseMappings() supplies that stream to
-/// ovrtx unmap, so the source allocation stays live without a CPU hard wait.
-/// Every mapping is released exactly once through releaseMappings(), on
-/// success, per-image failure, revocation, resize and shutdown alike.
-/// ovrtx stream ids: 0 = no synchronisation, 1 = the legacy default
-/// CUDA stream. The GPU upload consumes on the default stream.
-constexpr uintptr_t kCudaDefaultStream = 1;
+/// A GPU-resident image keeps the renderer mapping behind it live so the device
+/// pointer stays valid until the Vulkan upload has consumed it. The upload path
+/// queues its device-to-device copy and its CUDA-to-Vulkan semaphore signal on
+/// the legacy default stream. publishGroup() hands that stream to the render
+/// worker, which releases the mapping on it, so the renderer holds its
+/// allocation without a CPU hard wait.
+/// Stream ids: 0 = no synchronisation, 1 = the legacy default CUDA stream.
+constexpr uint64_t kCudaDefaultStream = 1;
+
+/// A number for the calling thread, unique for the life of the process on
+/// every platform. A system thread id can be given again to a later thread.
+uint64_t currentThreadIdentity()
+{
+    static std::atomic<uint64_t> s_lastIdentity{ 0 };
+    thread_local const uint64_t identity = ++s_lastIdentity;
+    return identity;
+}
 
 /// Outcome of publishing one completed renderer result.
 enum class PublishResult
@@ -339,16 +343,6 @@ enum class PublishResult
     ePublished,        ///< the group reached the slot ring
     eSkippedRetryable, ///< this frame was dropped; the session stays alive
     eFailed,           ///< unrecoverable; the session must stop
-};
-
-struct MappedImage
-{
-    std::vector<uint8_t> pixels;                    // host copy (fallback)
-    const void* devicePtr = nullptr;                // CUDA device pointer
-    size_t deviceRowStride = 0;
-    uint64_t mapHandle = 0;   // ovrtx_map_handle_t is uint64_t
-    bool mapped = false;                            // mapping still live
-    bool gpuResident = false;
 };
 
 struct Slot
@@ -374,254 +368,6 @@ struct FrameGroup
     std::array<double, 16> cameraWorld{};
 };
 
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-
-template <typename T>
-T loadSymbol(void* library, const char* name)
-{
-#  if defined(_WIN32)
-    return reinterpret_cast<T>(GetProcAddress(static_cast<HMODULE>(library), name));
-#  else
-    return reinterpret_cast<T>(dlsym(library, name));
-#  endif
-}
-
-class OvrtxApi
-{
-public:
-    enum SettingType : uint32_t
-    {
-        eSettingMissing = 0,
-        eSettingBool = 1,
-        eSettingInt = 2,
-    };
-
-    struct ReadSettingsV1
-    {
-        uint32_t abiVersion;
-        uint32_t structSize;
-        ovrtx_result_t (*getType)(ovx_string_t, SettingType*);
-        ovrtx_result_t (*getBool)(ovx_string_t, bool*);
-        ovrtx_result_t (*getInt)(ovx_string_t, int64_t*);
-        ovrtx_result_t (*getFloat)(ovx_string_t, double*);
-        ovrtx_result_t (*getString)(ovx_string_t, char*, size_t, size_t*);
-    };
-
-    using GetVersion = void (*)(uint32_t*, uint32_t*, uint32_t*);
-    using QueryExtension = ovrtx_result_t (*)(const char*, const void**);
-    using WriteAttribute = ovrtx_enqueue_result_t (*)(ovrtx_renderer_t*, const ovrtx_binding_desc_or_handle_t*,
-                                                       const ovrtx_input_buffer_t*, ovrtx_data_access_t);
-    using Step = ovrtx_enqueue_result_t (*)(ovrtx_renderer_t*, ovrtx_render_product_set_t, double,
-                                             ovrtx_step_result_handle_t*);
-    using WaitOp = ovrtx_result_t (*)(ovrtx_renderer_t*, ovrtx_op_id_t, ovrtx_timeout_t,
-                                       ovrtx_op_wait_result_t*);
-    using Fetch = ovrtx_result_t (*)(ovrtx_renderer_t*, ovrtx_step_result_handle_t, ovrtx_timeout_t,
-                                      ovrtx_render_product_set_outputs_t*);
-    using Map = ovrtx_result_t (*)(ovrtx_renderer_t*, ovrtx_render_var_output_handle_t,
-                                    const ovrtx_map_output_description_t*, ovrtx_timeout_t,
-                                    ovrtx_render_var_output_t*);
-    using Unmap = ovrtx_result_t (*)(ovrtx_renderer_t*, ovrtx_render_var_output_map_handle_t, ovrtx_cuda_sync_t);
-    using Destroy = ovrtx_result_t (*)(ovrtx_renderer_t*, ovrtx_step_result_handle_t);
-    using GetLastError = ovx_string_t (*)();
-
-    ~OvrtxApi() { close(); }
-
-    bool open(const char* path, std::string& error)
-    {
-        if (!path || !path[0])
-        {
-            error = "ovrtx library path is empty";
-            return false;
-        }
-#  if defined(_WIN32)
-        m_library = static_cast<void*>(LoadLibraryA(path));
-#  else
-        m_library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-#  endif
-        if (!m_library)
-        {
-            error = "could not open the ovrtx library";
-            return false;
-        }
-        getVersion = loadSymbol<GetVersion>(m_library, "ovrtx_get_version");
-        queryExtension = loadSymbol<QueryExtension>(m_library, "ovrtx_query_extension");
-        writeAttribute = loadSymbol<WriteAttribute>(m_library, "ovrtx_write_attribute");
-        step = loadSymbol<Step>(m_library, "ovrtx_step");
-        waitOp = loadSymbol<WaitOp>(m_library, "ovrtx_wait_op");
-        fetch = loadSymbol<Fetch>(m_library, "ovrtx_fetch_results");
-        map = loadSymbol<Map>(m_library, "ovrtx_map_render_var_output");
-        unmap = loadSymbol<Unmap>(m_library, "ovrtx_unmap_render_var_output");
-        destroy = loadSymbol<Destroy>(m_library, "ovrtx_destroy_results");
-        getLastError = loadSymbol<GetLastError>(m_library, "ovrtx_get_last_error");
-        if (!writeAttribute || !step || !fetch || !map || !unmap || !destroy)
-        {
-            error = "ovrtx library is missing a required native-pacing C ABI symbol";
-            close();
-            return false;
-        }
-        if (getVersion)
-            getVersion(&major, &minor, &patch);
-        if (queryExtension)
-        {
-            const void* applyTable = nullptr;
-            const ovrtx_result_t applyResult =
-                queryExtension("ovrtx.settings.apply_settings", &applyTable);
-            applySettingsAvailable =
-                applyResult.status == OVRTX_API_SUCCESS && applyTable != nullptr;
-
-            const void* readTable = nullptr;
-            const ovrtx_result_t readResult =
-                queryExtension("ovrtx.settings.read_settings.v1", &readTable);
-            if (readResult.status == OVRTX_API_SUCCESS && readTable)
-            {
-                const auto* candidate = static_cast<const ReadSettingsV1*>(readTable);
-                if (candidate->abiVersion == 1u &&
-                    candidate->structSize >= sizeof(ReadSettingsV1) &&
-                    candidate->getType && candidate->getBool && candidate->getInt)
-                    readSettings = candidate;
-            }
-        }
-        return true;
-    }
-
-    bool readBool(const char* path, bool& value, bool& present) const
-    {
-        present = false;
-        if (!readSettings || !path)
-            return false;
-        const ovx_string_t key{path, std::strlen(path)};
-        SettingType type = eSettingMissing;
-        if (readSettings->getType(key, &type).status != OVRTX_API_SUCCESS)
-            return false;
-        if (type == eSettingMissing)
-            return true;
-        if (type != eSettingBool)
-            return false;
-        if (readSettings->getBool(key, &value).status != OVRTX_API_SUCCESS)
-            return false;
-        present = true;
-        return true;
-    }
-
-    bool readInt(const char* path, int64_t& value, bool& present) const
-    {
-        present = false;
-        if (!readSettings || !path)
-            return false;
-        const ovx_string_t key{path, std::strlen(path)};
-        SettingType type = eSettingMissing;
-        if (readSettings->getType(key, &type).status != OVRTX_API_SUCCESS)
-            return false;
-        if (type == eSettingMissing)
-            return true;
-        if (type != eSettingInt)
-            return false;
-        if (readSettings->getInt(key, &value).status != OVRTX_API_SUCCESS)
-            return false;
-        present = true;
-        return true;
-    }
-
-    bool readSettingsAvailable() const { return readSettings != nullptr; }
-
-    std::string lastError() const
-    {
-        if (!getLastError)
-            return {};
-        const ovx_string_t value = getLastError();
-        return value.ptr ? std::string(value.ptr, value.length) : std::string{};
-    }
-
-    void close()
-    {
-        getVersion = nullptr;
-        queryExtension = nullptr;
-        writeAttribute = nullptr;
-        step = nullptr;
-        waitOp = nullptr;
-        fetch = nullptr;
-        map = nullptr;
-        unmap = nullptr;
-        destroy = nullptr;
-        getLastError = nullptr;
-        readSettings = nullptr;
-        applySettingsAvailable = false;
-        if (m_library)
-        {
-#  if defined(_WIN32)
-            FreeLibrary(static_cast<HMODULE>(m_library));
-#  else
-            dlclose(m_library);
-#  endif
-            m_library = nullptr;
-        }
-    }
-
-    GetVersion getVersion = nullptr;
-    QueryExtension queryExtension = nullptr;
-    WriteAttribute writeAttribute = nullptr;
-    Step step = nullptr;
-    WaitOp waitOp = nullptr;
-    Fetch fetch = nullptr;
-    Map map = nullptr;
-    Unmap unmap = nullptr;
-    Destroy destroy = nullptr;
-    GetLastError getLastError = nullptr;
-    const ReadSettingsV1* readSettings = nullptr;
-    bool applySettingsAvailable = false;
-    uint32_t major = 0;
-    uint32_t minor = 0;
-    uint32_t patch = 0;
-
-private:
-    void* m_library = nullptr;
-};
-
-bool stringEquals(ovx_string_t value, const char* expected)
-{
-    const size_t length = std::strlen(expected);
-    return value.ptr && value.length == length && std::memcmp(value.ptr, expected, length) == 0;
-}
-
-static_assert(sizeof(ovx_string_t) == 16, "unsupported ovx_string_t ABI");
-
-bool renderVarLayoutUsable(uint32_t stride, uint32_t nameOffset, uint32_t handleOffset)
-{
-    constexpr uint32_t kMaxRenderVarStride = 4096;
-    return stride >= sizeof(ovx_string_t) && stride <= kMaxRenderVarStride &&
-           nameOffset <= stride - sizeof(ovx_string_t) &&
-           handleOffset <= stride - sizeof(ovrtx_render_var_output_handle_t);
-}
-
-bool findRenderVarOutput(const ovrtx_render_product_frame_output_t& frame,
-                         uint32_t stride,
-                         uint32_t nameOffset,
-                         uint32_t handleOffset,
-                         const char* sourceName,
-                         ovrtx_render_var_output_handle_t& outputHandle)
-{
-    constexpr size_t kMaxRenderVarsPerFrame = 4096;
-    if (!frame.output_render_vars || !renderVarLayoutUsable(stride, nameOffset, handleOffset) ||
-        frame.render_var_count > kMaxRenderVarsPerFrame)
-        return false;
-    const auto* entries = reinterpret_cast<const unsigned char*>(frame.output_render_vars);
-    for (size_t index = 0; index < frame.render_var_count; ++index)
-    {
-        const unsigned char* entry = entries + index * stride;
-        ovx_string_t name{};
-        ovrtx_render_var_output_handle_t handle = OVRTX_INVALID_HANDLE;
-        std::memcpy(&name, entry + nameOffset, sizeof(name));
-        std::memcpy(&handle, entry + handleOffset, sizeof(handle));
-        if (stringEquals(name, sourceName))
-        {
-            outputHandle = handle;
-            return true;
-        }
-    }
-    return false;
-}
-
-#endif
 
 class NativeFramePacingService
 {
@@ -651,8 +397,7 @@ public:
                 // The stable identity is itself a valid black descriptor, so
                 // both active replay and the rate-zero handoff can expose the
                 // same key without borrowing a producer slot into UI geometry.
-                m_provider->setImageData(
-                    m_presentationKey, {m_providerWidth, m_providerHeight}, PixelFormat::eRGBA8_UNORM);
+                installPresentationKey(*m_provider, m_presentationKey, {m_providerWidth, m_providerHeight}, PixelFormat::eRGBA8_UNORM);
             }
         }
         m_cv.notify_all();
@@ -676,18 +421,60 @@ public:
                    uint32_t width,
                    uint32_t height)
     {
-#if !defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-        (void)renderer; (void)libraryPath; (void)renderVarStride; (void)renderVarNameOffset;
-        (void)renderVarHandleOffset; (void)provider; (void)renderProductPath;
-        (void)cameraPath; (void)width; (void)height;
-        fail("native frame pacing was built without the required OVRTX interfaces");
-        return 0;
-#else
-        if (!renderer || !provider || !renderProductPath || !renderProductPath[0] || !cameraPath || !cameraPath[0] ||
-            !width || !height || static_cast<uint64_t>(width) * height > kMaxFramePixels ||
-            !renderVarLayoutUsable(renderVarStride, renderVarNameOffset, renderVarHandleOffset))
+        const NativeFramePacingHooks* hooks = getNativeFramePacingHooks();
+        if (!hooks)
         {
-            fail("native frame pacing start received an invalid borrow, path, or RenderVar layout");
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const std::string message =
+                "native frame pacing has no renderer hooks installed";
+            ++m_stats.errors;
+            m_stats.lastError = message;
+            m_stats.statusReason = "hooks_unavailable";
+            // Callers retry start every frame; report the absence one time.
+            if (!m_missingHooksReported)
+            {
+                m_missingHooksReported = true;
+                // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+                fprintf(stderr, "NativeFramePacing: %s\n", message.c_str());
+            }
+            return 0;
+        }
+        // Rules 24.8 to 24.10: check what the frame source can do before any
+        // thread starts. A frame source that cannot do all of it presents on
+        // the UI tick.
+        NativeFramePacingCapabilities capabilities{};
+        capabilities.structSize = sizeof(capabilities);
+        hooks->queryCapabilities(&capabilities);
+        if (!capabilities.operatesOffUiThread || !capabilities.usesOwnQueue || !capabilities.presentReadsImages)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            // Rule 24.15: name each check that failed.
+            std::string failed;
+            if (!capabilities.operatesOffUiThread)
+                failed += "; it cannot operate on a thread other than the UI thread (rule 24.8)";
+            if (!capabilities.usesOwnQueue)
+                failed += "; the rendering and presentation threads cannot each get their own queue (rule 24.9)";
+            if (!capabilities.presentReadsImages)
+                failed += "; the presentation thread cannot read its images and their completion signals (rule 24.10)";
+            const std::string message =
+                "the frame source does not meet the conditions for threaded frame pacing" + failed;
+            const bool repeated = m_stats.lastError == message;
+            m_stats.lastError = message;
+            m_stats.statusReason = "frame_source_capability";
+            if (!repeated)
+                // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+                fprintf(stderr, "NativeFramePacing: %s\n", message.c_str());
+            return 0;
+        }
+        if (!ensureWorkerThreads())
+        {
+            fail("failed to start persistent native frame-pacing workers");
+            return 0;
+        }
+        if (!renderer || !provider || !renderProductPath || !renderProductPath[0] || !cameraPath || !cameraPath[0] ||
+            !width || !height || static_cast<uint64_t>(width) * height > kMaxFramePixels)
+        {
+            fail("native frame pacing start received an invalid borrow or path");
             return 0;
         }
         std::unique_lock<std::mutex> lock(m_mutex);
@@ -710,38 +497,41 @@ public:
             failLocked("failed to create the persistent Vulkan presentation key");
             return 0;
         }
-        std::string openError;
-        if (!m_api.open(libraryPath, openError))
+        // The hooks borrow the renderer under the token this session will use.
+        const uint64_t token = m_nextToken + 1;
+        NativeFramePacingOpenDesc openDesc{};
+        openDesc.structSize = sizeof(openDesc);
+        openDesc.renderer = renderer;
+        openDesc.libraryPath = libraryPath;
+        openDesc.renderVarStride = renderVarStride;
+        openDesc.renderVarNameOffset = renderVarNameOffset;
+        openDesc.renderVarHandleOffset = renderVarHandleOffset;
+        openDesc.renderProductPath = renderProductPath;
+        openDesc.cameraPath = cameraPath;
+        openDesc.host = &m_host;
+        const uint32_t openStatus = hooks->openRenderer(token, &openDesc);
+        if (openStatus != eNativeFramePacingOk)
         {
-            failLocked(openError);
+            const std::string message = hookError(
+                hooks, "the renderer hooks could not borrow the renderer");
+            if (openStatus == eNativeFramePacingIncompatible)
+            {
+                // Callers retry start every frame; report a persistent mismatch once.
+                const bool repeated = m_stats.lastError == message;
+                ++m_stats.errors;
+                m_stats.lastError = message;
+                m_stats.statusReason = "runtime_incompatible";
+                if (!repeated)
+                    // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+                    fprintf(stderr, "NativeFramePacing: %s\n", message.c_str());
+            }
+            else
+            {
+                failLocked(message);
+            }
             return 0;
         }
-        // Results are read with the struct layouts of the ovrtx headers this
-        // file was built against, and those layouts change between ovrtx
-        // minor releases. Only drive a runtime whose major.minor matches them.
-        if (!m_api.getVersion || m_api.major != OVRTX_VERSION_MAJOR || m_api.minor != OVRTX_VERSION_MINOR)
-        {
-            const std::string runtimeVersion = m_api.getVersion
-                ? std::to_string(m_api.major) + "." + std::to_string(m_api.minor) + "." + std::to_string(m_api.patch)
-                : std::string("of unknown version");
-            const std::string message = "ovrtx runtime " + runtimeVersion +
-                " does not match the ovrtx " + std::to_string(OVRTX_VERSION_MAJOR) + "." +
-                std::to_string(OVRTX_VERSION_MINOR) + " interfaces native frame pacing was built against";
-            m_api.close();
-            // Callers retry start every frame; report a persistent mismatch once.
-            const bool repeated = m_stats.lastError == message;
-            ++m_stats.errors;
-            m_stats.lastError = message;
-            m_stats.statusReason = "runtime_incompatible";
-            if (!repeated)
-                // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
-                fprintf(stderr, "NativeFramePacing: %s\n", message.c_str());
-            return 0;
-        }
-        m_renderer = reinterpret_cast<ovrtx_renderer_t*>(renderer);
-        m_renderVarStride = renderVarStride;
-        m_renderVarNameOffset = renderVarNameOffset;
-        m_renderVarHandleOffset = renderVarHandleOffset;
+        m_hooks = hooks;
         m_gpu = gpu;
         m_backend = backend;
         m_provider = std::move(provider);
@@ -751,17 +541,15 @@ public:
         // commands already emitted in that walk still bind a live descriptor.
         m_presentationKey = m_stablePresentationDescriptor;
         m_providerKeyInstalled = false;
-        m_renderProductPath = renderProductPath;
-        m_cameraPath = cameraPath;
-        m_initialWidth = width;
-        m_initialHeight = height;
         m_ownershipWidth = width;
         m_ownershipHeight = height;
         m_stopRequested = false;
         m_renderPauseRequested = false;
         m_renderPaused = false;
+        m_sessionReady = false;
         m_active = true;
         m_renderExited = false;
+        m_presentExited = false;
         m_renderFatal = false;
         m_lastSelected = invalidSlot();
         m_lastReal = invalidSlot();
@@ -784,35 +572,27 @@ public:
         m_stats.metricsEpoch = ++m_nextMetricsEpoch;
         m_stats.supported = true;
         m_stats.active = true;
-        m_stats.ovrtxVersionMajor = m_api.major;
-        m_stats.ovrtxVersionMinor = m_api.minor;
-        m_stats.ovrtxVersionPatch = m_api.patch;
         m_stats.ownershipGeneration = 1;
         m_stats.statusReason = "active";
-        refreshDlssRuntimeStateLocked();
+        refreshRendererInfoLocked();
 
         std::vector<uint8_t> initialPixels;
         try
         {
             m_slots.resize(kSlotCount);
-            m_retainedMapHandles.reserve(1);
-            // The steady-state pipeline transiently owns two accepted results.
-            // Both can require deferred cleanup if teardown follows a release
-            // failure, so reserve the full bounded failure set up front.
-            m_retainedResultHandles.reserve(2);
             initialPixels.assign(static_cast<size_t>(width) * height * 4, 0);
         }
         catch (...)
         {
             failLocked("failed to allocate bounded initial frame-slot storage");
-            m_active = false;
-            m_stats.active = false;
-            m_slots.clear();
-            m_provider.reset();
-            m_gpu = nullptr;
-            m_backend = nullptr;
-            m_renderer = nullptr;
-            m_api.close();
+            lock.unlock();
+            // stop() also ends the session the hooks' render worker was given.
+            while (!stop(token))
+            {
+                // The renderer borrow cannot return to Python while the hooks
+                // still hold a result or a map. There is no cancellation call.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             return 0;
         }
         const uint8_t* initialData = initialPixels.data();
@@ -853,7 +633,8 @@ public:
         // pixel during a rate change or re-entrant stop.
         // The previous synchronous provider image may still be referenced by
         // the UI submission from the preceding tick. Drain that submission
-        // before setImageData releases the old provider-owned texture.
+        // before switching the visible provider reference to the stable key;
+        // the provider-owned descriptor storage itself remains allocated.
         {
             std::lock_guard<std::mutex> queueLock(m_backend->getQueueMutex());
             if (vkDeviceWaitIdle(m_backend->getDevice()) != VK_SUCCESS)
@@ -864,25 +645,15 @@ public:
                 return 0;
             }
         }
-        m_provider->setImageData(m_presentationKey, {width, height}, PixelFormat::eRGBA8_UNORM);
+        installPresentationKey(*m_provider, m_presentationKey, {width, height}, PixelFormat::eRGBA8_UNORM);
         m_providerKeyInstalled = true;
         m_providerWidth = width;
         m_providerHeight = height;
-        const uint64_t token = m_token;
-        try
-        {
-            m_renderThread = std::thread([this, token]() { renderLoop(token); });
-            m_presentThread = std::thread([this, token]() { presentLoop(token); });
-        }
-        catch (...)
-        {
-            failLocked("failed to start native frame-pacing threads");
-            lock.unlock();
-            stop(token);
-            return 0;
-        }
-        return token;
-#endif
+        m_sessionReady = true;
+        m_renderOnChange = false;
+        m_renderKick = true;
+        m_cv.notify_all();
+        return m_token;
     }
 
     bool publish(uint64_t token,
@@ -905,31 +676,14 @@ public:
             return false;
         m_camera.width = width;
         m_camera.height = height;
-        double maximumPredictionDistance = 0.0;
-        if (m_camera.serial != 0)
-        {
-            const long double dx = static_cast<long double>(world[12]) - m_camera.world[12];
-            const long double dy = static_cast<long double>(world[13]) - m_camera.world[13];
-            const long double dz = static_cast<long double>(world[14]) - m_camera.world[14];
-            const long double displacement = std::sqrt(dx * dx + dy * dy + dz * dz);
-            if (std::isfinite(displacement))
-            {
-                const double candidate = static_cast<double>(displacement);
-                if (std::isfinite(candidate))
-                    maximumPredictionDistance = candidate;
-            }
-        }
         m_camera.world = world;
-        m_camera.velocity = velocity;
-        m_camera.timestamp = timestamp;
-        m_camera.maximumPredictionDistance = maximumPredictionDistance;
         ++m_camera.serial;
         ++m_stats.cameraPublications;
         // Safe because publish is called on the UI thread and the provider's
         // texture reference remains the same stable key.
         if (width != m_providerWidth || height != m_providerHeight)
         {
-            m_provider->setImageData(m_presentationKey, {width, height}, PixelFormat::eRGBA8_UNORM);
+            installPresentationKey(*m_provider, m_presentationKey, {width, height}, PixelFormat::eRGBA8_UNORM);
             m_providerWidth = width;
             m_providerHeight = height;
         }
@@ -939,32 +693,41 @@ public:
 
     bool pauseRender(uint64_t token)
     {
-        std::thread renderThread;
+        bool paused = false;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait(lock, [this]() { return !m_stopCallActive; });
             if (!m_active || token != m_token || m_stopRequested)
+            {
                 return false;
+            }
             if (m_renderPaused)
+            {
                 return true;
+            }
             m_stopCallActive = true;
             m_renderPauseRequested = true;
-            renderThread = std::move(m_renderThread);
+            m_cv.notify_all();
         }
-        m_cv.notify_all();
-        if (renderThread.joinable())
-            renderThread.join();
+        cancelHook(token);
 
-        const bool released = releaseRetainedOvrtxHandles();
-        std::lock_guard<std::mutex> lock(m_mutex);
-        const bool paused = released && m_active && token == m_token &&
+        // The render worker belongs to the hooks. They wait until it has
+        // parked or left the session, then release every retained renderer
+        // handle. The worker reports the park through renderLoopEnded().
+        const bool released = pauseRenderWorkerHook(token);
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this, token]() {
+            return !m_active || token != m_token || m_stopRequested ||
+                m_renderPaused || m_renderExited;
+        });
+        paused = released && m_active && token == m_token &&
             m_renderPaused && !m_stopRequested;
         if (paused)
         {
             // A render pause is the ownership boundary used before a Stage,
             // camera, RenderProduct, or extent mutation.  No queued image or
             // renderer-time anchor from the old state may be interpreted as
-            // part of the resumed state.  ovrtx is allowed to restart its
+            // part of the resumed state.  The renderer may restart its
             // frame-time origin after such a mutation (and does so for the
             // selection/picking path), so preserve the last displayed image
             // but retire every unpublished old-state image and begin a new
@@ -983,49 +746,87 @@ public:
             m_hasLastSuccessfulPresentTime = false;
         }
         if (!released)
+        {
             m_stats.statusReason = "cleanup_retry_required";
+        }
         m_stopCallActive = false;
         m_cv.notify_all();
         return paused;
     }
 
-    bool resumeRender(uint64_t token)
+    bool resumeRender(uint64_t token, bool render)
     {
         std::unique_lock<std::mutex> lock(m_mutex);
         m_cv.wait(lock, [this]() { return !m_stopCallActive; });
         if (!m_active || token != m_token || m_stopRequested)
+        {
             return false;
+        }
         if (!m_renderPaused)
-            return !m_renderPauseRequested && m_renderThread.joinable();
+        {
+            return !m_renderPauseRequested && !m_renderExited;
+        }
         m_stopCallActive = true;
         m_renderPauseRequested = false;
-        m_renderPaused = false;
-        m_renderExited = false;
-        m_renderFatal = false;
-        try
+        m_cv.notify_all();
+        lock.unlock();
+        // Wake the parked worker of the hooks. It reports the resume through
+        // renderResumed(), which clears m_renderPaused.
+        const bool woken = m_hooks && m_hooks->resumeRenderWorker(token);
+        lock.lock();
+        if (!woken)
         {
-            m_renderThread = std::thread([this, token]() { renderLoop(token); });
-        }
-        catch (...)
-        {
-            m_renderPauseRequested = true;
-            m_renderPaused = true;
-            m_renderExited = true;
-            m_renderFatal = true;
-            failLocked("failed to resume the native frame-pacing render worker");
+            // The worker has left the session; the caller stops it.
+            if (m_active && token == m_token)
+            {
+                m_renderPaused = false;
+                m_renderExited = true;
+                m_stats.renderLoopExited = true;
+            }
             m_stopCallActive = false;
             m_cv.notify_all();
             return false;
         }
+        m_cv.wait(lock, [this, token]() {
+            return !m_active || token != m_token || m_stopRequested ||
+                !m_renderPaused || m_renderExited;
+        });
+        const bool resumed = m_active && token == m_token &&
+            !m_stopRequested && !m_renderPauseRequested && !m_renderPaused &&
+            !m_renderExited;
+        // What changed during the pause is rendered, unless the caller says
+        // that its change does not change the picture.
+        if (render)
+            m_renderKick = true;
         m_stopCallActive = false;
+        m_cv.notify_all();
+        return resumed;
+    }
+
+    bool setRenderPolicy(uint64_t token, bool onChange, uint32_t settleFrames)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_active || token != m_token || m_stopRequested)
+            return false;
+        m_renderOnChange = onChange;
+        m_renderSettleFrames = settleFrames;
+        m_renderKick = true;
+        m_cv.notify_all();
+        return true;
+    }
+
+    bool requestRender(uint64_t token)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_active || token != m_token || m_stopRequested)
+            return false;
+        m_renderKick = true;
         m_cv.notify_all();
         return true;
     }
 
     bool stop(uint64_t token)
     {
-        std::thread renderThread;
-        std::thread presentThread;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait(lock, [this]() { return !m_stopCallActive; });
@@ -1039,26 +840,38 @@ public:
                 return false;
             m_stopCallActive = true;
             m_stopRequested = true;
-            renderThread = std::move(m_renderThread);
-            presentThread = std::move(m_presentThread);
+            m_cv.notify_all();
         }
-        m_cv.notify_all();
-        if (renderThread.joinable()) renderThread.join();
-        if (presentThread.joinable()) presentThread.join();
+        cancelHook(token);
 
-        if (!releaseRetainedOvrtxHandles())
+        // The hooks wake their render worker if it is parked, wait until it
+        // has left the session, then drain the renderer results and maps.
+        // Work the renderer already queued cannot be cancelled, so a failed
+        // release is retried by a later stop(token).
+        const bool closed = closeRendererHook(token);
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (m_sessionReady)
+            {
+                m_cv.wait(lock, [this, token]() {
+                    return !m_active || token != m_token || m_presentExited;
+                });
+            }
+        }
+        if (!closed)
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_stats.active = true;
             m_stats.statusReason = "cleanup_retry_required";
-            // Keep the borrowed renderer, API, slots, provider, and token pinned.
-            // A later stop(token) call retries only the failed releases.
+            // Keep the borrowed renderer, hooks, slots, provider, and token
+            // pinned. A later stop(token) call retries only the failed releases.
             m_stopCallActive = false;
             m_cv.notify_all();
             return false;
         }
 
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this]() { return !m_uiSubmitting; });
         discardGroupLocked(m_currentGroup);
         discardGroupLocked(m_pendingGroup);
         if (m_lastSelected != invalidSlot())
@@ -1071,8 +884,9 @@ public:
             releaseSlotReferenceLocked(m_lastReal);
             m_lastReal = invalidSlot();
         }
-        // Drain every UI/presenter sample before provider mutation can release
-        // its prior image and before slot descriptors are destroyed.
+        // Drain every UI/presenter sample before the native slot resources are
+        // destroyed. The provider mutation below preserves its byte-image
+        // descriptor storage for any ImGui draw list already assembled on CPU.
         if (m_backend && m_backend->getDevice() != VK_NULL_HANDLE)
         {
             std::lock_guard<std::mutex> queueLock(m_backend->getQueueMutex());
@@ -1085,8 +899,7 @@ public:
         // descriptor until platform shutdown. The next synchronous image
         // upload replaces it through the provider's ordinary state.
         if (m_provider && m_providerKeyInstalled)
-            m_provider->setImageData(
-                m_stablePresentationDescriptor,
+            installPresentationKey(*m_provider, m_stablePresentationDescriptor,
                 {m_providerWidth, m_providerHeight},
                 PixelFormat::eRGBA8_UNORM);
         m_providerKeyInstalled = false;
@@ -1095,7 +908,9 @@ public:
             for (Slot& slot : m_slots)
             {
                 if (slot.gpuState)
+                {
                     m_gpu->destroyState(slot.gpuState);
+                }
                 slot = {};
             }
         }
@@ -1104,12 +919,10 @@ public:
         m_presentationKey = nullptr;
         m_gpu = nullptr;
         m_backend = nullptr;
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-        m_renderer = nullptr;
-        m_api.close();
-#endif
+        m_hooks = nullptr;
         m_drawData.reset();
         m_camera = {};
+        m_sessionReady = false;
         m_active = false;
         m_stopRequested = false;
         m_renderPauseRequested = false;
@@ -1134,25 +947,41 @@ public:
         while (token && !stop(token))
         {
             // Platform teardown must not revoke the borrowed renderer or
-            // destroy descriptors while ovrtx still owns a result/map. There
-            // is no cancellation API, so retry the public release calls.
+            // destroy descriptors while the renderer still owns a result/map.
+            // Queued renderer work cannot be cancelled, so retry the release.
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::thread presentThread;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_workerShutdownRequested = true;
+            presentThread = std::move(m_presentThread);
+        }
+        m_cv.notify_all();
+        // The hooks join their render worker, ovui joins its present worker.
+        if (const NativeFramePacingHooks* hooks = getNativeFramePacingHooks())
+        {
+            hooks->shutdownWorker();
+        }
+        if (presentThread.joinable())
+        {
+            presentThread.join();
         }
         std::lock_guard<std::mutex> lock(m_mutex);
         releaseStablePresentationKeyLocked();
+        // The renderer borrow is back, both workers are joined and the stable
+        // key is gone. Only now may the slot be cleared; doing it earlier would
+        // strand renderer results and destroy live descriptors.
+        setNativeFramePacingHooks(nullptr);
     }
 
     NativeFramePacingStats stats()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
         if (m_active)
-            refreshDlssRuntimeStateLocked();
-#endif
+            refreshRendererInfoLocked();
         NativeFramePacingStats result = m_stats;
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-        result.supported = true;
-#endif
+        result.supported = getNativeFramePacingHooks() != nullptr;
         result.active = m_active;
         result.sessionToken = m_active ? m_token : 0;
         result.presentRate = m_presentRate;
@@ -1162,6 +991,7 @@ public:
         result.renderLoopExited = m_renderExited;
         result.renderLoopFatal = m_renderFatal;
         result.renderPaused = m_renderPaused;
+        result.renderIdle = m_active && m_workerWaiting && !m_pendingGroup && !renderDueLocked();
         if (m_platformBackend)
         {
             result.windowSurfaceActive = m_platformBackend->hasWindowSurface();
@@ -1180,15 +1010,14 @@ public:
                 default: result.activePresentMode = "unavailable"; break;
             }
         }
-#if !defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-        result.statusReason = "build_unavailable";
-#else
-        if (!m_active && result.lastError.empty())
+        if (!result.supported)
+            result.statusReason = "hooks_unavailable";
+        else if (!m_active && result.lastError.empty())
             result.statusReason = "inactive";
         else if (!m_active && !result.lastError.empty() && result.statusReason != "backend_unavailable" &&
-                 result.statusReason != "runtime_incompatible")
+                 result.statusReason != "runtime_incompatible" &&
+                 result.statusReason != "frame_source_capability")
             result.statusReason = "runtime_error";
-#endif
         if (result.dlssGeneratedFrameCapability.empty())
             result.dlssGeneratedFrameCapability =
                 "DLSS-G runtime capability has not been evaluated for a native pacing session";
@@ -1254,6 +1083,17 @@ public:
             m_cv.notify_all();
             return true;
         }
+        // The geometry gate is held from here to the end of this function, not
+        // for the whole UI tick: the presenter replays m_drawData against the
+        // base image, and both are replaced below.
+        m_uiGeometryUpdating = true;
+        m_cv.wait(lock, [this]() { return !m_active || !m_presenterComposing; });
+        if (!m_active || m_stopRequested || backend != m_backend)
+        {
+            m_uiGeometryUpdating = false;
+            m_cv.notify_all();
+            return false;
+        }
         ++m_uiGeneration;
         if (outGeneration) *outGeneration = m_uiGeneration;
         if (width != m_drawWidth || height != m_drawHeight)
@@ -1298,19 +1138,41 @@ public:
         // the only point that samples arbitrary external texture descriptors.
         // Before releasing the UI/presenter gate, snapshot those final pixels
         // into a persistent transfer-only native image.
+        //
+        // The GPU work runs without m_mutex, so the render and present threads
+        // never wait for the UI's queue lock or frame fence. What it reads stays
+        // valid: the gate keeps the presenter from composing, the sampled slot
+        // is pinned as a reader, and stop() waits for m_uiSubmitting.
+        const bool pinned = uiSlot < m_slots.size() && descriptor;
+        if (pinned)
+            ++m_slots[uiSlot].readers;
+        VulkanBackend* gpuBackend = m_backend;
+        m_uiSubmitting = true;
+        lock.unlock();
         bool uiComposed = false;
         bool baseCaptured = false;
         if (width > 0 && height > 0 && drawData)
         {
-            std::lock_guard<std::mutex> queueLock(m_backend->getQueueMutex());
-            if (m_backend->beginFrame(width, height))
+            std::lock_guard<std::mutex> queueLock(gpuBackend->getQueueMutex());
+            if (gpuBackend->beginFrame(width, height))
             {
                 ImGui_ImplVulkan_RenderDrawData(
-                    const_cast<ImDrawData*>(drawData), m_backend->getCommandBuffer());
-                uiComposed = m_backend->endFrame();
-                if (uiComposed && saved && saved->valid())
-                    baseCaptured = m_backend->snapshotNativeFramePacingBase(width, height);
+                    const_cast<ImDrawData*>(drawData), gpuBackend->getCommandBuffer());
+                if (saved && saved->valid())
+                    uiComposed = baseCaptured = gpuBackend->snapshotNativeFramePacingBase(width, height);
+                else
+                    uiComposed = gpuBackend->endFrame();
             }
+        }
+        lock.lock();
+        m_uiSubmitting = false;
+        if (pinned && uiSlot < m_slots.size() && m_slots[uiSlot].readers)
+            --m_slots[uiSlot].readers;
+        if (!m_active || m_stopRequested || backend != m_backend)
+        {
+            m_uiGeometryUpdating = false;
+            m_cv.notify_all();
+            return false;
         }
 
         if (!uiComposed)
@@ -1339,17 +1201,11 @@ public:
         return true;
     }
 
-    void beginUiUpdate(VulkanBackend* backend)
+    void beginUiUpdate(VulkanBackend* /*backend*/)
     {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (!m_active || m_stopRequested || backend != m_backend)
-            return;
-        m_uiGeometryUpdating = true;
-        // Wait only while a presenter is composing a replay. Slot readers stay
-        // held across the blocking display hand-off, which the UI never needs
-        // to observe: backend ordering is already established by the shared
-        // queue mutex and frame fence.
-        m_cv.wait(lock, [this]() { return !m_active || !m_presenterComposing; });
+        // The UI tick takes no gate and waits for no presenter here: the
+        // presenter may compose the newest renderer image while the UI polls
+        // input and builds its widgets. submitDrawData takes the gate.
     }
 
     bool waitPresentation(uint64_t generation, uint64_t timeoutNanoseconds)
@@ -1368,6 +1224,29 @@ public:
 
 private:
     static size_t invalidSlot() { return std::numeric_limits<size_t>::max(); }
+
+    /// The present worker is ovui's and persists across sessions; it parks on
+    /// m_sessionReady between them. The render worker belongs to the hooks.
+    bool ensureWorkerThreads()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_presentThread.joinable())
+        {
+            return true;
+        }
+
+        m_workerShutdownRequested = false;
+        try
+        {
+            m_presentThread = std::thread([this]() { presentWorkerLoop(); });
+        }
+        catch (...)
+        {
+            m_workerShutdownRequested = true;
+            return false;
+        }
+        return true;
+    }
 
     bool hasPendingUiRepeatLocked() const
     {
@@ -1418,7 +1297,9 @@ private:
             vkDeviceWaitIdle(m_stablePresentationBackend->getDevice());
         }
         if (m_stablePresentationGpu)
+        {
             m_stablePresentationGpu->destroyState(m_stablePresentationGpuState);
+        }
         m_stablePresentationGpu = nullptr;
         m_stablePresentationBackend = nullptr;
         m_stablePresentationGpuState = nullptr;
@@ -1453,60 +1334,52 @@ private:
             m_renderPauseRequested;
     }
 
-    bool releaseRetainedOvrtxHandles()
+    /// The last message of the renderer hooks, or `fallback` when they have none.
+    static std::string hookError(const NativeFramePacingHooks* hooks, const char* fallback)
     {
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-        bool allReleased = true;
-        for (auto it = m_retainedMapHandles.begin(); it != m_retainedMapHandles.end();)
+        if (hooks && hooks->lastError)
         {
-            const ovrtx_cuda_sync_t noSync{0, 0};
-            const ovrtx_result_t result = m_api.unmap(m_renderer, *it, noSync);
-            if (result.status == OVRTX_API_SUCCESS)
+            const size_t length = hooks->lastError(nullptr, 0);
+            if (length)
             {
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    if (m_stats.liveMappings) --m_stats.liveMappings;
-                }
-                it = m_retainedMapHandles.erase(it);
-            }
-            else
-            {
-                allReleased = false;
-                ++it;
+                std::string message(length, '\0');
+                const size_t written = hooks->lastError(message.data(), message.size() + 1);
+                message.resize(std::min(written, length));
+                if (!message.empty())
+                    return message;
             }
         }
-        if (m_retainedMapHandles.empty())
-        {
-            for (auto it = m_retainedResultHandles.begin(); it != m_retainedResultHandles.end();)
-            {
-                const ovrtx_result_t result = m_api.destroy(m_renderer, *it);
-                if (result.status == OVRTX_API_SUCCESS)
-                {
-                    {
-                        std::lock_guard<std::mutex> lock(m_mutex);
-                        if (m_stats.liveStepResults) --m_stats.liveStepResults;
-                    }
-                    it = m_retainedResultHandles.erase(it);
-                }
-                else
-                {
-                    allReleased = false;
-                    ++it;
-                }
-            }
-        }
-        else
-        {
-            // A fetched result owns the mapped output. Do not even attempt to
-            // release its container until every failed map has been unmap-retried.
-            allReleased = false;
-        }
-        if (!allReleased)
-            fail(m_api.lastError().empty() ? "ovrtx cleanup release must be retried" : m_api.lastError());
-        return allReleased;
-#else
-        return true;
-#endif
+        return fallback;
+    }
+
+    /// ovui's render worker has parked. Let the hooks give every retained
+    /// renderer handle back, so Python owns the renderer alone.
+    /// Cancel the outstanding request of the hooks. Safe from each thread.
+    void cancelHook(uint64_t token) const
+    {
+        sendNativeFramePacingCancel(token);
+    }
+
+    bool pauseRenderWorkerHook(uint64_t token)
+    {
+        if (!m_hooks)
+            return true;
+        if (m_hooks->pauseRenderWorker(token))
+            return true;
+        fail(hookError(m_hooks, "renderer cleanup release must be retried"));
+        return false;
+    }
+
+    /// End the session in the hooks. They keep their worker state for the next
+    /// session, which is what keeps the per-resize retention down.
+    bool closeRendererHook(uint64_t token)
+    {
+        if (!m_hooks)
+            return true;
+        if (m_hooks->closeRenderer(token))
+            return true;
+        fail(hookError(m_hooks, "renderer cleanup release must be retried"));
+        return false;
     }
 
     size_t acquireSlot(uint64_t token)
@@ -1561,573 +1434,71 @@ private:
         releaseGroupLocked(group);
     }
 
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-    void refreshDlssRuntimeStateLocked()
+    /// Copy the renderer facts of the hooks into the published statistics.
+    /// Without hooks, or outside a session, the renderer-owned counters keep
+    /// their last values and the capability sentence says why.
+    void refreshRendererInfoLocked()
     {
-        bool supported = false;
-        bool supportedPresent = false;
-        bool x3x4 = false;
-        bool x3x4Present = false;
-        bool enabled = false;
-        bool enabledPresent = false;
-        int64_t requestedCount = 0;
-        bool requestedCountPresent = false;
-        int64_t activeCount = 0;
-        bool activeCountPresent = false;
-
-        const bool readable = m_api.readSettingsAvailable() &&
-            m_api.readBool(kDlssgSupportedSetting, supported, supportedPresent) &&
-            m_api.readBool(kDlssgX3X4SupportedSetting, x3x4, x3x4Present) &&
-            m_api.readBool(kDlssgEnabledSetting, enabled, enabledPresent) &&
-            m_api.readInt(kDlssgRequestedCountSetting, requestedCount,
-                          requestedCountPresent) &&
-            m_api.readInt(kDlssgActiveCountSetting, activeCount,
-                          activeCountPresent);
-        m_stats.dlssGeneratedFrameRuntimeSupported =
-            readable && supportedPresent && supported;
-        m_stats.dlssGeneratedFrameX3X4Supported =
-            readable && x3x4Present && x3x4;
+        if (!m_hooks || !m_active)
+        {
+            if (m_stats.dlssGeneratedFrameCapability.empty())
+                m_stats.dlssGeneratedFrameCapability =
+                    "no native frame pacing session has evaluated generated-frame capability";
+            return;
+        }
+        NativeFramePacingRendererInfo info{};
+        info.structSize = sizeof(info);
+        m_hooks->readRendererInfo(m_token, &info);
+        m_stats.rendererVersionMajor = info.versionMajor;
+        m_stats.rendererVersionMinor = info.versionMinor;
+        m_stats.rendererVersionPatch = info.versionPatch;
+        m_stats.liveStepResults = info.liveStepResults;
+        m_stats.liveMappings = info.liveMappings;
+        m_stats.fetchPolls = info.fetchPolls;
+        m_stats.fetchBoundedWaits = info.fetchBoundedWaits;
+        m_stats.dlssGeneratedFrameRuntimeSupported = info.generatedFrameRuntimeSupported != 0;
+        m_stats.dlssGeneratedFrameX3X4Supported = info.generatedFrameX3X4Supported != 0;
         m_stats.dlssGeneratedFrameGlobalEnableOpinionPresent =
-            readable && enabledPresent;
-        m_stats.dlssGeneratedFrameRequestedEnabled =
-            readable && enabledPresent && enabled;
-        const int64_t count = requestedCountPresent ? requestedCount :
-            (activeCountPresent ? activeCount : 0);
-        m_stats.dlssGeneratedFrameRequestedCount = static_cast<int32_t>(
-            std::max<int64_t>(std::numeric_limits<int32_t>::min(),
-                std::min<int64_t>(std::numeric_limits<int32_t>::max(), count)));
-        m_stats.dlssGeneratedFrameActivationSupported = readable &&
-            m_api.applySettingsAvailable && supportedPresent && supported;
+            info.generatedFrameGlobalEnableOpinionPresent != 0;
+        m_stats.dlssGeneratedFrameRequestedEnabled = info.generatedFrameRequestedEnabled != 0;
+        m_stats.dlssGeneratedFrameRequestedCount = info.generatedFrameRequestedCount;
+        m_stats.dlssGeneratedFrameActivationSupported = info.generatedFrameActivationSupported != 0;
         if (!m_stats.dlssGeneratedFrameRuntimeSupported)
         {
             m_stats.dlssGeneratedFrameEffectiveActive = false;
             m_stats.dlssGeneratedFrameEffectiveCount = 0;
         }
-
-        if (!m_api.readSettingsAvailable())
-            m_stats.dlssGeneratedFrameCapability =
-                "the current ovRTX runtime does not expose settings readback v1";
-        else if (!readable)
-            m_stats.dlssGeneratedFrameCapability =
-                "the current ovRTX runtime rejected a typed DLSS-G settings read";
-        else if (!m_api.applySettingsAvailable)
-            m_stats.dlssGeneratedFrameCapability =
-                "the current ovRTX runtime does not expose live settings publication";
-        else if (!supportedPresent || !supported)
-            m_stats.dlssGeneratedFrameCapability =
-                "the current GPU/driver/NGX/ovRTX runtime reports DLSS-G unsupported";
-        else
-            m_stats.dlssGeneratedFrameCapability =
-                std::string("supported; x3/x4=") + (x3x4 ? "true" : "false") +
-                "; global_enable_opinion=" + (enabledPresent ? "present" : "absent") +
-                "; requested_enabled=" + (enabled ? "true" : "false") +
-                "; requested_count=" + std::to_string(count) +
-                "; effective_output_count=" +
+        info.generatedFrameCapability[sizeof(info.generatedFrameCapability) - 1] = '\0';
+        m_stats.dlssGeneratedFrameCapability = info.generatedFrameCapability;
+        // Only ovui knows how many images the last complete group carried.
+        if (m_stats.dlssGeneratedFrameRuntimeSupported &&
+            m_stats.dlssGeneratedFrameActivationSupported)
+            m_stats.dlssGeneratedFrameCapability += "; effective_output_count=" +
                 std::to_string(m_stats.dlssGeneratedFrameEffectiveCount);
     }
-#endif
-
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-    bool writeCamera(const CameraPublication& publication, std::array<double, 16>& predictedWorld)
-    {
-        ovrtx_xform_matrix44d_t transform{};
-        std::copy(publication.world.begin(), publication.world.end(), transform.v);
-        const double elapsed = std::max(0.0, monotonicSeconds() - publication.timestamp);
-        const double hardHorizon = kPredictionFullResponseSeconds + kPredictionDecaySeconds;
-        double effectiveSeconds = 0.0;
-        if (elapsed > 0.0 && elapsed < hardHorizon)
-        {
-            if (elapsed <= kPredictionFullResponseSeconds)
-            {
-                effectiveSeconds = elapsed;
-            }
-            else
-            {
-                // Cubic Hermite decay from the full-response position and
-                // velocity to the authoritative anchor with zero terminal
-                // velocity. Position and velocity are continuous at both
-                // boundaries; after the hard horizon the untouched raw matrix
-                // below is bit-stable.
-                const double u = (elapsed - kPredictionFullResponseSeconds) /
-                    kPredictionDecaySeconds;
-                const double u2 = u * u;
-                const double u3 = u2 * u;
-                effectiveSeconds = (2.0 * u3 - 3.0 * u2 + 1.0) *
-                    kPredictionFullResponseSeconds +
-                    (u3 - 2.0 * u2 + u) * kPredictionDecaySeconds;
-            }
-        }
-
-        double appliedDistance = 0.0;
-        const long double vx = publication.velocity[0];
-        const long double vy = publication.velocity[1];
-        const long double vz = publication.velocity[2];
-        const long double speed = std::sqrt(vx * vx + vy * vy + vz * vz);
-        if (effectiveSeconds > 0.0 && speed > 0.0L && std::isfinite(speed) &&
-            publication.maximumPredictionDistance > 0.0)
-        {
-            const long double requestedDistance = speed * effectiveSeconds;
-            const long double distance = std::min(
-                requestedDistance,
-                static_cast<long double>(publication.maximumPredictionDistance));
-            const long double scale = distance / speed;
-            transform.v[12] += static_cast<double>(vx * scale);
-            transform.v[13] += static_cast<double>(vy * scale);
-            transform.v[14] += static_cast<double>(vz * scale);
-            appliedDistance = static_cast<double>(distance);
-        }
-        std::copy(std::begin(transform.v), std::end(transform.v), predictedWorld.begin());
-        {
-        const ovx_string_t camera{m_cameraPath.c_str(), m_cameraPath.size()};
-        const size_t count = 1;
-        const DLDataType dtype{kDLFloat, 64, 16};
-        int64_t shape = 1;
-        int64_t stride = 1;
-        DLTensor tensor{};
-        tensor.data = &transform;
-        tensor.device = {kDLCPU, 0};
-        tensor.ndim = 1;
-        tensor.dtype = dtype;
-        tensor.shape = &shape;
-        tensor.strides = &stride;
-        ovrtx_input_buffer_t input{};
-        input.tensors = &tensor;
-        input.tensor_count = 1;
-        ovrtx_binding_desc_or_handle_t binding{};
-        binding.binding_desc.prim_list = {&camera, count};
-        binding.binding_desc.attribute_name.string = {"omni:xform", 10};
-        binding.binding_desc.attribute_type = {dtype, false, OVRTX_SEMANTIC_XFORM_MAT4x4};
-        binding.binding_desc.prim_mode = OVRTX_BINDING_PRIM_MODE_EXISTING_ONLY;
-        binding.binding_desc.flags = OVRTX_BINDING_FLAG_NONE;
-        const ovrtx_enqueue_result_t result = m_api.writeAttribute(
-            m_renderer, &binding, &input, OVRTX_DATA_ACCESS_SYNC);
-        if (result.status != OVRTX_API_SUCCESS)
-        {
-            fail(m_api.lastError().empty() ? "camera publication failed" : m_api.lastError());
-            return false;
-        }
-        }
-        if (appliedDistance > 0.0)
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            ++m_stats.cameraIntegrations;
-            m_stats.maximumPredictionOffset = std::max(
-                m_stats.maximumPredictionOffset, appliedDistance);
-        }
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_stats.authoritativeCameraWorld = publication.world;
-            m_stats.hasAuthoritativeCameraWorld = true;
-            m_stats.predictedCameraWorld = predictedWorld;
-            m_stats.hasPredictedCameraWorld = true;
-        }
-        return true;
-    }
-
-    bool waitFetch(ovrtx_step_result_handle_t handle,
-                   ovrtx_render_product_set_outputs_t& outputs,
-                   bool drainOnly)
-    {
-        ovrtx_timeout_t timeout{0};
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            ++m_stats.fetchPolls;
-        }
-        ovrtx_result_t result = m_api.fetch(m_renderer, handle, timeout, &outputs);
-        while (result.status == OVRTX_API_TIMEOUT)
-        {
-            timeout.time_out_ns = kBoundedWaitNanoseconds;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                ++m_stats.fetchBoundedWaits;
-            }
-            result = m_api.fetch(m_renderer, handle, timeout, &outputs);
-        }
-        if (result.status != OVRTX_API_SUCCESS)
-        {
-            if (!drainOnly)
-                fail(m_api.lastError().empty() ? "ovrtx result fetch failed" : m_api.lastError());
-            return false;
-        }
-        return true;
-    }
-
-    /// Release every still-live mapping exactly once. Idempotent: a released
-    /// entry is marked so a later call cannot unmap it again. A failed unmap
-    /// retains the handle for the shutdown drain, matching the host path.
-    void releaseMappings(std::vector<MappedImage>& images)
-    {
-        for (MappedImage& image : images)
-        {
-            if (!image.mapped)
-                continue;
-            image.mapped = false;
-            image.devicePtr = nullptr;
-            // GPU-resident publication copies from the mapped tensor on the
-            // legacy default CUDA stream.  Let ovrtx retain its allocation
-            // until that stream reaches the copy/signal handoff; CPU mappings
-            // have already been copied synchronously and need no signal.
-            const ovrtx_cuda_sync_t noSync{
-                image.gpuResident ? kCudaDefaultStream : 0, 0};
-            const ovrtx_result_t unmapResult =
-                m_api.unmap(m_renderer, image.mapHandle, noSync);
-            if (unmapResult.status != OVRTX_API_SUCCESS)
-            {
-                fail(m_api.lastError().empty() ? "LdrColor unmap failed" : m_api.lastError());
-                m_retainedMapHandles.push_back(image.mapHandle);
-                continue;
-            }
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_stats.liveMappings) --m_stats.liveMappings;
-        }
-    }
-
-    /// Map one LdrColor output as a CUDA device pointer. Returns false without
-    /// consuming the output when the runtime cannot supply a usable GPU tensor,
-    /// so the caller can fall back to the host copy below.
-    bool mapImageGpu(ovrtx_render_var_output_handle_t handle, MappedImage& out,
-                     uint32_t& width, uint32_t& height)
-    {
-        // sync_stream must name the stream the consumer will read on, or the
-        // map performs no synchronisation at all (ovrtx_types.h: "0 = no
-        // synchronization") and the device pointer can be read while the
-        // renderer is still producing it — stale or torn frames. The Vulkan
-        // upload issues its device-to-device copy on the legacy default
-        // stream, which is stream id 1 in this API.
-        ovrtx_map_output_description_t description{OVRTX_MAP_DEVICE_TYPE_CUDA,
-                                                   kCudaDefaultStream};
-        ovrtx_render_var_output_t output{};
-        ovrtx_timeout_t timeout{0};
-        ovrtx_result_t result = m_api.map(m_renderer, handle, &description, timeout, &output);
-        while (result.status == OVRTX_API_TIMEOUT)
-        {
-            timeout.time_out_ns = kBoundedWaitNanoseconds;
-            result = m_api.map(m_renderer, handle, &description, timeout, &output);
-        }
-        if (result.status != OVRTX_API_SUCCESS)
-            return false;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            ++m_stats.liveMappings;
-        }
-        out.mapHandle = output.map_handle;
-        out.mapped = true;
-
-        bool usable = false;
-        if (output.status == OVRTX_EVENT_COMPLETED && output.num_tensors > 0 &&
-            output.tensors && output.tensors[0].dl)
-        {
-            const DLTensor& tensor = *output.tensors[0].dl;
-            const bool packedPixels = !tensor.strides ||
-                (tensor.strides[0] >= static_cast<int64_t>(tensor.shape[1]) * 4 &&
-                 tensor.strides[1] == 4 && tensor.strides[2] == 1);
-            if (tensor.device.device_type == kDLCUDA && tensor.ndim == 3 && tensor.shape &&
-                tensor.data && tensor.shape[0] > 0 && tensor.shape[1] > 0 &&
-                tensor.shape[2] == 4 && tensor.dtype.lanes == 1 &&
-                tensor.dtype.code == kDLUInt && tensor.dtype.bits == 8 && packedPixels &&
-                tensor.shape[0] <= std::numeric_limits<uint32_t>::max() &&
-                tensor.shape[1] <= std::numeric_limits<uint32_t>::max() &&
-                static_cast<uint64_t>(tensor.shape[0]) * tensor.shape[1] <= kMaxFramePixels)
-            {
-                height = static_cast<uint32_t>(tensor.shape[0]);
-                width = static_cast<uint32_t>(tensor.shape[1]);
-                out.devicePtr = static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset;
-                out.deviceRowStride = tensor.strides
-                    ? static_cast<size_t>(tensor.strides[0])
-                    : static_cast<size_t>(width) * 4;
-                out.gpuResident = true;
-                usable = true;
-            }
-        }
-        if (!usable)
-        {
-            // Release this mapping before the caller retries on the host path;
-            // the output itself has not been consumed.
-            std::vector<MappedImage> single;
-            single.push_back(std::move(out));
-            releaseMappings(single);
-            out = MappedImage{};
-        }
-        return usable;
-    }
-
-    bool mapImage(ovrtx_render_var_output_handle_t handle, std::vector<uint8_t>& pixels,
-                  uint32_t& width, uint32_t& height)
-    {
-        ovrtx_map_output_description_t description{OVRTX_MAP_DEVICE_TYPE_CPU, 0};
-        ovrtx_render_var_output_t output{};
-        ovrtx_timeout_t timeout{0};
-        ovrtx_result_t result = m_api.map(m_renderer, handle, &description, timeout, &output);
-        while (result.status == OVRTX_API_TIMEOUT)
-        {
-            timeout.time_out_ns = kBoundedWaitNanoseconds;
-            result = m_api.map(m_renderer, handle, &description, timeout, &output);
-        }
-        if (result.status != OVRTX_API_SUCCESS)
-        {
-            fail(m_api.lastError().empty() ? "LdrColor map failed" : m_api.lastError());
-            return false;
-        }
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            ++m_stats.liveMappings;
-        }
-
-        bool copied = false;
-        try
-        {
-            if (output.status == OVRTX_EVENT_COMPLETED && output.num_tensors > 0 && output.tensors && output.tensors[0].dl)
-            {
-                const DLTensor& tensor = *output.tensors[0].dl;
-                if (tensor.device.device_type == kDLCPU && tensor.ndim == 3 && tensor.shape &&
-                    tensor.data && tensor.shape[0] > 0 && tensor.shape[1] > 0 && tensor.shape[2] == 4 &&
-                    tensor.shape[0] <= std::numeric_limits<uint32_t>::max() &&
-                    tensor.shape[1] <= std::numeric_limits<uint32_t>::max() && tensor.dtype.lanes == 1)
-                {
-                    height = static_cast<uint32_t>(tensor.shape[0]);
-                    width = static_cast<uint32_t>(tensor.shape[1]);
-                    const uint64_t count = static_cast<uint64_t>(width) * height * 4;
-                    const int64_t rowStrideElements =
-                        tensor.strides ? tensor.strides[0] : static_cast<int64_t>(width) * 4;
-                    const size_t scalarBytes = tensor.dtype.bits / 8;
-                    const bool packedPixels = !tensor.strides ||
-                        (tensor.strides[0] >= static_cast<int64_t>(width) * 4 &&
-                         tensor.strides[1] == 4 && tensor.strides[2] == 1);
-                    const bool uint8Image = tensor.dtype.code == kDLUInt && tensor.dtype.bits == 8;
-                    const bool float32Image = tensor.dtype.code == kDLFloat && tensor.dtype.bits == 32 &&
-                        scalarBytes == sizeof(float);
-                    if (static_cast<uint64_t>(width) * height <= kMaxFramePixels && packedPixels &&
-                        (uint8Image || float32Image))
-                    {
-                        pixels.resize(static_cast<size_t>(count));
-                        const uint8_t* base = static_cast<const uint8_t*>(tensor.data) + tensor.byte_offset;
-                        if (uint8Image)
-                        {
-                            for (uint32_t y = 0; y < height; ++y)
-                                std::memcpy(pixels.data() + static_cast<size_t>(y) * width * 4,
-                                            base + static_cast<size_t>(y * rowStrideElements),
-                                            static_cast<size_t>(width) * 4);
-                            copied = true;
-                        }
-                        else
-                        {
-                            for (uint32_t y = 0; y < height; ++y)
-                            {
-                                const float* row = reinterpret_cast<const float*>(base +
-                                    static_cast<size_t>(y * rowStrideElements) * sizeof(float));
-                                for (uint32_t x = 0; x < width * 4; ++x)
-                                {
-                                    const float value = std::max(0.0f, std::min(1.0f, row[x]));
-                                    pixels[(static_cast<size_t>(y) * width * 4) + x] =
-                                        static_cast<uint8_t>(value * 255.0f + 0.5f);
-                                }
-                            }
-                            copied = true;
-                        }
-                    }
-                }
-            }
-        }
-        catch (...)
-        {
-            fail("failed to allocate bounded CPU storage for a mapped LdrColor image");
-            copied = false;
-        }
-
-        // The CPU copy is complete before unmap, so no producer signal is
-        // carried beyond this point. Every successful map is unmapped once.
-        const ovrtx_cuda_sync_t noSync{0, 0};
-        const ovrtx_result_t unmapResult = m_api.unmap(m_renderer, output.map_handle, noSync);
-        if (unmapResult.status != OVRTX_API_SUCCESS)
-        {
-            fail(m_api.lastError().empty() ? "LdrColor unmap failed" : m_api.lastError());
-            m_retainedMapHandles.push_back(output.map_handle);
-            copied = false;
-        }
-        else
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_stats.liveMappings) --m_stats.liveMappings;
-        }
-        if (!copied)
-            fail("LdrColor did not expose a supported CPU RGBA tensor");
-        return copied;
-    }
-
-    bool extractGroup(const ovrtx_render_product_set_outputs_t& outputs,
-                      std::vector<MappedImage>& images,
-                      std::vector<double>& frameEndTimes,
-                      uint32_t& width,
-                      uint32_t& height)
-    {
-        const ovrtx_render_product_output_t* product = nullptr;
-        for (size_t i = 0; i < outputs.output_count; ++i)
-        {
-            if (stringEquals(outputs.outputs[i].render_product_path, m_renderProductPath.c_str()))
-            {
-                product = &outputs.outputs[i];
-                break;
-            }
-        }
-        if (!product || product->output_frame_count < 1 ||
-            product->output_frame_count > kMaxOrderedFrames)
-        {
-            fail("ovrtx returned an unsupported ordered frame-group shape (expected 1, 2, 3, or 4)");
-            return false;
-        }
-        std::vector<size_t> extractionOrder;
-        try
-        {
-            images.resize(product->output_frame_count);
-            frameEndTimes.resize(product->output_frame_count);
-            extractionOrder.reserve(product->output_frame_count);
-        }
-        catch (...)
-        {
-            fail("failed to allocate bounded ordered frame-group storage");
-            return false;
-        }
-        auto rejectTimestamps = [this](const char* reason) {
-            fail(reason);
-            std::lock_guard<std::mutex> lock(m_mutex);
-            ++m_stats.rendererTimestampOrderViolations;
-            return false;
-        };
-        for (size_t frameIndex = 0; frameIndex < product->output_frame_count;
-             ++frameIndex)
-        {
-            const ovrtx_render_product_frame_output_t& frame =
-                product->output_frames[frameIndex];
-            if (!std::isfinite(frame.frame_start_time) ||
-                !std::isfinite(frame.frame_end_time) ||
-                frame.frame_end_time < frame.frame_start_time)
-                return rejectTimestamps(
-                    "ordered frame group contains an invalid renderer timestamp");
-            if (frameIndex + 1 < product->output_frame_count)
-            {
-                const double instantTolerance = 1e-6 *
-                    std::max(1.0, std::abs(frame.frame_end_time));
-                if (std::abs(frame.frame_start_time - frame.frame_end_time) >
-                    instantTolerance)
-                    return rejectTimestamps(
-                        "generated frame does not describe one renderer-time instant");
-            }
-            frameEndTimes[frameIndex] = frame.frame_end_time;
-        }
-
-        bool haveInterval = false;
-        double expectedInterval = 0.0;
-        double previousEnd = frameEndTimes.front();
-        size_t firstComparedIndex = 1;
-        if (m_hasLastAcceptedRealEndTime)
-        {
-            previousEnd = m_lastAcceptedRealEndTime;
-            firstComparedIndex = 0;
-        }
-        for (size_t frameIndex = firstComparedIndex;
-             frameIndex < frameEndTimes.size(); ++frameIndex)
-        {
-            const double interval = frameEndTimes[frameIndex] - previousEnd;
-            if (!(interval > 0.0) || !std::isfinite(interval))
-            {
-                char message[320];
-                std::snprintf(
-                    message,
-                    sizeof(message),
-                    "ordered frame group renderer times are not strictly increasing "
-                    "(previous=%.17g current=%.17g group_size=%zu index=%zu "
-                    "previous_group=%s stop_requested=%s)",
-                    previousEnd,
-                    frameEndTimes[frameIndex],
-                    frameEndTimes.size(),
-                    frameIndex,
-                    m_hasLastAcceptedRealEndTime ? "true" : "false",
-                    stopRequested(m_token) ? "true" : "false");
-                return rejectTimestamps(message);
-            }
-            if (!haveInterval)
-            {
-                expectedInterval = interval;
-                haveInterval = true;
-            }
-            else
-            {
-                const double intervalTolerance =
-                    std::max(1e-6, std::abs(expectedInterval) * 1e-4);
-                if (std::abs(interval - expectedInterval) > intervalTolerance)
-                    return rejectTimestamps(
-                        "generated frame renderer times are not evenly spaced between real frames");
-            }
-            previousEnd = frameEndTimes[frameIndex];
-        }
-        // The final entry is the real rendered frame. Validate/copy it first so
-        // generated images never become publishable without their real anchor,
-        // while retaining the original array order for presentation.
-        extractionOrder.push_back(product->output_frame_count - 1);
-        for (size_t i = 0; i + 1 < product->output_frame_count; ++i)
-            extractionOrder.push_back(i);
-        for (size_t frameIndex : extractionOrder)
-        {
-            const ovrtx_render_product_frame_output_t& frame = product->output_frames[frameIndex];
-            ovrtx_render_var_output_handle_t ldr = OVRTX_INVALID_HANDLE;
-            findRenderVarOutput(frame, m_renderVarStride, m_renderVarNameOffset,
-                                m_renderVarHandleOffset, "LdrColor", ldr);
-            if (ldr == OVRTX_INVALID_HANDLE)
-            {
-                fail("ordered frame is missing LdrColor");
-                return false;
-            }
-            uint32_t imageWidth = 0;
-            uint32_t imageHeight = 0;
-            MappedImage image;
-            // Prefer the GPU-resident mapping so the displayed image never
-            // makes a host round trip. Fall back to the host copy whenever the
-            // build, device or tensor shape cannot supply one.
-            bool wantGpu = m_gpu && m_gpu->supportsFromGpu();
-            if (wantGpu)
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                wantGpu = !m_gpuPublishDisabled;
-            }
-            if (!wantGpu || !mapImageGpu(ldr, image, imageWidth, imageHeight))
-            {
-                if (!mapImage(ldr, image.pixels, imageWidth, imageHeight))
-                    return false;
-            }
-            if (width != 0 && (imageWidth != width || imageHeight != height))
-            {
-                fail("ordered frame group contains inconsistent image extents");
-                return false;
-            }
-            width = imageWidth;
-            height = imageHeight;
-            images[frameIndex] = std::move(image);
-        }
-        return true;
-    }
-#endif
 
     PublishResult uploadGroup(uint64_t token,
-                     std::vector<MappedImage>& images,
-                     const std::vector<double>& frameEndTimes,
-                     uint32_t width,
-                     uint32_t height,
-                     uint64_t rendererFrameSerial,
-                     const std::array<double, 16>& cameraWorld)
+                     const NativeFramePacingGroup& produced,
+                     uint64_t rendererFrameSerial)
     {
+        const size_t imageCount = static_cast<size_t>(produced.imageCount);
+        const uint32_t width = produced.images[0].width;
+        const uint32_t height = produced.images[0].height;
         std::shared_ptr<FrameGroup> group;
         try
         {
             group = std::make_shared<FrameGroup>();
-            group->slots.reserve(images.size());
-            group->frameEndTimes = frameEndTimes;
+            group->slots.reserve(imageCount);
+            group->frameEndTimes.assign(
+                produced.frameEndTimes, produced.frameEndTimes + imageCount);
         }
         catch (...)
         {
             fail("failed to allocate bounded Vulkan frame-group metadata");
             return PublishResult::eFailed;
         }
-        group->cameraWorld = cameraWorld;
+        std::copy(std::begin(produced.cameraWorld), std::end(produced.cameraWorld),
+                  group->cameraWorld.begin());
         group->rendererFrameSerial = rendererFrameSerial;
         uint64_t targetOwnershipGeneration = 0;
         {
@@ -2136,8 +1507,15 @@ private:
                 ((width != m_ownershipWidth || height != m_ownershipHeight) ? 1 : 0);
             group->ownershipGeneration = targetOwnershipGeneration;
         }
-        for (MappedImage& image : images)
+        // The provider of this session: its upload failure hook applies here.
+        std::shared_ptr<ByteImageProvider> provider;
         {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            provider = m_provider;
+        }
+        for (size_t imageIndex = 0; imageIndex < imageCount; ++imageIndex)
+        {
+            const NativeFramePacingImage& image = produced.images[imageIndex];
             const size_t slotIndex = acquireSlot(token);
             if (slotIndex == invalidSlot())
             {
@@ -2148,28 +1526,73 @@ private:
             group->slots.push_back(slotIndex);
             Slot& slot = m_slots[slotIndex];
             IByteImageGpu::UpdateResult update{};
+            const char* hostRefusal = nullptr;
+            if (image.gpuResident && !waitForPacedImage(image.readyStream, image.readyEvent))
+            {
+                // The upload is queued on the legacy default stream. It waits
+                // for the image's completion event. Without one it can only
+                // follow the legacy default stream, so drop this frame.
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ++m_stats.gpuPublicationFailures;
+                releaseGroupLocked(group);
+                return PublishResult::eSkippedRetryable;
+            }
             if (image.gpuResident)
             {
                 const uint8_t* data = static_cast<const uint8_t*>(image.devicePtr);
-                size_t stride = image.deviceRowStride;
+                size_t stride = static_cast<size_t>(image.deviceRowStride);
                 VulkanByteImageGpu* nativeGpu = dynamic_cast<VulkanByteImageGpu*>(m_gpu);
-                if (nativeGpu)
-                    update = nativeGpu->updateImageFromGpuAsync(
+                bool accepted = false;
+                const char* refusal = nullptr;
+                // The checked result is the answer. The plain result also
+                // holds the OLD texture reference when the upload was
+                // refused, so it cannot tell success from a refusal.
+                if (!nativeGpu)
+                {
+                    refusal = "the GPU backend is not the Vulkan backend";
+                }
+                else if (provider && provider->takeInjectedUploadFailure())
+                {
+                    refusal = "refused on purpose by injectUploadFailures";
+                }
+                else
+                {
+                    const UploadResult checked = nativeGpu->updateImageFromGpuAsyncChecked(
                         slot.gpuState, data, stride, {width, height}, PixelFormat::eRGBA8_UNORM);
-                if (update.imGuiReference)
+                    accepted = checked.status != UploadStatus::eFailed && checked.update.imGuiReference;
+                    if (accepted)
+                        update = checked.update;
+                    else if (checked.status != UploadStatus::eFailed)
+                        refusal = "the backend returned no texture";
+                    else
+                        refusal = checked.cause ? checked.cause : "the backend refused the upload and gave no reason";
+                }
+                if (accepted)
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
                     ++m_stats.gpuResidentPublications;
+                    m_consecutiveGpuRefusals = 0;
                 }
                 else
                 {
                     // The device pair cannot carry this frame (no visible CUDA
-                    // device, a mismatched adapter, an unsupported format).
-                    // That is a capability answer, not a session error: latch
-                    // GPU publication off so every later frame maps on the
-                    // host, drop only this frame, and keep pacing alive.
+                    // device, a mismatched adapter, an unsupported format), or
+                    // the upload was refused. Drop only this frame and keep
+                    // pacing alive. One refusal can be short-lived, so GPU
+                    // publication is latched off after three in a row, and
+                    // at once when there is no Vulkan backend. Later frames
+                    // then map on the host.
                     std::lock_guard<std::mutex> lock(m_mutex);
-                    m_gpuPublishDisabled = true;
+                    if (!nativeGpu || ++m_consecutiveGpuRefusals >= kGpuRefusalsBeforeFallback)
+                    {
+                        if (!m_gpuPublishDisabled)
+                            // logging: allow printf - standalone backend is carb-free; no OMNI_LOG/Carbonite channel is available here
+                            fprintf(stderr,
+                                    "NativeFramePacing: GPU publication refused (%s); later frames use the host copy "
+                                    "(fallback)\n",
+                                    refusal);
+                        m_gpuPublishDisabled = true;
+                    }
                     ++m_stats.gpuPublicationFailures;
                     releaseGroupLocked(group);
                     return PublishResult::eSkippedRetryable;
@@ -2177,10 +1600,27 @@ private:
             }
             else
             {
-                const uint8_t* data = image.pixels.data();
+                const uint8_t* data = image.pixels;
                 size_t stride = static_cast<size_t>(width) * 4;
-                update = m_gpu->updateImage(slot.gpuState, &data, &stride, 1, {width, height},
-                                            PixelFormat::eRGBA8_UNORM, false, 0, 0, 0);
+                if (provider && provider->takeInjectedUploadFailure())
+                {
+                    // Test hook: this upload is refused before the backend.
+                    hostRefusal = "refused on purpose by injectUploadFailures";
+                }
+                else if (auto* checkedGpu = dynamic_cast<IByteImageGpuChecked*>(m_gpu))
+                {
+                    const UploadResult checked = checkedGpu->updateImageChecked(
+                        slot.gpuState, &data, &stride, 1, {width, height}, PixelFormat::eRGBA8_UNORM, false, 0, 0, 0);
+                    if (checked.status != UploadStatus::eFailed)
+                        update = checked.update;
+                    else
+                        hostRefusal = checked.cause;
+                }
+                else
+                {
+                    update = m_gpu->updateImage(slot.gpuState, &data, &stride, 1, {width, height},
+                                                PixelFormat::eRGBA8_UNORM, false, 0, 0, 0);
+                }
                 if (update.imGuiReference)
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
@@ -2190,7 +1630,8 @@ private:
             if (!update.imGuiReference)
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                failLocked("failed to upload an ordered image into the Vulkan slot ring");
+                failLocked(std::string("failed to upload an ordered image into the Vulkan slot ring: ") +
+                           (hostRefusal ? hostRefusal : "the backend returned no texture"));
                 releaseGroupLocked(group);
                 return PublishResult::eFailed;
             }
@@ -2200,7 +1641,7 @@ private:
             // image-distinctness rather than reporting a false match.
             const uint64_t fingerprint = image.gpuResident
                 ? ++m_nextContentFingerprint
-                : rgbaFingerprint(image.pixels);
+                : rgbaFingerprint(image.pixels, image.pixelsSize);
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 slot.descriptor = update.imGuiReference;
@@ -2264,7 +1705,7 @@ private:
         }
         m_pendingGroup = std::move(group);
         ++m_stats.completedFrameGroups;
-        switch (images.size())
+        switch (imageCount)
         {
             case 1: ++m_stats.completedFrameGroupsSize1; break;
             case 2: ++m_stats.completedFrameGroupsSize2; break;
@@ -2273,190 +1714,148 @@ private:
             default: break;
         }
         m_stats.dlssGeneratedFrameEffectiveCount =
-            static_cast<int32_t>(images.size() - 1);
-        m_stats.dlssGeneratedFrameEffectiveActive = images.size() > 1;
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-        refreshDlssRuntimeStateLocked();
-#endif
+            static_cast<int32_t>(imageCount - 1);
+        m_stats.dlssGeneratedFrameEffectiveActive = imageCount > 1;
+        refreshRendererInfoLocked();
         m_cv.notify_all();
         return PublishResult::ePublished;
     }
 
-    void renderLoop(uint64_t token)
+    // The host side of the render worker. The worker itself belongs to the
+    // renderer hooks; these are the parts of its loop that touch ovui's state,
+    // and the worker calls them from its own thread, in the order of #331's
+    // renderLoop().
+
+    /// Whether the render worker renders now: always under the continuous
+    /// policy; under "on_change" for a changed camera or size, a kick, or a
+    /// settle frame left.
+    bool renderDueLocked() const
     {
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-        struct PendingStep
+        return !m_renderOnChange || m_renderKick || m_renderSettleLeft > 0 ||
+            m_camera.world != m_lastRendered.world || m_camera.width != m_lastRendered.width ||
+            m_camera.height != m_lastRendered.height;
+    }
+
+    static NativeFramePacingService& self(void* context)
+    {
+        return *static_cast<NativeFramePacingService*>(context);
+    }
+
+    /// Wait for a camera publication while the slot ring can take a group.
+    /// False ends the render loop: stop, pause or a new owner.
+    bool hostWaitForWork(uint64_t token, double world[16])
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_workerWaiting = true;
+        m_cv.wait(lock, [this, token]() {
+            return !m_active || token != m_token || m_stopRequested ||
+                m_renderPauseRequested ||
+                (m_sessionReady && m_camera.serial != 0 && m_presentRate != 0.0 &&
+                 !m_pendingGroup && renderDueLocked());
+        });
+        m_workerWaiting = false;
+        if (!m_active || token != m_token || m_stopRequested ||
+            m_renderPauseRequested)
         {
-            ovrtx_step_result_handle_t handle = OVRTX_INVALID_HANDLE;
-            ovrtx_enqueue_result_t enqueue{};
-            std::array<double, 16> cameraWorld{};
-            bool valid = false;
-        };
-        PendingStep retainedStep{};
-        uint64_t observedPublication = 0;
-        auto lastStep = Clock::now();
-        while (true)
-        {
-            CameraPublication publication;
-            {
-                std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv.wait(lock, [this, token]() {
-                    return !m_active || token != m_token || m_stopRequested ||
-                        m_renderPauseRequested ||
-                        (m_camera.serial != 0 && m_presentRate != 0.0 &&
-                         !m_pendingGroup);
-                });
-                if (!m_active || token != m_token || m_stopRequested ||
-                    m_renderPauseRequested)
-                    break;
-                publication = m_camera;
-            }
-            observedPublication = publication.serial;
-            (void)observedPublication;
-            std::array<double, 16> predictedWorld{};
-            if (!writeCamera(publication, predictedWorld))
-                break;
-
-            const auto now = Clock::now();
-            double rendererDelta = std::chrono::duration<double>(now - lastStep).count();
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                refreshDlssRuntimeStateLocked();
-            }
-            // Renderer time follows elapsed execution independently of the
-            // configured presentation rate.  The returned frame timestamps
-            // then promote a low positive presentation rate when necessary.
-            const double delta = std::max(
-                1.0 / 1000.0, std::min(1.0 / 15.0, rendererDelta));
-            lastStep = now;
-            const ovx_string_t productString{m_renderProductPath.c_str(), m_renderProductPath.size()};
-            const ovrtx_render_product_set_t productSet{&productString, 1};
-            ovrtx_step_result_handle_t handle = OVRTX_INVALID_HANDLE;
-            ovrtx_enqueue_result_t stepResult{};
-            stepResult = m_api.step(m_renderer, productSet, delta, &handle);
-            if (stepResult.status != OVRTX_API_SUCCESS || handle == OVRTX_INVALID_HANDLE)
-            {
-                fail(m_api.lastError().empty() ? "ovrtx step enqueue failed" : m_api.lastError());
-                break;
-            }
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                ++m_stats.liveStepResults;
-            }
-
-            // Keep one accepted result in flight so the renderer can execute
-            // frame N while frame N-1 is fetched, mapped, copied, hashed, and
-            // uploaded.  The result handle and its exact predicted camera
-            // travel together until publication; at most two accepted results
-            // are transiently live while the previous one is retired below.
-            PendingStep submitted{};
-            submitted.handle = handle;
-            submitted.enqueue = stepResult;
-            submitted.cameraWorld = predictedWorld;
-            submitted.valid = true;
-            if (!retainedStep.valid)
-            {
-                retainedStep = std::move(submitted);
-                continue;
-            }
-            handle = retainedStep.handle;
-            stepResult = retainedStep.enqueue;
-            predictedWorld = retainedStep.cameraWorld;
-            retainedStep = std::move(submitted);
-
-            ovrtx_render_product_set_outputs_t outputs{};
-            const bool draining = stopRequested(token);
-            const bool fetched = waitFetch(handle, outputs, draining);
-            std::vector<MappedImage> images;
-            std::vector<double> frameEndTimes;
-            // Any mapping still live when this scope unwinds is released
-            // exactly once, whichever branch below exits the iteration.
-            struct MappingGuard
-            {
-                NativeFramePacingService* service;
-                std::vector<MappedImage>* images;
-                ~MappingGuard() { service->releaseMappings(*images); }
-            } mappingGuard{this, &images};
-            uint32_t width = 0;
-            uint32_t height = 0;
-            bool extracted = false;
-            uint64_t rendererFrameSerial = 0;
-            const size_t retainedMapsBefore = m_retainedMapHandles.size();
-            if (fetched && !draining)
-                extracted = extractGroup(
-                    outputs, images, frameEndTimes, width, height);
-            if (extracted)
-            {
-                // Count completed usable ovrtx outputs at fetch/map completion,
-                // before slot pressure or a Vulkan upload can drop them.
-                std::lock_guard<std::mutex> lock(m_mutex);
-                // Renderer-time continuity belongs to the validated output
-                // sequence, not to the later GPU/host publication transport.
-                // A retryable GPU refusal drops this group before switching
-                // subsequent groups to host publication, but ovrtx still
-                // advances its next generated timestamps from this real
-                // anchor. Retaining the older published anchor would falsely
-                // reject that next well-formed group as uneven and terminate
-                // pacing instead of allowing the required host fallback.
-                m_lastAcceptedRealEndTime = frameEndTimes.back();
-                m_hasLastAcceptedRealEndTime = true;
-                ++m_stats.realRenderCompletions;
-                ++m_stats.rendererCompletions;
-                rendererFrameSerial = ++m_nextRendererFrameSerial;
-                m_stats.generatedImages += images.size() - 1;
-            }
-            // Exactly one destroy for every accepted result handle, after all
-            // output maps have been copied and unmapped.
-            if (m_retainedMapHandles.size() != retainedMapsBefore)
-            {
-                m_retainedResultHandles.push_back(handle);
-                break;
-            }
-            else
-            {
-                const ovrtx_result_t destroyResult = m_api.destroy(m_renderer, handle);
-                if (destroyResult.status != OVRTX_API_SUCCESS)
-                {
-                    m_retainedResultHandles.push_back(handle);
-                    fail(m_api.lastError().empty() ? "ovrtx result release failed" : m_api.lastError());
-                    break;
-                }
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    if (m_stats.liveStepResults) --m_stats.liveStepResults;
-                }
-            }
-            if (draining)
-                break;
-            if (fetched && !extracted)
-                break;
-            if (fetched && extracted &&
-                uploadGroup(token, images, frameEndTimes, width, height,
-                            rendererFrameSerial, predictedWorld) ==
-                    PublishResult::eFailed)
-                break;
+            return false;
         }
-        // A stop or failure may leave the newest accepted step retained.  It
-        // is never publishable after revocation, but its non-cancellable work
-        // must still be observed, fetched, and destroyed exactly once before
-        // the renderer borrow can return to Python.
-        if (retainedStep.valid)
+        // The "on_change" policy: a change (or a kick) renders, then the
+        // settle frames, so the renderer's temporal accumulation settles.
+        const bool changed = m_renderKick || m_camera.world != m_lastRendered.world ||
+            m_camera.width != m_lastRendered.width || m_camera.height != m_lastRendered.height;
+        m_renderSettleLeft = changed ? m_renderSettleFrames : m_renderSettleLeft - (m_renderSettleLeft > 0);
+        m_renderKick = false;
+        m_lastRendered = m_camera;
+        m_stats.renderWorkerThread = currentThreadIdentity();
+        std::copy(m_camera.world.begin(), m_camera.world.end(), world);
+        return true;
+    }
+
+    void hostBeginStep(uint64_t token, const double world[16], NativeFramePacingStepDesc* desc)
+    {
+        (void)token;
+        // Prefer the GPU-resident mapping so the displayed image never makes a
+        // host round trip. The worker falls back to the host copy whenever the
+        // device or tensor shape cannot supply one.
+        bool wantGpu = m_gpu && m_gpu->supportsFromGpu();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::copy(world, world + 16, m_stats.authoritativeCameraWorld.begin());
+        m_stats.hasAuthoritativeCameraWorld = true;
+        // Keep the compatibility statistics field populated with the exact
+        // camera used for rendering. Native pacing no longer extrapolates
+        // beyond the authoritative UI camera publication.
+        m_stats.predictedCameraWorld = m_stats.authoritativeCameraWorld;
+        m_stats.hasPredictedCameraWorld = true;
+        refreshRendererInfoLocked();
+        if (wantGpu)
+            wantGpu = !m_gpuPublishDisabled;
+        if (desc && desc->structSize >= sizeof(NativeFramePacingStepDesc))
         {
-            ovrtx_render_product_set_outputs_t outputs{};
-            (void)waitFetch(retainedStep.handle, outputs, true);
-            const ovrtx_result_t destroyResult = m_api.destroy(m_renderer, retainedStep.handle);
-            if (destroyResult.status != OVRTX_API_SUCCESS)
-            {
-                m_retainedResultHandles.push_back(retainedStep.handle);
-                fail(m_api.lastError().empty() ?
-                    "ovrtx retained result release failed" : m_api.lastError());
-            }
-            else
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (m_stats.liveStepResults) --m_stats.liveStepResults;
-            }
+            desc->allowGpuMapping = wantGpu ? 1U : 0U;
+            desc->hasLastAcceptedRealEndTime = m_hasLastAcceptedRealEndTime ? 1U : 0U;
+            desc->lastAcceptedRealEndTime = m_lastAcceptedRealEndTime;
         }
+    }
+
+    uint32_t hostPublishGroup(uint64_t token,
+                              const NativeFramePacingStepOutput* output,
+                              uint64_t* cudaSyncStream)
+    {
+        // The upload queues its device-to-device copy and its CUDA-to-Vulkan
+        // semaphore signal on the legacy default stream. The worker releases
+        // the mapping on that stream, so the renderer keeps its allocation
+        // without a CPU hard wait.
+        if (cudaSyncStream)
+            *cudaSyncStream = kCudaDefaultStream;
+        if (!output || output->structSize < sizeof(NativeFramePacingStepOutput))
+            return eNativeFramePacingPublishFailed;
+        if (output->rendererTimestampOrderViolation)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            ++m_stats.rendererTimestampOrderViolations;
+        }
+        const bool extracted = output->groupValid != 0 && output->group.imageCount > 0 &&
+            output->group.images && output->group.frameEndTimes;
+        if (!extracted)
+            return eNativeFramePacingPublished;
+        uint64_t rendererFrameSerial = 0;
+        {
+            // Count completed usable renderer outputs at fetch/map completion,
+            // before slot pressure or a Vulkan upload can drop them.
+            std::lock_guard<std::mutex> lock(m_mutex);
+            // Renderer-time continuity belongs to the validated output
+            // sequence, not to the later GPU/host publication transport. A
+            // retryable GPU refusal drops this group before switching
+            // subsequent groups to host publication, but the renderer still
+            // advances its next generated timestamps from this real anchor.
+            // Retaining the older published anchor would falsely reject that
+            // next well-formed group as uneven and terminate pacing instead of
+            // allowing the required host fallback.
+            m_lastAcceptedRealEndTime = output->group.frameEndTimes[output->group.imageCount - 1];
+            m_hasLastAcceptedRealEndTime = true;
+            ++m_stats.realRenderCompletions;
+            ++m_stats.rendererCompletions;
+            rendererFrameSerial = ++m_nextRendererFrameSerial;
+            m_stats.generatedImages += output->group.imageCount - 1;
+        }
+        if (output->status != eNativeFramePacingGroupReady)
+            return eNativeFramePacingPublished;
+        OVUI_NESTED_DEVELOPMENT_TIME_SCOPE(
+            uploadScope, "NativeFramePacing.vulkan.uploadGroup [ovui debug]");
+        switch (uploadGroup(token, output->group, rendererFrameSerial))
+        {
+            case PublishResult::ePublished: return eNativeFramePacingPublished;
+            case PublishResult::eSkippedRetryable: return eNativeFramePacingSkippedRetryable;
+            case PublishResult::eFailed: break;
+        }
+        return eNativeFramePacingPublishFailed;
+    }
+
+    /// The end of #331's renderLoop(): a pause parks the worker, anything else
+    /// ends its part in the session.
+    uint32_t hostRenderLoopEnded(uint64_t token)
+    {
+        uint32_t end = eNativeFramePacingLoopExited;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_active && token == m_token)
@@ -2468,9 +1867,11 @@ private:
                     m_renderFatal = false;
                     m_stats.renderLoopExited = false;
                     m_stats.renderLoopFatal = false;
+                    end = eNativeFramePacingLoopParked;
                 }
                 else
                 {
+                    m_renderPaused = false;
                     m_renderExited = true;
                     m_renderFatal = !m_stopRequested;
                     m_stats.renderLoopExited = true;
@@ -2481,9 +1882,70 @@ private:
             }
         }
         m_cv.notify_all();
-#else
-        (void)token;
-#endif
+        return end;
+    }
+
+    /// A parked worker woke: a resume, or a stop of the session.
+    bool hostRenderResumed(uint64_t token)
+    {
+        bool resumed = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_active || token != m_token || m_stopRequested || m_renderPauseRequested)
+            {
+                if (m_active && token == m_token && !m_renderExited)
+                {
+                    m_renderPaused = false;
+                    m_renderExited = true;
+                    m_renderFatal = false;
+                    m_stats.renderLoopExited = true;
+                    m_stats.renderLoopFatal = false;
+                }
+            }
+            else
+            {
+                m_renderPaused = false;
+                m_renderExited = false;
+                m_renderFatal = false;
+                m_stats.renderLoopExited = false;
+                m_stats.renderLoopFatal = false;
+                resumed = true;
+            }
+        }
+        m_cv.notify_all();
+        return resumed;
+    }
+
+    static bool hostWaitForWorkThunk(void* context, uint64_t token, double world[16])
+    {
+        return self(context).hostWaitForWork(token, world);
+    }
+    static bool hostStopRequestedThunk(void* context, uint64_t token)
+    {
+        return self(context).stopRequested(token);
+    }
+    static void hostBeginStepThunk(void* context, uint64_t token, const double world[16],
+                                   NativeFramePacingStepDesc* desc)
+    {
+        self(context).hostBeginStep(token, world, desc);
+    }
+    static uint32_t hostPublishGroupThunk(void* context, uint64_t token,
+                                          const NativeFramePacingStepOutput* output,
+                                          uint64_t* cudaSyncStream)
+    {
+        return self(context).hostPublishGroup(token, output, cudaSyncStream);
+    }
+    static void hostReportErrorThunk(void* context, const char* message)
+    {
+        self(context).fail(message && message[0] ? message : "the render worker failed");
+    }
+    static uint32_t hostRenderLoopEndedThunk(void* context, uint64_t token)
+    {
+        return self(context).hostRenderLoopEnded(token);
+    }
+    static bool hostRenderResumedThunk(void* context, uint64_t token)
+    {
+        return self(context).hostRenderResumed(token);
     }
 
     void presentLoop(uint64_t token)
@@ -2666,6 +2128,8 @@ private:
                 height = m_drawHeight;
                 generation = m_uiGeneration;
             }
+            OVUI_DEVELOPMENT_TIME_SCOPE(
+                nativePresentFrameScope, "NativeFramePacing.presentFrame [ovui debug]");
             const void* descriptor = nullptr;
             uint64_t imageSerial = 0;
             uint64_t contentFingerprint = 0;
@@ -2689,16 +2153,25 @@ private:
             uint32_t swapchainImage = 0;
             bool attempted = descriptor && drawData && width > 0 && height > 0 &&
                 m_backend && m_backend->isInitialized();
+            // A frame fence still busy with the UI's composition, or no window
+            // image yet: retry after a short sleep instead of spinning on the
+            // queue lock, which the render thread's uploads need.
+            bool retryLater = false;
             if (attempted)
             {
+                OVUI_NESTED_DEVELOPMENT_TIME_SCOPE(
+                    composeScope, "NativeFramePacing.vulkan.compose [ovui debug]");
                 std::lock_guard<std::mutex> queueLock(m_backend->getQueueMutex());
                 bool frameDeferred = false;
-                if (m_backend->beginFrame(width, height, true, false))
+                // The UI submits its composition and base copy without waiting
+                // for them: give that GPU work up to 2 ms before deferring,
+                // instead of retrying against a busy frame fence.
+                if (m_backend->beginFrame(width, height, true, false, 2'000'000))
                 {
                     ImGui_ImplVulkan_RenderDrawData(
                         drawData->selectViewportImage(const_cast<void*>(descriptor)),
                         m_backend->getCommandBuffer());
-                    composed = m_backend->endFrame() && m_backend->restoreNativeFramePacingBase(
+                    composed = m_backend->restoreNativeFramePacingBase(
                         drawData->copyRegions(), width, height);
                     if (composed)
                     {
@@ -2706,6 +2179,10 @@ private:
                             width, height, &swapchainImage);
                         if (preparedWindow == VulkanBackend::WindowPresentResult::eFailed)
                             composed = false;
+                        else if (preparedWindow == VulkanBackend::WindowPresentResult::eDeferred)
+                            // No WSI image is ready yet. Retain this candidate
+                            // for retry instead of terminating the session.
+                            attempted = false, retryLater = true;
                     }
                 }
                 else
@@ -2713,7 +2190,7 @@ private:
                     frameDeferred = m_backend->isInitialized();
                 }
                 if (frameDeferred)
-                    attempted = false;
+                    attempted = false, retryLater = true;
             }
             // Composition is complete and its slot sampling is submitted. End
             // the UI exclusion here so the display hand-off below cannot pace
@@ -2736,8 +2213,13 @@ private:
             {
                 presentSubmitCalled = true;
                 presentStartedAt = Clock::now();
-                const VulkanBackend::WindowPresentResult presentResult =
-                    m_backend->presentWindowFrame(swapchainImage);
+                VulkanBackend::WindowPresentResult presentResult =
+                    VulkanBackend::WindowPresentResult::eFailed;
+                {
+                    OVUI_NESTED_DEVELOPMENT_TIME_SCOPE(
+                        presentScope, "NativeFramePacing.vulkan.present [ovui debug]");
+                    presentResult = m_backend->presentWindowFrame(swapchainImage);
+                }
                 presentSubmitNanoseconds = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         Clock::now() - presentStartedAt).count());
@@ -2745,7 +2227,11 @@ private:
                 presentSubmitSucceeded =
                     presentResult == VulkanBackend::WindowPresentResult::ePresented;
                 if (!presentSubmitSucceeded)
+                {
                     composed = false;
+                    if (presentResult == VulkanBackend::WindowPresentResult::eDeferred)
+                        attempted = false;
+                }
             }
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -2897,16 +2383,50 @@ private:
                 }
                 m_cv.notify_all();
             }
+            if (retryLater)
+                std::this_thread::sleep_for(std::chrono::microseconds(250));
+        }
+    }
+
+    void presentWorkerLoop()
+    {
+        uint64_t completedToken = 0;
+        while (true)
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait(lock, [this, completedToken]() {
+                return m_workerShutdownRequested ||
+                    (m_active && m_sessionReady && m_token != completedToken);
+            });
+            if (m_workerShutdownRequested)
+            {
+                break;
+            }
+
+            const uint64_t token = m_token;
+            m_stats.presentWorkerThread = currentThreadIdentity();
+            lock.unlock();
+            presentLoop(token);
+            lock.lock();
+            if (m_active && token == m_token)
+            {
+                m_presentExited = true;
+            }
+            completedToken = token;
+            m_cv.notify_all();
         }
     }
 
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     bool m_active = false;
+    bool m_sessionReady = false;
+    bool m_workerShutdownRequested = false;
     bool m_stopRequested = false;
     bool m_renderPauseRequested = false;
     bool m_renderPaused = false;
     bool m_presenterComposing = false;
+    bool m_uiSubmitting = false;
     bool m_stopCallActive = false;
     uint64_t m_token = 0;
     uint64_t m_nextToken = 0;
@@ -2923,16 +2443,19 @@ private:
     VulkanBackend* m_stablePresentationBackend = nullptr;
     IByteImageGpu::Handle m_stablePresentationGpuState = nullptr;
     void* m_stablePresentationDescriptor = nullptr;
-    uint32_t m_initialWidth = 0;
-    uint32_t m_initialHeight = 0;
     uint32_t m_providerWidth = 0;
     uint32_t m_providerHeight = 0;
     uint32_t m_ownershipWidth = 0;
     uint32_t m_ownershipHeight = 0;
-    std::string m_renderProductPath;
-    std::string m_cameraPath;
     CameraPublication m_camera;
-    std::thread m_renderThread;
+    // The render policy: continuous, or "on_change" (setRenderPolicy).
+    bool m_renderOnChange = false;
+    bool m_renderKick = true;
+    uint32_t m_renderSettleFrames = 8;
+    uint32_t m_renderSettleLeft = 0;
+    // The render worker waits in hostWaitForWork (see NativeFramePacingStats::renderIdle).
+    bool m_workerWaiting = false;
+    CameraPublication m_lastRendered;
     std::thread m_presentThread;
     std::vector<Slot> m_slots;
     std::shared_ptr<FrameGroup> m_currentGroup;
@@ -2943,6 +2466,8 @@ private:
     uint64_t m_nextContentFingerprint = 0;
     uint64_t m_nextRendererFrameSerial = 0;
     bool m_gpuPublishDisabled = false;  // latched by a real upload refusal
+    uint32_t m_consecutiveGpuRefusals = 0;
+    static constexpr uint32_t kGpuRefusalsBeforeFallback = 3;
     uint64_t m_lastPresentedImageSerial = 0;
     uint64_t m_lastPresentedRendererFrameSerial = 0;
     bool m_hasLastPresentedRendererFrameSerial = false;
@@ -2963,19 +2488,26 @@ private:
     uint64_t m_presentedUiGeneration = 0;
     bool m_uiGeometryUpdating = false;
     bool m_renderExited = false;
+    bool m_presentExited = false;
     bool m_renderFatal = false;
     bool m_hasSelectedCameraWorld = false;
     bool m_selectedImageGenerated = false;
     std::array<double, 16> m_selectedCameraWorld{};
-#if defined(OMNIUI_HAS_OVRTX_FRAME_PACING)
-    OvrtxApi m_api;
-    ovrtx_renderer_t* m_renderer = nullptr;
-    uint32_t m_renderVarStride = 0;
-    uint32_t m_renderVarNameOffset = 0;
-    uint32_t m_renderVarHandleOffset = 0;
-    std::vector<ovrtx_render_var_output_map_handle_t> m_retainedMapHandles;
-    std::vector<ovrtx_step_result_handle_t> m_retainedResultHandles;
-#endif
+    /// The renderer half of the session. Null without a renderer package.
+    const NativeFramePacingHooks* m_hooks = nullptr;
+    bool m_missingHooksReported = false;
+    /// What the render worker of the hooks calls back into.
+    const NativeFramePacingHost m_host{
+        sizeof(NativeFramePacingHost),
+        this,
+        hostWaitForWorkThunk,
+        hostStopRequestedThunk,
+        hostBeginStepThunk,
+        hostPublishGroupThunk,
+        hostReportErrorThunk,
+        hostRenderLoopEndedThunk,
+        hostRenderResumedThunk,
+    };
 };
 
 NativeFramePacingService& service()
@@ -3028,9 +2560,21 @@ bool pauseNativeFramePacingRender(uint64_t token)
     return service().pauseRender(token);
 }
 
-bool resumeNativeFramePacingRender(uint64_t token)
+bool resumeNativeFramePacingRender(uint64_t token, bool render)
 {
-    return service().resumeRender(token);
+    return service().resumeRender(token, render);
+}
+
+bool setNativeFramePacingRenderPolicy(uint64_t token, const char* policy, uint32_t settleFrames)
+{
+    if (!policy || (std::strcmp(policy, "continuous") != 0 && std::strcmp(policy, "on_change") != 0))
+        return false;
+    return service().setRenderPolicy(token, std::strcmp(policy, "on_change") == 0, settleFrames);
+}
+
+bool requestNativeFramePacingRender(uint64_t token)
+{
+    return service().requestRender(token);
 }
 
 bool stopNativeFramePacing(uint64_t token)

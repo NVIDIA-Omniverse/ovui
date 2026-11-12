@@ -11,7 +11,7 @@ description: |
 license: "Apache-2.0"
 metadata:
   python-distribution: ovui-widgets-app
-  version: "0.3.0"
+  version: "0.3.1"
 ---
 
 # ovui-widgets
@@ -103,6 +103,8 @@ trial app, do not add app-step tests, and do not add shape flags to
   providers ovui-widgets ships and how a host wires them.
 - `references/menu-and-qa.md` - Exercise 4 menu bar with File > Open and
   the screenshot-first QA flow with `ovui-inspect`.
+- `references/renderer-direct.md` - driving ovrtx directly from the atomic
+  viewport shell of the `omniverse-ui-apis` skill.
 
 ## Cumulative Exercises
 

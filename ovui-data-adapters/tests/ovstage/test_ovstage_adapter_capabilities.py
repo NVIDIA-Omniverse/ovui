@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from ovui_data_adapters.common import CreateActionErrorCode, CreateResult
 from ovui_data_adapters.ovstage.layer_stack_adapter import OvstageLayerStackAdapter
 from ovui_data_adapters.ovstage.property_adapter import OvstagePropertyAdapter
 from ovui_data_adapters.ovstage.provider import OvstageProviderSession
@@ -68,3 +71,68 @@ def test_ovstage_layer_capabilities_match_inert_layer_stack_behavior(tmp_path) -
     ):
         with pytest.raises(NotImplementedError):
             call()
+
+
+class _MaterialStageAdapter:
+    def __init__(self, bind_error_code: CreateActionErrorCode) -> None:
+        self.bind_error_code = bind_error_code
+        self.action_ids: list[str] = []
+
+    def create_prim(self, request) -> CreateResult:
+        self.action_ids.append(request.action_id)
+        if request.action_id.endswith(".bind"):
+            return CreateResult.rejected_result(
+                message="Native create failed: RuntimeError: bind",
+                error_code=self.bind_error_code,
+            )
+        return CreateResult.accepted_result(created_paths=("/World/Looks/PreviewSurface",))
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [CreateActionErrorCode.CREATE_FAILED, CreateActionErrorCode.VALIDATION_FAILED],
+)
+def test_ovstage_create_material_creates_the_material_after_a_failed_bind(
+    capsys, error_code: CreateActionErrorCode
+) -> None:
+    session = OvstageProviderSession(runtime=object())
+    adapter = _MaterialStageAdapter(error_code)
+    snapshot = SimpleNamespace(paths=lambda: ("/World/Mesh",))
+    published: list[list[str]] = []
+    bus = SimpleNamespace(
+        get_snapshot=lambda: snapshot,
+        publish=lambda paths, **_kwargs: published.append(list(paths)),
+    )
+    app = SimpleNamespace(stage_adapter=adapter, selection_bus=bus)
+
+    assert session.create_usd_preview_surface_material(app) == "/World/Looks/PreviewSurface"
+
+    assert adapter.action_ids == [
+        "create.material.usd-preview-surface.bind",
+        "create.material.usd-preview-surface",
+    ]
+    assert published == [["/World/Looks/PreviewSurface"]]
+    error = capsys.readouterr().err
+    assert "create.material.usd-preview-surface.bind was refused" in error
+    assert "RuntimeError: bind" in error
+    assert "Creating the material without a binding" in error
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [CreateActionErrorCode.DISABLED, CreateActionErrorCode.UNSUPPORTED],
+)
+def test_ovstage_create_material_without_bind_target_creates_unbound(
+    capsys, error_code: CreateActionErrorCode
+) -> None:
+    session = OvstageProviderSession(runtime=object())
+    adapter = _MaterialStageAdapter(error_code)
+    app = SimpleNamespace(stage_adapter=adapter, selection_bus=None)
+
+    assert session.create_usd_preview_surface_material(app) == "/World/Looks/PreviewSurface"
+
+    assert adapter.action_ids == [
+        "create.material.usd-preview-surface.bind",
+        "create.material.usd-preview-surface",
+    ]
+    assert capsys.readouterr().err == ""

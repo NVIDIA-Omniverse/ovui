@@ -12,6 +12,7 @@ import importlib.resources
 from typing import Any
 
 import omni.ui as ui
+from ovui_data_adapters.common import VisibilityState
 
 from ovui_widgets.stage.widget import stage_icons
 from ovui_widgets.stage.widget.hierarchy_model import HierarchyItem, HierarchyModel
@@ -414,22 +415,31 @@ class StageDelegate(ui.AbstractItemDelegate):
                     )
 
                 def build_eye_icon() -> None:
-                    is_hidden = (
+                    # The glyph shows the item's own state; an item hidden
+                    # only through a hidden ancestor keeps the open eye,
+                    # dimmed by the ``inherited`` style.
+                    state = (
                         model.profile_call(
-                            "StageBrowser.read_visibility", vis_model.get_value_as_bool
+                            "StageBrowser.read_visibility", vis_model.get_visibility_state
                         )
                         if isinstance(model, HierarchyModel)
-                        else vis_model.get_value_as_bool()
+                        else vis_model.get_visibility_state()
                     )
+                    is_hidden = state is VisibilityState.INVISIBLE
                     enabled = can_toggle_now()
                     icon = (
                         stage_icons.eye_off_icon()
                         if is_hidden
                         else stage_icons.eye_on_icon()
                     )
-                    name = "hidden" if is_hidden else "visible"
                     if not enabled:
                         name = "disabled"
+                    elif is_hidden:
+                        name = "hidden"
+                    elif state is VisibilityState.INHERITED_INVISIBLE:
+                        name = "inherited"
+                    else:
+                        name = "visible"
                     ui.ImageWithProvider(
                         stage_icons.provider(icon),
                         width=_VISIBILITY_ICON_SIZE,

@@ -29,6 +29,7 @@
 OMNIUI_NAMESPACE_OPEN_SCOPE
 
 constexpr char kWindowEnableDetachSettingsPath[] = "/exts/omni.ui/Window/enableDetach";
+constexpr char kWindowDetachedDecorationsPath[] = "/exts/omni.ui/Window/detachedDecorations";
 static constexpr char kDefaultRasterSettingsPath[] = "/exts/omni.ui/raster/default_rasterpolicy_enabled";
 
 // The sorted list of modal windows from bottom to top. Only the top one is using BeginPopupModal.
@@ -41,9 +42,9 @@ Window::WindowData::~WindowData()
     m_windowCloseObserverHandle.reset();
 }
 
-// Return the height of the window title. The same as ImGuiWindow::TitleBarHeight, can't use it because of linking
-// error.
-float WindowTitleBarHeight(ImGuiWindow* window)
+// Height an ImGui title bar occupies for this window, whether or not it currently has one. The
+// same as ImGuiWindow::TitleBarHeight, can't use it because of linking error.
+float WindowTitleBarHeightUnconditional(ImGuiWindow* window)
 {
     ImGuiContext* g = ImGui::GetCurrentContext();
 
@@ -53,12 +54,33 @@ float WindowTitleBarHeight(ImGuiWindow* window)
         scale *= window->ParentWindow->FontWindowScale;
     }
 
-    return (window->Flags & ImGuiWindowFlags_NoTitleBar) ? 0.0f : scale + g->Style.FramePadding.y * 2.0f;
+    return scale + g->Style.FramePadding.y * 2.0f;
+}
+
+// Height of the window title as currently drawn, so zero when the window has no title bar.
+float WindowTitleBarHeight(ImGuiWindow* window)
+{
+    return (window->Flags & ImGuiWindowFlags_NoTitleBar) ? 0.0f : WindowTitleBarHeightUnconditional(window);
 }
 
 /**
- * @brief Create a new application window with no decorations.
+ * @brief Whether detached windows should be created with window manager decorations.
+ *
+ * Off by default, which keeps the borderless window omni.ui has always created and moves and
+ * resizes it from the ImGui title bar. On, the window manager owns move and resize, which is the
+ * only thing that can work where a client cannot position itself -- notably Wayland -- at the cost
+ * of showing the WM title bar above the ImGui one, which is kept either way because it carries the
+ * menu that docks the window back.
  */
+static bool _useDetachedDecorations()
+{
+    auto* settings = PlatformRegistry::instance().settings();
+    if (!settings)
+        return false;
+    settings->setDefaultBool(kWindowDetachedDecorationsPath, false);
+    return settings->getBool(kWindowDetachedDecorationsPath, false);
+}
+
 static AppWindowHandle _newOsWindow(const char* title, uint64_t x, uint64_t y, uint64_t width, uint64_t height)
 {
     auto* platform = PlatformRegistry::instance().platform();
@@ -127,9 +149,6 @@ Window::Window(const std::string& title, Window::DockPreference dockPrefence, Wi
                 }
             }
         });
-
-    //NOTE: I think this is bogus and may be causing problems..
-    //this->setFocusedChangedFn(std::bind(&Window::_sizeExplicitlyChanged, this));
 
     // Create a frame and don't push created object to any container.
     OMNIKIT_WITH_CONTAINER(nullptr)
@@ -210,6 +229,50 @@ Window::~Window()
     this->destroy();
 }
 
+void Window::setOwnerModule(const std::string& moduleName)
+{
+    m_data->m_ownerModule = moduleName;
+}
+
+const std::string& Window::getOwnerModule() const
+{
+    return m_data->m_ownerModule;
+}
+
+void Window::_detectFirstInteraction()
+{
+    if (m_data->m_firstInteractionReported)
+    {
+        return;
+    }
+
+    // Only count clicks landing inside this Window's content area (including its child windows).
+    if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows))
+    {
+        return;
+    }
+
+    // IsWindowHovered alone is also true over the title bar and near the resize borders of a
+    // decorated window, so restrict to the inner (content) rect: moving or resizing a window
+    // is not "using" the extension's UI. InnerRect excludes the title bar, menu bar, and
+    // scrollbars. We are between ImGui::Begin/End for this window, so CurrentWindow is it.
+    ImGuiWindow* imGuiWindow = ImGui::GetCurrentContext()->CurrentWindow;
+    if (!imGuiWindow || !imGuiWindow->InnerRect.Contains(ImGui::GetMousePos()))
+    {
+        return;
+    }
+
+    if (!(ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+          ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
+          ImGui::IsMouseClicked(ImGuiMouseButton_Middle)))
+    {
+        return;
+    }
+
+    m_data->m_firstInteractionReported = true;
+    Workspace::onWindowFirstInteraction(m_title, m_data->m_ownerModule);
+}
+
 void Window::setActive(bool active)
 {
     ui::windowmanager::IWindowCallbackManager* windowCallbackManager =
@@ -248,6 +311,16 @@ void Window::destroy()
 void Window::notifyAppWindowChange(AppWindowHandle newAppWindow)
 {
     m_data->m_appWindow = newAppWindow;
+
+    // Only moveToNewOSWindow() knows whether the window it just created is decorated, and it sets
+    // this again right after. Any other route -- back to the main window, or onto an app window
+    // created elsewhere -- leaves omni.ui driving the frame itself, which is the default.
+    m_data->m_osWindowDecorated = false;
+
+    // Drop any drag in flight as well: the OS window it was moving is no longer ours, and a stale
+    // grab offset would make the next detach jump if the button is still held.
+    m_data->m_osWindowMoving = false;
+
     if (m_data->m_appWindow)
     {
         auto* platform = PlatformRegistry::instance().platform();
@@ -264,6 +337,12 @@ void Window::notifyAppWindowChange(AppWindowHandle newAppWindow)
                         // Kill both handles
                         m_data->m_windowCloseObserverHandle.reset();
                         m_data->m_deferredDestroyHandle.reset();
+                        if (auto* platform = PlatformRegistry::instance().platform())
+                        {
+                            auto mainAppWindow = platform->getDefaultAppWindowHandle();
+                            if (mainAppWindow && this->getAppWindow() != mainAppWindow)
+                                this->moveToAppWindow(mainAppWindow);
+                        }
                         this->setVisible(false);
                     });
             }
@@ -289,7 +368,11 @@ void Window::moveToAppWindow(AppWindowHandle newAppWindow)
         PlatformRegistry::instance().windowCallbackManager();
 
     uiWindowManager->moveCallbackToAppWindow(m_data->m_uiWindow.get(), newAppWindow);
-    this->notifyAppWindowChange(newAppWindow);
+    // A missing destination leaves the callback in its current set. Keep the
+    // window's draw/input destination consistent with that actual owner.
+    if (m_data->m_uiWindow && m_data->m_uiWindow->getWindowSet() &&
+        m_data->m_uiWindow->getWindowSet() == uiWindowManager->getWindowSetByAppWindow(newAppWindow))
+        this->notifyAppWindowChange(newAppWindow);
 }
 
 AppWindowHandle Window::getAppWindow() const
@@ -593,24 +676,35 @@ bool Window::moveToNewOSWindow()
     uint64_t width = static_cast<uint64_t>(this->getWidth());
     uint64_t height = static_cast<uint64_t>(this->getHeight());
 
+    // Unconditional: _draw() clears kWindowFlagNoTitleBar for a detached window, so the window we
+    // are about to create always has a title bar even when the docked one being measured here does
+    // not. Asking for the height as currently drawn would return 0 for exactly those windows and
+    // make both the size below and titleBarOffsetY one title bar short.
     float tbHeight = 0.0f;
     ImGuiContext* ctx = ImGui::GetCurrentContext();
     if (ctx)
     {
         ImGuiWindow* imGuiWindow = ctx->CurrentWindow;
         if (imGuiWindow)
-            tbHeight = WindowTitleBarHeight(imGuiWindow);
+            tbHeight = WindowTitleBarHeightUnconditional(imGuiWindow);
     }
 
     if (m_frame && m_frame->getComputedWidth() > 0.0f)
         width = static_cast<uint64_t>(m_frame->getComputedWidth());
+
+    const bool decorated = _useDetachedDecorations();
+
+    // The requested position is the client area origin, and a decorated window's WM title bar is
+    // drawn above it. Start one title bar lower so that bar lands inside the old window rather than
+    // over whatever was above it, or off the top of the display.
+    const float titleBarOffsetY = decorated ? tbHeight : 0.0f;
 
     if (m_frame && m_frame->getComputedHeight() > 0.0f)
         height = static_cast<uint64_t>(m_frame->getComputedHeight() + tbHeight);
 
     AppWindowHandle newOsWindow =
         _newOsWindow(this->getTitle().c_str(), static_cast<uint64_t>(position.x + m_positionX * dpiScale),
-                     static_cast<uint64_t>(position.y + m_positionY * dpiScale),
+                     static_cast<uint64_t>(position.y + m_positionY * dpiScale + titleBarOffsetY),
                      std::max(width, minSize), std::max(height, minSize));
 
     if (!newOsWindow)
@@ -622,6 +716,9 @@ bool Window::moveToNewOSWindow()
     }
 
     this->moveToAppWindow(newOsWindow);
+
+    // After moveToAppWindow(), which goes through notifyAppWindowChange() and clears this.
+    m_data->m_osWindowDecorated = decorated;
     return true;
 }
 
@@ -635,6 +732,10 @@ void Window::moveToMainOSWindow()
     AppWindowHandle mainAppWindow = platform ? platform->getDefaultAppWindowHandle() : nullptr;
 
     uiWindowManager->moveCallbackToAppWindow(m_data->m_uiWindow.get(), mainAppWindow);
+
+    if (!m_data->m_uiWindow || !m_data->m_uiWindow->getWindowSet() ||
+        m_data->m_uiWindow->getWindowSet() != uiWindowManager->getWindowSetByAppWindow(mainAppWindow))
+        return;
 
     AppWindowHandle currentAppWindow = m_data->m_appWindow;
 
@@ -652,6 +753,48 @@ void Window::moveToMainOSWindow()
     }
 
     this->notifyAppWindowChange(mainAppWindow);
+}
+
+void Window::_updateOSWindowDrag(bool canStartDrag)
+{
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+    {
+        m_data->m_osWindowMoving = false;
+        return;
+    }
+
+    const bool startDrag = canStartDrag && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    if (!startDrag && !m_data->m_osWindowMoving)
+    {
+        return;
+    }
+
+    auto* platform = PlatformRegistry::instance().platform();
+    if (!platform || !m_data->m_appWindow || platform->isAppWindowVirtual(m_data->m_appWindow))
+        return;
+
+    // getCursorPosition() is window-relative, so a frame-to-frame delta taken from it cancels out
+    // as the window follows the cursor. Anchor on the grab offset and re-derive an absolute target
+    // instead. That is idempotent -- once the window has caught up the target equals its current
+    // position -- so a stale getWindowPosition(), routine on X11 where the window manager applies
+    // moves asynchronously, recomputes the same target and self-corrects instead of compounding.
+    const Int2 cursorInWindow = platform->getAppWindowCursorPosition(m_data->m_appWindow);
+
+    if (!m_data->m_osWindowMoving)
+    {
+        m_data->m_osWindowGrabOffset = cursorInWindow;
+        m_data->m_osWindowMoving = true;
+        return;
+    }
+
+    const Int2 windowPosition = platform->getAppWindowOsPosition(m_data->m_appWindow);
+    const Int2 target = { windowPosition.x + cursorInWindow.x - m_data->m_osWindowGrabOffset.x,
+                                windowPosition.y + cursorInWindow.y - m_data->m_osWindowGrabOffset.y };
+
+    if (target.x != windowPosition.x || target.y != windowPosition.y)
+    {
+        platform->setAppWindowOsPosition(m_data->m_appWindow, target.x, target.y);
+    }
 }
 
 bool Window::_updateFocusState()
@@ -731,6 +874,17 @@ void Window::_draw(const char* windowName, float elapsedTime)
     bool appWindowIsMainWindow = m_data->m_appWindow == defaultWindow;
     bool windowDrivesAppWindow = !appWindowIsMainWindow && !(this->getFlags() & (kWindowFlagModal | kWindowFlagPopup));
 
+    // Whether that app window is a real OS window, i.e. this Window was detached with
+    // moveToNewOSWindow() -- _newOsWindow() gives up unless it gets a window with a
+    // carb::windowing::Window behind it, so a detached window is always this.
+    //
+    // Not every app window that is not the main one is an OS window: omni.ui.scene hosts each
+    // ui.scene.Widget in a ui::Window moved onto a *virtual* app window that renders to an
+    // offscreen texture. Such a window has no window manager, no title bar to drag and nowhere to
+    // move back to, and its pixels are the widget the user sees, so none of the detached-window
+    // handling below applies to it.
+    bool windowDrivesOsWindow = windowDrivesAppWindow && !this->isVirtual();
+
     if (windowDrivesAppWindow)
     {
         // Check if this is an ImGui window in the detached application window.
@@ -739,6 +893,13 @@ void Window::_draw(const char* windowName, float elapsedTime)
         ui::windowmanager::IWindowCallbackManager* uiWindowManager =
             PlatformRegistry::instance().windowCallbackManager();
         omni::ui::windowmanager::WindowSet* currentWindowSet = uiWindowManager->getWindowSetByAppWindow(m_data->m_appWindow);
+        if (!currentWindowSet)
+        {
+            OMNIUI_LOG_WARN("Window '%s' lost its app-window association; restoring its callback owner's destination",
+                            getTitle().c_str());
+            this->notifyAppWindowChange(m_data->m_uiWindow->getAppWindow());
+            return;
+        }
 
         // Get the first callback in current application window.
         omni::ui::windowmanager::IWindowCallback* callback = uiWindowManager->getWindowSetCallbackAt(currentWindowSet, 0);
@@ -860,6 +1021,10 @@ void Window::_draw(const char* windowName, float elapsedTime)
         flags |= kWindowFlagNoScrollbar | kWindowFlagNoScrollWithMouse;
     }
 
+    // Captured before the branch below clears it: the OS window sync further down needs to know
+    // whether an explicit width/height assignment landed this frame.
+    const bool sizeExplicitlyChanged = m_data->m_sizeExplicitlyChanged;
+
     if (!this->getAutoResize())
     {
         if (m_data->m_sizeExplicitlyChanged)
@@ -876,17 +1041,65 @@ void Window::_draw(const char* windowName, float elapsedTime)
             m_data->m_sizeExplicitlyChanged = false;
         }
 
-        if (windowDrivesAppWindow && platform)
-        {
-            // this is not great and introduce some Jitter but if you resize slowy it "works"
-            platform->resizeAppWindow(m_data->m_appWindow,
-                                       static_cast<int>(this->getWidth() * uiScale),
-                                       static_cast<int>(this->getHeight() * uiScale));
-        }
     }
     else
     {
         flags |= ImGuiWindowFlags_AlwaysAutoResize;
+    }
+
+    if (windowDrivesAppWindow && platform)
+    {
+        // A decorated OS window is resized by the window manager, so it is the authoritative size
+        // and the ui.Window has to follow it. An auto-resize window is still driven by its content,
+        // and an explicit width/height assignment is still a request to resize the OS window, so
+        // both of those keep pushing even when decorated.
+        const bool pullFromOSWindow =
+            m_data->m_osWindowDecorated && !this->getAutoResize() && !sizeExplicitlyChanged;
+
+        // Pushing the size of an auto-resize window is part of the detached-window fix and is
+        // deliberately limited to OS windows. A virtual app window is sized by whoever created it
+        // -- omni.ui.scene drives its own from the widget resolution -- and an auto-resize window
+        // on one was never pushed to from here, so leave that path exactly as it was.
+        const bool pushToOSWindow = windowDrivesOsWindow || !this->getAutoResize();
+
+        if (pullFromOSWindow)
+        {
+            // The window manager sizes this window, so take the ImGui resize grip out of play.
+            // ConfigWindowsResizeFromEdges above only covers the edges, and a grip drag would be
+            // overridden by the SetNextWindowSize below on the very next frame anyway.
+            flags |= ImGuiWindowFlags_NoResize;
+
+            int width = 0;
+            int height = 0;
+            platform->getAppWindowSize(m_data->m_appWindow, &width, &height);
+            const float appWidth = float(width);
+            const float appHeight = float(height);
+
+            if (appWidth > 0.0f && appHeight > 0.0f)
+            {
+                // Fill the app window. Overrides the ImGuiCond_Once position set further up, which
+                // only covers the first frame.
+                ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(appWidth, appHeight), ImGuiCond_Always);
+            }
+        }
+        else if (pushToOSWindow)
+        {
+            // Keep the OS window in sync with the ImGui window. _updateWindow() writes the real
+            // ImGui::GetWindowSize() back into getWidth()/getHeight() every frame, so this is the
+            // authoritative size for auto-resize windows too. This used to sit inside the
+            // !getAutoResize() branch above, which meant a detached auto-resize window never
+            // resized its borderless OS window and so could not be resized at all.
+            const uint32_t osWidth = uint32_t(this->getWidth() * uiScale);
+            const uint32_t osHeight = uint32_t(this->getHeight() * uiScale);
+
+            // Guard the first frames, where the size has not been computed yet: resizing the OS
+            // window to zero leaves it unrecoverable.
+            if (osWidth > 0 && osHeight > 0)
+            {
+                platform->resizeAppWindow(m_data->m_appWindow, static_cast<int>(osWidth), static_cast<int>(osHeight));
+            }
+        }
     }
 
     bool useClose = ((this->getFlags() & kWindowFlagNoClose) == kWindowFlagNoClose);
@@ -894,9 +1107,25 @@ void Window::_draw(const char* windowName, float elapsedTime)
 
     if (windowDrivesAppWindow)
     {
-        // Without the Tittle bar is nice but remove the options for the Menu
-        // ultimately the goal is with Tittle Bar but NoDecoration so that is ok for now
-        flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse; //| ImGuiWindowFlags_NoTitleBar;
+        flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse;
+    }
+
+    if (windowDrivesOsWindow)
+    {
+        // The ImGui title bar carries the "Move to Main Window" context menu, which is the only
+        // route back to the docked state that every detached window has -- an app window menu only
+        // covers windows the application registered there. So it is forced on, even for a window
+        // that asked for kWindowFlagNoTitleBar while docked, which would otherwise detach into
+        // something that cannot be recovered.
+        //
+        // Borderless, it is also the only chrome the OS window has and carries the drag region
+        // that moves it. Under /exts/omni.ui/Window/detachedDecorations it sits below the window
+        // manager's own title bar, so such a window shows two; that is the price of the setting,
+        // and why it is off by default.
+        //
+        // Only for a real OS window: forcing a title bar onto a virtual app window would draw one
+        // into the offscreen texture an omni.ui.scene widget is made of.
+        flags &= ~ImGuiWindowFlags_NoTitleBar;
     }
 
     // if the menuBar is not visible turn off the MenuBar Flag
@@ -1010,15 +1239,26 @@ void Window::_draw(const char* windowName, float elapsedTime)
                 ImGui::SetFocusID(ctx->CurrentWindow->ID, ctx->CurrentWindow);
             }
 
+            _detectFirstInteraction();
+
             if (m_data->m_multiOSWindowSupport)
             {
                 // we need to move that to a Settings so we can hide it while it dev
                 // Also this being here mean we need to do the same for the kit.ui,window and cpp Window
                 // might be better to move that Logic into some utility in window_manager ?
-                // TitleBarHeight to be sure the mouse is ot top of the title
-                if ((ImGui::GetMousePos().y < +ImGui::GetWindowPos().y + WindowTitleBarHeight(imGuiWindow) &&
-                     m_data->m_enableWindowDetach && this->isDetachable()) ||
-                    m_data->m_titleMenuOpened)
+                // TitleBarHeight to be sure the mouse is ot top of the title. Purely geometric --
+                // whether the title bar is allowed to *act* is the separate test below.
+                const bool overTitleBar =
+                    ImGui::GetMousePos().y < ImGui::GetWindowPos().y + WindowTitleBarHeight(imGuiWindow);
+
+                // Detaching needs permission; docking back never does. moveToNewOSWindow() is
+                // callable from Python without consulting isDetachable() -- omni.kit.window.file_*
+                // and omni.kit.capture.viewport all do exactly that -- and a window detached that
+                // way must still be able to get home.
+                const bool canUseTitleMenu =
+                    windowDrivesOsWindow || (m_data->m_enableWindowDetach && this->isDetachable());
+
+                if ((overTitleBar && canUseTitleMenu) || m_data->m_titleMenuOpened)
                 {
                     m_data->m_titleMenuOpened = ImGui::BeginPopupContextItem("OS Window");
                     if (m_data->m_titleMenuOpened)
@@ -1051,37 +1291,15 @@ void Window::_draw(const char* windowName, float elapsedTime)
                     }
                 }
 
-                if (windowDrivesAppWindow && platform)
+                // Deliberately outside the title bar test above: only *starting* a drag needs the
+                // cursor over the title bar, an in-flight one has to keep running wherever the
+                // cursor goes. Nesting it meant dragging downwards left the band on the first
+                // frame, which stopped the move and skipped the release handling, latching the
+                // drag state on. Skipped when decorated: the window manager moves the window and
+                // setWindowPosition() from here would fight it.
+                if (windowDrivesOsWindow && !m_data->m_osWindowDecorated)
                 {
-                    if ((ImGui::IsItemHovered() || m_data->m_osWindowMoving) && ImGui::IsMouseDown(ImGuiMouseButton_Left))
-                    {
-                        m_data->m_osWindowMoving = true;
-
-                        Int2 mouseCoords = platform->getAppWindowCursorPosition(m_data->m_appWindow);
-
-                        if (!m_data->m_mouseWasDragging)
-                        {
-                            m_data->m_mouseDragPoint = mouseCoords;
-                            m_data->m_mouseWasDragging = true;
-                        }
-
-                        Int2 mouseDelta = {mouseCoords.x - m_data->m_mouseDragPoint.x, mouseCoords.y - m_data->m_mouseDragPoint.y};
-
-                        if (mouseDelta.x != m_data->m_mouseDelta.x || mouseDelta.y != m_data->m_mouseDelta.y)
-                        {
-                            Int2 position = platform->getAppWindowOsPosition(m_data->m_appWindow);
-
-                            position.x += mouseDelta.x;
-                            position.y += mouseDelta.y;
-                            platform->setAppWindowOsPosition(m_data->m_appWindow, position.x, position.y);
-                            m_data->m_mouseDelta = mouseDelta;
-                        }
-                    }
-                    else
-                    {
-                        m_data->m_mouseWasDragging = false;
-                        m_data->m_osWindowMoving = false;
-                    }
+                    _updateOSWindowDrag(overTitleBar && !m_data->m_titleMenuOpened);
                 }
             }
             this->_updateWindow(windowName, elapsedTime, true);

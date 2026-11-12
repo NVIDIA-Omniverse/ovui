@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import contextlib
 import inspect
 import math
 import os
@@ -21,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque, List, Optional
 
 import numpy as np
+from ovui_data_adapters.ovstage._handles import handle_number, native_prim_path
 from ovui_data_adapters.common import (
     AovAuthoringCatalog,
     AovOutputDescriptor,
@@ -41,6 +44,7 @@ from ovui_data_adapters.common import (
     RenderFrameMetadata,
     RenderFrameResult,
     RendererAdapter,
+    RendererStageMismatchError,
     RenderSettingApplyResult,
     RenderSettingDescriptor,
     RenderSettingRequirement,
@@ -81,9 +85,38 @@ from ovui_data_adapters.common._ldr_overlap import (
     LdrOverlapState,
     camera_state_differs,
 )
+from ovui_data_adapters.common.ovrtx_compile_limits import limit_shader_compile_sessions
+from ovui_data_adapters.common.render_diagnostics import (
+    LOGGER,
+    HostMemoryWatch,
+    check_scene_resources,
+    note_gpu_memory_before_renderer,
+)
+from ovui_data_adapters.common.render_material_report import FileEventLinker, record_file_events
+from ovui_data_adapters.common.render_probe import (
+    LivePlan,
+    MaterialCheckRequests,
+    MaterialMismatchError,
+    extract_images,
+    failure_summary,
+    record_result,
+    verify_mode,
+)
+from ovui_data_adapters.common.render_native_log import (
+    begin_scene_events,
+    record_scene_failure,
+    record_step_failure,
+    release_native_log,
+    retire_closed_scene_events,
+    settle_body_resources,
+    start_native_log,
+)
 from ovui_data_adapters.common.instrumentation import (
     RENDER_THREAD_SCOPE,
     get_instrumentation,
+)
+from ovui_data_adapters.common.ovrtx_carb_settings import (
+    apply_environment_carb_settings,
 )
 from ovui_data_adapters.common.ovrtx_import import import_ovrtx
 from ovui_data_adapters.common.render_settings import (
@@ -94,6 +127,17 @@ from ovui_data_adapters.common.render_settings import (
     render_setting_owner_scope,
     render_setting_spec_owner_scope,
 )
+from ovui_data_adapters.common.render_telemetry import (
+    get_material_messages,
+    native_renderer_handle,
+    note_renderer_diagnostics,
+    prepare_material_messages,
+    start_material_messages,
+    stop_material_messages,
+)
+from ovui_data_adapters.common.stored_render_settings import (
+    stored_render_setting_lines,
+)
 from ovui_data_adapters.ovstage._authoring import (
     MISSING as _NATIVE_MISSING,
 )
@@ -102,10 +146,13 @@ from ovui_data_adapters.ovstage._authoring import (
     NativeValueEditCommand,
 )
 from ovui_data_adapters.ovstage._catalog import native_catalog_snapshot
+from ovui_data_adapters.ovstage._material_plan import plan_native, read_shader_catalog
+from ovui_data_adapters.ovstage._material_report import describe_native_materials
 from ovui_data_adapters.ovstage._errors import raise_not_ready
 from ovui_data_adapters.ovstage._native import (
     read_matrix_attribute,
     read_path_attribute_records,
+    read_population_meters_per_unit,
     read_paths_attribute_records,
     read_token_attribute,
     resolve_token_id,
@@ -114,6 +161,10 @@ from ovui_data_adapters.ovstage._scene import (
     _kit_type_records,
     _load_population_module,
     _reconcile_native_write_floor,
+    begin_native_camera_writes,
+    end_native_camera_writes,
+    note_camera_ordinal,
+    note_value_edit_ordinal,
 )
 from ovui_data_adapters.ovstage._stage_write import (
     StageWriteBatch,
@@ -148,6 +199,21 @@ _RENDER_SETTINGS_OWNER_LOCAL_PATH = "/Render/OmniverseGlobalRenderSettings"
 _RENDER_SETTINGS_OWNER_PRIM_TYPE = "RenderSettings"
 _OVRTX_XFORM_ATTR = "omni:xform"
 _DEFAULT_RESOLUTION = (1280, 720)
+# ovrtx refuses to attach an ovstage that was not built to work with it, with
+# this text in the error.
+_RENDERER_STAGE_MISMATCH_TEXT = "does not publish the internal accessor extension"
+_RENDERER_STAGE_MISMATCH_MESSAGE = (
+    "Cannot render the scene: the installed renderer library (ovrtx) and the "
+    "installed stage library (ovstage) do not match. Install an ovrtx package "
+    "and an ovstage package that match."
+)
+# A new viewport size goes to the owned render product only after the size
+# that the viewport asks for stayed the same for this time. A window resize
+# (a drag of the window border, a maximize) asks for a new size on many frames,
+# and the first step at a new resolution is slow (a renderer reset and new
+# render buffers). Until the size settles, the renderer renders at the size
+# that it has, and the image is scaled to the viewport.
+_RESIZE_SETTLE_S = 0.200
 _MIN_DT = 1.0 / 300.0
 _MAX_DT = 0.1
 _RENDER_WORKER_WAIT_TIMEOUT_NS = 5_000_000
@@ -158,7 +224,15 @@ _VISIBILITY_INHERITED = "inherited"
 _VISIBILITY_INVISIBLE = "invisible"
 _VISIBILITY_TOKENS = frozenset({_VISIBILITY_INHERITED, _VISIBILITY_INVISIBLE})
 _SELECTION_OUTLINE_GROUP_ID = 1
+#: Without a change stream that polls, a new scene starts native frame pacing
+#: after this many synchronous frames.
+_SCENE_OPEN_SYNCHRONOUS_FRAMES = 60
+#: The first native session of a scene restarts its frame timing once, after
+#: it has presented this many frames: the renderer's first frames are slow.
+_SCENE_OPEN_SETTLE_FRAMES = 120
 _SELECTION_OUTLINE_CLEAR_GROUP_ID = 0
+_SELECTION_OUTLINE_HIDDEN_GROUP_ID = 2
+_SELECTION_OUTLINE_ANCHOR_ATTEMPTS = 3
 _SELECTION_OUTLINE_COLOR = (0.0, 138.0 / 255.0, 249.0 / 255.0, 1.0)
 _SELECTION_OUTLINE_FILL = (0.0, 138.0 / 255.0, 249.0 / 255.0, 0.0)
 _PICK_HIT_VAR = "ovrtx_pick_hit"
@@ -2228,9 +2302,24 @@ class OvstageRendererAdapter(RendererAdapter):
         self._ovrtx = ovrtx
         config = _borrow_renderer_config(ovrtx)
         get_instrumentation().prepare_renderer_config(self, config)
+        # A renderer with the public log callback names the module of each material in its materials channel.
+        prepare_material_messages()
+        # The native renderer reports material and texture failures only in
+        # its own log file: read it, so that they are not silent.
+        start_native_log(self, config)
+        # Cap parallel shader compilation (host memory grows with it), with
+        # the complete config of this renderer.
+        limit_shader_compile_sessions(config)
+        # The GPU memory that is free now is what the new renderer can use.
+        note_gpu_memory_before_renderer()
+        # Carb settings that a plugin reads when it starts must be set first.
+        apply_environment_carb_settings(ovrtx, config)
         self._renderer = ovrtx.Renderer(config)
         validate_ovrtx_borrow_renderer(self._renderer)
+        start_material_messages(self)
         self._gpu_device_name = _detect_gpu_device_name()
+        # The memory check needs the scene: load_stage runs it with the scene
+        # size.
         self._logged_first_step = False
         self._zero_copy_state: Optional[ZeroCopyState] = None
         # A replacement renderer is constructed before the provider tears
@@ -2268,9 +2357,23 @@ class OvstageRendererAdapter(RendererAdapter):
         self._active_camera_common_path: str | None = None
         self._last_resolution = _DEFAULT_RESOLUTION
         self._last_render_product_resolution = _DEFAULT_RESOLUTION
+        # The newest size that the viewport asked for, and when it asked for it
+        # first. ``None`` so the first size after a scene load applies at once.
+        self._resize_request: tuple[int, int] | None = None
+        self._resize_request_time = -math.inf
+        self._clock = time.perf_counter
         self._dt_clock = time.perf_counter()
         self._last_load_from_scene_context = False
         self._borrow_step_count = 0
+        self._file_check_due = False
+        self._live_check_due = False
+        self._strict_refusal = None
+        # The files that the shaders of the attached scene name, and its material catalog (see _material_catalog).
+        self._shader_files: list[dict[str, Any]] | None = None
+        self._file_linker: FileEventLinker | None = None
+        self._material_catalog: tuple[Any, dict[str, str]] | None = None
+        # material_verify asks for a check here; render_frame runs it on the thread that renders.
+        self._material_check_requests = MaterialCheckRequests()
         self._successful_frame_count = 0
         self._last_frame_nonblack_pixels: int | None = None
         self._last_frame_shape: tuple[int, ...] | None = None
@@ -2435,6 +2538,11 @@ class OvstageRendererAdapter(RendererAdapter):
 
     def set_zero_copy_state(self, state: Optional[ZeroCopyState]) -> None:
         self._zero_copy_state = state
+        # An ovrtx 0.4 CUDA mapping makes the GPU upload slower than the CPU
+        # image path (about 100 versus 140 frames per second).
+        version = getattr(self, "_ovrtx_version", None)
+        if state is not None and isinstance(version, tuple) and version < (0, 5):
+            state.mark_fallback(f"ovrtx {'.'.join(map(str, version))} CUDA mapping is slower")
 
     def set_undo_manager(self, undo_manager: Any | None) -> None:
         """Bind application history after pre-UI OVRTX construction.
@@ -2502,10 +2610,24 @@ class OvstageRendererAdapter(RendererAdapter):
 
         if self._attached_stage is not None:
             raise RuntimeError("OVRTX does not support swapping an attached OVStage")
+        # The failures of the scene that this one replaces are dropped when it is attached.
+        scene_mark = begin_scene_events()
+        records = _query_records(ovstage)
+        # The native stage does not list the layers that it composes, so the scene size is the size of
+        # the root file only: an underestimate when the scene references other layers. A scene with no
+        # prims gets no minimum.
+        source = str(getattr(scene, "source_path", "") or "")
+        if source and os.path.isfile(source):
+            check_scene_resources(
+                os.path.getsize(source), "root file only (the native stage does not list its layers)", not records
+            )
+        else:
+            check_scene_resources(0, "no scene file", not records)
         # Ownership: nothing retained may outlive the native attach below.
         self._discard_async_render_state()
         self._release_retained_output()
-        records = _query_records(ovstage)
+        # The prim types are kept for the material commands: reading them again costs seconds on a large scene.
+        shader_files, material_catalog = _read_material_catalog(scene, ovstage, records)
         runtime_root_path = _select_runtime_root_path(scene)
         runtime_layer = _build_runtime_layer(
             ovstage,
@@ -2513,6 +2635,9 @@ class OvstageRendererAdapter(RendererAdapter):
             records=records,
             runtime_root_path=runtime_root_path,
             viewport_quality=self._viewport_quality,
+            stored_lines=stored_render_setting_lines(
+                getattr(scene, "stored_render_settings", dict)()
+            ),
         )
         self._remove_scene()
         population = _load_population_module(import_module("ovstage"))
@@ -2577,9 +2702,29 @@ class OvstageRendererAdapter(RendererAdapter):
                 reference_handle=reference_handle,
                 runtime_root_path=runtime_layer.root_path,
             )
+            if _RENDERER_STAGE_MISMATCH_TEXT in str(exc):
+                raise RendererStageMismatchError(
+                    _RENDERER_STAGE_MISMATCH_MESSAGE
+                ) from exc
             raise
         self._scene = scene
         self._attached_stage = ovstage
+        # The renderer compiles the scene with its first frames. After them, the files that the shaders name
+        # are checked, and the material check runs when OVUI_VERIFY_MATERIALS asks for it.
+        self._shader_files = shader_files
+        self._material_catalog = material_catalog
+        self._file_check_due = True
+        self._file_linker = None
+        self._live_check_due = verify_mode() != "off"
+        self._strict_refusal = None
+        # What the renderer said about the materials of the previous scene does not hold for this one.
+        get_material_messages().clear()
+        retire_closed_scene_events(scene_mark)
+        # The renderer's totals are read after each step with this handle (taken here, not at each frame).
+        self._renderer_totals_handle = native_renderer_handle(self.instrumentation_target())
+        # Read at the scene's first frame, after the attach has written the
+        # runtime layer.
+        self._native_pacing_after_ordinal = 0
         existing_barrier = getattr(
             ovstage,
             "_ovui_before_frame_publication",
@@ -2625,6 +2770,8 @@ class OvstageRendererAdapter(RendererAdapter):
         self._active_render_product_common_path = None
         self._last_resolution = _DEFAULT_RESOLUTION
         self._last_render_product_resolution = _DEFAULT_RESOLUTION
+        self._resize_request = None
+        self._resize_request_time = -math.inf
         self._secondary_last_resolution = _DEFAULT_RESOLUTION
         self._secondary_last_pushed_camera_state = None
         self._secondary_viewport_frame = None
@@ -2660,6 +2807,9 @@ class OvstageRendererAdapter(RendererAdapter):
         # The newly attached scene needs one activation reset after
         # membership next exists (see __init__).
         self._selection_outline_pass_needs_reset = True
+        self._selection_outline_anchor_applied = False
+        self._selection_outline_anchor_pending = True
+        self._selection_outline_anchor_attempts = 0
         self._borrow_step_count = 0
         self._successful_frame_count = 0
         self._last_frame_nonblack_pixels = None
@@ -2731,7 +2881,13 @@ class OvstageRendererAdapter(RendererAdapter):
         return native_ui
 
     def _before_ovstage_frame_publication(self) -> None:
-        """Hand Stage publication ownership back to Python before begin_frame."""
+        """Hand Stage publication ownership back to Python before begin_frame.
+
+        The topology version relies on this gate: while a native session
+        runs, every ordinal it commits is counted as a camera write
+        (``begin_native_camera_writes``). A writer that bypasses this gate
+        while a session runs would leave the stage tree stale.
+        """
 
         token = int(getattr(self, "_frame_pacing_token", 0) or 0)
         if not token:
@@ -2795,7 +2951,7 @@ class OvstageRendererAdapter(RendererAdapter):
             and self._frame_pacing_camera_path_list
             and self._frame_pacing_query_path == camera_path
         ):
-            return int(query.handle)
+            return handle_number(query.handle)
         self._release_frame_pacing_camera_query()
         stage = self._attached_stage
         dictionary = self._path_dictionary
@@ -2811,7 +2967,7 @@ class OvstageRendererAdapter(RendererAdapter):
             self._frame_pacing_query_path = camera_path
             query = stage.query_from_path_list(path_list)
             self._frame_pacing_camera_query = query
-            handle = int(getattr(query, "handle", 0) or 0)
+            handle = handle_number(getattr(query, "handle", 0) or 0)
             if not handle:
                 raise RuntimeError("OVStage camera query returned an invalid handle")
         except Exception:
@@ -2851,7 +3007,7 @@ class OvstageRendererAdapter(RendererAdapter):
                 )
             )
             if not operation_succeeded:
-                status, error_op_ids, _ = stage.wait_op(int(operation.op_id))
+                status, error_op_ids, _ = stage.wait_op(operation.op_id)
                 operation_succeeded = (
                     int(status) == int(operation.status)
                     and not error_op_ids
@@ -2859,7 +3015,7 @@ class OvstageRendererAdapter(RendererAdapter):
                 self._frame_pacing_camera_query_release_succeeded = (
                     operation_succeeded
                 )
-            release_status = int(stage.release_op(int(operation.op_id)))
+            release_status = int(stage.release_op(operation.op_id))
             if release_status != int(operation.status):
                 # Keep both the claimed Query wrapper and its terminal
                 # operation id so the next lifecycle drain can retry release
@@ -2969,6 +3125,7 @@ class OvstageRendererAdapter(RendererAdapter):
         pause_render: bool = False,
     ) -> None:
         """Drain native renderer/Stage work before any Python operation."""
+        self._still_frame_requested = True
 
         transition_lock = getattr(self, "_frame_pacing_transition_lock", None)
         if transition_lock is None:
@@ -3076,6 +3233,7 @@ class OvstageRendererAdapter(RendererAdapter):
             native_ui._native_frame_pacing_pause_render, token,
         )):
             self._frame_pacing_render_paused = True
+            end_native_camera_writes(self._attached_stage)
             return
         drain_scope = self.start_ovui_performance_scope(
             "OvstageRendererAdapter.native_pacing.drain"
@@ -3091,6 +3249,60 @@ class OvstageRendererAdapter(RendererAdapter):
         stage = self._attached_stage
         if stage is not None:
             _reconcile_native_write_floor(stage)
+            end_native_camera_writes(stage)
+
+    def _scene_open_changes_delivered(self) -> bool:
+        """Whether the changes of the scene's attach reached the change stream's listeners.
+
+        Their first delivery makes the stage browser read the whole scene on
+        the main thread. A native session that already renders slows that
+        read down by a fifth, while the synchronous path renders nothing
+        until it ends. So a newly attached scene renders synchronously until
+        the frame after that delivery, or for at most
+        ``_SCENE_OPEN_SYNCHRONOUS_FRAMES`` frames when nothing polls.
+        """
+        after = getattr(self, "_native_pacing_after_ordinal", None)
+        if after is None:
+            return True
+        if after < 0 or int(getattr(self, "_successful_frame_count", 0) or 0) >= _SCENE_OPEN_SYNCHRONOUS_FRAMES:
+            self._native_pacing_after_ordinal = None
+            self._native_pacing_settle_pending = True
+            return True
+        if after == 0:
+            after = int(_reconcile_native_write_floor(self._attached_stage))
+            self._native_pacing_after_ordinal = after
+        stream = getattr(getattr(self, "_scene", None), "_change_stream", None)
+        if stream is not None and int(getattr(stream, "last_ordinal", -1)) >= after:
+            # Delivered in this frame; a listener may run later in it.
+            self._native_pacing_after_ordinal = -1
+        return False
+
+    def _settle_scene_open_frame_timing(self, native_ui: Any) -> None:
+        """Restart the frame timing of a scene's first session once.
+
+        The render worker starts a frame when the previous one is shown, and
+        each frame is shown after the renderer time of the frame before it,
+        so a session keeps the pace of its first frames. Those are the
+        renderer's slowest on a new scene: a session that starts with them
+        renders a still view at a third of the renderer's rate. A pause and
+        resume, without a renderer reset, starts the timing again once the
+        session has shown ``_SCENE_OPEN_SETTLE_FRAMES`` frames.
+        """
+        if not getattr(self, "_native_pacing_settle_pending", False):
+            return
+        try:
+            status = dict(native_ui._get_native_frame_pacing_status())
+        except Exception:
+            self._native_pacing_settle_pending = False
+            return
+        if int(status.get("presented_renderer_frames") or 0) < _SCENE_OPEN_SETTLE_FRAMES:
+            return
+        self._native_pacing_settle_pending = False
+        self._stop_native_frame_pacing_locked(
+            "scene open frame timing",
+            capture_selected_camera=False,
+            pause_render=True,
+        )
 
     def _publish_native_frame(
         self,
@@ -3153,15 +3365,32 @@ class OvstageRendererAdapter(RendererAdapter):
                     pause_render=True,
                 )
                 return False
+            if self._owns_render_product_resolution() and tuple(
+                getattr(self, "_last_resolution", None) or ()
+            ) != size:
+                # A new viewport size waits until it settles; the synchronous
+                # path applies it (_apply_resolution_when_settled). The native
+                # worker does not run before that, or the render product would
+                # keep its old size.
+                if self._frame_pacing_token and not self._native_render_is_paused():
+                    self._stop_native_frame_pacing_locked(
+                        "viewport size change",
+                        capture_selected_camera=False,
+                        pause_render=True,
+                    )
+                return False
             native_ui = self._frame_pacing_bindings()
             if native_ui is None:
                 return False
             if self._frame_pacing_token and self._native_render_is_paused():
                 if self._in_flight_pick_queries:
                     return False
+                committed_ordinal = int(_reconcile_native_write_floor(stage))
+                begin_native_camera_writes(stage, committed_ordinal)
                 if not bool(
                     native_ui._native_frame_pacing_resume_render(
                         self._frame_pacing_token,
+                        committed_ordinal,
                     )
                 ):
                     self._stop_native_frame_pacing_locked(
@@ -3173,6 +3402,8 @@ class OvstageRendererAdapter(RendererAdapter):
                 self._frame_pacing_render_paused = False
                 self._frame_pacing_needs_sync_step = False
             if self._frame_pacing_needs_sync_step:
+                return False
+            if not self._frame_pacing_token and not self._scene_open_changes_delivered():
                 return False
             if not self._frame_pacing_token:
                 borrow = self._borrow_native_frame_pacing_state(camera_path)
@@ -3190,6 +3421,7 @@ class OvstageRendererAdapter(RendererAdapter):
                     render_var_name_offset,
                     render_var_handle_offset,
                 ) = borrow
+                begin_native_camera_writes(stage, committed_ordinal)
                 token = int(
                     native_ui._native_frame_pacing_start_ovstage(
                         renderer_address,
@@ -3209,6 +3441,7 @@ class OvstageRendererAdapter(RendererAdapter):
                     or 0
                 )
                 if not token:
+                    end_native_camera_writes(stage)
                     if restore_overlap:
                         self.set_ldr_overlap_enabled(True)
                     return False
@@ -3238,10 +3471,15 @@ class OvstageRendererAdapter(RendererAdapter):
                     "failed camera publication",
                     capture_selected_camera=False,
                 )
+            else:
+                self._settle_scene_open_frame_timing(native_ui)
             return published
 
-    def _release_retained_output(self) -> None:
+    def _release_retained_output(self, *, renderer_changes: bool = True) -> None:
         """Release the retained step result and presentation cache.
+
+        With ``renderer_changes`` (a renderer mutation follows) the next frame
+        steps again even when its camera is unchanged (see :meth:`_still_frame`).
 
         MUST run immediately before every ownership-invalidating native
         mutation (OVStage attach/detach, renderer reset, teardown), after
@@ -3250,6 +3488,8 @@ class OvstageRendererAdapter(RendererAdapter):
         one live across a native mutation is undefined. Idempotent and cheap
         when nothing is retained.
         """
+        if renderer_changes:
+            self._still_frame_requested = True
         if int(getattr(self, "_frame_pacing_token", 0) or 0) and (
             not self._native_render_is_paused()
         ):
@@ -3293,7 +3533,8 @@ class OvstageRendererAdapter(RendererAdapter):
             if getattr(self, "_ldr_overlap", None) is None:
                 self._ldr_overlap = LdrOverlapState()
             return True
-        self._release_retained_output()
+        # Only the presentation changes: a still camera needs no new step.
+        self._release_retained_output(renderer_changes=False)
         self._ldr_overlap = None
         return False
 
@@ -3570,7 +3811,7 @@ class OvstageRendererAdapter(RendererAdapter):
         self._consume_render_settings_renderer_update()
         for request in requests.values():
             if request.primary:
-                self._apply_resolution(request.width, request.height)
+                self._apply_resolution_when_settled(request.width, request.height)
                 self._last_view_matrix = request.view_matrix
                 self._last_proj_matrix = request.projection_matrix
                 self._push_view_camera_state(
@@ -3622,6 +3863,7 @@ class OvstageRendererAdapter(RendererAdapter):
             ordinal=ordinal,
         )
         self._borrow_step_count += 1
+        self._apply_selection_outline_anchor()
         self._in_flight_render_batch = _InFlightRenderBatch(
             operation=operation,
             metadata=metadata,
@@ -3750,7 +3992,7 @@ class OvstageRendererAdapter(RendererAdapter):
         view_matrix: Matrix4d,
         proj_matrix: Matrix4d,
     ) -> np.ndarray:
-        self._apply_resolution(width, height)
+        self._apply_resolution_when_settled(width, height)
         request = self._secondary_viewport_request
         if request is None:
             secondary_width = width
@@ -3783,6 +4025,7 @@ class OvstageRendererAdapter(RendererAdapter):
             ordinal=ordinal,
         )
         self._borrow_step_count += 1
+        self._apply_selection_outline_anchor()
         self._dispatch_pending_pick_results(products)
         self._extract_requested_point_cloud_frames(products)
         self._extract_requested_render_var_output_frames(products)
@@ -3815,10 +4058,14 @@ class OvstageRendererAdapter(RendererAdapter):
         # the viewport overlay. It is valid for exactly the UI composition
         # following that render and never survives into the next raw intent.
         self._frame_pacing_presented_snapshot = None
+        self._still_frame_kept = False
         width = max(int(width), 1)
         height = max(int(height), 1)
         if self._attached_stage is None:
             return np.zeros((height, width, 4), dtype=np.uint8)
+        # Before the native publication below returns: with native frame
+        # pacing, no frame of this scene comes through the Python step.
+        self._service_render_diagnostics()
         if self._secondary_viewport_active:
             return self._render_multi_viewport_frame(
                 width,
@@ -3854,7 +4101,10 @@ class OvstageRendererAdapter(RendererAdapter):
             view_matrix = pacing_pick_snapshot.view
             proj_matrix = pacing_pick_snapshot.projection
             width, height = pacing_pick_snapshot.size
-        self._apply_resolution(width, height)
+        self._apply_resolution_when_settled(width, height)
+        kept = self._picture_kept_for_resize(width, height)
+        if kept is not None:
+            return kept
         # Shared render-setting lifecycle actuation (declared WARMUP
         # requirement): drain the per-edge pending ledger — one renderer
         # reset per owed committed edge — on the presentation thread, with
@@ -3885,6 +4135,9 @@ class OvstageRendererAdapter(RendererAdapter):
                     pick_skip = True
                 view_matrix = presented.view
                 proj_matrix = presented.projection
+        still = self._still_frame(width, height, view_matrix, proj_matrix)
+        if still is not None:
+            return still
         self._last_view_matrix = _coerce_matrix4(view_matrix)
         self._last_proj_matrix = _coerce_matrix4(proj_matrix)
         self._profile_ovui_call(
@@ -3904,13 +4157,24 @@ class OvstageRendererAdapter(RendererAdapter):
                     file=sys.stderr,
                 )
             ordinal = int(getattr(self._scene, "current_ordinal", 0) or 0)
-            products = self._renderer.step(
-                render_products=self._render_products_for_step(),
-                delta_time=dt,
-                ordinal=ordinal,
-            )
+            # The first native step compiles every material and can grow host
+            # memory without bound on a large scene: watch it and warn.
+            with contextlib.ExitStack() as first_step_scope:
+                if self._borrow_step_count == 0:
+                    first_step_scope.enter_context(HostMemoryWatch("the first native step"))
+                products = self._renderer.step(
+                    render_products=self._render_products_for_step(),
+                    delta_time=dt,
+                    ordinal=ordinal,
+                )
             self._borrow_step_count += 1
+            self._apply_selection_outline_anchor()
+            # Texture-streaming and device-memory totals (read-only; at most once a second).
+            note_renderer_diagnostics(getattr(self, "_renderer_totals_handle", None))
         except Exception as exc:
+            # A failed step must not look like a normal black frame: keep the
+            # message (it names the resource when the renderer gives one).
+            record_step_failure(exc)
             # exceptional transition: never trust the retained container
             # across a failed step (renderer state is suspect).
             self._release_retained_output()
@@ -4016,6 +4280,12 @@ class OvstageRendererAdapter(RendererAdapter):
                 (height, width),
                 pick_skip,
             )
+        return self._record_successful_frame(output, width, height)
+
+    def _record_successful_frame(self, output: Any, width: int, height: int) -> Any:
+        """Record a frame that :meth:`render_frame` returns for inspector state."""
+
+        self._still_frame_output = output
         self._successful_frame_count = int(getattr(self, "_successful_frame_count", 0) or 0) + 1
         if isinstance(output, np.ndarray):
             self._last_frame_shape = tuple(int(value) for value in output.shape)
@@ -4049,6 +4319,101 @@ class OvstageRendererAdapter(RendererAdapter):
             )
             self._last_frame_nonblack_pixels = None
         return output
+
+    def set_render_policy(self, policy: str, settle_frames: int) -> None:
+        """See :meth:`RendererAdapter.set_render_policy` (the synchronous step path)."""
+        value = (str(policy), max(0, int(settle_frames)))
+        if value != getattr(self, "_still_frame_policy", None):
+            self._still_frame_policy = value
+            self._still_frame_requested = True
+
+    def last_frame_unchanged(self) -> bool:
+        """See :meth:`RendererAdapter.last_frame_unchanged`: the kept picture of :meth:`_still_frame`."""
+        return bool(getattr(self, "_still_frame_kept", False))
+
+    def request_render(self) -> None:
+        """Step again, then the settle frames, for a change the camera does not show."""
+        self._still_frame_requested = True
+
+    def _still_frame_work_waits(self) -> bool:
+        """Whether work waits for the next step: then a still camera still steps."""
+        return bool(
+            getattr(self, "_frame_pacing_token", 0)
+            or getattr(self, "_frame_pacing_needs_sync_step", False)
+            or getattr(self, "_frame_pacing_pick_snapshot", None) is not None
+            or not getattr(self, "_borrow_step_count", 0)
+            or getattr(self, "_in_flight_pick_queries", None)
+            or getattr(self, "_point_cloud_requests", None)
+            or getattr(self, "_render_var_output_requests", None)
+            or getattr(self, "_livestream", None) is not None
+            or getattr(self, "_material_check_requests", None)
+            or int(getattr(self, "_render_settings_update_pending_edges", 0) or 0) > 0
+        )
+
+    def _still_frame(
+        self, width: int, height: int, view_matrix: Any, proj_matrix: Any
+    ) -> Any:
+        """The output of the last step when this frame needs no step, else ``None``.
+
+        Under the ``on_change`` policy (:meth:`set_render_policy`) a frame
+        steps for a changed camera, size, render product, renderer, Stage or
+        committed Stage ordinal, a request (:meth:`request_render`, a
+        selection, a renderer-side write), then for the settle frames, and
+        while work waits for a step (:meth:`_still_frame_work_waits`). A frame
+        that needs no step returns the same output object again, so the
+        viewport keeps its picture and ovrtx keeps no new memory.
+        Under the frame overlap a step shows the image of the step before it,
+        so the first such frame shows the newest step, with no new step: the
+        kept picture is the newest camera for every settle count, also zero.
+        """
+        policy, settle = getattr(self, "_still_frame_policy", None) or ("continuous", 0)
+        overlap = getattr(self, "_ldr_overlap", None)
+        key = (
+            int(width),
+            int(height),
+            np.asarray(view_matrix, dtype=np.float64).tobytes(),
+            np.asarray(proj_matrix, dtype=np.float64).tobytes(),
+            str(self._runtime_camera_path() or ""),
+            str(getattr(self, "_render_product_path", "") or ""),
+            id(self._renderer),
+            id(self._attached_stage),
+            int(getattr(getattr(self, "_scene", None), "current_ordinal", 0) or 0),
+            tuple(getattr(self, "_last_resolution", None) or ()),
+        )
+        last = getattr(self, "_still_frame_output", None)
+        changed = (
+            policy != "on_change"
+            or getattr(self, "_still_frame_requested", True)
+            or key != getattr(self, "_still_frame_key", None)
+            or last is None
+            or self._active_product_uses_point_cloud_overlay()
+            or self._still_frame_work_waits()
+            # The overlap may not show its newest step now: step again.
+            or (
+                overlap is not None
+                and overlap.has_unshown_step()
+                and not self._ldr_overlap_allowed()
+            )
+        )
+        self._still_frame_key = key
+        self._still_frame_requested = False
+        if changed:
+            self._still_frame_settle_left = settle
+            return None
+        left = int(getattr(self, "_still_frame_settle_left", 0) or 0)
+        if left > 0:
+            self._still_frame_settle_left = left - 1
+            return None
+        if overlap is not None and overlap.has_unshown_step():
+            newest = overlap.present_retained(
+                lambda retained: self._profile_ovui_call(
+                    "OvstageRendererAdapter._extract_ldr_color",
+                    self._extract_ldr_color, retained, width, height,
+                )
+            )
+            return self._record_successful_frame(newest, width, height)
+        self._still_frame_kept = True
+        return last
 
     def set_resolution(self, width: int, height: int) -> None:
         """Resize only the provider-owned transient RenderProduct.
@@ -4086,6 +4451,7 @@ class OvstageRendererAdapter(RendererAdapter):
         undo history. Release/cancel lifecycle policy remains owned by the
         existing manipulator contract and its later Step 13 completion.
         """
+        self._still_frame_requested = True
 
         if not self.supports_live_local_transform:
             return False
@@ -4140,6 +4506,10 @@ class OvstageRendererAdapter(RendererAdapter):
             with scene.change_stream.suppress_notifications():
                 ovstage = import_module("ovstage")
                 with StageWriteBatch(stage, [normalized_path]) as batch:
+                    # A preview frame is a value edit, not a structure change.
+                    note_value_edit_ordinal(
+                        stage, batch.ordinal, _OVRTX_XFORM_ATTR, (normalized_path,)
+                    )
                     batch.write_fixed(
                         _OVRTX_XFORM_ATTR,
                         values,
@@ -4157,11 +4527,19 @@ class OvstageRendererAdapter(RendererAdapter):
                 and transition_lock is not None
             ):
                 with ownership_gate, transition_lock:
-                    if self._native_render_is_paused() and bool(
-                        native_ui._native_frame_pacing_resume_render(token)
-                    ):
-                        self._frame_pacing_render_paused = False
-                        self._frame_pacing_needs_sync_step = False
+                    if self._native_render_is_paused():
+                        committed_ordinal = int(_reconcile_native_write_floor(stage))
+                        begin_native_camera_writes(stage, committed_ordinal)
+                        if bool(
+                            native_ui._native_frame_pacing_resume_render(
+                                token,
+                                committed_ordinal,
+                            )
+                        ):
+                            self._frame_pacing_render_paused = False
+                            self._frame_pacing_needs_sync_step = False
+                        else:
+                            end_native_camera_writes(stage)
         except Exception:
             return False
 
@@ -4188,6 +4566,7 @@ class OvstageRendererAdapter(RendererAdapter):
 
     def clear_live_local_transforms(self, paths: List[str]) -> None:
         """Discard preview bookkeeping without an additional native write."""
+        self._still_frame_requested = True
 
         preview_paths = getattr(self, "_live_preview_paths", None)
         if isinstance(preview_paths, set):
@@ -5179,6 +5558,13 @@ class OvstageRendererAdapter(RendererAdapter):
                         record,
                         current_value,
                     )
+                    if descriptor is not None and not self._render_setting_native_authored(
+                        active_path, attr_name, current_value
+                    ):
+                        descriptor = replace(
+                            descriptor,
+                            value_state=replace(descriptor.value_state, authored=False),
+                        )
             except Exception:
                 warnings.append(
                     RenderSettingWarning(
@@ -6800,6 +7186,9 @@ class OvstageRendererAdapter(RendererAdapter):
             if getattr(self, state_attribute, None) == camera_state:
                 return
             with StageWriteBatch(stage, [camera_path]) as batch:
+                note_camera_ordinal(
+                    stage, getattr(batch, "ordinal", None), (camera_path,)
+                )
                 batch.write_fixed(
                     _OVRTX_XFORM_ATTR,
                     world_tensor,
@@ -6849,6 +7238,9 @@ class OvstageRendererAdapter(RendererAdapter):
             if getattr(self, state_attribute, None) == camera_state:
                 return
             with StageWriteBatch(stage, [camera_path]) as batch:
+                note_camera_ordinal(
+                    stage, getattr(batch, "ordinal", None), (camera_path,)
+                )
                 batch.write_fixed(
                     _OVRTX_XFORM_ATTR,
                     world_tensor,
@@ -7009,6 +7401,35 @@ class OvstageRendererAdapter(RendererAdapter):
         self._last_pick_query_name = name
         self._last_pick_paths = ()
 
+    def query_surface(self, x: float, y: float) -> int:
+        """Ask for the surface point under render NDC ``(x, y)``; 0 when not available.
+
+        The query rides on the next paced render step, so unlike :meth:`pick`
+        it never pauses native frame pacing; a render is requested for it, so
+        an idle on-change session renders once more. :meth:`surface_hit`
+        returns the answer a frame or two later.
+        """
+        bindings = self._frame_pacing_bindings()
+        query = getattr(bindings, "_native_frame_pacing_query_surface", None)
+        if not self._frame_pacing_token or not callable(query):
+            return 0
+        left, top, right, bottom = self._ndc_rect_to_pick_pixels(x, y, x, y)
+        width, height = (max(1, int(size)) for size in self._pick_resolution())
+        number = int(query(left / width, top / height, right / width, bottom / height))
+        request = getattr(bindings, "_native_frame_pacing_request_render", None)
+        if number and callable(request):
+            request(self._frame_pacing_token)
+        return number
+
+    def surface_hit(self) -> tuple:
+        """``(query, world point or None)`` of the newest answered :meth:`query_surface`."""
+        hit = getattr(self._frame_pacing_bindings(), "_native_frame_pacing_surface_hit", None)
+        query, meters = hit() if callable(hit) else (0, None)
+        if meters is None:
+            return query, None
+        meters_per_unit = read_population_meters_per_unit(self._attached_stage) or 1.0
+        return query, tuple(value / meters_per_unit for value in meters)
+
     def cancel_pick(self, query_name: str) -> None:
         self._cancel_in_flight_point(
             str(query_name or "viewport_click"),
@@ -7101,6 +7522,7 @@ class OvstageRendererAdapter(RendererAdapter):
         with neither transport degrade honestly: selection still
         synchronizes, no outline appears.
         """
+        self._still_frame_requested = True
         selected = list(dict.fromkeys(str(path) for path in (paths or []) if path))
         self._selected_paths = selected
         self._configure_selection_outline_styles()
@@ -7210,6 +7632,8 @@ class OvstageRendererAdapter(RendererAdapter):
             finally:
                 self._livestream = None
         renderer = self._renderer
+        # The material-message callback is removed while the renderer system still runs.
+        stop_material_messages(self)
         if renderer is not None:
             # Instrumentation wrappers can retain the Python renderer after
             # this adapter retires. Destroy its native sync scope
@@ -7218,6 +7642,172 @@ class OvstageRendererAdapter(RendererAdapter):
             renderer.destroy()
         get_instrumentation().release_renderer(self)
         self._renderer = None
+        self._renderer_totals_handle = None
+        # The renderer is gone: stop the log reader after it reads the last lines.
+        release_native_log(self)
+
+    def verify_materials_live(self, path_prefix: str = "", limit: int = 500) -> dict[str, Any]:
+        """Draw each material beside a flat reference in THIS renderer and compare them.
+
+        The same check as the OpenUSD adapter (see ``render_probe``), through the OVStage population and
+        copy-in APIs: the layer with the cameras, products and reference cubes is added under the runtime
+        root, the original geometry prim of each material is cloned into its cell (the copy keeps the
+        original material binding), the products are stepped, and the layer is removed. The plan is read
+        from the CURRENT native stage, without OpenUSD (``_material_plan``). Call it on the thread that
+        renders.
+        """
+
+        scene, stage = self._scene, self._attached_stage
+        if scene is None or stage is None:
+            raise RuntimeError("no scene is loaded; there is nothing to check")
+        # Native frame pacing writes camera frames into the stage while it runs. Stop it before the plan is read:
+        # after a camera change, a read at the ordinal that it was writing found no prim, so every material was
+        # reported without a surface shader.
+        self._stop_native_frame_pacing("live material check")
+        records, attribute_names = self._current_material_catalog()
+        todo, skipped = plan_native(stage, records, attribute_names, path_prefix, limit)
+        live = LivePlan(todo, skipped, f"{self._runtime_root_path}/LiveCheck")
+        if not live.todo:
+            live.cleanup()
+            return record_result(live.judge({}))
+        self._discard_async_render_state()
+        self._release_retained_output()
+        ovstage = import_module("ovstage")
+        population = _load_population_module(ovstage)
+        handle = None
+        images = {}
+        try:
+            handle = _add_runtime_layer(population, stage, live.layer_text, prefix_path=live.mount)
+            targets = [target for target, _source, _matrix in live.clones]
+            matrices = np.ascontiguousarray(np.asarray([m for _t, _s, m in live.clones], dtype=np.float64))
+            with scene.change_stream.suppress_notifications():
+                ordinal = int(stage.begin_frame())
+                try:
+                    for target, source_prim, _matrix in live.clones:
+                        stage.clone(source_prim, [target], ordinal)
+                finally:
+                    stage.end_frame(ordinal)
+                with StageWriteBatch(stage, targets) as batch:
+                    batch.write_fixed(_OVRTX_XFORM_ATTR, matrices, lanes=16, semantic=ovstage.AttributeSemantic.MATRIX)
+            for product in live.products:
+                output = None
+                for _ in range(4):
+                    output = self._renderer.step(
+                        render_products={product}, delta_time=_MIN_DT,
+                        ordinal=int(getattr(scene, "current_ordinal", 0) or 0),
+                    )
+                images[product] = extract_images(output[product].frames[0], self._ovrtx.Device.CPU)
+                output = None
+        finally:
+            try:
+                if handle is not None:
+                    _remove_runtime_layer(population, stage, handle)
+            finally:
+                live.cleanup()
+        return record_result(live.judge(images))
+
+    def request_material_check(self, path_prefix: str = "", limit: int = 500) -> concurrent.futures.Future:
+        """Ask for the material check of the attached scene. It runs at the next frame, on the thread that renders.
+
+        Returns a future with the result of :meth:`verify_materials_live` (or its error). A future that is
+        cancelled before that frame leaves the queue and is never run.
+        """
+
+        return self._material_check_requests.request(path_prefix, limit)
+
+    def _service_render_diagnostics(self) -> None:
+        """The diagnostics work of a frame, on the thread that renders: the checks that ``material_verify`` asked for,
+        the checks after the first frames, and the late renderer failures that name only a file.
+
+        ``render_frame`` calls it before it publishes a camera to native frame pacing, so it runs also when the native
+        worker draws the viewport. A check stops native pacing first (see :meth:`verify_materials_live`).
+        """
+
+        requests = getattr(self, "_material_check_requests", None)
+        if requests:
+            requests.run(self.verify_materials_live)
+        if getattr(self, "_borrow_step_count", 0) > 0 and (
+            getattr(self, "_file_check_due", False) or getattr(self, "_live_check_due", False)
+        ):
+            self._after_first_frames()
+        linker = getattr(self, "_file_linker", None)
+        if linker is not None:
+            linker.poll()
+        refusal = getattr(self, "_strict_refusal", None)
+        if refusal is not None:
+            # Strict mode: a scene that is shown wrong is not shown at all (every frame).
+            raise refusal
+
+    def _current_material_catalog(self) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
+        """(prim types, shader input names) of the attached scene as it is now.
+
+        The prim types are read again only when its prims changed; the input names are read each time (one narrow
+        read), so an input that was set after the scene loaded is seen.
+        """
+
+        scene, stage = self._scene, self._attached_stage
+        if scene is None or stage is None:
+            raise RuntimeError("no scene is loaded")
+        revision = getattr(scene, "topology_revision", None)
+        catalog = self._material_catalog
+        if catalog is None or revision is None or catalog[0] != revision:
+            catalog = (revision, _query_records(stage))
+            self._material_catalog = catalog
+        records = catalog[1]
+        attribute_names, _files = read_shader_catalog(stage, records)
+        return records, attribute_names
+
+    def describe_materials(self, path_prefix: str = "", limit: int = 500) -> dict[str, Any]:
+        """The report of each material of the attached native scene, read without OpenUSD (``_material_report``).
+
+        Values are read at the current ordinal, so an edit that is not saved is reported as it is shown.
+        """
+
+        records, attribute_names = self._current_material_catalog()
+        return describe_native_materials(self._attached_stage, records, attribute_names, path_prefix, limit)
+
+    def _after_first_frames(self) -> None:
+        """After the first frame of a scene: check the files of its shaders, then the materials when asked.
+
+        A missing file is a failure (the renderer does not always say it), and a renderer failure that named only
+        a file names its materials too. The material check draws extra frames, so it runs only when
+        ``OVUI_VERIFY_MATERIALS`` asks for it; a failure is loud and strict mode refuses the scene.
+        """
+
+        if self._file_check_due:
+            self._file_check_due = False
+            if self._shader_files is not None:
+                record_file_events(self._shader_files)
+                # A failure that the renderer reports later (a texture that fails to load) names them too.
+                self._file_linker = FileEventLinker(self._shader_files)
+            else:
+                # No files to explain a renderer line about a texture: it is a failure, as the renderer wrote it.
+                settle_body_resources(None)
+        if not self._live_check_due:
+            return
+        self._live_check_due = False
+        mode = verify_mode()
+        try:
+            result = self.verify_materials_live()
+        except Exception as exc:  # noqa: BLE001 - reported; strict mode raises it
+            LOGGER.error("the material check could not run: %s: %s", type(exc).__name__, exc)
+            record_scene_failure(f"the material check could not run: {type(exc).__name__}: {exc}", "unverified", names=False)
+            if mode == "strict":
+                raise
+            return
+        if result["unverified"]:
+            LOGGER.warning(
+                "%d material(s) could not be checked and are not known to be right: %s",
+                len(result["unverified"]), ", ".join(result["unverified"][:10]),
+            )
+        if result["failures"]:
+            LOGGER.error("The renderer shows this scene wrong: %s", failure_summary(result))
+            if mode == "strict":
+                self._strict_refusal = MaterialMismatchError(
+                    f"the renderer shows this scene wrong: {failure_summary(result)} "
+                    "(OVUI_VERIFY_MATERIALS=strict refuses this scene)"
+                )
+                raise self._strict_refusal
 
     def _remove_scene(self) -> None:
         stage = self._attached_stage
@@ -7385,6 +7975,79 @@ class OvstageRendererAdapter(RendererAdapter):
                 # persistent export filters the stranded private subtree.
                 pass
 
+    def _owns_render_product_resolution(self) -> bool:
+        """Whether a size change writes the resolution of the active render product.
+
+        Only the runtime render product of this adapter is resized; a public
+        render product keeps its own resolution (see :meth:`_apply_resolution`).
+        """
+        if getattr(self, "_attached_stage", None) is None:
+            return False
+        render_product_path = str(getattr(self, "_render_product_path", "") or "")
+        runtime_root_path = str(
+            getattr(self, "_runtime_root_path", _RUNTIME_ROOT_LOCAL_PATH)
+        )
+        return render_product_path == runtime_root_path or render_product_path.startswith(
+            f"{runtime_root_path}/"
+        )
+
+    def _apply_resolution_when_settled(self, width: int, height: int) -> None:
+        """Give the owned render product the viewport size when that size has settled.
+
+        * The first size after construction or a scene load applies at once.
+        * A later new size applies when the viewport asked for the same size for
+          ``_RESIZE_SETTLE_S``. So the first frame after a maximize shows the
+          window at its new size at once (before, the new window area stayed
+          black during the slow first step at the new size), and a drag of the
+          window border applies the size once, when the drag stops.
+        * A render product that this adapter does not resize follows at once.
+        """
+        target = (int(width), int(height))
+        if not self._owns_render_product_resolution():
+            self._apply_resolution(*target)
+            return
+        request = getattr(self, "_resize_request", None)
+        if target == tuple(getattr(self, "_last_resolution", None) or ()):
+            self._resize_request = target
+            return
+        now = getattr(self, "_clock", time.perf_counter)()
+        if target != request:
+            if request is not None and (
+                now - getattr(self, "_resize_request_time", -math.inf) >= _RESIZE_SETTLE_S
+            ):
+                # An isolated size change: a maximize, a restore, or the start of
+                # a drag. See _picture_kept_for_resize.
+                self._resize_hold_frame = True
+            self._resize_request = target
+            self._resize_request_time = now
+            if request is not None:
+                return
+        elif now - getattr(self, "_resize_request_time", -math.inf) < _RESIZE_SETTLE_S:
+            return
+        self._apply_resolution(*target)
+
+    def _picture_kept_for_resize(self, width: int, height: int) -> Any:
+        """The picture on screen, fitted to the new size, for an isolated size change.
+
+        The frame in which the window gets a new size also makes the new
+        swapchain, so it is slower than others. Until that frame is presented,
+        the new window area is black. So the first frame of an isolated size
+        change (a maximize, a restore, the start of a drag) does no renderer
+        step and no upload: it gives the picture on screen again, scaled to the
+        new size, and the viewport keeps its texture (:meth:`last_frame_unchanged`).
+        The next frame renders as usual. Returns ``None`` for every other frame,
+        and with native frame pacing, which owns the picture of a paused session.
+        """
+        if not getattr(self, "_resize_hold_frame", False):
+            return None
+        self._resize_hold_frame = False
+        shown = getattr(self, "_still_frame_output", None)
+        if getattr(self, "_frame_pacing_token", 0) or not isinstance(shown, np.ndarray):
+            return None
+        self._still_frame_kept = True
+        self._still_frame_requested = True
+        return _normalize_rgba(shown, int(width), int(height))
+
     def _apply_resolution(self, width: int, height: int) -> None:
         metric_id = self.start_ovui_performance_scope("OvstageRendererAdapter._apply_resolution")
         try:
@@ -7427,7 +8090,9 @@ class OvstageRendererAdapter(RendererAdapter):
                 reset = getattr(self._renderer, "reset", None)
                 if callable(reset):
                     reset()
-                    if not self._selection_outline_previous_paths:
+                    if not self._selection_outline_previous_paths and not getattr(
+                        self, "_selection_outline_anchor_applied", False
+                    ):
                         # A reset while no outline membership is applied leaves
                         # the outline pass inactive for later writes; re-arm the
                         # one-shot activation reset for the next selection.
@@ -7474,6 +8139,13 @@ class OvstageRendererAdapter(RendererAdapter):
         renderer = getattr(self, "_renderer", None)
         setter = getattr(renderer, "set_selection_group_styles", None)
         if setter is None:
+            if renderer is not None and not getattr(self, "_selection_outline_styles_missing_reported", False):
+                self._selection_outline_styles_missing_reported = True
+                print(
+                    "[OvstageRendererAdapter] selection outline styles not set: "
+                    "missing ovrtx API ovrtx.Renderer.set_selection_group_styles",
+                    file=sys.stderr,
+                )
             return
         # Ownership: style configuration mutates native renderer state; the
         # latch above keeps this off the per-frame no-op path.
@@ -7491,8 +8163,22 @@ class OvstageRendererAdapter(RendererAdapter):
                     "fill_color": _SELECTION_OUTLINE_FILL,
                 }
             )
-            setter({_SELECTION_OUTLINE_GROUP_ID: style})
-        except Exception:
+            hidden = (0.0, 0.0, 0.0, 0.0)
+            hidden_style = (
+                style_cls(outline_color=hidden, fill_color=hidden)
+                if style_cls is not None
+                else {"outline_color": hidden, "fill_color": hidden}
+            )
+            setter(
+                {
+                    _SELECTION_OUTLINE_GROUP_ID: style,
+                    _SELECTION_OUTLINE_HIDDEN_GROUP_ID: hidden_style,
+                }
+            )
+        except Exception as exc:
+            # Keep only the text: the traceback would keep the caller's
+            # frames, and with them the step outputs, alive.
+            self._selection_outline_styles_error = f"{type(exc).__name__}: {exc}"
             return
         self._selection_outline_styles_configured = True
         self._selection_outline_style_calls += 1
@@ -7549,9 +8235,13 @@ class OvstageRendererAdapter(RendererAdapter):
         if (
             callable(group_setter) or callable(async_group_setter)
         ) and not self._native_render_is_paused():
+            # A pause hands the renderer to Python as a stop does, but the
+            # next frame resumes the same session instead of rendering one
+            # frame on the UI thread first.
             self._profile_ovui_call(
                 "OvstageRendererAdapter._stop_native_frame_pacing",
                 self._stop_native_frame_pacing, "selection outline membership",
+                pause_render=True,
             )
         if callable(group_setter):
             try:
@@ -7639,6 +8329,56 @@ class OvstageRendererAdapter(RendererAdapter):
             return set()
         self._selection_outline_reserved_writes += 1
         return set(target_paths)
+
+    def _apply_selection_outline_anchor(self) -> None:
+        """Put the runtime layer's mesh with no area in the hidden outline group.
+
+        ovrtx draws new outlines on an image that it no longer refines
+        only while a prim that is not hidden is in an outline group. No user
+        can select or hide this mesh. The renderer gets the attached prims
+        at its first step and drops membership written before it, so this
+        runs after a step of an attached scene. With the anchor in place, the
+        first selection needs no activation reset.
+
+        A failure is reported with its cause and tried again at the next
+        step, up to ``_SELECTION_OUTLINE_ANCHOR_ATTEMPTS`` times. Without the
+        anchor, the first selection resets the renderer, as on main.
+        """
+        if not getattr(self, "_selection_outline_anchor_pending", False):
+            return
+        anchor = f"{self._runtime_root_path}/Render/OutlineAnchor"
+        try:
+            self._configure_selection_outline_styles()
+            if not getattr(self, "_selection_outline_styles_configured", False):
+                raise RuntimeError(
+                    "selection outline styles were not configured: "
+                    f"{getattr(self, '_selection_outline_styles_error', None)}"
+                )
+            setter = getattr(self._renderer, "set_selection_outline_group_strings", None)
+            if not callable(setter):
+                raise RuntimeError("the renderer has no set_selection_outline_group_strings")
+            setter([anchor], _SELECTION_OUTLINE_HIDDEN_GROUP_ID)
+        except Exception as exc:
+            attempts = int(getattr(self, "_selection_outline_anchor_attempts", 0)) + 1
+            self._selection_outline_anchor_attempts = attempts
+            if attempts >= _SELECTION_OUTLINE_ANCHOR_ATTEMPTS:
+                self._selection_outline_anchor_pending = False
+                outcome = (
+                    "no more attempts for this scene; the first selection resets "
+                    "the renderer, and new outlines can be missing after a hide"
+                )
+            else:
+                outcome = "it is tried again at the next step"
+            print(
+                "[OvstageRendererAdapter] selection outline anchor write failed "
+                f"(attempt {attempts} of {_SELECTION_OUTLINE_ANCHOR_ATTEMPTS}, {anchor}): "
+                f"{type(exc).__name__}: {exc}; {outcome}",
+                file=sys.stderr,
+            )
+            return
+        self._selection_outline_anchor_pending = False
+        self._selection_outline_anchor_applied = True
+        self._selection_outline_pass_needs_reset = False
 
     def _ensure_selection_outline_pass_active(self) -> None:
         """Activate outlines once, avoiding repeated modern membership resets.
@@ -8161,7 +8901,7 @@ class OvstageRendererAdapter(RendererAdapter):
         if paths is None:
             return None
         try:
-            path = paths.path_to_string(int(prim_path_id))
+            path = paths.path_to_string(native_prim_path(paths, prim_path_id))
         except Exception:
             return None
         return _borrowed_path_to_scene_path(
@@ -8187,6 +8927,11 @@ class OvstageRendererAdapter(RendererAdapter):
                     "ovrtx render output map failed "
                     f"({type(exc).__name__}: {exc})"
                 ) from exc
+            record_scene_failure(
+                f"the renderer returned no image (output map failed: {type(exc).__name__}: {exc}); "
+                "see the native renderer log for the cause",
+                names=False,
+            )
             return np.zeros((height, width, 4), dtype=np.uint8)
 
         state = getattr(self, "_zero_copy_state", None)
@@ -8370,8 +9115,12 @@ def _build_runtime_layer(
     records: dict[str, str] | None = None,
     runtime_root_path: str = _RUNTIME_ROOT_LOCAL_PATH,
     viewport_quality: int = 0,
+    stored_lines: Mapping[str, list[str]] | None = None,
 ) -> _RuntimeLayer:
+    """``stored_lines`` are the scene's stored render settings, per owner type."""
+
     records = _query_records(stage) if records is None else records
+    stored_lines = stored_lines or {}
     # A newly-created durable USD has no user prims yet. The private runtime
     # layer below supplies the camera, RenderProduct, RenderVar and fallback
     # light that OVRTX needs, so an empty query is a valid document rather than
@@ -8393,6 +9142,7 @@ def _build_runtime_layer(
         "        {",
         '            def Camera "Main"',
         "            {",
+        *(f"                {line}" for line in stored_lines.get("Camera", ())),
         "                float focalLength = 24",
         "                float horizontalAperture = 20.955",
         "                float verticalAperture = 15.2908",
@@ -8419,6 +9169,7 @@ def _build_runtime_layer(
         f"            custom int omni:rtx:quality = {viewport_quality}",
         "            rel orderedVars = <../Vars/LdrColor>",
         f"            uniform int2 resolution = ({width}, {height})",
+        *(f"            {line}" for line in stored_lines.get("RenderProduct", ())),
         "        }",
         '        def RenderProduct "ViewportSecondary"',
         "        {",
@@ -8433,6 +9184,12 @@ def _build_runtime_layer(
         "            {",
         f'                uniform string sourceName = "{_LDR_VAR_NAME}"',
         "            }",
+        "        }",
+        '        def Mesh "OutlineAnchor"',
+        "        {",
+        "            int[] faceVertexCounts = [3]",
+        "            int[] faceVertexIndices = [0, 1, 2]",
+        "            point3f[] points = [(0, 0, 0), (0, 0, 0), (0, 0, 0)]",
         "        }",
     ]
     if not _has_light(records):
@@ -8591,13 +9348,21 @@ def _validate_configured_ovrtx_source(module: Any) -> None:
         # Native modules always expose ``__file__``. File-less ModuleType test
         # doubles remain supported without weakening production validation.
         return
-    try:
-        Path(module_file).resolve().relative_to(Path(configured_root).expanduser().resolve())
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(
-            "OVRTX_ROOT is configured, but Python imported ovrtx from a "
-            f"different installation: {module_file}"
-        ) from exc
+    module_path = Path(module_file)
+    root_path = Path(configured_root).expanduser()
+    # The path Python imported from is checked first. A root may link its
+    # package to an install elsewhere, and that link is the configured root's
+    # own choice. Resolved paths are checked too, for a root reached by a link.
+    for take in (Path.absolute, Path.resolve):
+        try:
+            take(module_path).relative_to(take(root_path))
+            return
+        except (OSError, ValueError) as exc:
+            error = exc
+    raise RuntimeError(
+        f"OVRTX_ROOT={configured_root!r} is configured, but Python imported "
+        f"ovrtx from a different installation: {module_file}"
+    ) from error
 
 
 def _apply_population_changes(population: Any, stage: Any) -> int:
@@ -8822,6 +9587,25 @@ def _remove_runtime_layer(population: Any, stage: Any, handle: Any) -> None:
         return
     remove_reference(stage, handle)
     _apply_population_changes(population, stage)
+
+
+def _read_material_catalog(scene: Any, stage: Any, records: dict[str, str]) -> tuple[
+    list[dict[str, Any]] | None, tuple[Any, dict[str, str]] | None
+]:
+    """The files that the shaders of a scene name, and its material catalog (its prim types, at its topology revision).
+
+    A failure is reported and gives (None, None): the scene still loads, without the missing-file check.
+    """
+
+    try:
+        _attribute_names, files = read_shader_catalog(stage, records)
+    except Exception as exc:  # noqa: BLE001 - reported; the scene loads without the file check
+        LOGGER.error("the shader files of the scene could not be read: %s: %s", type(exc).__name__, exc)
+        record_scene_failure(
+            f"the missing-file check could not run: {type(exc).__name__}: {exc}", "unverified", names=False
+        )
+        return None, None
+    return files, (getattr(scene, "topology_revision", None), records)
 
 
 def _query_records(stage: Any) -> dict[str, str]:
@@ -9470,6 +10254,21 @@ def _camera_projection_mode(proj_matrix: Any) -> str | None:
     return None
 
 
+def _gather_rgba(rgba: np.ndarray, y_idx: np.ndarray, x_idx: np.ndarray) -> np.ndarray:
+    """Return the rows ``y_idx`` and the columns ``x_idx`` of an ``(H, W, 4)`` uint8 image.
+
+    Each pixel moves as one 32-bit value, not as four bytes: the same result as
+    ``rgba[y_idx][:, x_idx]`` in about a tenth of the time. While a new viewport
+    size waits (``_RESIZE_SETTLE_S``) every frame is scaled to the new size, and
+    the first of these frames is the first frame after a window resize or
+    maximize: a slow scale delays it, and the new window area stays black longer.
+    """
+    rows, columns = rgba.shape[0], rgba.shape[1]
+    pixels = np.ascontiguousarray(rgba).view(np.uint32).reshape(rows, columns)
+    picked = np.take(np.take(pixels, y_idx, axis=0), x_idx, axis=1)
+    return picked.view(np.uint8).reshape(len(y_idx), len(x_idx), 4)
+
+
 def _normalize_rgba(arr: np.ndarray, width: int, height: int) -> np.ndarray:
     rgba = np.asarray(arr)
     if rgba.dtype != np.uint8:
@@ -9485,7 +10284,7 @@ def _normalize_rgba(arr: np.ndarray, width: int, height: int) -> np.ndarray:
         return np.ascontiguousarray(rgba)
     y_idx = np.linspace(0, rgba.shape[0] - 1, height).astype(np.int64)
     x_idx = np.linspace(0, rgba.shape[1] - 1, width).astype(np.int64)
-    return np.ascontiguousarray(rgba[y_idx][:, x_idx])
+    return _gather_rgba(rgba, y_idx, x_idx)
 
 
 def _format_matrix(values: tuple[float, ...]) -> str:

@@ -35,12 +35,37 @@ are released when the command drops off the undo stack
 
 from __future__ import annotations
 
+import inspect
+import logging
 from typing import List, Optional
 
 from ovui_data_adapters.common import LayerSnapshot, LayerStackAdapter
 
 from ovui_data_adapters.services.layers.commands.base import AbstractLayerCommand
 from ovui_data_adapters.services.selection import SelectionBus
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _two_argument_transfer_reason(adapter: LayerStackAdapter) -> Optional[str]:
+    """Return why Flatten must call ``transfer_layer_content`` with two arguments.
+
+    Return ``None`` when the adapter's method names ``dst_is_stronger``.
+    An adapter written for the two-argument form (the source is always
+    the stronger layer) raises :class:`TypeError` when it is called with
+    the keyword, so every other method gets the two-argument call, which
+    works with both forms: also ``**kwargs`` (it may pass the keyword on
+    to such a method) and a method whose signature cannot be read, such
+    as a native pybind11 or Boost.Python function. The signature is read
+    before any transfer runs.
+    """
+    try:
+        params = inspect.signature(adapter.transfer_layer_content).parameters
+    except (TypeError, ValueError) as exc:
+        return f"has no readable signature ({type(exc).__name__}: {exc})"
+    if "dst_is_stronger" in params:
+        return None
+    return "does not take dst_is_stronger"
 
 
 class MergeDownCommand(AbstractLayerCommand):
@@ -55,7 +80,8 @@ class MergeDownCommand(AbstractLayerCommand):
     ``do_impl`` snapshots both the source and destination layers (so
     undo can restore both), invokes
     :meth:`~ovui_widgets.common.adapters.LayerStackAdapter.transfer_layer_content`
-    to copy the source's root prim specs onto the destination, then
+    to merge the source's root prim specs into the destination (the
+    source is stronger), then
     calls :meth:`~ovui_widgets.common.adapters.LayerStackAdapter.remove_sublayer`
     to unlink the source from the parent.
 
@@ -134,10 +160,14 @@ class FlattenSublayersCommand(AbstractLayerCommand):
 
     Walks the parent's direct-sublayer list at ``do`` time, snapshots
     the parent and each sublayer, then transfers each sublayer's
-    content into the parent in strength order (weakest-first so
-    stronger opinions overwrite weaker ones — matches USD's native
-    flatten semantics), finally removing the sublayers from the
-    parent's :attr:`subLayerPaths`.
+    content into the parent in strength order (strongest-first, with
+    the parent as the stronger side of each merge, so the merged
+    opinions are the ones that USD composition shows), finally
+    removing the sublayers from the parent's :attr:`subLayerPaths`.
+    An adapter whose ``transfer_layer_content`` does not name
+    ``dst_is_stronger``, or has no readable signature (a native
+    function), gets the merge it had before ``dst_is_stronger``:
+    weakest-first, each sublayer the stronger side, with a warning log.
 
     Direct sublayers only: v1 does not recursively flatten grandchild
     layers. A sub-sublayer remains referenced by its direct-sublayer
@@ -189,14 +219,33 @@ class FlattenSublayersCommand(AbstractLayerCommand):
                     self._adapter.snapshot_layer(child_id)
                 )
 
-        # Transfer content weakest-first: the LAST sublayer (strongest
-        # in USD composition) lands in the parent last, so its
-        # opinions win on overlapping paths. This matches the native
-        # Kit ``FlattenLayers`` semantics.
-        for snap in reversed(self._sublayer_snapshots):
-            self._adapter.transfer_layer_content(
-                snap.identifier, self._parent_id
+        two_argument_reason = _two_argument_transfer_reason(self._adapter)
+        if two_argument_reason is None:
+            # Merge strongest-first. In USD the FIRST sublayer is the
+            # strongest, and the parent's own opinions are stronger than
+            # all of its sublayers, so the parent (with the sublayers
+            # merged so far) is the stronger side of each merge.
+            for snap in self._sublayer_snapshots:
+                self._adapter.transfer_layer_content(
+                    snap.identifier, self._parent_id, dst_is_stronger=True
+                )
+        else:
+            # The adapter may have the two-argument form, where the
+            # source always wins. Keep the merge it had before:
+            # weakest-first, so the strongest sublayer lands in the
+            # parent last.
+            _LOGGER.warning(
+                "FlattenSublayersCommand: %s.transfer_layer_content %s; "
+                "flattening %r with the two-argument merge (weakest "
+                "sublayer first, each sublayer stronger than the parent)",
+                type(self._adapter).__name__,
+                two_argument_reason,
+                self._parent_id,
             )
+            for snap in reversed(self._sublayer_snapshots):
+                self._adapter.transfer_layer_content(
+                    snap.identifier, self._parent_id
+                )
         # Remove sublayers back-to-front so earlier indices stay valid
         # through the iteration.
         for idx in range(len(self._sublayer_snapshots) - 1, -1, -1):

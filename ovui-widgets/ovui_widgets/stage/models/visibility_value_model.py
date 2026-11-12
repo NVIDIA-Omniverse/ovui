@@ -5,12 +5,16 @@
 
 VisibilityValueModel supplies the StageWidget eye-checkbox behavior.
 
-``get_value_as_bool()`` returns ``True`` when the item is effectively
-**invisible** — the convention Kit's visibility checkbox uses ("checked" ⇒
-the eye-closed icon draws, so the prim is hidden). ``set_value(hidden)``
-toggles visibility; if the owning item is part of a multi-selection,
-*every* selected item is toggled in the same undo group (DAW-style group
-operation). Instance proxies are gated out via ``is_enabled``.
+``get_value_as_bool()`` returns ``True`` when the item itself is authored
+**invisible** ("checked" ⇒ the eye-closed icon draws). An item that is
+hidden only through a hidden ancestor reads ``False``: its own state is not
+hidden. ``get_visibility_state()`` returns the three states, so the eye can
+show that inherited case apart. ``set_value(hidden)`` authors visibility on
+the item only (``StageAdapter.set_own_visibility``): it never shows a hidden
+ancestor or hides that ancestor's other children. If the owning item is
+part of a multi-selection, *every* selected item is toggled in the same undo
+group (DAW-style group operation). Instance proxies are gated out via
+``is_enabled``.
 """
 
 from __future__ import annotations
@@ -53,10 +57,13 @@ class VisibilityValueModel(ui.AbstractValueModel):
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
+    def get_visibility_state(self) -> VisibilityState:
+        """Return the item's visibility: visible, invisible, or inherited invisible."""
+        return self._adapter.compute_visibility(self._item.adapter_item)
+
     def get_value_as_bool(self) -> bool:
-        """Return True when the item is effectively invisible (eye closed)."""
-        state = self._adapter.compute_visibility(self._item.adapter_item)
-        return state != VisibilityState.VISIBLE
+        """Return True when the item itself is authored invisible (eye closed)."""
+        return self.get_visibility_state() is VisibilityState.INVISIBLE
 
     def get_value_as_int(self) -> int:
         return 1 if self.get_value_as_bool() else 0
@@ -72,9 +79,11 @@ class VisibilityValueModel(ui.AbstractValueModel):
     def set_value(self, value) -> None:
         """Set the hidden state; group-toggles every selected item if applicable.
 
-        ``value`` is the inverted convention: True hides, False shows. A
-        single undo group wraps the whole batch so one click produces one
-        undo entry regardless of selection size.
+        ``value`` is the inverted convention: True hides, False shows. Each
+        target is authored alone, so showing an item under a hidden ancestor
+        leaves it hidden through that ancestor. A single undo group wraps the
+        whole batch so one click produces one undo entry regardless of
+        selection size.
         """
         hidden = bool(value)
         visible = not hidden
@@ -95,7 +104,7 @@ class VisibilityValueModel(ui.AbstractValueModel):
         self._adapter.begin_undo_group("Toggle Visibility")
         try:
             for target in targets:
-                self._adapter.set_visibility(target, visible)
+                self._adapter.set_own_visibility(target, visible)
         except BaseException as member_error:
             # Structured scope ownership: a failed member aborts the whole
             # group so completed members are compensated instead of leaving

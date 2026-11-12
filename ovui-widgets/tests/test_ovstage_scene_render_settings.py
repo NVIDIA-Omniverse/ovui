@@ -77,7 +77,7 @@ def test_the_scene_exposes_its_stored_render_settings(
     Kit applies ``customLayerData['renderSettings']`` when it opens a scene.
     The native ovstage provider has no backing USD stage, so the settings
     must come from the stage metadata that population puts on ``/``.
-    Without them the regression fixture scene opens black.
+    Without them the regression scene opens black.
     """
 
     path = tmp_path / "scene.usda"

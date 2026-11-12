@@ -72,7 +72,7 @@ def _patch_scene_load(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         renderer_module,
         "_build_runtime_layer",
-        lambda _stage, *, resolution, records, runtime_root_path, viewport_quality: SimpleNamespace(
+        lambda _stage, *, resolution, records, runtime_root_path, viewport_quality, **_kwargs: SimpleNamespace(
             usda="#usda 1.0",
             root_path=runtime_root_path,
             camera_path=f"{runtime_root_path}/Render/Cameras/Main",

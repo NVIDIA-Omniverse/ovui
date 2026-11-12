@@ -3,7 +3,7 @@
 
 """Session-level pytest fixtures.
 
-Forces a clean process exit once pytest has reported its results.
+Owns test-session teardown before the process exits.
 
 The standalone backend's GLFW + Vulkan + CUDA-GL interop stack tears
 down in an order that glibc reports as a heap double-free during
@@ -12,11 +12,16 @@ originates inside ``libGLX.so.0`` and is not caused by any single test
 — removing the most-recently-added cursor or streaming tests still
 reproduces it.
 
-There is no Python-level fix for the destructor ordering, so we cut
-the process off at ``pytest_sessionfinish``: once pytest has tallied
+For the legacy windowed/OpenGL paths we cut
+the process off at ``pytest_unconfigure``: once pytest has tallied
 its results and the exit status is success, we flush stdio and
 ``os._exit`` with that status. This skips Python interpreter shutdown
 (and therefore the C++ ``__attribute__((destructor))`` chain) entirely.
+
+Headless Vulkan must instead release the backend and exit normally. On
+Windows, ``os._exit`` still runs DLL detach, with live native resources if
+the Python atexit shutdown was skipped. A passing summary alone does not
+prove that the export process can shut down.
 """
 
 from __future__ import annotations
@@ -146,6 +151,8 @@ def _disable_core_dumps() -> None:
 
 @pytest.hookimpl(trylast=True)
 def pytest_unconfigure(config) -> None:
+    if _is_headless_mode() and not _is_opengl_backend():
+        return
     if getattr(config.option, "collectonly", False):
         return
     session = getattr(config, "_pytest_session_exitstatus", None)
@@ -159,3 +166,15 @@ def pytest_unconfigure(config) -> None:
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus: int) -> None:
     session.config._pytest_session_exitstatus = exitstatus
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _shutdown_headless_vulkan():
+    yield
+    if _is_headless_mode() and not _is_opengl_backend():
+        # Do not import the product for CPU-only tests. If it was used, retire
+        # its resources while Python and the graphics runtimes are still live.
+        # An exception here is a pytest teardown error, never a forced success.
+        standalone = sys.modules.get("omni.ui.standalone")
+        if standalone is not None:
+            standalone.shutdown()

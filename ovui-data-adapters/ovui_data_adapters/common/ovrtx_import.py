@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 import importlib
+import logging
 import os
 from pathlib import Path
 import platform
@@ -18,6 +20,8 @@ from typing import Any
 OVRTX_ROOT_ENV = "OVRTX_ROOT"
 OVRTX_BIN_DIR_ENV = "OVRTX_BIN_DIR"
 OVRTX_LIBRARY_PATH_HINT_ENV = "OVRTX_LIBRARY_PATH_HINT"
+
+_LOGGER = logging.getLogger(__name__)
 
 _OVRTX_DLL_HANDLES: list[Any] = []
 _OVRTX_IMPORT_RESULT: "OvRtxImportResult | None" = None
@@ -87,6 +91,16 @@ def _ovrtx_runtime_dirs(raw_root: str) -> tuple[Path, ...]:
     return tuple(dirs)
 
 
+def ovrtx_runtime_dirs() -> tuple[Path, ...]:
+    """Return the native-runtime directories of the ``OVRTX_ROOT`` install.
+
+    An ``OVRTX_ROOT`` install keeps its Python package and its runtime files in
+    separate trees, so resources that ship beside the native libraries are not
+    found next to ``ovrtx.__file__``.
+    """
+    return _ovrtx_runtime_dirs(os.environ.get(OVRTX_ROOT_ENV, ""))
+
+
 def ovrtx_root_mdl_base_dirs() -> tuple[Path, ...]:
     """Return the MDL ``Base`` library directories of the ``OVRTX_ROOT`` install."""
     raw_root = os.environ.get(OVRTX_ROOT_ENV, "").strip()
@@ -100,18 +114,166 @@ def ovrtx_root_mdl_base_dirs() -> tuple[Path, ...]:
 
 
 _VERSION_ASSIGNMENT = re.compile(r"""^__version__\s*=\s*["']([^"']+)["']""", re.MULTILINE)
+_METADATA_VERSION = re.compile(r"^Version:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
+_VERSION_FILE_PARTS = ("major", "minor", "patch", "build_number")
+
+
+def _version_from_version_file(package_dir: Path) -> tuple[str, str]:
+    """Return ``(version, problem)`` from the ``_version.py`` of a package.
+
+    The ovrtx and ovstage builds generate ``_version.py`` with ``major``,
+    ``minor``, ``patch`` and ``build_number``; ovstage also writes ``version``.
+    The file is read as text, so nothing is imported. A source tree has no such
+    file, and that is not a problem. A file that exists but cannot be read is a
+    problem; so is a link to a file that is missing or that cannot be reached.
+    """
+    path = package_dir / "_version.py"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        if not os.path.lexists(path):
+            return "", ""
+        return "", f"cannot read {path} ({type(exc).__name__}: {exc})"
+    except (OSError, UnicodeDecodeError) as exc:
+        return "", f"cannot read {path} ({type(exc).__name__}: {exc})"
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except (SyntaxError, ValueError) as exc:
+        return "", f"cannot read {path} ({type(exc).__name__}: {exc})"
+    values: dict[str, Any] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant)
+        ):
+            values[node.targets[0].id] = node.value.value
+    version = values.get("version")
+    if isinstance(version, str) and version.strip():
+        return version.strip(), ""
+    parts = [values.get(name) for name in _VERSION_FILE_PARTS]
+    if all(isinstance(part, int) for part in parts[:3]):
+        if not isinstance(parts[3], int):
+            parts = parts[:3]
+        return ".".join(str(part) for part in parts), ""
+    return "", f"{path} names no version"
+
+
+def _version_from_distribution_metadata(directory: Path, distribution: str) -> tuple[str, str]:
+    """Return ``(version, problem)`` from the ``*.dist-info`` in ``directory``.
+
+    A copy outside an installed environment has no ``*.dist-info``, and that is
+    not a problem. A folder that cannot be listed is a problem, because the
+    metadata can be in it.
+    """
+    prefix = f"{distribution.replace('-', '_')}-"
+    try:
+        names = os.listdir(directory)
+    except (FileNotFoundError, NotADirectoryError):
+        return "", ""
+    except OSError as exc:
+        return "", f"cannot list {directory} for {distribution} metadata ({type(exc).__name__}: {exc})"
+    found = sorted(
+        directory / name for name in names if name.startswith(prefix) and name.endswith(".dist-info")
+    )
+    if not found:
+        return "", ""
+    if len(found) > 1:
+        names = ", ".join(path.name for path in found)
+        return "", f"{directory} has more than one {distribution} metadata folder ({names})"
+    path = found[0] / "METADATA"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return "", f"cannot read {path} ({type(exc).__name__}: {exc})"
+    match = _METADATA_VERSION.search(text)
+    if not match:
+        return "", f"{path} names no Version"
+    return match.group(1), ""
+
+
+def package_version(package_dir: Path, distribution: str, declared_version: str = "") -> str:
+    """Return the full version of the ``distribution`` package in ``package_dir``.
+
+    ``__version__`` can be shorter than the version of the copy: ovrtx
+    0.5.1.385782 sets it to "0.5.1". The generated ``_version.py`` of the
+    package comes first, then the metadata installed next to the package, and
+    ``declared_version`` (the ``__version__`` of the package) last.
+    ``package_dir`` is not resolved through links, so a copy selected by a root
+    gives its own version, not the version of the copy it links to. A file that
+    exists but cannot be read is reported, with the source used instead.
+    """
+    problems: list[str] = []
+    readers = (
+        ("_version.py", lambda: _version_from_version_file(package_dir)),
+        ("metadata", lambda: _version_from_distribution_metadata(package_dir.parent, distribution)),
+    )
+    for source, read in readers:
+        version, problem = read()
+        if problem:
+            problems.append(problem)
+        if version:
+            if problems:
+                _LOGGER.warning(
+                    "Reading the %s version: %s. The %s version %s comes from its %s.",
+                    distribution, "; ".join(problems), distribution, version, source,
+                )
+            return version
+    if problems:
+        _LOGGER.warning(
+            "Reading the %s version: %s. The %s version %r comes from __version__.",
+            distribution, "; ".join(problems), distribution, declared_version,
+        )
+    return declared_version
+
+
+def loaded_module_version(module: Any, distribution: str) -> str:
+    """Return the full version of a loaded ovrtx or ovstage package."""
+    if module is None:
+        return ""
+    declared = str(getattr(module, "__version__", "") or "")
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        return declared
+    return package_version(Path(os.path.abspath(module_file)).parent, distribution, declared)
+
+
+def loaded_ovrtx_version() -> str:
+    """Return the version of the ovrtx that is loaded, or "" when none is.
+
+    This does not import ovrtx. It names the copy that ``import_ovrtx`` took,
+    not a copy that it tried and rejected.
+    """
+    result = _OVRTX_IMPORT_RESULT
+    return loaded_module_version(result.module if result is not None else None, "ovrtx")
 
 
 def ovrtx_root_version() -> str:
-    """Return ``ovrtx.__version__`` of the ``OVRTX_ROOT`` install without importing it."""
-    for candidate in _ovrtx_python_path_candidates(os.environ.get(OVRTX_ROOT_ENV, "")):
+    """Return the version of the ``OVRTX_ROOT`` ovrtx without importing it.
+
+    When ``import_ovrtx`` has loaded a copy from the root, this is the version
+    of that copy. Otherwise it is the version of the first copy under the root.
+    """
+    candidates = _ovrtx_python_path_candidates(os.environ.get(OVRTX_ROOT_ENV, ""))
+    result = _OVRTX_IMPORT_RESULT
+    if result is not None and result.module is not None:
+        if result.source in {str(candidate) for candidate in candidates}:
+            return loaded_ovrtx_version()
+    for candidate in candidates:
+        package_dir = candidate / "ovrtx"
         try:
-            text = (candidate / "ovrtx" / "__init__.py").read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            text = (package_dir / "__init__.py").read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            _LOGGER.warning(
+                "Reading the ovrtx version: cannot read %s (%s: %s). The next copy under %s is used.",
+                package_dir / "__init__.py", type(exc).__name__, exc, OVRTX_ROOT_ENV,
+            )
             continue
         match = _VERSION_ASSIGNMENT.search(text)
-        if match:
-            return match.group(1)
+        version = package_version(package_dir, "ovrtx", match.group(1) if match else "")
+        if version:
+            return version
     return ""
 
 
@@ -179,98 +341,85 @@ def _close_dll_handles(handles: list[Any]) -> None:
                 pass
 
 
+def _clear_ovrtx_modules() -> None:
+    """Drop ovrtx and every ovrtx.* submodule from the import cache.
+
+    A new top-level ovrtx must not keep children loaded from another copy.
+    """
+    for loaded_name in list(sys.modules):
+        if loaded_name == "ovrtx" or loaded_name.startswith("ovrtx."):
+            sys.modules.pop(loaded_name, None)
+
+
+def _imported_through(candidate: Path, module: Any) -> bool:
+    """Return whether ``module`` was imported through ``candidate``.
+
+    The found file path is compared without following symbolic links, so a
+    package that ``candidate`` supplies through a link still counts as its own.
+    A module without a file path cannot be placed, so it is accepted.
+    """
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        return True
+    found = Path(os.path.abspath(module_file))
+    root = Path(os.path.abspath(str(candidate)))
+    return root == found or root in found.parents
+
+
 def _import_ovrtx_from_path(candidate: Path) -> Any:
-    """Import ovrtx with ``candidate`` temporarily leading ``sys.path``."""
+    """Import ovrtx with ``candidate`` leading ``sys.path``.
+
+    ``candidate`` goes to the front even when it is already on the path later,
+    so a copy earlier on the path does not win. The path order is restored.
+    """
     candidate_str = str(candidate)
-    inserted = False
-    if candidate_str not in sys.path:
-        sys.path.insert(0, candidate_str)
-        inserted = True
+    original = list(sys.path)
+    sys.path[:] = [candidate_str] + [p for p in original if p != candidate_str]
     try:
         return importlib.import_module("ovrtx")
     finally:
-        if inserted:
-            try:
-                sys.path.remove(candidate_str)
-            except ValueError:
-                pass
+        sys.path[:] = original
 
 
 def _compose_ovrtx_import_error(
-    normal_error: BaseException,
+    normal_error: BaseException | None,
     raw_root: str,
     root_errors: list[str],
 ) -> ImportError:
-    message = (
-        "Could not import ovrtx from the active environment "
-        f"({type(normal_error).__name__}: {normal_error})."
-    )
     if raw_root:
-        if root_errors:
-            detail = "; ".join(root_errors)
-        else:
-            detail = "no import attempts were made"
-        message = f"{message} {OVRTX_ROOT_ENV}={raw_root!r} also failed: {detail}"
-    else:
-        message = f"{message} {OVRTX_ROOT_ENV} is not set."
-    return ImportError(message)
-
-
-_OVUI_IMGUI_HANDLE: Any = None
-
-
-def _load_ovui_imgui() -> None:
-    """Load ovui's ImGui library before ovrtx loads its own.
-
-    A process has one library named imgui. ovui's copy also provides the old
-    entry points ovrtx imports, but ovrtx's older copy lacks what ovui needs,
-    so ovui's must be the one loaded. Only the library is loaded: omni.ui
-    itself is not imported. Without an installed omni.ui this does nothing.
-    """
-    global _OVUI_IMGUI_HANDLE
-    if _OVUI_IMGUI_HANDLE is not None:
-        return
-    try:
-        import ctypes
-        import importlib.util
-
-        spec = importlib.util.find_spec("omni.ui")
-    except (ImportError, ValueError):
-        return
-    if spec is None or not spec.submodule_search_locations:
-        return
-    name = {"win32": "imgui.dll", "darwin": "libimgui.dylib"}.get(sys.platform, "libimgui.so")
-    for location in spec.submodule_search_locations:
-        library = Path(location) / name
-        if library.is_file():
-            _OVUI_IMGUI_HANDLE = ctypes.CDLL(str(library))
-            return
+        detail = "; ".join(root_errors) if root_errors else "no import attempts were made"
+        return ImportError(f"Could not import ovrtx from {OVRTX_ROOT_ENV}={raw_root!r}: {detail}")
+    return ImportError(
+        "Could not import ovrtx from the active environment "
+        f"({type(normal_error).__name__}: {normal_error}). {OVRTX_ROOT_ENV} is not set."
+    )
 
 
 def import_ovrtx() -> OvRtxImportResult:
-    """Resolve ovrtx from the active env first, then ``OVRTX_ROOT``."""
+    """Resolve ovrtx from ``OVRTX_ROOT`` when it is set, else the active env."""
     global _OVRTX_IMPORT_RESULT
     if _OVRTX_IMPORT_RESULT is not None:
         return _OVRTX_IMPORT_RESULT
 
-    _load_ovui_imgui()
-
-    try:
-        module = importlib.import_module("ovrtx")
-    except (ImportError, RuntimeError, OSError) as exc:
-        normal_error = exc
-    else:
-        _OVRTX_IMPORT_RESULT = OvRtxImportResult(
-            module=module,
-            error=None,
-            source="active environment",
-        )
-        return _OVRTX_IMPORT_RESULT
-
     raw_root = os.environ.get(OVRTX_ROOT_ENV, "").strip()
+    normal_error: BaseException | None = None
+    if not raw_root:
+        try:
+            module = importlib.import_module("ovrtx")
+        except (ImportError, RuntimeError, OSError) as exc:
+            normal_error = exc
+        else:
+            _OVRTX_IMPORT_RESULT = OvRtxImportResult(
+                module=module,
+                error=None,
+                source="active environment",
+            )
+            return _OVRTX_IMPORT_RESULT
+
+    # A set OVRTX_ROOT selects ovrtx, with no fallback to the active environment.
     root_errors: list[str] = []
     if raw_root:
-        sys.modules.pop("ovrtx", None)
+        _clear_ovrtx_modules()
         _configure_ovrtx_runtime_environment(raw_root)
         candidates = _ovrtx_python_path_candidates(raw_root)
         if not candidates:
@@ -278,12 +427,16 @@ def import_ovrtx() -> OvRtxImportResult:
                 f"no importable ovrtx package found under {OVRTX_ROOT_ENV}"
             )
         for candidate in candidates:
-            sys.modules.pop("ovrtx", None)
+            _clear_ovrtx_modules()
             handles = _add_windows_ovrtx_dll_directories(raw_root)
             try:
                 module = _import_ovrtx_from_path(candidate)
+                if not _imported_through(candidate, module):
+                    raise ImportError(
+                        f"ovrtx was imported from {getattr(module, '__file__', None)}"
+                    )
             except (ImportError, RuntimeError, OSError) as path_exc:
-                sys.modules.pop("ovrtx", None)
+                _clear_ovrtx_modules()
                 _close_dll_handles(handles)
                 root_errors.append(
                     f"{candidate}: {type(path_exc).__name__}: {path_exc}"
@@ -297,7 +450,7 @@ def import_ovrtx() -> OvRtxImportResult:
             )
             return _OVRTX_IMPORT_RESULT
 
-    sys.modules.pop("ovrtx", None)
+    _clear_ovrtx_modules()
     _OVRTX_IMPORT_RESULT = OvRtxImportResult(
         module=None,
         error=_compose_ovrtx_import_error(normal_error, raw_root, root_errors),

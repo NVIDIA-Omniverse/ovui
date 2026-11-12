@@ -57,6 +57,7 @@ The repository ships a Claude Code-compatible inspector skill that exposes a loc
 When a request maps to a known ovui workflow, go directly to the relevant skill in `skills/`:
 
 - Atomic ovui construction (windows, layouts, TreeView, model-view, inputs, menus, viewport-like ovrtx panels, styling, strict UI validation) -> `skills/omniverse-ui-apis/SKILL.md`
+  - `skills/omniverse-ui-apis/references/layout-presets.md` - layout presets for standard components: spacing, alignment and default options of tool windows, sections, form rows, fields, sliders, button rows, and toolbars.
   - `skills/omniverse-ui-apis/references/layout.md` - lengths, containers, clipping, scroll, nested layout, docking layout patterns.
   - `skills/omniverse-ui-apis/references/model-view-tree.md` - value models, item models, delegates, TreeView behavior, stage hierarchy trees.
   - `skills/omniverse-ui-apis/references/inputs-windows-viewport.md` - controls, callbacks, menus, drag/drop, keyboard focus, window/docking behavior, ovrtx viewport shells, QA constraints.

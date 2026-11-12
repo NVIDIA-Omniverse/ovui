@@ -13,7 +13,7 @@ import contextlib
 from typing import Any
 
 try:
-    from pxr import Sdf, Tf, Usd, UsdGeom
+    from pxr import Sdf, Tf, Usd, UsdGeom, UsdShade
     _HAS_USD = True
 except ImportError:
     _HAS_USD = False
@@ -74,16 +74,20 @@ class _CameraPoseSnapshot:
                 Sdf.CopySpec(self._holder, prop_path, layer, prop_path)
 
 
-# The write-set prediction mirrors the UsdGeomImageable algorithm of this
-# exact pinned OpenUSD version (verified against its source and probes).
-# Any other runtime — Kit or custom builds may supply their own USD — is not
-# a verified prediction target and must take the safe whole-layer mode. The
-# decision is frozen at import time so it cannot drift mid-attempt.
+# The MakeVisible write-set prediction mirrors the UsdGeomImageable algorithm
+# of this exact pinned OpenUSD version (verified against its source and
+# probes). With any other OpenUSD version — Kit or custom builds may supply
+# their own USD — a MakeVisible show is not a verified prediction target and
+# must take the safe whole-layer mode. A hide (MakeInvisible) and an own-only
+# show author the target's visibility alone with every OpenUSD version, so
+# they need no pinned prediction (see
+# ``SetVisibilityCommand._needs_pinned_prediction``).
+# The decision is frozen at import time so it cannot drift mid-attempt.
 _PINNED_USD_VERSION = (0, 25, 11)
 
 
 def prediction_runtime_supported() -> bool:
-    """Frozen support decision for the targeted (Mode A) prediction."""
+    """Frozen support decision for the targeted (Mode A) MakeVisible prediction."""
     if not _HAS_USD:
         return False
     try:
@@ -114,7 +118,9 @@ def _edit_target_globally_identity(edit_target: Any) -> bool:
         return False
 
 
-def predict_visibility_write_prims(stage: Any, prim: Any, visible: bool) -> set:
+def predict_visibility_write_prims(
+    stage: Any, prim: Any, visible: bool, own_only: bool = False
+) -> set:
     """Scene prim paths a MakeVisible/MakeInvisible call may author.
 
     Mirrors UsdGeomImageable (usdGeom/imageable.cpp): MakeInvisible eagerly
@@ -123,11 +129,13 @@ def predict_visibility_write_prims(stage: Any, prim: Any, visible: bool) -> set:
     value reads 'invisible', flips authored-invisible imageable ancestors
     root-down, and authors 'invisible' on imageable non-chain children of
     each imageable ancestor at or below the first invisible one;
-    non-imageable ancestors contribute nothing. Used only to scope exact
-    transaction capture and semantic pre-reads — never to build event paths.
+    non-imageable ancestors contribute nothing. With ``own_only`` the
+    command authors the target alone (see ``_make_own_visible``). Used only
+    to scope exact transaction capture and semantic pre-reads — never to
+    build event paths.
     """
     writes = {str(prim.GetPath())}
-    if not visible:
+    if not visible or own_only:
         return writes
     chain = []
     parent = prim.GetParent()
@@ -156,6 +164,16 @@ def predict_visibility_write_prims(stage: Any, prim: Any, visible: bool) -> set:
                 if child != keep and UsdGeom.Imageable(child):
                     writes.add(str(child.GetPath()))
     return writes
+
+
+def _make_own_visible(imageable: Any) -> None:
+    """The target step of MakeVisible, without its ancestor and sibling writes.
+
+    Authors 'inherited' when the target's own value reads 'invisible'. Under
+    a hidden ancestor the prim stays hidden through that ancestor.
+    """
+    if imageable.GetVisibilityAttr().Get() == UsdGeom.Tokens.invisible:
+        imageable.CreateVisibilityAttr().Set(UsdGeom.Tokens.inherited)
 
 
 def _ensure_prim_spec_chain(layer: Any, prim_path: Any) -> Any:
@@ -551,18 +569,22 @@ class _WholeLayerVisibilitySnapshot:
 class SetVisibilityCommand(Command):
     """Transactional visibility toggle with exact edit-target restore.
 
-    do() authors via MakeVisible/MakeInvisible and keeps two immutable
-    restoration targets (pre_do / post_do); undo/redo replay them exactly.
+    do() authors via MakeVisible/MakeInvisible (with ``own_only``, a show
+    authors the target alone) and keeps two immutable restoration targets
+    (pre_do / post_do); undo/redo replay them exactly.
     Every edge takes a fresh compensation snapshot first and rolls back to it
     if replay fails partway. Undo/redo edges bracket themselves through the
     owning adapter (when provided) so their genuine notices become one
     truthful adapter event; the adapter brackets do() itself.
     """
 
-    def __init__(self, prim: Any, visible: bool, adapter: Any = None) -> None:
+    def __init__(
+        self, prim: Any, visible: bool, adapter: Any = None, own_only: bool = False
+    ) -> None:
         self._stage = prim.GetStage()
         self._path = prim.GetPath()
         self._visible = bool(visible)
+        self._own_only = bool(own_only)
         self._adapter = adapter
         self._mode: Any = None
         self._layer: Any = None
@@ -574,7 +596,9 @@ class SetVisibilityCommand(Command):
 
     def predicted_write_prims(self) -> set:
         prim = self._stage.GetPrimAtPath(self._path)
-        return predict_visibility_write_prims(self._stage, prim, self._visible)
+        return predict_visibility_write_prims(
+            self._stage, prim, self._visible, self._own_only
+        )
 
     def edge_hint_prims(self) -> set:
         """Semantic pre-read hint for undo/redo edges.
@@ -586,6 +610,24 @@ class SetVisibilityCommand(Command):
         if self._predicted is not None:
             return set(self._predicted)
         return self.predicted_write_prims()
+
+    def replays_targeted_specs(self) -> bool:
+        """True once do() chose Mode A: undo/redo replay only the exact
+        visibility specs of the predicted prims, never the whole layer."""
+        return self._mode == "A"
+
+    def authors_targeted_specs(self) -> bool:
+        """True when do() writes and snapshots only the exact visibility
+        specs of the predicted prims (Mode A), never the whole layer.
+
+        The first call chooses the mode from the current edit target, as
+        do() does; do() then keeps that choice. The owning adapter asks
+        before it opens the do-time attempt, and nothing authors between
+        that call and do().
+        """
+        if self._mode is None:
+            self._select_mode()
+        return self._mode == "A"
 
     def operation_layers(self) -> list:
         """The layer(s) this command's authoring/replay writes.
@@ -610,12 +652,24 @@ class SetVisibilityCommand(Command):
             return _TargetedVisibilitySnapshot(self._layer, self._predicted)
         return _WholeLayerVisibilitySnapshot(self._layer)
 
+    def _needs_pinned_prediction(self) -> bool:
+        """True only for a MakeVisible show.
+
+        MakeVisible also shows hidden ancestors and hides their other
+        children; ``predict_visibility_write_prims`` mirrors that walk for
+        the pinned OpenUSD version only. MakeInvisible authors the target's
+        own visibility attribute, and an own-only show is
+        ``_make_own_visible``: both write the target alone on every
+        OpenUSD version, so their one-prim prediction holds everywhere.
+        """
+        return self._visible and not self._own_only
+
     def _select_mode(self) -> None:
         edit_target = self._stage.GetEditTarget()
         self._layer = edit_target.GetLayer()
         self._predicted = sorted(self.predicted_write_prims())
-        if not _PREDICTION_SUPPORTED:
-            # Unverified/unsupported USD runtime: the targeted prediction
+        if not _PREDICTION_SUPPORTED and self._needs_pinned_prediction():
+            # Unverified/unsupported OpenUSD version: the MakeVisible prediction
             # cannot be trusted, so the exact whole-layer mode applies.
             self._mode = "B"
             return
@@ -682,7 +736,9 @@ class SetVisibilityCommand(Command):
         imageable = UsdGeom.Imageable(prim)
         try:
             with self._operation_window():
-                if self._visible:
+                if self._visible and self._own_only:
+                    _make_own_visible(imageable)
+                elif self._visible:
                     imageable.MakeVisible()
                 else:
                     imageable.MakeInvisible()
@@ -813,6 +869,8 @@ class DeletePrimCommand(Command):
             Sdf.CreatePrimInLayer(tmp, parent_path)
         Sdf.CopySpec(layer, self._path, tmp, self._path)
         self._captured_layer = tmp
+        siblings = layer.GetObjectAtPath(parent_path).nameChildren.keys()
+        self._index = list(siblings).index(self._path.name)
         batch = Sdf.BatchNamespaceEdit()
         batch.Add(self._path, Sdf.Path.emptyPath)
         layer.Apply(batch)
@@ -827,32 +885,291 @@ class DeletePrimCommand(Command):
         # If a future caller deletes the parent too, the parent's
         # ``DeletePrimCommand`` undoes first under ``UndoGroup`` ordering.
         Sdf.CopySpec(self._captured_layer, self._path, layer, self._path)
+        # CopySpec appends the prim. Move it out and back to its old index.
+        temp_path = self._path.ReplaceName(self._path.name + "_")
+        while layer.GetObjectAtPath(temp_path):
+            temp_path = temp_path.ReplaceName(temp_path.name + "_")
+        batch = Sdf.BatchNamespaceEdit()
+        batch.Add(self._path, temp_path)
+        batch.Add(temp_path, self._path, self._index)
+        layer.Apply(batch)
+
+
+def _path_list_op_items(list_op: Any) -> tuple:
+    return (
+        *list_op.explicitItems,
+        *list_op.addedItems,
+        *list_op.prependedItems,
+        *list_op.appendedItems,
+        *list_op.deletedItems,
+        *list_op.orderedItems,
+    )
+
+
+# Properties that hold a material binding or a shading connection, in any
+# list form.
+_SHADING_LINK_PREFIXES = ("material:binding", "inputs:", "outputs:")
+
+# Type name -> True for Material, NodeGraph, Shader and the types derived
+# from them.
+_SHADING_TYPE_NAMES: dict = {}
+
+# The attribute names of the USD schemas, without the shading names. Filled
+# on first use by ``_schema_attribute_names``.
+_SCHEMA_ATTRIBUTE_NAMES: frozenset | None = None
+
+# Namespaces that USD uses only for attributes: transform operations and
+# primvars.
+_ATTRIBUTE_NAMESPACES = ("xformOp:", "primvars:")
+
+
+def _is_shading_type_name(type_name: str) -> bool:
+    known = _SHADING_TYPE_NAMES.get(type_name)
+    if known is None:
+        schema_type = Usd.SchemaRegistry.GetTypeFromName(type_name)
+        known = schema_type.IsA(Tf.Type.Find(UsdShade.NodeGraph)) or schema_type.IsA(
+            Tf.Type.Find(UsdShade.Shader)
+        )
+        _SHADING_TYPE_NAMES[type_name] = known
+    return known
+
+
+def _schema_attribute_names() -> frozenset:
+    """Names that the typed and API schemas of USD define as attributes.
+
+    ``_retarget_moved_paths`` does not look up the spec of a property with
+    one of these names (``points``, ``extent``, ...), because on a large
+    layer that lookup costs more than the rest of the scan.
+    """
+    global _SCHEMA_ATTRIBUTE_NAMES
+    if _SCHEMA_ATTRIBUTE_NAMES is None:
+        registry = Usd.SchemaRegistry()
+        names: set = set()
+        for base in (Usd.Typed, Usd.APISchemaBase):
+            for schema_type in Tf.Type.Find(base).GetAllDerivedTypes():
+                type_name = Usd.SchemaRegistry.GetSchemaTypeName(schema_type)
+                definition = type_name and (
+                    registry.FindConcretePrimDefinition(type_name)
+                    or registry.FindAppliedAPIPrimDefinition(type_name)
+                )
+                if not definition:
+                    continue
+                names.update(
+                    name
+                    for name in definition.GetPropertyNames()
+                    if definition.GetAttributeDefinition(name)
+                )
+        _SCHEMA_ATTRIBUTE_NAMES = frozenset(
+            name for name in names if not name.startswith(_SHADING_LINK_PREFIXES)
+        )
+    return _SCHEMA_ATTRIBUTE_NAMES
+
+
+def _layer_defines_shading_prim(layer: Any, stage: Any, path: Any) -> bool:
+    """True when ``layer`` has a shading prim spec at ``path`` or below it.
+
+    Material bindings point to materials, and shading connections point to
+    materials, node graphs and shaders. A move of any other subtree breaks
+    neither, so it does not need ``_retarget_moved_paths`` and its scan of
+    the whole layer. A spec without a shading type, for example an
+    ``over`` of a material that another layer defines, does not move the
+    material: the links must keep the old path.
+
+    The composed prims of ``stage`` give the shading candidates at about
+    one microsecond for each prim.
+    """
+    prim = stage.GetPrimAtPath(path)
+    if not prim:
+        return False
+    for candidate in Usd.PrimRange.AllPrims(prim):
+        if not _is_shading_type_name(candidate.GetTypeName()):
+            continue
+        spec = layer.GetPrimAtPath(candidate.GetPath())
+        if spec is not None and _is_shading_type_name(spec.typeName):
+            return True
+    return False
+
+
+def _retarget_moved_paths(layer: Any, stage: Any, old_path: Any, new_path: Any) -> tuple:
+    """Point the links in ``layer`` that a move broke at the moved prim.
+
+    ``Sdf.BatchNamespaceEdit`` moves only the specs. A relationship target
+    or an attribute connection that names the moved prim, or an object
+    below it, keeps the old path: for example the ``material:binding`` of
+    each prim that uses a renamed material, and the shader connections in
+    that material. Call this after the move: ``stage`` then shows where
+    each object is. A link changes from ``old_path`` to ``new_path`` only
+    when the move broke it: no prim is defined at its old path any more,
+    and a prim is defined at its new path. A link to an object that the
+    move did not take away keeps its path, for example a material that a
+    sublayer defines and ``layer`` only overrides. The list editor of the
+    spec makes the change, so the target and connection child specs stay
+    in step with the list.
+
+    A list read from a text layer has no target or connection child specs
+    when it is not explicit (``prepend rel look = </World/Looks/M>``), so
+    the candidates are found by name: each property with a shading name,
+    and each other property except the attributes of the USD schemas and
+    of the transform operation and primvar namespaces. The owner of each
+    target or connection child spec in the moved subtree is a candidate
+    too. Only the list ops of the candidates are read.
+
+    Returns ``(property path, list name, old list op)`` for each changed
+    list, for ``_restore_path_lists``.
+    """
+    schema_attributes = _schema_attribute_names()
+    get_property = layer.GetPropertyAtPath
+    candidates: dict = {}
+
+    def _collect(path: Any) -> None:
+        # Called for each spec of the layer, so the cheapest tests come
+        # first. A target or connection path has an empty name. A prim
+        # path has no property spec.
+        name = path.name
+        if name:
+            if name.startswith(_SHADING_LINK_PREFIXES) or (
+                name not in schema_attributes
+                and not name.startswith(_ATTRIBUTE_NAMESPACES)
+                and get_property(path) is not None
+            ):
+                candidates[path] = None
+        elif path.IsTargetPath() and path.targetPath.HasPrefix(old_path):
+            candidates[path.GetParentPath()] = None
+
+    layer.Traverse(Sdf.Path.absoluteRootPath, _collect)
+
+    def _is_defined(path: Any) -> bool:
+        prim = stage.GetPrimAtPath(path.GetPrimPath())
+        return bool(prim) and prim.IsDefined()
+
+    # Item -> its new value. Many links name the same object (each binding
+    # of one material), so each item is checked once.
+    moved_items: dict = {}
+
+    def _moved(item: Any) -> Any:
+        moved = moved_items.get(item)
+        if moved is None:
+            moved = item
+            if item.HasPrefix(old_path) and not _is_defined(item):
+                candidate = item.ReplacePrefix(old_path, new_path)
+                if _is_defined(candidate):
+                    moved = candidate
+            moved_items[item] = moved
+        return moved
+
+    changed = []
+    for path in candidates:
+        spec = layer.GetPropertyAtPath(path)
+        if isinstance(spec, Sdf.RelationshipSpec):
+            field, list_name = "targetPaths", "targetPathList"
+        elif isinstance(spec, Sdf.AttributeSpec):
+            field, list_name = "connectionPaths", "connectionPathList"
+        else:
+            continue
+        if not spec.HasInfo(field):
+            continue
+        old_list = spec.GetInfo(field)
+        if all(_moved(item) == item for item in _path_list_op_items(old_list)):
+            continue
+        changed.append((path, list_name, old_list))
+    with Sdf.ChangeBlock():
+        for path, list_name, _old_list in changed:
+            getattr(layer.GetPropertyAtPath(path), list_name).ModifyItemEdits(_moved)
+    return tuple(changed)
+
+
+def _restore_path_lists(layer: Any, changed: tuple) -> None:
+    """Put back each list op that ``_retarget_moved_paths`` changed."""
+    for path, list_name, old_list in reversed(changed):
+        editor = getattr(layer.GetPropertyAtPath(path), list_name)
+        if old_list.isExplicit:
+            editor.ClearEditsAndMakeExplicit()
+            editor.explicitItems[:] = old_list.explicitItems
+            continue
+        editor.ClearEdits()
+        for name in (
+            "prependedItems",
+            "appendedItems",
+            "deletedItems",
+            "addedItems",
+            "orderedItems",
+        ):
+            items = getattr(old_list, name)
+            if items:
+                getattr(editor, name)[:] = items
 
 
 class NamespaceEditCommand(Command):
     """Move a prim path (rename or reparent) via Sdf.BatchNamespaceEdit.
 
-    Undo swaps src and dst, restoring the original path. As with
+    When the layer moves a shading prim (a material, a node graph or a
+    shader, or a prim above one), the move also changes the relationship
+    targets and attribute connections in the same layer that the move
+    broke, so that a renamed or moved material stays bound (see
+    ``_retarget_moved_paths``). Links in other layers are not changed:
+    those layers can be shared or read-only files. Undo puts back those
+    values, then swaps src and dst, restoring the original path. As with
     deletion, ``affects_namespace`` settles active property edit
     transactions before the namespace mutates.
+
+    A new path that is not a prim path, for example the empty path that an
+    invalid name gives, is refused with ``ValueError`` and nothing changes:
+    Sdf would remove the prim, and undo could not bring it back.
+
+    ``stage`` is the stage that composes ``layer``. It shows which links a
+    move breaks; without it, the command moves only the specs.
     """
 
     affects_namespace = True
 
-    def __init__(self, layer: Any, old_path: "Sdf.Path", new_path: "Sdf.Path") -> None:
+    def __init__(
+        self,
+        layer: Any,
+        old_path: "Sdf.Path",
+        new_path: "Sdf.Path",
+        stage: Any = None,
+    ) -> None:
         self._layer = layer
         self._old_path = old_path
         self._new_path = new_path
+        self._stage = stage
+        self._retargeted: tuple = ()
+
+    @property
+    def retargeted_paths(self) -> tuple:
+        """Property paths whose targets or connections the last ``do`` changed."""
+        return tuple(path for path, _list_name, _old_list in self._retargeted)
 
     def do(self) -> None:
+        if not self._new_path.IsPrimPath():
+            raise ValueError(
+                f"Cannot move {self._old_path}: the new path "
+                f"<{self._new_path}> is not a prim path"
+            )
+        parent = self._layer.GetObjectAtPath(self._old_path.GetParentPath())
+        siblings = list(parent.nameChildren.keys()) if parent else []
+        name = self._old_path.name
+        self._index = siblings.index(name) if name in siblings else Sdf.NamespaceEdit.atEnd
         batch = Sdf.BatchNamespaceEdit()
         batch.Add(self._old_path, self._new_path)
-        self._layer.Apply(batch)
+        self._retargeted = ()
+        retarget = (
+            self._stage is not None
+            and _layer_defines_shading_prim(self._layer, self._stage, self._old_path)
+        )
+        # A move that does not apply changes no target. The links are
+        # changed after the move, when the stage shows which ones it broke.
+        if self._layer.Apply(batch) and retarget:
+            self._retargeted = _retarget_moved_paths(
+                self._layer, self._stage, self._old_path, self._new_path
+            )
 
     def undo(self) -> None:
         batch = Sdf.BatchNamespaceEdit()
-        batch.Add(self._new_path, self._old_path)
-        self._layer.Apply(batch)
+        batch.Add(self._new_path, self._old_path, self._index)
+        with Sdf.ChangeBlock():
+            _restore_path_lists(self._layer, self._retargeted)
+            self._layer.Apply(batch)
 
 
 def _create_copy_values(*_args: Any) -> bool:

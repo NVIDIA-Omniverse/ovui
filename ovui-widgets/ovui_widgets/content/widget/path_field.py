@@ -7,8 +7,10 @@ Step 17 (the content browser implementation step D, the content browser behavior
 plus the Bug-Fix refactor that replaced the popup edit window with an
 inline :class:`ui.StringField`. Renders the current directory URL as a
 horizontal strip of clickable breadcrumb buttons in BREADCRUMB mode;
-double-click on the strip swaps the breadcrumbs out for a visible,
-focused :class:`ui.StringField` carrying the current full path. Enter
+a click on an empty part of the strip, or a double-click, swaps the
+breadcrumbs out for a visible, focused :class:`ui.StringField` carrying
+the current full path, so typed keys go to the field. A click on a
+breadcrumb navigates to that folder and keeps the breadcrumbs. Enter
 applies the typed path, Escape / focus-loss reverts without applying.
 
 The widget owns no backend reference and does not validate paths —
@@ -49,12 +51,15 @@ _AUTOCOMPLETE_WINDOW_TITLE_PREFIX = "OvGear_PathField_Autocomplete_"
 # the dropdown has an opaque backing; the interior styling is painted
 # by the :class:`ui.Rectangle` backdrop plus the per-row
 # :class:`ui.Button` fills — see :meth:`_open_autocomplete_anchor`.
+# ``NO_FOCUS_ON_APPEARING`` keeps typing in the edit field when the
+# dropdown reopens — see :meth:`_rebuild_autocomplete`.
 _AUTOCOMPLETE_POPUP_FLAGS = (
     ui.WINDOW_FLAGS_NO_TITLE_BAR
     | ui.WINDOW_FLAGS_NO_MOVE
     | ui.WINDOW_FLAGS_NO_RESIZE
     | ui.WINDOW_FLAGS_NO_SCROLLBAR
     | ui.WINDOW_FLAGS_NO_DOCKING
+    | ui.WINDOW_FLAGS_NO_FOCUS_ON_APPEARING
     | ui.WINDOW_FLAGS_POPUP
 )
 
@@ -91,6 +96,12 @@ _KEY_V = ord("V")
 # callback, :class:`carb.input.KEYBOARD_MODIFIER_FLAG_*`, and
 # :class:`omni.ui.kKeyMod*` (see ``ovui/core/include/omni/ui/Types.h``).
 _KEY_MOD_CTRL = 1 << 1
+_KEY_MOD_ALT = 1 << 2
+
+# A press and a release on the overlay farther apart than this, in
+# pixels, are a drag (for example of a floating window), not a click.
+# Same value as ImGui's default ``io.MouseDragThreshold``.
+_CLICK_MOVE_LIMIT = 6.0
 
 # Autocomplete tuning. ``_AUTOCOMPLETE_MAX_VISIBLE`` caps the dropdown
 # at 10 entries — matches the content browser behavior's
@@ -142,7 +153,7 @@ class PathField:
     Mode state:
 
     * :data:`MODE_BREADCRUMB` — breadcrumb segments visible, edit
-      field hidden, overlay rectangle catches double-clicks.
+      field hidden, overlay rectangle catches clicks and double-clicks.
     * :data:`MODE_EDIT` — breadcrumb hidden, edit field visible and
       focused, overlay rectangle hidden so the field receives typing.
     """
@@ -218,18 +229,27 @@ class PathField:
         # current stack ref — the reference is replaced on every
         # :meth:`_rebuild_breadcrumbs` pass.
         self._breadcrumb_stack: Optional[ui.HStack] = None
+        # Breadcrumb labels of the current row, replaced on every
+        # :meth:`_rebuild_breadcrumbs` pass. The Inspector state reads
+        # their rectangles (``content_ui.breadcrumbs``) so that QA can
+        # click a folder name.
+        self._breadcrumb_labels: List[ui.Label] = []
         # Inline edit field — visible only in :data:`MODE_EDIT`. Carries
         # the editable URL text and owns the Enter/Escape/Tab key
-        # handler. Swapped in on double-click of the overlay rectangle;
-        # swapped out on Enter / Escape / focus-loss.
+        # handler. Swapped in on a click on an empty part of the overlay
+        # rectangle or a double-click; swapped out on Enter / Escape /
+        # focus-loss.
         self._edit_field: Optional[ui.StringField] = None
         # Transparent hit target — sits on top of the breadcrumb layer
-        # and catches double-clicks that toggle into edit mode. Hidden
-        # while in :data:`MODE_EDIT` so keyboard events reach
-        # :attr:`_edit_field`. Single clicks fall through to the
-        # breadcrumb buttons via ovui's button-priority hit-testing —
-        # same mechanism the prior popup design relied on.
+        # and catches the clicks and double-clicks that toggle into edit
+        # mode. Hidden while in :data:`MODE_EDIT` so keyboard events reach
+        # :attr:`_edit_field`. ovui also sends a click to the breadcrumb
+        # label under the overlay; a single click on a label only
+        # navigates, so the breadcrumbs stay.
         self._overlay_rect: Optional[ui.Rectangle] = None
+        # Screen point of a left press on the overlay that opens the field
+        # at its release (:meth:`_on_overlay_released`); ``None`` for none.
+        self._overlay_press: Optional[Tuple[float, float]] = None
 
         # Latch to break a re-entrancy cycle during EDIT → BREADCRUMB
         # transition: :meth:`ui.StringField.model.add_end_edit_fn`
@@ -261,6 +281,11 @@ class PathField:
         # the ScrollingFrame to make room for it.
         self._autocomplete_window: Optional[ui.Window] = None
         self._autocomplete_container: Optional[ui.VStack] = None
+        # Suggestion row buttons of the current dropdown, replaced on every
+        # :meth:`_rebuild_autocomplete`. The Inspector state reads their
+        # rectangles (``content_ui.suggestion_rows``) so that QA can click
+        # a suggestion.
+        self._suggestion_rows: List[ui.Button] = []
 
         # Step 18 — paste short-circuit (OM-75838). Latched on Ctrl+V
         # key press in the edit field; consumed on the next value-
@@ -282,6 +307,32 @@ class PathField:
         self._autocomplete_selected: int = -1
         self._autocomplete_match_str: str = ""
 
+        # Index of the suggestion row under the mouse, ``-1`` for none.
+        # ImGui ends the edit of the field at the mouse press on a row,
+        # before the row's own click arrives, so :meth:`_on_edit_end_edit`
+        # reads this to open the folder that the user pressed on.
+        self._hovered_suggestion: int = -1
+
+        # Escape or Enter that the window of the bar received while the
+        # field edits. The field ends its edit on that key in the same
+        # frame; the next key, or the mouse moving onto a suggestion row,
+        # clears it. A text change does not clear it: ImGui reverts the
+        # text on Escape and reports that as a change before the end of
+        # the edit. ``None`` when no such key is the last event: then an
+        # end of the edit with the mouse on a suggestion row is a press on
+        # that row.
+        self._edit_ending_key: Optional[int] = None
+
+        # Suggestion that Enter, received by the window of the bar, picked.
+        # Enter also ends the edit of the field in the same frame; then
+        # :meth:`_on_edit_end_edit` opens this folder. ``-1`` for none.
+        self._pending_suggestion: int = -1
+
+        # Down or Up key that :meth:`handle_window_key` used on its press.
+        # :meth:`_on_edit_key_pressed` skips the release of that key, so
+        # one key moves the highlight once.
+        self._window_cycled_key: Optional[int] = None
+
         self.build()
 
     # ── Build ────────────────────────────────────────────────────────────────
@@ -296,16 +347,15 @@ class PathField:
                     └── ZStack
                           ├── Frame (breadcrumbs — visible in BREADCRUMB mode)
                           ├── StringField (inline editor — visible in EDIT mode)
-                          └── Rectangle (transparent overlay; catches double-
-                                         click; visible in BREADCRUMB mode)
+                          └── Rectangle (transparent overlay; catches click
+                                         and double-click; visible in
+                                         BREADCRUMB mode)
 
-        The overlay rectangle sits on top so a double-click anywhere on
-        the empty path-bar pixels triggers :meth:`_enter_edit_mode`.
-        ovui's hit-testing prefers the explicit click area of a
-        :class:`ui.Button` inside its occupied pixels, so breadcrumb
-        buttons underneath still receive their single-click navigation
-        events — same mechanism the pre-refactor hidden StringField
-        overlay relied on.
+        The overlay rectangle sits on top so a click on an empty part of
+        the bar, or a double-click anywhere on it, triggers
+        :meth:`_enter_edit_mode`. ovui sends a click to every widget under
+        the cursor, so breadcrumb labels underneath still receive their
+        single-click navigation events; such a click keeps the breadcrumbs.
         """
         with ui.ZStack(height=_PATH_FIELD_HEIGHT):
             self._border_rect = ui.Rectangle(
@@ -371,17 +421,22 @@ class PathField:
                     )
 
                     # Transparent overlay — on top of the ZStack, catches
-                    # double-clicks that flip into edit mode. Its fill is
-                    # transparent (``Content.PathBar.Overlay`` uses the
-                    # shared transparent token palette);
-                    # breadcrumb single-clicks reach the button layer
-                    # underneath because ovui routes explicit ``Button``
-                    # hit areas before falling through to a bare Rectangle.
+                    # the clicks and double-clicks that flip into edit
+                    # mode. Its fill is transparent
+                    # (``Content.PathBar.Overlay`` uses the shared
+                    # transparent token palette); breadcrumb single-clicks
+                    # also reach the label layer underneath.
                     self._overlay_rect = ui.Rectangle(
                         style_type_name_override="Content.PathBar.Overlay",
                     )
                     self._overlay_rect.set_mouse_double_clicked_fn(
                         self._on_overlay_double_clicked,
+                    )
+                    self._overlay_rect.set_mouse_pressed_fn(
+                        self._on_overlay_pressed,
+                    )
+                    self._overlay_rect.set_mouse_released_fn(
+                        self._on_overlay_released,
                     )
 
     def _rebuild_breadcrumbs(self) -> None:
@@ -408,6 +463,7 @@ class PathField:
         # (QA harness, tests) see the currently-rendered stack rather
         # than a stale ref from the previous rebuild.
         self._breadcrumb_stack = ui.HStack(spacing=0)
+        self._breadcrumb_labels = []
         with self._breadcrumb_stack:
             for idx, label in enumerate(tokens):
                 if idx > 0:
@@ -432,6 +488,7 @@ class PathField:
                         self._on_breadcrumb_clicked(i) if button == 0 else None
                     )
                 )
+                self._breadcrumb_labels.append(breadcrumb)
         # Bug 3: only pin the view to the trailing breadcrumb when the
         # user navigates deeper or into a sibling/unrelated path. When
         # the new path is a prefix of the previous one (parent
@@ -603,8 +660,8 @@ class PathField:
 
     def _on_overlay_double_clicked(
         self,
-        _x: Any,
-        _y: Any,
+        x: Any,
+        y: Any,
         button: Any,
         _mod: Any,
     ) -> None:
@@ -615,11 +672,77 @@ class PathField:
         for text entry. Right / middle double-clicks are ignored so
         the context menu / middle-click behaviors the grid layer
         installs on neighbouring widgets are not accidentally
-        shadowed here.
+        shadowed here. The field opens at the release of the second
+        click (:meth:`_on_overlay_released`), also when that click is on
+        a breadcrumb.
         """
         if int(button) != 0:
             return
+        self._overlay_press = (float(x), float(y))
+
+    def _on_overlay_pressed(
+        self,
+        x: Any,
+        y: Any,
+        button: Any,
+        _mod: Any,
+    ) -> None:
+        """Note a left press on an empty part of the bar.
+
+        Its release opens the field (:meth:`_on_overlay_released`), so
+        the keys the user types next go to the field and not to an
+        application shortcut (F frames the selection, H sends the camera
+        home). A press on a breadcrumb is the click of that label: ovui
+        also sends it to the label under the overlay, which navigates,
+        and the bar keeps its breadcrumbs. The labels of the clicked row
+        are still in :attr:`_breadcrumb_labels` here: a navigation
+        rebuilds them on the next draw (:meth:`set_path`).
+        """
+        self._overlay_press = None
+        if int(button) != 0:
+            return
+        if self._breadcrumb_at(float(x), float(y)):
+            return
+        self._overlay_press = (float(x), float(y))
+
+    def _on_overlay_released(
+        self,
+        x: Any,
+        y: Any,
+        button: Any,
+        _mod: Any,
+    ) -> None:
+        """Enter edit mode at the release of a noted left click.
+
+        In a floating window, ImGui takes a press on an empty part of the
+        window as the start of a window move, and it ignores a keyboard
+        focus request while the window moves (``SetKeyboardFocusHere`` in
+        ``ovui/third_party/imgui/imgui.cpp``). At the release the move is
+        over, so the field gets the keyboard focus. A release far from
+        its press ends a drag (of the window), not a click.
+        """
+        press = self._overlay_press
+        self._overlay_press = None
+        if press is None or int(button) != 0:
+            return
+        if (
+            abs(float(x) - press[0]) > _CLICK_MOVE_LIMIT
+            or abs(float(y) - press[1]) > _CLICK_MOVE_LIMIT
+        ):
+            return
         self._enter_edit_mode()
+
+    def _breadcrumb_at(self, x: float, y: float) -> bool:
+        """Return ``True`` when the screen point is on a breadcrumb label."""
+        for label in self._breadcrumb_labels:
+            left = label.screen_position_x
+            top = label.screen_position_y
+            if (
+                left <= x < left + label.computed_width
+                and top <= y < top + label.computed_height
+            ):
+                return True
+        return False
 
     # ── Edit mode transitions ───────────────────────────────────────────────
 
@@ -642,6 +765,8 @@ class PathField:
         if self._edit_field is None:
             return
         self._mode = MODE_EDIT
+        self._edit_ending_key = None
+        self._overlay_press = None
 
         if self._breadcrumb_frame is not None:
             self._breadcrumb_frame.visible = False
@@ -708,6 +833,12 @@ class PathField:
             self._hide_autocomplete()
             self._is_paste = False
             self._mode = MODE_BREADCRUMB
+            # The edit is over: its latch and its ending key must not act
+            # on a later edit.
+            self._suppress_end_edit = False
+            self._edit_ending_key = None
+            self._window_cycled_key = None
+            self._pending_suggestion = -1
 
             if (
                 apply
@@ -735,8 +866,9 @@ class PathField:
           Enter) would reach :meth:`_on_edit_end_edit` first and apply
           the draft as a committed path, which is not what the user
           meant by pressing Escape.
-        * **Enter on press AND release** — either commits the highlighted
-          autocomplete row into the field or applies the typed path.
+        * **Enter on press AND release** — either opens the folder of the
+          highlighted autocomplete row (as a click on the row does) or
+          applies the typed path.
           Handling both edges gives robustness against ovui event
           ordering — the second call short-circuits on the mode check.
         * **Tab on press AND release** — only commits an autocomplete
@@ -749,6 +881,8 @@ class PathField:
           autocomplete round-trip. See §15.7 OM-75838.
         * **Down / Up on release** — autocomplete selection cycling;
           release-only so key autorepeat does not tear through the list.
+          In the Content Browser, :meth:`handle_window_key` moves the
+          highlight on the press; the release here then does nothing.
         """
         if pressed and key == _KEY_V and (mod & _KEY_MOD_CTRL):
             self._is_paste = True
@@ -757,8 +891,8 @@ class PathField:
             self._exit_edit_mode(apply=False)
             return
         if key in (_KEY_ENTER, _KEY_KEYPAD_ENTER):
-            if self._autocomplete_selected >= 0:
-                self._commit_autocomplete_selection()
+            if 0 <= self._autocomplete_selected < len(self._autocomplete_matches):
+                self._on_autocomplete_row_clicked(self._autocomplete_selected)
                 return
             self._exit_edit_mode(apply=True)
             return
@@ -767,6 +901,9 @@ class PathField:
                 self._commit_autocomplete_selection()
             return
         if pressed:
+            return
+        if key in (_KEY_DOWN, _KEY_UP) and key == self._window_cycled_key:
+            self._window_cycled_key = None
             return
         if key == _KEY_DOWN:
             self._cycle_autocomplete(+1)
@@ -788,14 +925,76 @@ class PathField:
         * Escape pre-empts by flipping mode to ``BREADCRUMB`` via the
           key-pressed handler; the :meth:`_exit_edit_mode` mode-check
           short-circuits this call.
-        * Autocomplete commit (Tab + selection, or the Enter path
-          before exit) latches :attr:`_suppress_end_edit`; we consume
-          and return so the committed-but-not-exited edit continues.
+        * Autocomplete commit (Tab + selection) latches
+          :attr:`_suppress_end_edit`; we consume and return so the
+          committed-but-not-exited edit continues.
+        * Enter with a highlighted suggestion, received by the window
+          (:meth:`handle_window_key`), opens that folder here.
+        * A mouse press on a folder suggestion ends the edit before the
+          row's own click arrives. When no key ended the edit and the
+          mouse is on a suggestion row, open that folder, as the click
+          on the row does (:meth:`_on_autocomplete_row_clicked`).
         """
         if self._suppress_end_edit:
             self._suppress_end_edit = False
             return
+        pending = self._pending_suggestion
+        self._pending_suggestion = -1
+        if 0 <= pending < len(self._autocomplete_matches):
+            self._on_autocomplete_row_clicked(pending)
+            return
+        ending_key = self._edit_ending_key
+        self._edit_ending_key = None
+        if (
+            ending_key is None
+            and 0 <= self._hovered_suggestion < len(self._autocomplete_matches)
+        ):
+            self._on_autocomplete_row_clicked(self._hovered_suggestion)
+            return
         self._exit_edit_mode(apply=True)
+
+    def handle_window_key(self, key: int, modifiers: int) -> bool:
+        """Handle a key press that the window of the path bar received.
+
+        ovui sends the key events of the edit field to
+        :meth:`_on_edit_key_pressed` only while the mouse is over the
+        field, and the release of Down and Up often does not come. The
+        window gets each key press while it has the focus, before the
+        field draws in the same frame. The Content Browser window sends
+        its key presses here. While the field edits:
+
+        * Down / Up move the folder suggestion highlight.
+        * Enter with a highlighted suggestion picks it. The field ends its
+          edit on Enter in the same frame, and :meth:`_on_edit_end_edit`
+          then opens that folder, as a click on the suggestion does. The
+          edit is not ended here: the field has not drawn yet in this
+          frame.
+        * Escape and Enter are noted: they end the edit of the field in
+          this frame, so :meth:`_on_edit_end_edit` does not take that end
+          for a mouse press on a suggestion row. Any other key clears the
+          note. Tab is not noted: the field keeps editing after Tab, and a
+          later click on a suggestion must still open it.
+
+        Returns ``True`` when the key was used here.
+        """
+        if self._mode != MODE_EDIT:
+            return False
+        self._edit_ending_key = (
+            key if key in (_KEY_ESCAPE, _KEY_ENTER, _KEY_KEYPAD_ENTER) else None
+        )
+        if modifiers & (_KEY_MOD_CTRL | _KEY_MOD_ALT):
+            return False
+        if key in (_KEY_DOWN, _KEY_UP) and self._autocomplete_matches:
+            self._cycle_autocomplete(+1 if key == _KEY_DOWN else -1)
+            self._window_cycled_key = key
+            return True
+        if (
+            key in (_KEY_ENTER, _KEY_KEYPAD_ENTER)
+            and 0 <= self._autocomplete_selected < len(self._autocomplete_matches)
+        ):
+            self._pending_suggestion = self._autocomplete_selected
+            return True
+        return False
 
     # ── Autocomplete (Step 18) ───────────────────────────────────────────────
 
@@ -935,9 +1134,10 @@ class PathField:
         Each entry becomes a clickable :class:`ui.Button` row so mouse
         clicks commit the selection and apply-navigate to it (Bug C —
         the requirement that "clicking a suggestion should change directory").
-        The currently keyboard-highlighted row carries the
-        ``Content.PathBar.Autocomplete.Item::selected`` variant so the
-        theme paints it with the accent colour; the others use
+        The currently keyboard-highlighted row has the widget name
+        ``selected``, so the theme key
+        ``Content.PathBar.Autocomplete.Item::selected`` paints it with the
+        accent colour; all rows use the type
         ``Content.PathBar.Autocomplete.Item``. An empty match list
         hides the container — no empty dropdown frame, no wasted
         screen real estate.
@@ -946,23 +1146,35 @@ class PathField:
         if container is None:
             return
         container.clear()
+        # The rows are new; the hover callback of a new row under the
+        # mouse sets this again.
+        self._hovered_suggestion = -1
+        self._suggestion_rows = []
         if not self._autocomplete_matches:
             container.visible = False
+            # The window stays open from the last matches; hide it too,
+            # or its backdrop is drawn as an empty box. This is the one
+            # place that hides the dropdown for an empty list.
+            window = self._autocomplete_window
+            if window is not None:
+                window.visible = False
             return
         with container:
             for idx, name in enumerate(self._autocomplete_matches):
-                style = (
-                    "Content.PathBar.Autocomplete.Item::selected"
-                    if idx == self._autocomplete_selected
-                    else "Content.PathBar.Autocomplete.Item"
-                )
-                ui.Button(
+                # The style key ``Content.PathBar.Autocomplete.Item::selected``
+                # matches a row of that type with the widget name "selected".
+                row = ui.Button(
                     name,
+                    name="selected" if idx == self._autocomplete_selected else "",
                     height=_AUTOCOMPLETE_ROW_HEIGHT,
                     alignment=ui.Alignment.LEFT_CENTER,
-                    style_type_name_override=style,
+                    style_type_name_override="Content.PathBar.Autocomplete.Item",
                     clicked_fn=lambda i=idx: self._on_autocomplete_row_clicked(i),
                 )
+                row.set_mouse_hovered_fn(
+                    lambda hovered, i=idx: self._on_suggestion_hovered(i, hovered)
+                )
+                self._suggestion_rows.append(row)
         container.visible = True
         # Shrink the popup window to match the actual row count so the
         # dropdown does not leave an empty backdrop strip below the
@@ -970,6 +1182,9 @@ class PathField:
         # :data:`_AUTOCOMPLETE_MAX_VISIBLE`.
         window = self._autocomplete_window
         if window is not None:
+            # The edit field closes the popup when it takes keyboard
+            # focus (ImGui ``FocusWindow``), so reopen it for the matches.
+            window.visible = True
             try:
                 window.height = (
                     len(self._autocomplete_matches) * _AUTOCOMPLETE_ROW_HEIGHT
@@ -977,6 +1192,18 @@ class PathField:
                 )
             except Exception:  # pragma: no cover — ovui window may refuse resize
                 pass
+
+    def _on_suggestion_hovered(self, idx: int, hovered: bool) -> None:
+        """Keep :attr:`_hovered_suggestion` on the row under the mouse.
+
+        The mouse moved onto a row after any noted Escape or Enter, so
+        that key did not end the edit: the note is cleared.
+        """
+        if hovered:
+            self._hovered_suggestion = idx
+            self._edit_ending_key = None
+        elif self._hovered_suggestion == idx:
+            self._hovered_suggestion = -1
 
     def _on_autocomplete_row_clicked(self, idx: int) -> None:
         """Click on a dropdown row — commit the selection and navigate.
@@ -996,19 +1223,17 @@ class PathField:
         self._exit_edit_mode(apply=True)
 
     def _hide_autocomplete(self) -> None:
-        """Clear the dropdown state and hide its container.
+        """Clear the dropdown state and hide the dropdown.
 
-        Used by the paste short-circuit and by edit-mode exit.
-        Separate from :meth:`_rebuild_autocomplete` so the empty-state
-        path (no matches yet) and the clear-everything path (close
-        dropdown outright) don't get conflated.
+        Used by the paste short-circuit, by a committed selection and by
+        edit-mode exit. The empty-list branch of
+        :meth:`_rebuild_autocomplete` hides the container and the window,
+        so every path that empties the list hides the dropdown the same way.
         """
         self._autocomplete_matches = []
         self._autocomplete_selected = -1
         self._autocomplete_match_str = ""
-        if self._autocomplete_container is not None:
-            self._autocomplete_container.clear()
-            self._autocomplete_container.visible = False
+        self._rebuild_autocomplete()
 
     def _cycle_autocomplete(self, direction: int) -> None:
         """Advance the dropdown selection by ``direction`` (±1).
@@ -1094,6 +1319,7 @@ class PathField:
         self._fill_rect = None
         self._breadcrumb_frame = None
         self._breadcrumb_stack = None
+        self._breadcrumb_labels = []
         self._edit_field = None
         self._overlay_rect = None
         # Step 18: the autocomplete container is nulled inside
@@ -1101,6 +1327,7 @@ class PathField:
         # teardown path.
         self._autocomplete_container = None
         self._autocomplete_window = None
+        self._suggestion_rows = []
         self._autocomplete_matches = []
         self._autocomplete_selected = -1
         self._autocomplete_match_str = ""

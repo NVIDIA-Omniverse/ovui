@@ -97,3 +97,14 @@ class TestPlot(OmniUiTest):
         plot.mode = ui.PlotMode.LEGACY
         assert not await self._red_at(plot, 0.5, 0.4)
         assert await self._red_at(plot, 0.5, 0.75)
+
+    async def test_constructor_takes_int_values(self):
+        # The legacy constructor used to drop Python int values. Each bar is then as high as the float bars above.
+        window = await self.create_test_window(128, 64)
+        with window.frame:
+            plot = ui.Plot(ui.Type.HISTOGRAM, 0, 2, 1, 1, 1,
+                           sparkline=True,
+                           style={"background_color": 0xFF000000, "color": 0xFF0000FF,
+                                  "padding": 0, "border_width": 0})
+        assert await self._red_at(plot, 0.5, 0.75)
+        assert not await self._red_at(plot, 0.5, 0.4)

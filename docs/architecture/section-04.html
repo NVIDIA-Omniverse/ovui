@@ -253,6 +253,7 @@
       </div>
       <ul>
         <li>The Python package imports <code>_ui</code>, style helpers, markdown helpers, and standalone runtime functions.</li>
+        <li>The standalone host window can be resized with <code>omni.ui.standalone.set_window_size()</code> immediately after <code>init()</code>. Success requires the actual framebuffer to match. On Windows, resize dimensions are physical pixels and may exceed the desktop size; initial window creation still applies the primary monitor's DPI scale.</li>
         <li>The C++ core defines widget behavior, layout calculation, styling, image providers, and rendering support.</li>
         <li>The Python bindings expose classes such as <code>Window</code>, <code>Frame</code>, <code>Button</code>, <code>TreeView</code>, and model classes.</li>
         <li>Examples and tests show real use: showcase widgets, markdown, images, scene tools, model updates, input helpers, and screenshot checks.</li>

@@ -20,7 +20,7 @@ NATIVE wheels must each carry it. A native wheel is one whose filename tag is
 not `py3-none-any`: it holds compiled payload and is built by a job that
 records the commit. A native wheel with no
 build info has no provenance at all, so it is REJECTED, not skipped. Counting
-attested wheels across the set is not enough — one good wheel must never vouch
+attested wheels across the set is not enough â€” one good wheel must never vouch
 for another.
 
 The pure-Python wheels carry no build info. They are produced by the same job,
@@ -160,7 +160,7 @@ def selftest() -> int:
 
     Covers every way the release set can be wrong:
       * a native wheel built from another commit,
-      * a native wheel with no build info at all — the hole an earlier version
+      * a native wheel with no build info at all â€” the hole an earlier version
         of this script left open, because it skipped what it could not read,
       * a set with no native wheel,
       * the wrong number of native wheels.
@@ -178,8 +178,8 @@ def selftest() -> int:
                     f"__version__ = '0.0.0'\n__commit__ = {commit!r}\n",
                 )
 
-    native = "ovui-0.0.0-cp312-cp312-win_amd64.whl"
-    native2 = "ovui-0.0.0-cp312-cp312-linux_x86_64.whl"
+    native = "ovui-0.0.0-cp312.cp313.cp314.cp315-cp312.cp313.cp314.cp315-win_amd64.whl"
+    native2 = "ovui-0.0.0-cp312.cp313.cp314.cp315-cp312.cp313.cp314.cp315-linux_x86_64.whl"
     pure = "ovui_widgets_app-0.0.0-py3-none-any.whl"
 
     cases = [

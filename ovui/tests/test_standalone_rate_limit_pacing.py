@@ -223,6 +223,21 @@ class TestRunAsyncInFlightRateChange(unittest.TestCase):
                 )
 
 
+class TestPacingDeadlineGrid(unittest.TestCase):
+    def test_small_wake_up_lateness_does_not_add_up(self):
+        """Defect: each iteration added its wake-up lateness to the period
+        (a 60 Hz cap ran at 16.74 ms)."""
+        standalone.set_max_frame_rate(60.0)
+        try:
+            deadline = 10.0
+            self.assertEqual(standalone._pacing_anchor(deadline + 0.0003, deadline), deadline)
+            # A real overrun or an early wake counts from the iteration start.
+            self.assertEqual(standalone._pacing_anchor(deadline + 0.002, deadline), deadline + 0.002)
+            self.assertEqual(standalone._pacing_anchor(deadline - 0.001, deadline), deadline - 0.001)
+        finally:
+            standalone.set_max_frame_rate(None)
+
+
 class TestDefaultAutoInitialization(unittest.TestCase):
     def test_auto_initialized_run_has_no_pacing_budget(self):
         """A caller that omits init() must not inherit a hidden UI cap."""

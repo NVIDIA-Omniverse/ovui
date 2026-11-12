@@ -6,6 +6,7 @@
 #include "StandaloneImageBackend.h"
 
 #include "StandaloneRasterImageLoader.h"
+#include "platform/ISvgRasterizer.h"
 #include "platform/Log.h"
 
 #include <algorithm>
@@ -18,18 +19,41 @@ namespace standalone {
 
 namespace {
 
+/// The texture of one loaded image, as getImGuiTextureId reads it.
+struct LoadedTextureHandle : IImageBackend::TextureHandle
+{
+    void* imGuiReference = nullptr;
+};
+
 /// GPU state of one loaded texture. Each handle is one loader instance, so the
 /// loader keeps the shared texture alive until the last handle is destroyed.
-struct RasterTextureHandle final : IImageBackend::TextureHandle
+struct RasterTextureHandle final : LoadedTextureHandle
 {
     std::weak_ptr<StandaloneRasterImageLoader> loader;
-    void* imGuiReference = nullptr;
 
     ~RasterTextureHandle() override
     {
         if (auto l = loader.lock())
         {
             l->releaseLoad(this);
+        }
+    }
+};
+
+/// One reference to a texture in the cache of the SVG rasterizer. The cache
+/// shares the texture with every image of the same file and size, also with
+/// ui.ImageWithProvider, and frees it when the last reference is released.
+struct SvgTextureHandle final : LoadedTextureHandle
+{
+    std::weak_ptr<ISvgRasterizer> rasterizer;
+    std::string cacheKey;
+
+    ~SvgTextureHandle() override
+    {
+        // After shutdown the rasterizer is gone and has freed its textures.
+        if (auto r = rasterizer.lock())
+        {
+            r->releaseGpuResource(cacheKey);
         }
     }
 };
@@ -81,8 +105,9 @@ bool hasSvgExtension(const std::string& path)
 
 } // anonymous namespace
 
-StandaloneImageBackend::StandaloneImageBackend(std::shared_ptr<StandaloneRasterImageLoader> loader)
-    : m_loader(loader)
+StandaloneImageBackend::StandaloneImageBackend(std::shared_ptr<StandaloneRasterImageLoader> loader,
+                                               std::shared_ptr<ISvgRasterizer> svgRasterizer)
+    : m_loader(loader), m_svgRasterizer(svgRasterizer)
 {
 }
 
@@ -139,8 +164,8 @@ void StandaloneImageBackend::_logFailure(const std::string& sourceUrl, const cha
 }
 
 IImageBackend::LoadResult StandaloneImageBackend::loadTexture(const std::string& sourceUrl,
-                                                              float /*contentWidth*/,
-                                                              float /*contentHeight*/,
+                                                              float contentWidth,
+                                                              float contentHeight,
                                                               SetTextureDataFn setTextureData,
                                                               NotifyProgressFn /*notifyProgress*/)
 {
@@ -160,8 +185,7 @@ IImageBackend::LoadResult StandaloneImageBackend::loadTexture(const std::string&
     const std::string path = urlToLocalPath(sourceUrl);
     if (hasSvgExtension(path))
     {
-        _logFailure(sourceUrl, "SVG files are not supported");
-        return LoadResult::eFailed;
+        return _loadSvg(sourceUrl, contentWidth, contentHeight, setTextureData);
     }
 
     auto handle = std::make_unique<RasterTextureHandle>();
@@ -186,9 +210,45 @@ IImageBackend::LoadResult StandaloneImageBackend::loadTexture(const std::string&
     return LoadResult::eSyncComplete;
 }
 
+IImageBackend::LoadResult StandaloneImageBackend::_loadSvg(const std::string& sourceUrl,
+                                                           float contentWidth,
+                                                           float contentHeight,
+                                                           const SetTextureDataFn& setTextureData)
+{
+    auto rasterizer = m_svgRasterizer.lock();
+    if (!rasterizer)
+    {
+        _logFailure(sourceUrl, "no SVG rasterizer is registered");
+        return LoadResult::eFailed;
+    }
+
+    // The same request as VectorImageProvider makes for ui.ImageWithProvider,
+    // so both widgets of the same size share one texture. The rasterizer logs
+    // the cause of a failure and names the parts of the file it does not draw.
+    ImageProviderTextureOptions textureOptions{};
+    auto result = rasterizer->rasterize(sourceUrl, contentWidth, contentHeight, /*maxMipLevels*/ 1, textureOptions);
+    if (!result.success)
+    {
+        return LoadResult::eFailed;
+    }
+
+    // The handle holds the cache reference that rasterize() took.
+    auto handle = std::make_unique<SvgTextureHandle>();
+    handle->rasterizer = rasterizer;
+    handle->cacheKey = std::move(result.cacheKey);
+    handle->imGuiReference = result.imGuiReference;
+
+    TextureInfo info;
+    info.width = result.imageSize.x;
+    info.height = result.imageSize.y;
+    info.handle = std::move(handle);
+    setTextureData(std::move(info));
+    return LoadResult::eSyncComplete;
+}
+
 void* StandaloneImageBackend::getImGuiTextureId(const TextureHandle& handle) const
 {
-    return static_cast<const RasterTextureHandle&>(handle).imGuiReference;
+    return static_cast<const LoadedTextureHandle&>(handle).imGuiReference;
 }
 
 } // namespace standalone

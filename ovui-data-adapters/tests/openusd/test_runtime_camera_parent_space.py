@@ -5,7 +5,6 @@
 import numpy as np
 import pytest
 
-pytest.importorskip("pxr")
 from ovui_data_adapters.openusd.renderer_adapter import OvRtxRendererAdapter
 from pxr import Gf, Usd, UsdGeom
 

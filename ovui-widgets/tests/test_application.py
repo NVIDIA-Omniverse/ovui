@@ -95,7 +95,7 @@ class TestWindowTitle:
 
 
 # ---------------------------------------------------------------------------
-# request_exit() — issue #35 Step 6 (Codex Round 1 F8)
+# request_exit() — the regression Step 6 (Codex Round 1 F8)
 # ---------------------------------------------------------------------------
 
 
@@ -574,33 +574,47 @@ class TestSaveStageTo:
         assert result is False
 
     def test_save_calls_stage_export(self, app, tmp_path):
-        """Happy path: Export is called with the path."""
+        """Happy path: the provider writes the root layer with its sublayers."""
+        from pxr import Sdf, Usd
+
+        sublayer = Sdf.Layer.CreateNew(str(tmp_path / "sub.usda"))
+        Sdf.CreatePrimInLayer(sublayer, "/FromSublayer")
+        assert sublayer.Save()
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().subLayerPaths.append(sublayer.identifier)
+        stage.DefinePrim("/FromRoot")
         target = str(tmp_path / "out.usd")
-        fake_stage = MagicMock()
-        app._stage_adapter = MagicMock(stage=fake_stage)
+        app._stage_adapter = MagicMock(stage=stage)
         result = app.save_stage_to(target)
         assert result is True
-        fake_stage.Export.assert_called_once_with(target)
+        saved = Sdf.Layer.FindOrOpen(target)
+        assert list(saved.subLayerPaths) == [sublayer.identifier]
+        assert [prim.name for prim in saved.rootPrims] == ["FromRoot"]
 
     def test_save_updates_current_file_path(self, app, tmp_path):
         """On success, the current path is updated so subsequent Save works."""
+        from pxr import Usd
+
         target = str(tmp_path / "out.usd")
-        app._stage_adapter = MagicMock(stage=MagicMock())
+        app._stage_adapter = MagicMock(stage=Usd.Stage.CreateInMemory())
         app.save_stage_to(target)
         assert app._current_file_path == target
 
     def test_save_appends_to_recent_files(self, app, tmp_path):
+        from pxr import Usd
+
         target = str(tmp_path / "out.usd")
-        app._stage_adapter = MagicMock(stage=MagicMock())
+        app._stage_adapter = MagicMock(stage=Usd.Stage.CreateInMemory())
         app.save_stage_to(target)
         assert target in app._recent_files.get_ordered()
 
     def test_save_returns_false_when_export_raises(self, app, tmp_path):
         """Export raising is surfaced as False, no current_file_path update."""
         target = str(tmp_path / "broken.usd")
-        fake_stage = MagicMock()
-        fake_stage.Export.side_effect = RuntimeError("disk full")
-        app._stage_adapter = MagicMock(stage=fake_stage)
+        session = self._ExportSession(supported=True)
+        session.export_stage = MagicMock(side_effect=RuntimeError("disk full"))
+        app._adapter_session = session
+        app._stage_adapter = MagicMock(stage=object())
         result = app.save_stage_to(target)
         assert result is False
         assert app._current_file_path is None
@@ -983,14 +997,9 @@ class TestEmptyStartupStageUnsupported:
         prebuilt.shutdown.assert_called_once_with()
 
 
-try:
-    from pxr import Usd as _Usd  # noqa: F401
-    _HAS_USD = True
-except ImportError:
-    _HAS_USD = False
+from pxr import Usd as _Usd  # noqa: F401
 
 
-@pytest.mark.skipif(not _HAS_USD, reason="pxr not available")
 class TestEmptyStartupStage:
     """No-file startup must create a stage that follows file-open wiring."""
 
@@ -1015,7 +1024,6 @@ class TestEmptyStartupStage:
         assert not os.path.exists(stage_dir)
 
 
-@pytest.mark.skipif(not _HAS_USD, reason="pxr not available")
 class TestLayerAdapterWiring:
     """LAYERS-PLAN Step 9: Application builds + wires a UsdLayerStackAdapter
     whenever a stage is loaded, stores it as ``_layer_adapter``, and hands
@@ -1228,7 +1236,6 @@ class TestDeleteSelectedClearsSelection:
 
     @pytest.fixture
     def app_with_simple_scene(self, tmp_path):
-        pytest.importorskip("pxr", reason="pxr not available")
         import os
         import shutil
 
@@ -1287,6 +1294,58 @@ class TestDeleteSelectedClearsSelection:
         # And the restored selection points at a VALID prim.
         for item in snap.items:
             assert app._stage_adapter.stage.GetPrimAtPath(item.path).IsValid()
+
+    def test_undo_restores_selected_parent_and_child(self, app_with_simple_scene):
+        app = app_with_simple_scene
+        app.selection_bus.publish(["/World", "/World/Cube"], source="stage")
+        app._delete_selected()
+        assert app._undo_manager.undo()
+        assert app._stage_adapter.stage.GetPrimAtPath("/World/Cube").IsValid()
+
+    def test_a_failed_delete_closes_its_undo_group_and_is_reported(
+        self, tmp_path, monkeypatch
+    ):
+        """A prim that is not in the authoring layer cannot be deleted.
+
+        The Delete undo group closes, nothing is deleted, the failure is
+        reported with the path and the cause, and later edits can be undone.
+        """
+        from pxr import Usd
+
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        shown = []
+        monkeypatch.setattr(ErrorReporter, "show_error", lambda message, *a, **k: shown.append(message))
+        sub = tmp_path / "sub.usda"
+        sub.write_text(
+            '#usda 1.0\ndef Xform "World"\n{\n    def Scope "Looks"\n    {\n'
+            '        def Material "Green"\n        {\n        }\n    }\n}\n'
+        )
+        root = tmp_path / "root.usda"
+        root.write_text(
+            '#usda 1.0\n(\n    subLayers = [@./sub.usda@]\n)\n'
+            'def Xform "World"\n{\n    def Cube "Cube"\n    {\n    }\n}\n'
+        )
+        application = Application()
+        try:
+            application.open_stage(Usd.Stage.Open(str(root)))
+            stage = application._stage_adapter.stage
+            before = stage.GetRootLayer().ExportToString()
+            application.selection_bus.publish(["/World/Looks", "/World/Looks/Green"], source="stage")
+
+            application._delete_selected()
+
+            undo = application._undo_manager
+            assert undo.open_group_depth == 0
+            assert stage.GetRootLayer().ExportToString() == before
+            assert stage.GetPrimAtPath("/World/Looks/Green").IsValid()
+            assert any("/World/Looks" in message for message in shown), shown
+            application.selection_bus.publish(["/World/Cube"], source="stage")
+            application._delete_selected()
+            assert undo.undo()
+            assert stage.GetPrimAtPath("/World/Cube").IsValid()
+        finally:
+            application.shutdown()
 
     def test_delete_then_immediate_call_later_does_not_access_invalid_prim(
         self, app_with_simple_scene

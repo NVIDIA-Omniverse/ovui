@@ -15,6 +15,9 @@
 
 #include <limits>
 #include "AbstractShapeData.h"
+#include "DragFollow.h"
+
+#include <utility>
 
 OMNIUI_SCENE_NAMESPACE_OPEN_SCOPE
 
@@ -37,10 +40,24 @@ struct Points::PointsData : public AbstractShapeData
 Points::Points(const std::vector<Vector3>& positions) : AbstractShape(new PointsData)
 {
     this->_setPositionsChangedFn(std::bind(&This::_dirtyCache, this));
-    this->_setColorsChangedFn(std::bind(&This::_dirtyCache, this));
-    this->_setSizesChangedFn(std::bind(&This::_dirtyCache, this));
+    this->_setColorsChangedFn(std::bind(&This::_dirtyAppearance, this));
+    this->_setSizesChangedFn(std::bind(&This::_dirtyAppearance, this));
     this->_setIntersectionSizeChangedFn([this](const auto&) { _getData< PointsData>().m_intersectionSizeExplicitlyChanged = true; });
     this->setPositions(positions);
+}
+
+// The positions are written by hand, not by the property macro, so that a gesture that is running its callback is told
+// what they were and what they are (see DragGesture).
+void Points::setPositions(std::vector<Vector3> const& value)
+{
+    if (checkIfEqual(m_positions, value))
+    {
+        return;
+    }
+    DragFollow::Write write(this);
+    write.notePositions(this, m_positions, value);
+    m_positions = value;
+    m__setPositionsChangedFnCallbacks(value);
 }
 
 Points::~Points() = default;
@@ -130,8 +147,9 @@ void Points::intersect(const Vector3 origin,
     }
 
     auto& lastGesturePayload = data.m_lastGesturePayload;
-    Vector3 lastClosestPoint = lastGesturePayload->rayClosestPoint;
-    Float lastDistance = lastGesturePayload->distanceToPoint;
+    const bool held = std::exchange(data.m_baselineHeld, false);
+    Vector3 lastClosestPoint = held ? data.m_baselinePoint : lastGesturePayload->rayClosestPoint;
+    Float lastDistance = held ? data.m_baselineA : lastGesturePayload->distanceToPoint;
 
     lastGesturePayload->itemClosestPoint = Vector3{ transform * Vector4{ positions[minIndex], 1.0 } };
     lastGesturePayload->rayClosestPoint = minRayClosestPoint;
@@ -143,6 +161,20 @@ void Points::intersect(const Vector3 origin,
 
     // Copy
     *stateGesturePayload.get() = *lastGesturePayload.get();
+}
+
+bool Points::_getFollowReport(Vector3& moved) const
+{
+    const auto& payload = *_getData<PointsData>().m_lastGesturePayload;
+    moved = payload.moved;
+    return true;
+}
+
+void Points::_captureBaseline() const
+{
+    auto& data = _getData<PointsData>();
+    data.m_baselinePoint = data.m_lastGesturePayload->rayClosestPoint;
+    data.m_baselineA = data.m_lastGesturePayload->distanceToPoint;
 }
 
 const Points::PointsGesturePayload* Points::getGesturePayload() const

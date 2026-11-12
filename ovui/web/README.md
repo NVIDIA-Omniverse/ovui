@@ -83,5 +83,5 @@ Included:
 
 Excluded:
 
-- ovui-widgets, ovrtx, USD, CUDA, Vulkan, NVENC, and server streaming.
+- ovui-widgets, USD, CUDA, Vulkan, NVENC, and server streaming.
 - `omni.ui_scene` in the first browser target.

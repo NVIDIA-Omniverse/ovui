@@ -198,21 +198,21 @@ class TestGetTypeName:
         assert adapter.get_type_name(prim) == raw
 
     def test_empty_type_name_class_spec_returns_class(self):
-        Sdf = pytest.importorskip("pxr", reason="pxr not available").Sdf
+        from pxr import Sdf
         adapter = _make_adapter()
         prim = _make_prim("")
         prim.GetSpecifier.return_value = Sdf.SpecifierClass
         assert adapter.get_type_name(prim) == "Class"
 
     def test_empty_type_name_over_spec_returns_empty(self):
-        Sdf = pytest.importorskip("pxr", reason="pxr not available").Sdf
+        from pxr import Sdf
         adapter = _make_adapter()
         prim = _make_prim("")
         prim.GetSpecifier.return_value = Sdf.SpecifierOver
         assert adapter.get_type_name(prim) == ""
 
     def test_empty_type_name_def_spec_returns_empty(self):
-        Sdf = pytest.importorskip("pxr", reason="pxr not available").Sdf
+        from pxr import Sdf
         adapter = _make_adapter()
         prim = _make_prim("")
         prim.GetSpecifier.return_value = Sdf.SpecifierDef

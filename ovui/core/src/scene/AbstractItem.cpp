@@ -10,10 +10,18 @@
 #include <omni/ui/scene/Scene.h>
 
 #include "AbstractItemData.h"
+#include "DragFollow.h"
+
+#include <atomic>
 
 OMNIUI_SCENE_NAMESPACE_OPEN_SCOPE
 
 static constexpr uint64_t kProfilerMask = 1;
+
+namespace
+{
+std::atomic<uint64_t> s_writeCounter{ 0 };
+} // namespace
 
 AbstractItem::AbstractItemData::~AbstractItemData()
 {
@@ -128,7 +136,27 @@ DrawList* AbstractItem::_getDrawList() const
 
 void AbstractItem::forceDirty(DirtyReason reason)
 {
+    // A content change that starts at this item is a write to it. The redraw of a transform that changed
+    // (kDirtyReasonDescendantChanged) and the notification that a descendant changed are not.
+    if (reason == DirtyReason::kDirtyReasonContentChanged)
+    {
+        this->_markWritten();
+    }
     this->_forceDirty(reason);
+}
+
+uint64_t AbstractItem::getWriteStamp() const
+{
+    return m_itemData->m_writeStamp;
+}
+
+void AbstractItem::_markWritten()
+{
+    // Not a read-modify-write: the scene is used by one thread at a time, and a lock-prefixed add costs more than a write.
+    const uint64_t stamp = s_writeCounter.load(std::memory_order_relaxed) + 1;
+    s_writeCounter.store(stamp, std::memory_order_relaxed);
+    m_itemData->m_writeStamp = stamp;
+    DragFollow::noteWrite(this);
 }
 
 void AbstractItem::_forceDirty(DirtyReason reason)
@@ -137,7 +165,8 @@ void AbstractItem::_forceDirty(DirtyReason reason)
     if (parent != nullptr)
     {
         auto modParent = const_cast<AbstractContainer*>(parent);
-        modParent->forceDirty(reason);
+        // The notification that a descendant changed is not a write of the parent: it does not take a stamp.
+        static_cast<AbstractItem*>(modParent)->_forceDirty(reason);
     }
 }
 

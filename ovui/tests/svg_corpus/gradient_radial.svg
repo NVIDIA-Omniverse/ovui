@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <radialGradient id="a">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#1e88e5"/>
+    </radialGradient>
+    <radialGradient id="b" cx="0.5" cy="0.5" r="0.5" fx="0.3" fy="0.3">
+      <stop offset="0" stop-color="#fdd835"/>
+      <stop offset="0.6" stop-color="#e53935"/>
+      <stop offset="1" stop-color="#4a148c"/>
+    </radialGradient>
+    <radialGradient id="c" gradientUnits="userSpaceOnUse" cx="17" cy="47" r="6" spreadMethod="reflect">
+      <stop offset="0" stop-color="#43a047"/>
+      <stop offset="1" stop-color="#e8f5e9"/>
+    </radialGradient>
+    <radialGradient id="d" gradientUnits="userSpaceOnUse" cx="47" cy="47" r="5" spreadMethod="repeat" gradientTransform="translate(47 47) scale(2 1) translate(-47 -47)">
+      <stop offset="0" stop-color="#fb8c00"/>
+      <stop offset="1" stop-color="#fb8c00" stop-opacity="0.1"/>
+    </radialGradient>
+  </defs>
+  <circle cx="17" cy="17" r="13" fill="url(#a)"/>
+  <rect x="34" y="4" width="26" height="26" rx="4" fill="url(#b)"/>
+  <rect x="4" y="34" width="26" height="26" fill="url(#c)"/>
+  <ellipse cx="47" cy="47" rx="13" ry="12" fill="url(#d)"/>
+</svg>

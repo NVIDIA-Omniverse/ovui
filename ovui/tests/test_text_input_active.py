@@ -3,7 +3,7 @@
 
 """``omni.ui.standalone.is_text_input_active()`` while a number field is edited.
 
-Regression: an application shortcut handler (``Window.set_key_pressed_fn``)
+an application shortcut handler (``Window.set_key_pressed_fn``)
 receives Backspace and Delete even while a ``FloatDrag`` or ``IntDrag`` is in
 keyboard-edit mode and edits its text. The USD Viewer ran its prim-delete
 shortcut on those keys. The handler must be able to tell that a text input

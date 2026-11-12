@@ -17,6 +17,42 @@ using namespace pybind11;
 
 OMNIUI_SCENE_NAMESPACE_USING_DIRECTIVE
 
+namespace
+{
+
+/**
+ * @brief Returns the fully qualified Python class name for a gesture.
+ * Used as a fallback identifier when no explicit name is set.
+ */
+std::string getGestureQualifiedName(const std::shared_ptr<AbstractGesture>& self)
+{
+    if (!self)
+    {
+        return "<null gesture>";
+    }
+    object py_obj = cast(self);
+    auto cls = py_obj.attr("__class__");
+    return cls.attr("__module__").cast<std::string>() + "." + cls.attr("__qualname__").cast<std::string>();
+}
+
+/**
+ * @brief Returns the gesture's explicit name if set, otherwise the qualified class name.
+ */
+std::string getGestureDisplayName(const std::shared_ptr<AbstractGesture>& self)
+{
+    if (self)
+    {
+        const std::string& name = self->getName();
+        if (!name.empty())
+        {
+            return name;
+        }
+    }
+    return getGestureQualifiedName(self);
+}
+
+} // anonymous namespace
+
 void wrapAbstractGesture(module& m)
 {
     constexpr const char* gestureDoc = OMNIUI_PYBIND_CLASS_DOC(AbstractGesture);
@@ -54,7 +90,11 @@ void wrapAbstractGesture(module& m)
 
     abstractGesture
         .def("__repr__",
-             [](const std::shared_ptr<AbstractGesture>& self) -> std::string { return "<AbstractGesture " + (self ? self->getName(): "") + ">"; })
+             [](const std::shared_ptr<AbstractGesture>& self) -> std::string {
+                 object py_obj = cast(self);
+                 auto cls_name = py_obj.attr("__class__").attr("__qualname__").cast<std::string>();
+                 return "<" + cls_name + " " + getGestureDisplayName(self) + ">";
+             })
         .def("get_gesture_payload", [](const AbstractGesture& self) { return self.getGesturePayload(); },
              return_value_policy::reference, OMNIUI_PYBIND_DOC_AbstractGesture_getGesturePayload)
         .def("get_gesture_payload",

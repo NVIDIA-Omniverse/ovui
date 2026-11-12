@@ -5,11 +5,7 @@
 
 import pytest
 
-try:
-    import omni.ui as ui
-    _OMNI_UI_AVAILABLE = True
-except ImportError:
-    _OMNI_UI_AVAILABLE = False
+import omni.ui as ui
 
 
 # ---------------------------------------------------------------------------
@@ -17,8 +13,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def _can_create_window() -> bool:
-    if not _OMNI_UI_AVAILABLE:
-        return False
     try:
         w = ui.Window("__probe__", width=10, height=10)
         w.destroy()

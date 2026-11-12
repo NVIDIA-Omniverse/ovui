@@ -11,7 +11,10 @@ import os
 from types import ModuleType
 
 from ovui_data_adapters.common.ovrtx_import import import_ovrtx
-from ovui_data_adapters.ovstage.runtime_import import import_ovstage_runtime_module
+from ovui_data_adapters.ovstage.runtime_import import (
+    OVSTAGE_ROOT_ENV,
+    import_ovstage_runtime_module,
+)
 
 
 OVSTAGE_INSTALL_MESSAGE = "Please install ovstage."
@@ -67,7 +70,12 @@ class OvstageRuntimePreflightError(RuntimeError):
         self.entry_point_value = entry_point_value
         self.requirement_name = requirement_name
         self.exception_text = f"{type(exception).__name__}: {exception}"
-        if requirement_name == "ovstage" and isinstance(exception, ImportError):
+        # A failure with OVSTAGE_ROOT keeps the detail that names OVSTAGE_ROOT.
+        if (
+            requirement_name == "ovstage"
+            and isinstance(exception, ImportError)
+            and not os.environ.get(OVSTAGE_ROOT_ENV, "").strip()
+        ):
             message = OVSTAGE_INSTALL_MESSAGE
         else:
             message = (

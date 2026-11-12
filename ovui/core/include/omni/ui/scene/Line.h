@@ -60,12 +60,16 @@ public:
     /**
      * @brief The start point of the line
      */
-    OMNIUI_PROPERTY(Vector3, start, DEFAULT, Vector3{ 0.0 }, READ, getStart, WRITE, setStart, NOTIFY, _setStartChangedFn);
+    OMNIUI_PROPERTY(Vector3, start, DEFAULT, Vector3{ 0.0 }, READ, getStart, NOTIFY, _setStartChangedFn);
+    OMNIUI_SCENE_API
+    virtual void setStart(Vector3 const& value);
 
     /**
      * @brief The end point of the line
      */
-    OMNIUI_PROPERTY(Vector3, end, DEFAULT, Vector3{ 0.0 }, READ, getEnd, WRITE, setEnd, NOTIFY, _setEndChangedFn);
+    OMNIUI_PROPERTY(Vector3, end, DEFAULT, Vector3{ 0.0 }, READ, getEnd, NOTIFY, _setEndChangedFn);
+    OMNIUI_SCENE_API
+    virtual void setEnd(Vector3 const& value);
 
     /**
      * @brief The line color
@@ -100,6 +104,9 @@ protected:
 
     OMNIUI_SCENE_API
     void _drawContent(const Matrix44& projection, const Matrix44& view) override;
+
+    bool _getFollowReport(Vector3& moved) const override;
+    void _captureBaseline() const override;
 
     void _dirty();
     void _setChangedFn();

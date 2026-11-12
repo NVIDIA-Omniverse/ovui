@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- clip-rule is inherited: the clip path shapes take it from the ancestors
+       of <clipPath>, not from the element that is clipped. The star crosses
+       itself, so even-odd leaves its middle out. -->
+  <defs clip-rule="evenodd">
+    <clipPath id="star"><path d="M64 6 L100 118 L6 48 L122 48 L28 118 Z"/></clipPath>
+  </defs>
+  <rect width="128" height="128" fill="#1e88e5" clip-path="url(#star)" clip-rule="nonzero"/>
+</svg>

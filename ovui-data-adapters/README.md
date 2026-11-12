@@ -22,7 +22,11 @@ backends. Four distributions:
 - **`ovui-data-adapters-openusd`** — concrete OpenUSD adapters that
   implement the contracts above. Depends on `numpy`; the standalone
   `usd-core==25.11` runtime is available only through the optional
-  `[standalone]` extra. Uses `ovrtx` when it is importable from the active
+  `[standalone]` extra. That usd-core release has wheels for Python 3.8 to
+  3.13 and none for Python 3.14 or 3.15, so on Python 3.14 and 3.15 the extra
+  cannot be installed: use the OVStage provider or a `pxr` from the
+  environment (usd-core 26.11 has Python
+  3.14 wheels, but this adapter is not validated with it). Uses `ovrtx` when it is importable from the active
   environment or from an external checkout exposed through `OVRTX_ROOT`.
 
 - **`ovui-data-adapters-ovstage`** — the native OVStage provider. It depends
@@ -105,6 +109,63 @@ reporting ovrtx as unavailable.
 The OpenUSD `[standalone]` extra belongs only in an environment intended for
 the standalone `openusd` provider. The native OVStage provider neither needs
 nor uses `pxr`, so the extra is simply unnecessary there.
+
+## ovrtx and ovstage compatibility
+
+ovui does not install ovrtx or ovstage and does not pin them. Install the
+ones you want into the same environment. Existing users do not need to
+upgrade. The ovstage adapter reads both tensor layouts, so earlier ovstage
+releases keep working. In one layout the components of a vector or matrix are
+reported in the data type (DLPack lanes). In the other they are reported in
+the trailing dimensions of the shape.
+
+The adapter tests marked `requires_ovstage` read real stages and show the
+values with the layout of the installed release. They do not check native
+frame pacing. The first render in a fresh process can take over a minute while
+the renderer starts.
+
+The public distribution presents the viewport on the normal UI tick.
+Optional native frame-pacing providers are not included. The renderer hook
+interfaces remain available for separately supplied compatible providers.
+
+## ovrtx Carb settings and MaterialX deduplication
+
+`ovrtx.RendererConfig` has no field for a generic Carb setting. Some plugin
+settings are read when the plugin starts, so they must be set before the first
+renderer exists. Set the environment variable `OVUI_OVRTX_CARB_SETTINGS`. Both
+renderer adapters (OpenUSD and ovstage) apply it through the ovrtx extension
+`ovrtx.settings.apply_settings` right before they create an `ovrtx.Renderer`. When
+the renderer library is not loaded yet, they load it with the config of that
+renderer. Without the variable, the adapters change nothing.
+
+```bash
+export OVUI_OVRTX_CARB_SETTINGS='/persistent/app/material/materialx/disableDeduplication=true'
+```
+
+Entries are `/path/to/key=value`. Separate entries with new lines or semicolons.
+A value is passed to Carb unchanged. An entry that is not valid, or a setting
+that ovrtx rejects, stops the renderer from starting and names the setting. A
+host application can call
+`ovui_data_adapters.common.ovrtx_carb_settings.apply_carb_settings(ovrtx, tokens, config)`
+itself, before it creates a renderer. For USD Workbench, set the variable in the
+environment of the app (in a container: `docker run -e OVUI_OVRTX_CARB_SETTINGS=...`).
+
+By default ovrtx generates one MaterialX MDL module for all materials that have the
+same cache key. The cache key is a sum over node types and connection names. Two
+graphs with the same node types and connection names but other wiring get one
+module, and one of the two materials then fails and shows an error color.
+`disableDeduplication=true` gives each material its own module and prevents
+this. Each material then compiles its own module, which takes more time when the
+shader cache is cold, so the adapters do not set it by default. An ovrtx that does not apply this setting
+ignores it; the adapters then log a warning. The real-renderer test is
+`tests/openusd/test_materialx_identity_real_renderer.py`.
+
+The MaterialX plugin keeps its generated modules in a cache folder. When ovrtx has
+no cache root, it tries a `cache` folder next to the executable (for Python, often
+`/usr/bin/cache`), logs `Unable to create directory`, and uses a temporary folder.
+This does not depend on `disableDeduplication`. To give it a writable folder, add
+`/persistent/app/material/materialx/tempDirectory=<writable folder>` to the
+variable. The plugin then keeps that folder when the app ends.
 
 ## OVUI 0.2 native OVStage runtime
 

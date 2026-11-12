@@ -47,7 +47,7 @@ class TestImportsAndStructure:
         assert ovui_widgets.layers.LayerWindow is LayerWindow
 
     def test_layer_stack_adapter_in_ovgear_adapters(self):
-        """LayerStackAdapter lives in ovui_widgets.common.adapters as of issue #38."""
+        """LayerStackAdapter lives in ovui_widgets.common.adapters as of the regression."""
         from ovui_data_adapters.common import LayerStackAdapter
 
         from ovui_widgets.common.testing.mock_layer_stack import MockLayerStackAdapter
@@ -55,9 +55,6 @@ class TestImportsAndStructure:
 
     def test_is_managed_window_subclass(self):
         assert issubclass(LayerWindow, ManagedWindow)
-
-    def test_title_constant(self):
-        assert LayerWindow.TITLE == "Layers"
 
     def test_layers_styles_is_dict(self):
         # Step 11 populates the dict; assert the public symbol is the

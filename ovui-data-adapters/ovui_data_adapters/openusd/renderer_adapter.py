@@ -33,15 +33,20 @@ import os
 os.environ.setdefault("OVRTX_SKIP_USD_CHECK", "1")
 
 import collections
+import concurrent.futures
+import contextlib
+import hashlib
 import math
 import re
+import shutil
 import struct
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace as _dataclass_replace
-from typing import Any, Callable, Deque, List, Optional, Tuple
+from typing import Any, Callable, Deque, Hashable, Iterable, Iterator, List, Optional, Tuple
 
 # RFC 3986 URI scheme prefix (used by ``_anchor_asset_path`` to keep
 # URI/resolver identifiers byte-for-byte when relocating a live-root
@@ -100,7 +105,45 @@ from ovui_data_adapters.common._ldr_overlap import (
     camera_state_differs,
 )
 from ovui_data_adapters.common.instrumentation import get_instrumentation
+from ovui_data_adapters.common.ovrtx_carb_settings import (
+    OvrtxCarbSettingsError,
+    apply_environment_carb_settings,
+    read_carb_bool,
+)
 from ovui_data_adapters.common.ovrtx_import import import_ovrtx
+from ovui_data_adapters.common.ovrtx_compile_limits import limit_shader_compile_sessions
+from ovui_data_adapters.common.render_diagnostics import (
+    LOGGER,
+    BackgroundTaskStuckError,
+    HostMemoryWatch,
+    check_stage_resources,
+    note_gpu_memory_before_renderer,
+)
+from ovui_data_adapters.common.render_material_report import (
+    FileEventLinker,
+    describe_materials,
+    record_file_events,
+    shader_files,
+)
+from ovui_data_adapters.common.render_native_log import (
+    begin_scene_events,
+    record_scene_failure,
+    record_step_failure,
+    release_native_log,
+    retire_closed_scene_events,
+    settle_body_resources,
+    start_native_log,
+)
+from ovui_data_adapters.common.render_probe import (
+    LIVE_PREFIX,
+    MaterialCheckRequests,
+    MaterialMismatchError,
+    extract_images,
+    failure_summary,
+    live_plan,
+    record_result,
+    verify_mode,
+)
 from ovui_data_adapters.common.render_settings import (
     CAMERA_OWNER_SCOPE as _CAMERA_OWNER_SCOPE,
     RENDER_SETTINGS_OWNER_SCOPE as _RENDER_SETTINGS_OWNER_SCOPE,
@@ -108,6 +151,18 @@ from ovui_data_adapters.common.render_settings import (
     build_render_setting_builtin_spec_index,
     render_setting_owner_scope,
 )
+from ovui_data_adapters.common.render_telemetry import (
+    get_material_messages,
+    native_renderer_handle,
+    note_renderer_diagnostics,
+    prepare_material_messages,
+    start_material_messages,
+    stop_material_messages,
+)
+from ovui_data_adapters.common.stored_render_settings import (
+    stored_render_setting_lines,
+)
+from ovui_data_adapters.openusd._settled_pictures import SettledPictures
 
 # ── Note on carb's ``omni.hydra`` re-registration warning ──
 # ovrtx's bundled carb prints the line
@@ -146,6 +201,14 @@ from ovui_data_adapters.common.render_settings import (
 # opening any stage in the same process. :meth:`Application.open_file`
 # enforces this ordering for the user-facing USD-open path.
 _ovrtx: Any = None
+#: Carb settings of the renderer library: where it reads render-setting attributes.
+_FABRIC_RENDER_SETTINGS_KEY = "/app/hydra/renderSettings/useFabricAttributes"
+_USD_RENDER_SETTINGS_KEY = "/app/hydra/renderSettings/useUsdAttributes"
+#: Eco Mode only says when the renderer stops refining a still picture; it changes no pixel.
+_ECO_MODE_ENABLED_ATTR = "omni:rtx:rt:ecoMode:enabled"
+_ECO_MODE_FRAME_LIMIT_ATTR = "omni:rtx:rt:ecoMode:maxFramesWithoutChange"
+#: The renderer stops after at least this many frames without a change.
+_ECO_MODE_MIN_FRAME_LIMIT = 2
 _OVRTX_IMPORT_ERROR: Optional[BaseException] = None
 _OVRTX_PROBED: bool = False
 
@@ -208,6 +271,9 @@ _RENDER_PRODUCT_PATH = "/OvGearSession/Render/Viewport"
 _LDR_VAR_PATH = "/OvGearSession/Render/Vars/LdrColor"
 _DOME_LIGHT_PATH = "/OvGearSession/Lights/FallbackDome"
 _SESSION_ROOT_PATH = "/OvGearSession"
+#: Prim types that the renderer draws nothing for. A created prim whose subtree has only these types does
+#: not go to the renderer, and its changes do not step it.
+_UNDRAWN_PRIM_TYPES = frozenset({"", "Xform", "Scope"})
 
 # The prim OVRTX itself resolves for globally owned render settings.
 # ``RenderProductPrim::getStageRenderSettings`` (omni.usd-abi) tries the stage
@@ -229,21 +295,45 @@ _PICK_RENDER_PRODUCT_DEVICE_IDS: Tuple[int, ...] = (0,)
 # when the frame loop stalls (e.g., first-frame shader compile).
 _MIN_DT = 1.0 / 300.0
 _MAX_DT = 0.1
+# Stored settled pictures of render-settings states: a Reset,
+# its Undo and its Redo use two; a few more cover a short series of changes.
+_SETTLED_PICTURES_LIMIT = 4
+_SETTLED_PICTURES_MAX_BYTES = 128 * 1024 * 1024
+# The numbers of the surface answers under a stored picture start here, far
+# above the numbers of the native surface queries (see query_surface).
+_HELD_SURFACE_QUERY_BASE = 1 << 62
 
-# Resize debounce tuning (the viewport behavior). The plan defines a big
-# delta as the strict inequality ``|new - last| > _RESIZE_BIG_DELTA_PX``,
-# so ``_RESIZE_BIG_DELTA_PX`` is the *exclusive* threshold (an 8 px change
-# is NOT big; 9 px IS). When two such deltas land within
-# ``_RESIZE_ACTIVE_WINDOW_S`` of each other we consider the viewport to be
-# in an active drag-resize and throttle RenderProduct reinjects to one per
-# ``_RESIZE_DEBOUNCE_S``. Between drags (or for a single isolated jump)
-# the new resolution is applied immediately.
-_RESIZE_BIG_DELTA_PX = 8
-_RESIZE_ACTIVE_WINDOW_S = 0.200
-_RESIZE_DEBOUNCE_S = 0.250
+# The longest wait at shutdown for the step that builds the scene again after
+# a stage edit. ovrtx cannot cancel the step, and the renderer must not be
+# released while it runs. On the Factory scene (41,000 prims) the step took up
+# to about 45 s on a 48 GB GPU partition, so an exit during an ordinary
+# rebuild stays inside the limit.
+_REBUILD_STEP_SHUTDOWN_TIMEOUT_S = 120.0
+
+# A new viewport size goes to the owned render product only after the size
+# that the viewport asks for stayed the same for this time. A window resize
+# (a drag of the window border, a maximize) asks for a new size on many frames,
+# and the first ovrtx step at a new resolution is slow (new render buffers) and
+# runs on the UI thread. Until the size settles, ovrtx renders at the size that
+# it has, and the image is scaled to the viewport.
+_RESIZE_SETTLE_S = 0.200
 
 _SELECTION_OUTLINE_GROUP_ID = 1
 _SELECTION_OUTLINE_CLEAR_GROUP_ID = 0
+_SELECTION_OUTLINE_HIDDEN_GROUP_ID = 2
+#: The selection outline pass starts when the viewport is idle after the
+#: scene opened: this long after its first frames were shown, once the camera
+#: has not moved for ``_OUTLINE_PASS_STILL_S``. Starting it costs one UI frame
+#: of about 50 ms, which then falls outside the start-up and outside any
+#: camera move.
+_OUTLINE_PASS_AFTER_S = 15.0
+#: Marks a session restart that waits for three frames shown after a reset.
+_SETTLE_AFTER_SHOWN_FRAMES = object()
+_OUTLINE_PASS_STILL_S = 2.0
+# A mesh of the session layer, with three equal points. It has no area, so
+# it draws no pixel, and no user can select, hide or save it. Its membership
+# in the hidden outline group keeps the ovrtx outline pass on.
+_SELECTION_OUTLINE_ANCHOR_PATH = f"{_SESSION_ROOT_PATH}/OutlineAnchor"
 _SELECTION_OUTLINE_ATTR = "omni:selectionOutlineGroup"
 _SELECTION_OUTLINE_COLOR = (0.0, 138.0 / 255.0, 249.0 / 255.0, 1.0)
 _SELECTION_OUTLINE_FILL = (0.0, 138.0 / 255.0, 249.0 / 255.0, 0.0)
@@ -258,6 +348,265 @@ _PICK_HIT_RECORD = struct.Struct("<QIIQdddffff")
 _ROOT_STAGE_SENTINEL = object()
 _SESSION_INSTALL_SENTINEL = object()
 _ROLLBACK_NATIVE_SENTINEL = object()
+
+# The ovrtx file loader keeps each USD file that it reads for the life of the
+# process, for every renderer. A later open of the same path gives the content
+# of that first read, also after the file was saved with other content. These
+# are the files that ovrtx has read in this process, by normalized real path.
+# The value is the SHA-256 digest of the content of a root file that ovrtx
+# opened by its path, or None when the adapter does not know the content of
+# the read: a file that ovrtx read only as a sublayer, reference or payload,
+# or a root file that the adapter could not read.
+_OVRTX_READ_LAYER_FILES: dict[str, Optional[bytes]] = {}
+
+# The ovrtx file loader keeps the first read of each USD file for the life of
+# the process, for every renderer. A later load that names the same file gets
+# that first read, also after the file was saved with other content, or after
+# another program changed it and Layers > Reload read the new content into the
+# USD stage. This is the state of each file (by real path) when a load first
+# let ovrtx read it. It holds one entry for each file, so it stays as small as
+# the set of files.
+_OVRTX_FIRST_READ_FILE_STATES: dict[str, tuple[int, int, int, int]] = {}
+
+# The changed layer files that a renderer load already reported.
+_REPORTED_CHANGED_LAYER_FILES: set[str] = set()
+
+
+@dataclass(frozen=True)
+class _LayerCopy:
+    """A copy of a layer that an adapter wrote for ovrtx.
+
+    ``layer`` is the layer (a weak handle, which does not keep the layer),
+    ``change_count`` its change count when the copy was written,
+    ``named_copies`` the copies of other layers that the copy names (by
+    their keys), and ``path`` the path of the copy. ``source_digest`` is
+    the SHA-256 digest of the layer file when the layer had the content of
+    that file, else None. See ``_write_layer_copies_for_renderer``.
+    """
+
+    layer: Any
+    change_count: int
+    named_copies: tuple[tuple[str, str], ...]
+    path: str
+    source_digest: Optional[bytes]
+
+
+def _layer_file_key(layer: Any) -> Optional[str]:
+    """Return the key of the file of a file-backed layer in the file records above."""
+    if layer is None or layer.anonymous:
+        return None
+    real_path = layer.realPath
+    if not real_path:
+        return None
+    return os.path.normcase(os.path.abspath(real_path))
+
+
+def _file_of_layer(layer: Any) -> Optional[str]:
+    """Return the file of a file-backed layer: for a layer in a package (.usdz), the package file."""
+    from pxr import Ar
+
+    if layer is None or layer.anonymous or not layer.realPath:
+        return None
+    file_path = layer.realPath
+    if Ar.IsPackageRelativePath(file_path):
+        file_path = Ar.SplitPackageRelativePathOuter(file_path)[0]
+    return file_path
+
+
+def _file_state(file_path: str) -> tuple[int, int, int, int]:
+    """Return the device, the file number, the size and the change time in nanoseconds of a file.
+
+    Raises ``OSError`` when the state cannot be read.
+    """
+    info = os.stat(file_path)
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _layer_file_state(layer: Any) -> Optional[tuple[int, int, int, int]]:
+    """Return the current state of the file of a file-backed layer (see ``_file_state``).
+
+    A save writes a new file or a new time, so a saved file gets a new state.
+    A layer in a package (.usdz) has the state of the package file. Anonymous
+    layers give None. A file whose state cannot be read (for example, a file
+    that was moved or deleted while the stage keeps its layer) gives None and
+    is reported once, with the cause.
+    """
+    file_path = _file_of_layer(layer)
+    if file_path is None:
+        return None
+    try:
+        state = _file_state(file_path)
+    except OSError as error:
+        _report_file_problem(
+            "state",
+            file_path,
+            f"cannot read the state of the layer file {file_path} "
+            f"({type(error).__name__}: {error}); the renderer loads a copy of the "
+            "layer that the stage has in memory",
+        )
+        return None
+    _end_file_problem("state", file_path)
+    return state
+
+
+# The last report of a problem with a file, by operation and file. A problem
+# is reported once, and again only when its cause changes or after the
+# operation worked. It holds at most one entry for each file and operation.
+_REPORTED_FILE_PROBLEMS: dict[tuple[str, str], str] = {}
+
+
+def _report_file_problem(operation: str, file_path: str, message: str) -> None:
+    """Report a failed ``operation`` on a file, once while the same problem stays."""
+    key = (operation, file_path)
+    if _REPORTED_FILE_PROBLEMS.get(key) == message:
+        return
+    _REPORTED_FILE_PROBLEMS[key] = message
+    print(f"[OvRtxRendererAdapter] {message}", file=sys.stderr)
+
+
+def _end_file_problem(operation: str, file_path: str) -> None:
+    """Forget the report of ``operation`` on a file: the operation worked."""
+    if _REPORTED_FILE_PROBLEMS:
+        _REPORTED_FILE_PROBLEMS.pop((operation, file_path), None)
+
+
+# The last report of each failure or fallback of the render-settings work,
+# by case. A case is reported once, and again only when its
+# message changes or after the operation worked (:func:`_end_report`).
+_REPORTED_CASES: dict[Hashable, str] = {}
+
+
+def _report_once(case: Hashable, message: str) -> None:
+    """Report a failed operation or a fallback of ``case``, once while the same message stays."""
+    if _REPORTED_CASES.get(case) == message:
+        return
+    _REPORTED_CASES[case] = message
+    print(f"[OvRtxRendererAdapter] {message}", file=sys.stderr)
+
+
+def _end_report(case: Hashable) -> None:
+    """The operation of ``case`` worked: its next failure is reported again."""
+    if _REPORTED_CASES:
+        _REPORTED_CASES.pop(case, None)
+
+
+def _layers_changed_since_ovrtx_read(stage: Any) -> dict[str, tuple[Any, bool]]:
+    """Return the used layers, other than the root layer, that must go to ovrtx as copies.
+
+    These are the file-backed layers whose file changed after a load first let
+    ovrtx read it: ovrtx would draw that first read, not the layer that the
+    stage composes now (for example, a referenced file that was saved, or a
+    sublayer that another program changed and Layers > Reload read again).
+    A file whose state cannot be read is in the result too: the adapter
+    cannot know whether ovrtx has its content. The root layer is not in the
+    result: the result is for the files that the root layer composes.
+
+    The result maps the key of each file (see ``_layer_file_key``) to its
+    layer and whether the state of the file could be read.
+    """
+    root_layer = stage.GetRootLayer()
+    changed = {}
+    for layer in stage.GetUsedLayers():
+        if layer == root_layer:
+            continue
+        key = _layer_file_key(layer)
+        if key is None:
+            continue
+        state = _layer_file_state(layer)
+        if state is None:
+            changed[key] = (layer, False)
+            continue
+        first_read_state = _OVRTX_FIRST_READ_FILE_STATES.get(key)
+        if first_read_state is not None and state != first_read_state:
+            changed[key] = (layer, True)
+    return changed
+
+
+def _root_file_digest(root_layer: Any) -> Optional[bytes]:
+    """Return the SHA-256 digest of the root layer's file, or None when it cannot be read."""
+    digest = hashlib.sha256()
+    try:
+        with open(root_layer.realPath, "rb") as stream:
+            for block in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(block)
+    except OSError as exc:
+        LOGGER.warning(
+            "cannot read %s to compare it with the renderer's earlier read of the file "
+            "(%s: %s); when the file opens again, the renderer loads a copy of its root layer",
+            root_layer.realPath,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    return digest.digest()
+
+
+def _ovrtx_root_read_is_stale(root_layer: Any) -> bool:
+    """True when ovrtx read this root file before and that read can differ from the file now.
+
+    Then an open by its path would show the earlier read. A file that has the
+    content that ovrtx read is opened by its path again, as on its first open.
+    """
+    key = _layer_file_key(root_layer)
+    if key is None or key not in _OVRTX_READ_LAYER_FILES:
+        return False
+    read_digest = _OVRTX_READ_LAYER_FILES[key]
+    return read_digest is None or _root_file_digest(root_layer) != read_digest
+
+
+def _note_layer_files_read_by_ovrtx(stage: Any, *, root_read_by_path: bool) -> None:
+    """Record the files that ovrtx can read when it loads ``stage``.
+
+    ovrtx can read each file-backed layer that the stage uses (sublayers,
+    references, payloads). The root file is read only when ovrtx opens it by
+    its path, not when a snapshot or inline text of the root layer replaces
+    it; then the digest of its content is recorded. A file that ovrtx read
+    before keeps its record, because ovrtx keeps its first read. A file
+    recorded without a read only causes an extra snapshot later.
+
+    The state of each file (see ``_layer_file_state``) is recorded too, once:
+    a later load compares it with the file (see
+    ``_layers_changed_since_ovrtx_read``). A file recorded without a read by
+    ovrtx only makes a later load give ovrtx a copy of its layer.
+    """
+    root_layer = stage.GetRootLayer()
+    for layer in stage.GetUsedLayers():
+        key = _layer_file_key(layer)
+        if key is None:
+            continue
+        if key not in _OVRTX_FIRST_READ_FILE_STATES:
+            state = _layer_file_state(layer)
+            if state is not None:
+                _OVRTX_FIRST_READ_FILE_STATES[key] = state
+        if key in _OVRTX_READ_LAYER_FILES:
+            continue
+        if layer != root_layer:
+            _OVRTX_READ_LAYER_FILES[key] = None
+        elif root_read_by_path:
+            _OVRTX_READ_LAYER_FILES[key] = _root_file_digest(layer)
+
+
+def _modify_asset_paths_keeping_sublayer_offsets(
+    layer: Any, modify: Callable[[str], str]
+) -> None:
+    """Change the asset paths of ``layer``, and keep the time offset of each sublayer.
+
+    ``UsdUtils.ModifyAssetPaths`` gives a sublayer whose path it changes the
+    identity offset; the copy that ovrtx composes must keep the authored
+    offset and scale. When the number of sublayers changes (two paths that
+    become the same), the offsets cannot be matched, and this raises.
+    """
+    from pxr import UsdUtils
+
+    offsets = list(layer.subLayerOffsets)
+    UsdUtils.ModifyAssetPaths(layer, modify)
+    if len(layer.subLayerOffsets) != len(offsets):
+        raise RuntimeError(
+            f"the sublayers of {layer.identifier} changed in number when their paths "
+            "changed, so their time offsets cannot be kept"
+        )
+    for index, offset in enumerate(offsets):
+        layer.subLayerOffsets[index] = offset
 
 
 @dataclass
@@ -895,6 +1244,11 @@ _RENDER_SETTINGS_BUILTIN_SPEC_INDEX: dict[str, dict[str, Any]] = {}
 _SESSION_CAMERA_PRIM_METADATA_LINES: Tuple[str, ...] = ()
 _SESSION_CAMERA_ATTRIBUTE_LINES: Tuple[str, ...] = ()
 _RENDER_SETTINGS_CATALOG_REVISION_FN: Callable[[Any], Any] = repr
+_RENDER_SETTINGS_CATALOG_REVISION_STEPS_FN: Optional[Callable[[Any], Any]] = None
+# UI-thread time that one frame spends on a deferred settings publication.
+_RENDER_SETTINGS_PUBLISH_BUDGET_S = 0.008
+# Frames between a render-setting reset and the start of the native session.
+_NATIVE_FIRST_FRAME_DELAY_FRAMES = 2
 
 
 def configure_render_settings_schema(
@@ -909,8 +1263,15 @@ def configure_render_settings_schema(
     session_camera_prim_metadata_lines: Tuple[str, ...] = (),
     session_camera_attribute_lines: Tuple[str, ...] = (),
     catalog_revision_fn: Callable[[Any], Any] = repr,
+    catalog_revision_steps_fn: Optional[Callable[[Any], Any]] = None,
 ) -> None:
-    """Install an opaque optional renderer-property schema."""
+    """Install an opaque optional renderer-property schema.
+
+    ``catalog_revision_steps_fn`` is optional. It is the generator form of
+    ``catalog_revision_fn``: it yields between records and returns the same
+    revision. With it, the adapter publishes a settings change over several
+    frames, so that no UI frame waits for the whole canonicalization.
+    """
 
     global _RENDER_SETTINGS_PROVIDER_ID
     global _RENDER_SETTINGS_PROVIDER_LABEL
@@ -923,6 +1284,7 @@ def configure_render_settings_schema(
     global _SESSION_CAMERA_PRIM_METADATA_LINES
     global _SESSION_CAMERA_ATTRIBUTE_LINES
     global _RENDER_SETTINGS_CATALOG_REVISION_FN
+    global _RENDER_SETTINGS_CATALOG_REVISION_STEPS_FN
     _RENDER_SETTINGS_PROVIDER_ID = str(provider_id)
     _RENDER_SETTINGS_PROVIDER_LABEL = str(provider_label)
     _RENDER_SETTINGS_PUBLIC_NAMESPACES = tuple(public_namespaces)
@@ -930,12 +1292,57 @@ def configure_render_settings_schema(
     _RENDER_SETTINGS_GROUP_FALLBACK = str(group_fallback)
     _RENDER_SETTINGS_GROUP_LABEL_FALLBACK = str(group_label_fallback)
     _RENDER_SETTINGS_BUILTIN_SPECS = tuple(dict(spec) for spec in builtin_specs)
+    _RENDER_SETTINGS_BUILTIN_DESCRIPTORS.clear()
     _RENDER_SETTINGS_BUILTIN_SPEC_INDEX = build_render_setting_builtin_spec_index(
         _RENDER_SETTINGS_BUILTIN_SPECS
     )
     _SESSION_CAMERA_PRIM_METADATA_LINES = tuple(session_camera_prim_metadata_lines)
     _SESSION_CAMERA_ATTRIBUTE_LINES = tuple(session_camera_attribute_lines)
     _RENDER_SETTINGS_CATALOG_REVISION_FN = catalog_revision_fn
+    _RENDER_SETTINGS_CATALOG_REVISION_STEPS_FN = catalog_revision_steps_fn
+
+
+def _render_setting_value_unchanged(descriptor: Any, value: Any) -> bool:
+    """Whether ``value`` is the effective value that the setting had before this change.
+
+    The renderer already has that value, so the change is nothing for the
+    renderer. An unknown or not comparable value counts as changed.
+    """
+
+    before = getattr(getattr(descriptor, "value_state", None), "current_value", None)
+    if before is None or value is None:
+        return False
+    if isinstance(before, (bool, np.bool_)) != isinstance(value, (bool, np.bool_)):
+        return False
+    case = ("compare render setting values", getattr(descriptor, "setting_id", None))
+    try:
+        if np.shape(before) != np.shape(value):
+            return False
+        unchanged = bool(np.all(np.asarray(before) == np.asarray(value)))
+    except Exception as error:
+        _report_once(
+            case,
+            f"comparing the value of the render setting {getattr(descriptor, 'setting_id', '?')!r} "
+            f"before and after a change failed: {type(error).__name__}: {error}; the change "
+            "counts as a new value and goes to the renderer",
+        )
+        return False
+    _end_report(case)
+    return unchanged
+
+
+def _render_setting_value_key(value: Any) -> str:
+    """A hashable form of a setting value; equal values give equal keys."""
+
+    try:
+        return repr(np.asarray(value).tolist())
+    except Exception as error:
+        _report_once(
+            "render setting value key",
+            f"a render setting value has no array form ({type(error).__name__}: {error}); "
+            "stored pictures key it by its text form",
+        )
+        return repr(value)
 
 
 def _render_setting_builtin_spec(attr_name: str) -> dict[str, Any] | None:
@@ -1305,7 +1712,34 @@ def _render_setting_descriptor(
     )
 
 
+#: (product path, spec identity) -> built-in descriptor. A built-in
+#: descriptor depends only on its spec and the product, and it is frozen;
+#: the catalog is described several times per written setting, so building
+#: every built-in descriptor again each time made loading the stored
+#: settings of a scene slow. Each entry keeps its spec, so the identity
+#: check stays exact. Cleared when a schema is installed.
+_RENDER_SETTINGS_BUILTIN_DESCRIPTORS: dict[tuple[Any, ...], tuple[dict[str, Any], RenderSettingDescriptor | None]] = {}
+
+
 def _render_setting_builtin_descriptor(
+    product_path: str,
+    spec: dict[str, Any],
+) -> RenderSettingDescriptor | None:
+    key = (
+        product_path,
+        id(spec),
+        _RENDER_SETTINGS_PROVIDER_ID,
+        _RENDER_SETTINGS_PUBLIC_NAMESPACES,
+        _RENDER_SETTINGS_GROUP_FALLBACK,
+    )
+    cached = _RENDER_SETTINGS_BUILTIN_DESCRIPTORS.get(key)
+    if cached is None or cached[0] is not spec:
+        cached = (spec, _build_render_setting_builtin_descriptor(product_path, spec))
+        _RENDER_SETTINGS_BUILTIN_DESCRIPTORS[key] = cached
+    return cached[1]
+
+
+def _build_render_setting_builtin_descriptor(
     product_path: str,
     spec: dict[str, Any],
 ) -> RenderSettingDescriptor | None:
@@ -1896,6 +2330,23 @@ def _render_setting_set_attr(
 ) -> None:
     if not attr.Set(_render_setting_usd_value(descriptor, normalized_value)):
         raise RuntimeError("USD attribute Set returned false")
+
+
+def _render_setting_edit_target_key(attr: Any) -> tuple[str, Any]:
+    """The edit layer and the path of ``attr``'s spec in it.
+
+    In a variant edit target the spec path differs from the composed path.
+    """
+
+    target = attr.GetStage().GetEditTarget()
+    return target.GetLayer().identifier, target.MapToSpecPath(attr.GetPath())
+
+
+def _render_setting_edit_target_spec(attr: Any) -> Any:
+    """The spec of ``attr`` in the current edit target, or ``None``."""
+
+    target = attr.GetStage().GetEditTarget()
+    return target.GetLayer().GetPropertyAtPath(target.MapToSpecPath(attr.GetPath()))
 
 
 def _render_setting_clear_attr(attr: Any) -> None:
@@ -2641,6 +3092,16 @@ _LIVE_INPUT_DTYPES = {
     "float3": (np.float32, 3),
     "color3f": (np.float32, 3),
 }
+# Size attributes of the implicit shapes that OVRTX resizes in place with
+# write_attribute (float64, one row per prim). Mesh points and topology stay
+# structural.
+_LIVE_GEOMETRY_ATTRIBUTES = {
+    "Cube": frozenset({"size"}),
+    "Sphere": frozenset({"radius"}),
+    "Cylinder": frozenset({"radius", "height"}),
+    "Cone": frozenset({"radius", "height"}),
+    "Capsule": frozenset({"radius", "height"}),
+}
 _LIVE_LIGHT_INPUTS = frozenset(
     {
         "inputs:intensity",
@@ -2674,7 +3135,7 @@ def _build_session_usda(
     camera_setting_lines: Tuple[str, ...] = (),
     render_product_setting_lines: Tuple[str, ...] = (),
 ) -> str:
-    """Return an inline USDA layer defining OvGear's camera and render product.
+    """Return an inline USDA layer defining OvGear's camera, render product and outline anchor.
 
     The layer's ``defaultPrim`` is ``OvGearSession`` and every prim is
     nested under ``/OvGearSession/...`` so it can be composed into ovrtx
@@ -2747,6 +3208,14 @@ def _build_session_usda(
 
 def Scope "OvGearSession"
 {{
+    def Mesh "OutlineAnchor"
+    {{
+        point3f[] points = [(0, 0, 0), (0, 0, 0), (0, 0, 0)]
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        float3[] extent = [(0, 0, 0), (0, 0, 0)]
+    }}
+
     def Scope "Cameras"
     {{
         def Camera "Main"{camera_metadata_block}
@@ -3044,9 +3513,31 @@ class OvRtxRendererAdapter(RendererAdapter):
         # native handle.
         self._renderer_config = config
         get_instrumentation().prepare_renderer_config(self, config)
+        # A renderer with the public log callback names the module of each material in its materials channel.
+        prepare_material_messages()
+        # The native renderer reports material and texture failures only in
+        # its own log file: read it, so that they are not silent.
+        start_native_log(self, config)
+        # Cap parallel shader compilation (host memory grows with it), with
+        # the complete config of this renderer.
+        limit_shader_compile_sessions(config)
+        # The GPU memory that is free now is what the new renderer can use.
+        note_gpu_memory_before_renderer()
+        # Carb settings that a plugin reads when it starts must be set first.
+        apply_environment_carb_settings(_ovrtx, config)
         self._renderer = (
             _ovrtx.Renderer(config) if config is not None else _ovrtx.Renderer()
         )
+        start_material_messages(self)
+        # The memory check needs the scene: load_stage runs it with the real
+        # scene size.
+        self._first_step_done = False
+        self._file_check_due = False
+        self._file_linker = None
+        self._live_check_due = False
+        self._strict_refusal = None
+        # material_verify asks for a check here; render_frame runs it on the thread that renders.
+        self._material_check_requests = MaterialCheckRequests()
         # ovrtx pick-query coordinate convention changed at 0.4.0 (pixel ints
         # -> normalized [0, 1] NDC); record the version to dispatch correctly.
         self._ovrtx_version = _version_tuple(getattr(_ovrtx, "__version__", "unknown"))
@@ -3063,6 +3554,26 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._usd_handle: Any = None
         self._session_handle: Any = None
         self._live_resync_handles: list[Any] = []
+        # Prims created after the root was opened, which ovrtx shows through
+        # one reference each (handles in ``_live_resync_handles``, same order),
+        # with the text of each reference.
+        self._live_prim_reference_paths: list[Any] = []
+        self._live_prim_reference_contents: list[str] = []
+        # Prims created after the root was opened that draw nothing: ovrtx does not get them.
+        self._undrawn_created_prim_paths: list[Any] = []
+        # (event, stage, result) of _created_change for the last stage change.
+        self._created_change_memo: Optional[tuple[Any, Any, Any]] = None
+        # The state of the root file that ovrtx opened (see _opened_root_layer).
+        self._root_open_file_state: Optional[tuple[int, int, int, int]] = None
+        # (root payload, prim paths) of the root that ovrtx opened (see
+        # _root_layer_lost_an_opened_prim).
+        self._opened_root_prim_paths: Optional[tuple[Any, list[Any]]] = None
+        # The path of the root file while the renderer's scene is still its
+        # read of that file: nothing outside the session layer was written
+        # since that root opened. Then a load of the same unchanged file keeps
+        # the root and replaces only the session layer, because ovrtx keeps
+        # memory of each root that it opens.
+        self._native_root_unchanged_path: Optional[str] = None
         # Retryable native cleanup/restoration ownership.  The two legacy
         # lists remain derived audit views; the typed obligations below are
         # authoritative because a snapshot belongs to one exact root.
@@ -3092,10 +3603,10 @@ class OvRtxRendererAdapter(RendererAdapter):
         # Clock injection point — tests override to drive the debounce
         # timers deterministically without real wall-clock waits.
         self._clock: Callable[[], float] = time.perf_counter
-        # ``-inf`` so the very first size mismatch after construction
-        # applies immediately (no spurious "actively resizing" state).
-        self._last_big_delta_time: float = -math.inf
-        self._last_reinject_time: float = -math.inf
+        # The newest size that the viewport asked for, and when it asked for it
+        # first. ``None`` so the first size after construction applies at once.
+        self._resize_request: Optional[Tuple[int, int]] = None
+        self._resize_request_time: float = -math.inf
         self._selected_paths: List[str] = []
         self._selection_outline_previous_paths: set[str] = set()
         self._selection_outline_styles_configured: bool = False
@@ -3109,6 +3620,11 @@ class OvRtxRendererAdapter(RendererAdapter):
         # activation reset). Armed on construction, root reload, and session
         # reinjects that happen while no outline membership is applied.
         self._selection_outline_pass_needs_reset: bool = True
+        # True once the session layer's anchor mesh is in the hidden outline
+        # group. Then the outline pass stays on and no activation reset runs.
+        self._selection_outline_anchor_applied: bool = False
+        # Type and message of the last failed outline-group write, for reports.
+        self._selection_outline_write_error: str = ""
         # FIFO of in-flight ovrtx pick queries that we have already
         # enqueued and are waiting to drain on a subsequent frame. Each
         # entry is ``[seq, kind, name, cb_or_None, cancel_reason,
@@ -3131,6 +3647,34 @@ class OvRtxRendererAdapter(RendererAdapter):
         # Populated when we must export an anonymous root layer to disk
         # so ``open_usd`` can resolve it.
         self._owned_tmp_path: Optional[str] = None
+        # The folder of the copies of layers that ovrtx gets in place of
+        # their files (see ``_ovrtx_root_naming_changed_files``). It is made
+        # at the first copy and removed at shutdown; after each load, the
+        # copies that the loaded scene does not name are removed.
+        self._ovrtx_layer_copies_directory: Optional[str] = None
+        # The last copy of each layer, by the key of its file, and the number
+        # of changes of each layer file that the Sdf change notices reported
+        # since the first copy. A load uses a copy again while its layer did
+        # not change.
+        self._layer_copies: dict[str, _LayerCopy] = {}
+        self._layer_change_counts: dict[str, int] = {}
+        # The state of each layer file when its layer last read its content
+        # from it (a change notice of a clean layer, as after Reload).
+        self._layer_read_states: dict[str, tuple[int, int, int, int]] = {}
+        self._layer_change_listener: Any = None
+        # The last root layer copy: the root layer (a weak handle), its change
+        # count when the copy was written, what else the copy depends on (the
+        # layer copies that it names, and the session root strip), and its
+        # path. A later load uses the copy again while none of these changed.
+        # A copy that carries a render setting of the adapter is not recorded.
+        self._root_layer_copy: Optional[tuple[Any, int, tuple[Any, ...], str]] = None
+        # The root layer and the changed files of the last report that the
+        # layers cannot be copied, until a load does not need that fallback.
+        self._reported_layer_copy_fallback: Optional[tuple[str, tuple[str, ...]]] = None
+        # The failures of the last transform write. The same failures on each
+        # frame of a moving scene are reported once; a write without failures
+        # clears them, so a failure that comes back is reported again.
+        self._reported_transform_write_failure: Optional[tuple[tuple[str, str], ...]] = None
 
         # Whether the scene's root layer already carries its own lights
         # — drives whether we inject a fallback dome into ovrtx.
@@ -3201,6 +3745,11 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._frame_pacing_provider: Any = None
         self._frame_pacing_token: int = 0
         self._frame_pacing_needs_sync_step: bool = True
+        # Set by a render-setting restart: the first frame after the reset is
+        # slow (it takes seconds on a heavy scene), so the native worker renders
+        # it and no synchronous step runs on the UI thread first.
+        self._frame_pacing_first_frame_native: bool = False
+        self._frame_pacing_start_delay: int = 0
         self._frame_pacing_size: tuple[int, int] | None = None
         self._frame_pacing_projection: np.ndarray | None = None
         self._frame_pacing_camera_path: str = ""
@@ -3212,6 +3761,29 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._frame_pacing_pick_generated: bool = False
         self._frame_pacing_pick_association_unavailable: bool = False
         self._frame_pacing_render_paused: bool = False
+        # False while every pause since the last resume kept the picture.
+        self._frame_pacing_resume_renders: bool = True
+        # A stage edit that reloads the scene (for example a rename, and its
+        # Undo and Redo) makes ovrtx build the whole scene again in the next
+        # step. On a large scene that step takes many seconds, and every later
+        # ovrtx call waits for it. The UI thread does not wait: the step runs
+        # as an operation, the viewport keeps its last picture (a native
+        # frame pacing session stays paused and keeps presenting it), and the
+        # stage edits, selection outlines and viewport picks of that time go
+        # to ovrtx when the step is done.
+        self._rebuild_step_due: bool = False
+        # The ovrtx operation of that step, then its result to fetch.
+        self._rebuild_step: Any = None
+        self._rebuild_step_scope: Optional[contextlib.ExitStack] = None
+        # The time limit of the wait for that step at shutdown ran out.
+        self._rebuild_step_shutdown_expired: bool = False
+        self._deferred_stage_events: list[tuple[Any, Any]] = []
+        self._selection_highlight_deferred: bool = False
+        # Viewport picks and live-transform restores of that time, in order.
+        # The picks belong to the document that is loaded: another document
+        # and shutdown answer them as misses.
+        self._deferred_picks: list[tuple[str, tuple, Any, Optional[str]]] = []
+        self._deferred_transform_restores: list[str] = []
 
     def _native_render_is_paused(self) -> bool:
         """Report the pick lease state safely on compatibility instances.
@@ -3226,6 +3798,11 @@ class OvRtxRendererAdapter(RendererAdapter):
     def set_zero_copy_state(self, state: Optional[ZeroCopyState]) -> None:
         """Share zero-copy coordination state with the viewport bridge."""
         self._zero_copy_state = state
+        # An ovrtx 0.4 CUDA mapping makes the GPU upload slower than the CPU
+        # image path (about 100 versus 140 frames per second).
+        version = getattr(self, "_ovrtx_version", None)
+        if state is not None and isinstance(version, tuple) and version < (0, 5):
+            state.mark_fallback(f"ovrtx {'.'.join(map(str, version))} CUDA mapping is slower")
 
     def set_frame_pacing_provider(self, provider: Any) -> None:
         """Bind the viewport provider used by optional native frame pacing."""
@@ -3270,6 +3847,30 @@ class OvRtxRendererAdapter(RendererAdapter):
         if not all(callable(getattr(native_ui, name, None)) for name in names):
             return None
         return native_ui
+
+    def _native_frame_pacing_available(self) -> bool:
+        """Whether this process can run a native frame pacing session.
+
+        A session needs the renderer hooks of an optional package and the
+        standalone Vulkan presentation; both are in place before a scene
+        opens.
+        """
+        native_ui = self._frame_pacing_bindings()
+        if native_ui is None:
+            return False
+        try:
+            if float(native_ui._get_present_rate()) == 0.0:
+                return False
+            status = dict(native_ui._get_native_frame_pacing_status())
+        except Exception as error:
+            print(
+                "[OvRtxRendererAdapter] reading the native frame pacing status "
+                f"failed: {type(error).__name__}: {error}; the selection outline "
+                "anchor is written with the session layer, as without native pacing",
+                file=sys.stderr,
+            )
+            return False
+        return bool(status.get("supported")) and status.get("backend") == "vulkan"
 
     def _frame_pacing_eligible(self) -> bool:
         # The native worker steps one product; a group must keep stepping all.
@@ -3358,19 +3959,31 @@ class OvRtxRendererAdapter(RendererAdapter):
         *,
         capture_selected_camera: bool = False,
         pause_render: bool = False,
+        keep_picture: bool = False,
     ) -> None:
-        """Drain and join the borrower before any Python renderer operation."""
+        """Drain and join the borrower before any Python renderer operation.
 
+        With ``keep_picture`` (and ``pause_render``) the operation changes
+        nothing that the picture shows: no step is requested, and the paused
+        worker resumes without rendering.
+        """
+
+        if not keep_picture:
+            self._request_still_frame()
         token = int(getattr(self, "_frame_pacing_token", 0) or 0)
         self._frame_pacing_pick_snapshot = None
         self._frame_pacing_pick_generated = False
         self._frame_pacing_pick_association_unavailable = False
         if not token:
+            if keep_picture:
+                return
             # A pick callback can synchronously author selection while the
             # selected-camera image is being installed. Preserve that frame's
             # already-produced one-shot until the viewport consumes it; the
             # beginning of the next render clears it unconditionally.
-            self._frame_pacing_needs_sync_step = True
+            self._frame_pacing_needs_sync_step = not getattr(
+                self, "_frame_pacing_first_frame_native", False
+            )
             return
         self._frame_pacing_presented_snapshot = None
         native_ui = self._frame_pacing_bindings()
@@ -3428,8 +4041,15 @@ class OvRtxRendererAdapter(RendererAdapter):
                 # drain; the pick remains explicitly unavailable below.
                 self._frame_pacing_pick_snapshot = None
         if pause_render and bool(native_ui._native_frame_pacing_pause_render(token)):
+            # The resume renders unless every pause before it kept the picture.
+            self._frame_pacing_resume_renders = not keep_picture or (
+                self._native_render_is_paused()
+                and getattr(self, "_frame_pacing_resume_renders", True)
+            )
             self._frame_pacing_render_paused = True
-            self._frame_pacing_needs_sync_step = True
+            self._frame_pacing_needs_sync_step = not getattr(
+                self, "_frame_pacing_first_frame_native", False
+            )
             return
         # There is no ovrtx cancellation primitive. A failed native cleanup
         # attempt deliberately retains its maps/results and the borrowed token
@@ -3440,7 +4060,29 @@ class OvRtxRendererAdapter(RendererAdapter):
             time.sleep(0.001)
         self._frame_pacing_token = 0
         self._frame_pacing_render_paused = False
-        self._frame_pacing_needs_sync_step = True
+        self._frame_pacing_resume_renders = True
+        self._frame_pacing_needs_sync_step = not getattr(
+                self, "_frame_pacing_first_frame_native", False
+            )
+
+    def _resume_native_render(self, native_ui: Any) -> bool:
+        """Resume the paused render worker; without a render when the pauses kept the picture."""
+
+        renders = getattr(self, "_frame_pacing_resume_renders", True)
+        self._frame_pacing_resume_renders = True
+        token = self._frame_pacing_token
+        if not renders:
+            try:
+                return bool(native_ui._native_frame_pacing_resume_render(token, render=False))
+            except TypeError as error:
+                # An ovui without the option renders at each resume.
+                _report_once(
+                    "resume without a render",
+                    "the native resume of the render worker has no render option "
+                    f"({error}); the fallback is the resume that renders, so a change "
+                    "that keeps the picture (Eco Mode, a stored picture) renders one new frame",
+                )
+        return bool(native_ui._native_frame_pacing_resume_render(token))
 
     def _publish_native_frame(
         self,
@@ -3477,17 +4119,22 @@ class OvRtxRendererAdapter(RendererAdapter):
                 "resolution or camera intrinsics change", pause_render=True
             )
             return False
+        if self._uses_owned_render_product() and tuple(
+            getattr(self, "_last_resolution", None) or ()
+        ) != size:
+            # A new viewport size waits until it settles; the synchronous path
+            # applies it (_apply_resolution_if_allowed). The native worker does
+            # not run before that, or the render product would keep its old size.
+            if self._frame_pacing_token and not self._native_render_is_paused():
+                self._stop_native_frame_pacing("viewport size change", pause_render=True)
+            return False
         native_ui = self._frame_pacing_bindings()
         if native_ui is None:
             return False
         if self._frame_pacing_token and self._native_render_is_paused():
             if self._in_flight_pick_queries:
                 return False
-            if not bool(
-                native_ui._native_frame_pacing_resume_render(
-                    self._frame_pacing_token
-                )
-            ):
+            if not self._resume_native_render(native_ui):
                 self._stop_native_frame_pacing("failed render-worker resume")
                 return False
             self._frame_pacing_render_paused = False
@@ -3495,6 +4142,11 @@ class OvRtxRendererAdapter(RendererAdapter):
         if self._frame_pacing_needs_sync_step:
             return False
         if not self._frame_pacing_token:
+            if self._in_flight_pick_queries:
+                # A pick waits for the answer of a synchronous step; a new
+                # session would take every step, and the click would select
+                # nothing (a restart just before it).
+                return False
             borrow = self._borrow_native_renderer()
             if borrow is None:
                 return False
@@ -3504,6 +4156,7 @@ class OvRtxRendererAdapter(RendererAdapter):
             # leaves the existing overlap behavior untouched.
             restore_overlap = getattr(self, "_ldr_overlap", None) is not None
             self.set_ldr_overlap_enabled(False)
+            self._rendered_since_load = True
             (
                 address,
                 library_path,
@@ -3565,6 +4218,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         if not published:
             self._stop_native_frame_pacing("failed camera publication")
         else:
+            self._frame_pacing_first_frame_native = False
             self._frame_pacing_last_raw_world = raw_world.copy()
             self._frame_pacing_last_intent_time = publication_time
             self._frame_pacing_projection = projection.copy()
@@ -3572,8 +4226,13 @@ class OvRtxRendererAdapter(RendererAdapter):
 
     # ── Depth-one LdrColor overlap: ownership and presentation state ──
 
-    def _release_retained_output(self, *, keep_grouped_frames: bool = False) -> None:
+    def _release_retained_output(
+        self, *, keep_grouped_frames: bool = False, renderer_changes: bool = True
+    ) -> None:
         """Release the retained step result and presentation cache.
+
+        With ``renderer_changes`` (a renderer mutation follows) the next frame
+        steps again even when its camera is unchanged (see :meth:`_still_frame`).
 
         MUST run immediately before every ownership-invalidating native
         mutation (layer add/remove, root open/reload, renderer reset,
@@ -3589,7 +4248,17 @@ class OvRtxRendererAdapter(RendererAdapter):
 
         The static ownership audit verifies both the call-site coverage and
         the ordering of this call inside every boundary function.
+
+        A rebuild step that still runs (see :meth:`_rebuild_step_runs`) holds
+        a step result too: before a mutation the UI thread waits for it, and
+        the next step of the mutated renderer is an ordinary one. Shutdown
+        waits for it first, with a time limit
+        (:meth:`_finish_rebuild_step_before_shutdown`).
         """
+        if renderer_changes:
+            self._request_still_frame()
+            self._rebuild_step_due = False
+            self._finish_rebuild_step(wait_s=None)
         overlap = getattr(self, "_ldr_overlap", None)
         if overlap is not None:
             overlap.release(clear_presentation=True)
@@ -3717,7 +4386,8 @@ class OvRtxRendererAdapter(RendererAdapter):
             if getattr(self, "_ldr_overlap", None) is None:
                 self._ldr_overlap = LdrOverlapState()
             return True
-        self._release_retained_output()
+        # Only the presentation changes: a still camera needs no new step.
+        self._release_retained_output(renderer_changes=False)
         self._ldr_overlap = None
         return False
 
@@ -3921,8 +4591,32 @@ class OvRtxRendererAdapter(RendererAdapter):
         self,
         render_product_path: Optional[str] = None,
     ) -> RenderSettingsCatalog:
-        """Return public RenderProduct schema settings from the loaded USD stage."""
+        """Return public RenderProduct schema settings from the loaded USD stage.
 
+        Inside :meth:`render_setting_batch` an unchanged state is described
+        once: a Load writes dozens of settings and reads the catalog before
+        and after each write, and every read between two writes describes
+        the same state. Every apply, reset and stage change drops the kept
+        description.
+        """
+
+        kept = getattr(self, "_render_setting_batch_catalogs", None)
+        if kept is None:
+            return self._describe_render_settings(render_product_path)
+        key = (
+            str(render_product_path or ""),
+            str(self.get_active_render_product_path() or ""),
+        )
+        catalog = kept.get(key)
+        if catalog is None:
+            catalog = self._describe_render_settings(render_product_path)
+            kept[key] = catalog
+        return catalog
+
+    def _describe_render_settings(
+        self,
+        render_product_path: Optional[str] = None,
+    ) -> RenderSettingsCatalog:
         stage = getattr(self, "_stage", None)
         active_path = str(render_product_path or self.get_active_render_product_path() or "")
         if stage is None or not active_path:
@@ -4048,6 +4742,7 @@ class OvRtxRendererAdapter(RendererAdapter):
             # epoch signed up under, so a change that happened while nobody
             # listened can never surface as a false first event, and an
             # unrelated signal cannot manufacture one either.
+            self._render_settings_publish_job = None
             try:
                 self._render_settings_last_snapshot = (
                     self._render_settings_state_snapshot()
@@ -4124,7 +4819,9 @@ class OvRtxRendererAdapter(RendererAdapter):
             catalog_revision,
         )
 
-    def _publish_render_settings_change(self, catalog: Any = None) -> None:
+    def _publish_render_settings_change(
+        self, catalog: Any = None, *, keeps_picture: bool = False
+    ) -> None:
         """One authoritative event per LOGICAL settings change.
 
         Every producer (explicit apply/reset success and the USD stage-notice
@@ -4134,13 +4831,89 @@ class OvRtxRendererAdapter(RendererAdapter):
         BOTH producers notifies exactly once, unchanged repeated notices are
         suppressed, and a RenderProduct resync/removal (catalog change)
         notifies even though no attribute path was named.
+
+        ``keeps_picture``: this producer's change leaves the picture as it is
+        (:meth:`render_settings_change_keeps_picture`). The event keeps the
+        picture only when every producer since the last event says so.
         """
 
-        snapshot = self._render_settings_state_snapshot(catalog)
+        pending = getattr(self, "_render_settings_change_keeps_picture_pending", None)
+        self._render_settings_change_keeps_picture_pending = (
+            bool(keeps_picture) and pending is not False
+        )
+        if getattr(self, "_render_setting_batch_depth", 0) > 0:
+            # One event at the end of the batch, not one per setting.
+            self._render_setting_batch_publish = True
+            return
+        steps_fn = _RENDER_SETTINGS_CATALOG_REVISION_STEPS_FN
+        if steps_fn is not None and getattr(self, "_frame_service_active", False):
+            # Canonicalizing the whole catalog takes about 120 ms. A frame
+            # loop runs the steps a few milliseconds per frame, and the
+            # newest request replaces one that is still running: the gate
+            # compares the newest state with the last published one.
+            if catalog is None:
+                try:
+                    catalog = self.list_render_settings(None)
+                except Exception as error:
+                    print(
+                        "[OvRtxRendererAdapter] listing the render settings "
+                        f"for the change publication failed: "
+                        f"{type(error).__name__}: {error}; the change is "
+                        "published at once, in this frame",
+                        file=sys.stderr,
+                    )
+                    catalog = None
+            if catalog is not None:
+                self._render_settings_publish_job = (
+                    steps_fn(catalog),
+                    str(self.get_active_render_product_path() or ""),
+                )
+                return
+        self._complete_render_settings_publish(
+            self._render_settings_state_snapshot(catalog)
+        )
+
+    def _complete_render_settings_publish(self, snapshot: tuple | None) -> None:
+        keeps_picture = bool(
+            getattr(self, "_render_settings_change_keeps_picture_pending", None)
+        )
+        self._render_settings_change_keeps_picture_pending = None
         if snapshot == getattr(self, "_render_settings_last_snapshot", None):
             return
         self._render_settings_last_snapshot = snapshot
-        self._notify_render_settings_changed()
+        self._render_settings_change_keeps_picture = keeps_picture
+        try:
+            self._notify_render_settings_changed()
+        finally:
+            self._render_settings_change_keeps_picture = False
+
+    def render_settings_change_keeps_picture(self) -> bool:
+        """Whether the render-settings change being notified now needs no render request.
+
+        True only in a callback of :meth:`subscribe_render_settings_changes`,
+        for a change that the renderer has and that changes nothing the
+        picture shows (Eco Mode, see
+        :meth:`_render_setting_change_keeps_picture`), or a change that waits
+        for the next frame, which shows its stored picture or renders it (see
+        :meth:`_settled_picture_frame`). The viewport then requests no new
+        frames for it.
+        """
+
+        return bool(getattr(self, "_render_settings_change_keeps_picture", False))
+
+    def _service_render_settings_publish(self) -> None:
+        """Run a deferred settings publication for one frame's time budget."""
+        job = getattr(self, "_render_settings_publish_job", None)
+        if job is None:
+            return
+        steps, active_path = job
+        deadline = time.perf_counter() + _RENDER_SETTINGS_PUBLISH_BUDGET_S
+        try:
+            while time.perf_counter() < deadline:
+                next(steps)
+        except StopIteration as done:
+            self._render_settings_publish_job = None
+            self._complete_render_settings_publish((active_path, done.value))
 
     def read_render_setting(
         self,
@@ -4328,17 +5101,29 @@ class OvRtxRendererAdapter(RendererAdapter):
                 "Render setting is not available for apply.",
                 "unknown_setting",
             )
+        keeps_picture = False
         previous_edit_target = None
         target_layer = _render_setting_edit_target_layer(stage, descriptor)
         try:
             if target_layer is not None:
                 previous_edit_target = stage.GetEditTarget()
                 stage.SetEditTarget(target_layer)
+            owner_stage = self._render_setting_owner_stage_for(descriptor, create=True)
+            existing = _render_setting_attr_for_descriptor(owner_stage, descriptor)
+            had_spec = (
+                existing is not None
+                and _render_setting_edit_target_spec(existing) is not None
+            )
             attr = _render_setting_attr_for_descriptor(
-                self._render_setting_owner_stage_for(descriptor, create=True),
+                owner_stage,
                 descriptor,
                 create=True,
             )
+            if attr is not None and not had_spec:
+                # A reset removes the spec that this apply added to the edit layer.
+                vars(self).setdefault("_created_render_setting_attrs", set()).add(
+                    _render_setting_edit_target_key(attr)
+                )
             if attr is None:
                 return _render_setting_reject_apply(
                     descriptor.setting_id,
@@ -4362,7 +5147,7 @@ class OvRtxRendererAdapter(RendererAdapter):
                 previous_value = None
             try:
                 _render_setting_set_attr(attr, descriptor, validation.normalized_value)
-                self._write_render_setting_to_ovrtx(
+                keeps_picture = self._deliver_render_setting(
                     descriptor,
                     validation.normalized_value,
                 )
@@ -4380,6 +5165,7 @@ class OvRtxRendererAdapter(RendererAdapter):
                     "apply_failed",
                 )
         finally:
+            self._drop_kept_render_settings_catalogs()
             if previous_edit_target is not None:
                 try:
                     stage.SetEditTarget(previous_edit_target)
@@ -4400,7 +5186,8 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._publish_render_settings_change(
             written
             if written_product == str(self.get_active_render_product_path() or "")
-            else None
+            else None,
+            keeps_picture=keeps_picture,
         )
         return RenderSettingApplyResult.accepted_result(
             setting_id=descriptor.setting_id,
@@ -4485,19 +5272,26 @@ class OvRtxRendererAdapter(RendererAdapter):
                 previous_value = None
             try:
                 _render_setting_clear_attr(attr)
+                created = vars(self).get("_created_render_setting_attrs", set())
+                key = _render_setting_edit_target_key(attr)
+                if key in created:
+                    created.discard(key)
+                    attr.GetPrim().RemoveProperty(attr.GetName())
             except Exception as exc:
                 return _render_setting_reject_reset(
                     descriptor.setting_id,
                     f"Render setting reset failed: {exc}",
                     "reset_failed",
                 )
+            self._drop_kept_render_settings_catalogs()
             value_state = self.read_render_setting(
                 descriptor.setting_id,
                 render_product_path=descriptor.metadata.get("render_product_path"),
             )
+            keeps_picture = False
             try:
                 if value_state is not None:
-                    self._write_render_setting_to_ovrtx(
+                    keeps_picture = self._deliver_render_setting(
                         descriptor,
                         value_state.current_value,
                     )
@@ -4515,12 +5309,13 @@ class OvRtxRendererAdapter(RendererAdapter):
                     "reset_failed",
                 )
         finally:
+            self._drop_kept_render_settings_catalogs()
             if previous_edit_target is not None:
                 try:
                     stage.SetEditTarget(previous_edit_target)
                 except Exception:
                     pass
-        self._publish_render_settings_change()
+        self._publish_render_settings_change(keeps_picture=keeps_picture)
         return RenderSettingResetResult.accepted_result(
             setting_id=descriptor.setting_id,
             reset_value=None if value_state is None else value_state.current_value,
@@ -4615,6 +5410,7 @@ class OvRtxRendererAdapter(RendererAdapter):
             # Ownership: the retained step-result container must not survive a
             # new step's native output handles.
             self._release_retained_output()
+            self._rendered_since_load = True
             renderer.step(
                 render_products={self._render_product_path},
                 delta_time=_MIN_DT,
@@ -4672,6 +5468,8 @@ class OvRtxRendererAdapter(RendererAdapter):
             return f"native scene release failed: {type(exc).__name__}: {exc}"
         get_instrumentation().release_renderer(self)
         self._renderer = None
+        self._renderer_totals_handle = None
+        self._native_root_unchanged_path = None
         try:
             new_config = _config_with_selection_outline_enabled(
                 _renderer_config_with_overrides(
@@ -4679,6 +5477,7 @@ class OvRtxRendererAdapter(RendererAdapter):
                 )
             )
             self._renderer_config = new_config
+            apply_environment_carb_settings(_ovrtx, new_config)
             self._renderer = (
                 _ovrtx.Renderer(new_config) if new_config is not None else _ovrtx.Renderer()
             )
@@ -4767,9 +5566,12 @@ class OvRtxRendererAdapter(RendererAdapter):
             pass
         get_instrumentation().release_renderer(self)
         self._renderer = None
+        self._renderer_totals_handle = None
+        self._native_root_unchanged_path = None
         try:
             previous_config = capture.get("config")
             self._renderer_config = previous_config
+            apply_environment_carb_settings(_ovrtx, previous_config)
             self._renderer = (
                 _ovrtx.Renderer(previous_config)
                 if previous_config is not None
@@ -5068,6 +5870,10 @@ class OvRtxRendererAdapter(RendererAdapter):
             and self._is_grouped_product(next_path)
         )
         self._render_product_path = next_path
+        if not self._uses_owned_render_product():
+            # Each frame of a render product of the scene writes its camera,
+            # which is a prim of the scene.
+            self._note_native_scene_write()
         self._sync_active_selector_state()
         return True
 
@@ -5222,8 +6028,8 @@ class OvRtxRendererAdapter(RendererAdapter):
 
     def _reset_render_timing_state(self) -> None:
         self._dt_clock = time.perf_counter()
-        self._last_big_delta_time = -math.inf
-        self._last_reinject_time = -math.inf
+        self._resize_request = None
+        self._resize_request_time = -math.inf
         self._last_pushed_camera_intrinsics = None
 
     # ── Stage loading ──
@@ -5488,8 +6294,25 @@ class OvRtxRendererAdapter(RendererAdapter):
         session layer carries an equivalent structure so the rest of
         OvGear (Stage Browser, Property Inspector) sees OvGear's
         scaffolding prims too.
+
+        A reload of the loaded document (``use_live_root_snapshot`` with the
+        same stage) keeps a paused native frame pacing session paused, so its
+        presenter keeps the last picture; any other load stops the session.
         """
-        self._stop_native_frame_pacing("stage load")
+        # Settings that wait for the next frame belong to the stage loaded now.
+        self._apply_deferred_render_settings()
+        keep_paused = bool(
+            use_live_root_snapshot
+            and stage is not None
+            and stage is getattr(self, "_stage", None)
+            and self._native_render_is_paused()
+        )
+        self._stop_native_frame_pacing("stage load", pause_render=keep_paused)
+        if keep_paused and self._native_render_is_paused():
+            # The reload gives the session camera its default lens. The next
+            # frame writes the viewport's lens before the session renders
+            # again, as after a reset (see render_frame).
+            self._frame_pacing_first_frame_native = True
         from pxr import Usd  # lazy — module must import without pxr
 
         # A second document must never be published beside unresolved native
@@ -5510,31 +6333,69 @@ class OvRtxRendererAdapter(RendererAdapter):
         # prospective resource.
         root_usda: Optional[str] = None
         prospective_tmp_path: Optional[str] = None
+        # True when the root loads through a copy for a root file whose
+        # content differs from the read that ovrtx keeps.
+        root_copied = False
+        # The layers of the stage whose files changed after ovrtx read them,
+        # and the paths of the copies that ovrtx gets in place of the files
+        # (see ``_ovrtx_root_naming_changed_files``).
+        changed_layers: dict[str, tuple[Any, bool]] = {}
+        prospective_layer_copies: frozenset[str] = frozenset()
         # Globally owned (RenderSettings) opinions belong to the document that
         # is currently loaded. A load of a DIFFERENT document must not carry
         # them over, so they are neither exported here nor kept at commit.
         carries_owner = stage is getattr(self, "_stage", None) and stage is not None
+        if not carries_owner:
+            # Another document has its own render settings.
+            self._forget_renderer_setting_values()
+        # The failures of a document that another document replaces are dropped when the new one is loaded.
+        scene_mark = None if carries_owner else begin_scene_events()
         try:
             if isinstance(stage, str):
                 path = stage
                 prospective_stage = Usd.Stage.Open(path)
+                check_stage_resources(prospective_stage, (_SESSION_ROOT_PATH,))
                 root_layer = prospective_stage.GetRootLayer()
                 # ``Usd.Stage.Open`` can return a still-dirty cached layer
                 # (the same document was edited and reopened without
                 # saving). ovrtx must render what the stage composes, not
                 # the stale file on disk, so a dirty root layer always
-                # loads through a live snapshot of the in-memory layer.
+                # loads through a live snapshot of the in-memory layer. A
+                # root file whose content differs from the read that ovrtx
+                # keeps loads through a copy in the temp folder: ovrtx would
+                # give its old read of the file.
                 strip_scaffolding = self._root_layer_has_session_scaffolding(
                     root_layer
                 )
-                if strip_scaffolding or root_layer.dirty:
+                # ovrtx keeps its first read of each file. A file of the
+                # stage that changed after that read must not load by its
+                # path, or ovrtx draws the old content.
+                changed_layers = _layers_changed_since_ovrtx_read(prospective_stage)
+                if changed_layers:
+                    (
+                        path,
+                        prospective_tmp_path,
+                        prospective_layer_copies,
+                    ) = self._ovrtx_root_naming_changed_files(
+                        prospective_stage,
+                        changed_layers,
+                        strip_session_root=strip_scaffolding,
+                        include_render_settings_owner=False,
+                    )
+                elif strip_scaffolding or root_layer.dirty:
                     path = self._export_live_root_layer_snapshot(
                         root_layer,
                         strip_session_root=strip_scaffolding,
                     )
                     prospective_tmp_path = path
+                elif _ovrtx_root_read_is_stale(root_layer):
+                    path, prospective_tmp_path = self._root_copy_in_temp_folder(
+                        root_layer
+                    )
+                    root_copied = True
             elif hasattr(stage, "GetRootLayer"):
                 prospective_stage = stage
+                check_stage_resources(stage, (_SESSION_ROOT_PATH,))
                 root_layer = stage.GetRootLayer()
                 strip_session_root = self._root_layer_has_session_scaffolding(
                     root_layer
@@ -5546,7 +6407,15 @@ class OvRtxRendererAdapter(RendererAdapter):
                 has_session_sublayers = bool(
                     session_layer and session_layer.subLayerPaths
                 )
-                if prospective_muted_layers or has_session_sublayers:
+                composed_snapshot_needed = bool(
+                    prospective_muted_layers or has_session_sublayers
+                )
+                changed_layers = (
+                    {}
+                    if composed_snapshot_needed
+                    else _layers_changed_since_ovrtx_read(prospective_stage)
+                )
+                if composed_snapshot_needed:
                     # Muting is not authored into the root layer.  Loading the
                     # root file or a root-layer snapshot would therefore keep
                     # rendering the muted contribution.  Flatten the live
@@ -5559,6 +6428,23 @@ class OvRtxRendererAdapter(RendererAdapter):
                         include_render_settings_owner=carries_owner,
                     )
                     prospective_tmp_path = path
+                elif changed_layers:
+                    # ovrtx keeps its first read of each file. A file of the
+                    # stage that changed after that read (for example, a
+                    # referenced file that was opened, edited and saved, or a
+                    # sublayer that another program changed and Layers >
+                    # Reload read again) must not load by its path, or ovrtx
+                    # draws the old content.
+                    (
+                        path,
+                        prospective_tmp_path,
+                        prospective_layer_copies,
+                    ) = self._ovrtx_root_naming_changed_files(
+                        prospective_stage,
+                        changed_layers,
+                        strip_session_root=strip_session_root,
+                        include_render_settings_owner=carries_owner,
+                    )
                 elif root_layer.anonymous:
                     if getattr(self._renderer, "open_usd_from_string", None) is not None:
                         root_usda = self._export_root_layer_to_string(
@@ -5596,16 +6482,40 @@ class OvRtxRendererAdapter(RendererAdapter):
                     # opened, so an otherwise clean file-backed stage must
                     # also go through the snapshot — but ONLY while such an
                     # opinion is actually authored.
+                    #
+                    # ovrtx keeps the first read of each file for the life of
+                    # the process. When the content of this root file differs
+                    # from the read that ovrtx keeps (for example, the same
+                    # file opened again after Layers > Save All), ``realPath``
+                    # would show that old read, so the root layer loads
+                    # through a copy in the temp folder. A root file with the
+                    # content that ovrtx read is opened by its path.
+                    #
+                    # OpenUSD keeps a layer dirty after an edit that put back
+                    # the exact content that the layer had when it was clean
+                    # (Escape in a number field, or an edit that ends at its
+                    # start value). The application shows that layer as not
+                    # modified, and it opens by its path as a clean layer
+                    # does. A snapshot has a new path at each load, so the
+                    # renderer would read the root again at each open of the
+                    # same file and keep memory for each read.
+                    from ovui_data_adapters.openusd._layer_modified_state import (
+                        is_layer_modified,
+                    )
+
                     owner_root_needed = (
                         carries_owner and self._has_render_settings_owner_opinions()
                     )
                     live_root_needed = (
                         use_live_root_snapshot
-                        or root_layer.dirty
+                        or is_layer_modified(root_layer)
                         or owner_root_needed
                     )
+                    stale_root_read = not (
+                        live_root_needed or strip_session_root
+                    ) and _ovrtx_root_read_is_stale(root_layer)
                     if (
-                        live_root_needed
+                        (live_root_needed or stale_root_read)
                         and getattr(self._renderer, "open_usd_from_string", None) is not None
                         and getattr(self._renderer, "open_usd_from_file", None) is None
                         and getattr(self._renderer, "open_usd", None) is None
@@ -5623,6 +6533,11 @@ class OvRtxRendererAdapter(RendererAdapter):
                             include_render_settings_owner=carries_owner,
                         )
                         prospective_tmp_path = path
+                    elif stale_root_read:
+                        path, prospective_tmp_path = self._root_copy_in_temp_folder(
+                            root_layer
+                        )
+                        root_copied = True
                     else:
                         path = root_layer.realPath or root_layer.identifier
             else:
@@ -5697,6 +6612,19 @@ class OvRtxRendererAdapter(RendererAdapter):
                 render_product_setting_lines=product_setting_lines,
                 camera_setting_lines=camera_setting_lines,
             )
+            # Recorded before the native open below: when that open fails,
+            # the adapter cannot see which files ovrtx read. A record without
+            # a read can only cause an extra snapshot or layer copy later,
+            # never a stale picture. A root that loads through a copy already
+            # has a record, which stays.
+            _note_layer_files_read_by_ovrtx(
+                prospective_stage,
+                root_read_by_path=(
+                    root_usda is None
+                    and prospective_tmp_path is None
+                    and not prospective_layer_copies
+                ),
+            )
         except BaseException:
             if prospective_tmp_path is not None:
                 try:
@@ -5743,14 +6671,50 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._release_retained_output()
         new_root_handle = None
         new_session_handle = None
+        # The same unchanged file again (for example File > Recent Files with
+        # the file that is open): the renderer keeps its root and gets the new
+        # session layer only.
+        keep_native_root = self._can_keep_native_root(
+            path,
+            root_usda,
+            single_root_api=single_root_api,
+            old_root_handle=old_root_handle,
+            old_overlay_handles=old_overlay_handles,
+        )
         try:
-            new_root_handle = self._open_ovrtx_root(
-                path, root_layer_content=root_usda
-            )
+            if keep_native_root:
+                new_root_handle = old_root_handle
+                if old_session_handle is not None:
+                    self._renderer.remove_usd(old_session_handle)
+                    self._session_handle = None
+            else:
+                new_root_handle = self._open_ovrtx_root(
+                    path, root_layer_content=root_usda
+                )
             new_session_handle = self._add_ovrtx_session_layer(
                 prospective_session_usda
             )
+            if keep_native_root:
+                # An open of the root clears the rendering history and starts
+                # the clock of the renderer again. The kept root does the same,
+                # so its frames are the frames of a new open.
+                self._renderer.reset()
         except BaseException as primary:
+            if keep_native_root:
+                # The root was not touched. Put the previous session layer
+                # back, so the previous scene stays as it was.
+                if new_session_handle is not None:
+                    self._reclaim_prospective_native(
+                        None, new_session_handle, None, primary=primary
+                    )
+                if old_session_handle is not None and self._session_handle is None:
+                    self._restore_native_scene(
+                        primary,
+                        need_root=False,
+                        need_session=True,
+                        need_overlays=False,
+                    )
+                raise
             # Reclaim every partially installed prospective resource —
             # including on KeyboardInterrupt/SystemExit. A prospective
             # handle that cannot be removed becomes tracked cleanup debt
@@ -5810,21 +6774,77 @@ class OvRtxRendererAdapter(RendererAdapter):
             first_fault = fault
 
         if not carries_owner:
+            # A viewport pick kept while the renderer built the outgoing
+            # document again must never select in this one: it is a miss too.
+            try:
+                self._answer_kept_picks_as_misses()
+            except BaseException as fault:  # noqa: BLE001 - chained, raised at the end
+                first_fault = self._chain_faults(first_fault, fault)
             # A different document is now authoritative; its globally owned
             # settings start from the renderer's own defaults, and nothing
             # published for the previous document is restated for it.
             self._discard_render_settings_owner()
             self._published_render_settings = set()
+            self._created_render_setting_attrs = set()
         self._stage = prospective_stage
+        self._point_instancer_prototype_cache = None
+        # The renderer opened this stage afresh and has rendered nothing of it.
+        self._rendered_since_load = False
+        # The renderer compiles the scene with its first frames. After them, the files that the shaders name
+        # are checked, and the material check runs when OVUI_VERIFY_MATERIALS asks for it.
+        self._file_check_due = True
+        self._file_linker = None
+        self._scanned_shader_files = None
+        self._live_check_due = verify_mode() != "off"
+        self._strict_refusal = None
+        self._first_step_done = False
+        # What the renderer said about the materials of the previous scene does not hold for this one.
+        # A kept root is the same native scene, which the renderer does not compile again: its messages
+        # still hold.
+        if not keep_native_root:
+            get_material_messages().clear()
+            if scene_mark is not None:
+                retire_closed_scene_events(scene_mark)
+        # The renderer's totals are read after each step with this handle (taken here, not at each frame).
+        self._renderer_totals_handle = native_renderer_handle(self.instrumentation_target())
         self._loaded_muted_layer_identifiers = prospective_muted_layers
         self._usd_handle = new_root_handle
         self._session_handle = new_session_handle
         self._live_resync_handles = []
+        # The new root has the created prims; their references are retired with the old handles.
+        self._live_prim_reference_paths = []
+        self._live_prim_reference_contents = []
+        self._undrawn_created_prim_paths = []
+        self._created_change_memo = None
         # The new snapshot is now the owned snapshot; the OLD snapshot is
-        # released by reconciliation once its root handle is gone.
-        self._owned_tmp_path = prospective_tmp_path
+        # released by reconciliation once its root handle is gone. A copy
+        # that the previous load owned and that this load opens again stays
+        # owned (see ``_root_copy_in_temp_folder``).
+        if root_copied and prospective_tmp_path is None:
+            self._owned_tmp_path = old_snapshot
+        else:
+            self._owned_tmp_path = prospective_tmp_path
         # Rollback record: the exact payload the renderer now holds.
         self._root_open_payload = (path, root_usda)
+        self._opened_root_prim_paths = None
+        # While the root file keeps this state, it has what ovrtx read (see
+        # _opened_root_layer). None: not a file that can be read here.
+        try:
+            self._root_open_file_state = None if path is None else _file_state(str(path))
+        except OSError as error:
+            self._root_open_file_state = None
+            print(
+                f"[OvRtxRendererAdapter] cannot read the state of the root file {path} "
+                f"that ovrtx opened ({type(error).__name__}: {error}); a prim that "
+                "is created later reloads the scene",
+                file=sys.stderr,
+            )
+        # A root opened from a file is the renderer's read of that file until
+        # something outside the session layer is written to it. The frames of
+        # a render product of the scene write its camera.
+        self._native_root_unchanged_path = (
+            path if root_usda is None and self._uses_owned_render_product() else None
+        )
         self._session_layer_usda = prospective_session_usda
         self._scene_has_lights = prospective_has_lights
         # The pre-load gate proved that no earlier obligation remains.  New
@@ -5835,10 +6855,17 @@ class OvRtxRendererAdapter(RendererAdapter):
             reset_previous=True,
             reset_styles=True,
         )
+        # ovrtx 0.5 turns on the outline pass only if a prim is in an outline
+        # group when the scene first renders. A reset later stalls the UI.
+        # The marking above cleared the styles and re-armed the reset, so the
+        # anchor of the new session layer is written again here.
+        self._apply_selection_outline_anchor()
 
-        # ── Phase 5: RECONCILE OLD ── remove every old native handle for
-        # BOTH API shapes. The old snapshot file is deleted only once its
-        # root handle is gone (never delete a file a live handle still
+        # ── Phase 5: RECONCILE OLD ── for the HANDLE-BASED API, remove every
+        # old native handle. For the SINGLE-ROOT API, the destructive open
+        # already released them, so the old tokens are retired with no
+        # native call. The old snapshot file is deleted only once its root
+        # handle is gone (never delete a file a live handle still
         # references). An un-removable handle is recorded as cleanup debt +
         # unresolved state and chained — never a swallowed failure or a
         # success reported with residual old composition.
@@ -5853,6 +6880,15 @@ class OvRtxRendererAdapter(RendererAdapter):
                 primary=first_fault,
             ),
         )
+        # The layer copies that the old scene named are released as its
+        # snapshot is: only when no old native scene remains. The copies of
+        # this load stay, for a rollback of a later load.
+        if not self._native_scene_unresolved:
+            self._release_ovrtx_layer_copies_except(prospective_layer_copies)
+        if not (changed_layers and not prospective_layer_copies):
+            # This load did not use the composed-snapshot fallback for
+            # changed files, so a later use of it is reported again.
+            self._reported_layer_copy_fallback = None
 
         # ── Phase 6: COMMIT BOOKKEEPING ── may raise; chain so a late fault
         # never displaces the deferred pick / reconcile throwables.
@@ -5909,31 +6945,33 @@ class OvRtxRendererAdapter(RendererAdapter):
         surfaced truthfully via ``_native_scene_unresolved``.
 
         For the SINGLE-ROOT API (``open_usd*``) a destructive incoming open
-        may already have TORN DOWN some of the previous composition together
-        with the old root. Removal is still ATTEMPTED for every old handle
-        (so a still-live layer is genuinely released), but a removal failure
-        is treated as BENIGN — the destructive open already released that
-        handle — rather than as cleanup debt: re-removing an already-gone
-        native layer fails, and that failure must not abort the transition or
-        report residual composition. Returns the first REAL removal fault (if
-        any) for the caller to chain, so a genuine handle-based reconcile
-        failure never reports success with residual old composition.
+        resets the native stage. That open invalidates every handle of the
+        previous generation: the old root, session, and overlay tokens. Such
+        a token is RETIRED in bookkeeping only. It is never passed to native
+        ``remove_usd``. ovrtx does not document that such a call is safe.
+        A heap abort was reported near it; its cause is unconfirmed.
+        The old snapshot file is then free, because no handle
+        refers to it. Current-generation removal (session reinjection,
+        shutdown) does not come through this function and is unchanged.
+        Returns the first REAL removal fault (if any) for the caller to chain,
+        so a genuine handle-based reconcile failure never reports success
+        with residual old composition.
         """
         self._release_retained_output()
         fault: Optional[BaseException] = None
-        # Removal is ATTEMPTED for every old handle so a still-live layer is
-        # genuinely released. For the SINGLE-ROOT API a removal failure is
-        # BENIGN — the destructive open already released the handle — so it
-        # is neither debt nor a propagated fault. For the HANDLE-BASED API a
-        # failure is genuine cleanup debt. All native calls stay directly in
-        # this boundary body (after the release proof above).
-        for handle in list(old_overlays):
-            if handle is None or handle is _ROOT_STAGE_SENTINEL:
-                continue
-            try:
-                self._renderer.remove_usd(handle)
-            except BaseException as exc:  # noqa: BLE001
-                if not single_root_api:
+        if single_root_api:
+            # The destructive open already reset the native stage. Retire
+            # the old tokens here. No native call is made with them.
+            root_removed = True
+        else:
+            # HANDLE-BASED API: the old handles are still live. A removal
+            # failure is genuine cleanup debt.
+            for handle in list(old_overlays):
+                if handle is None or handle is _ROOT_STAGE_SENTINEL:
+                    continue
+                try:
+                    self._renderer.remove_usd(handle)
+                except BaseException as exc:  # noqa: BLE001
                     self._add_native_cleanup_obligation(
                         owner="old-overlay",
                         handle=handle,
@@ -5943,11 +6981,10 @@ class OvRtxRendererAdapter(RendererAdapter):
                         error=exc,
                     )
                     fault = self._chain_faults(fault, exc)
-        if old_session is not None and old_session is not _ROOT_STAGE_SENTINEL:
-            try:
-                self._renderer.remove_usd(old_session)
-            except BaseException as exc:  # noqa: BLE001
-                if not single_root_api:
+            if old_session is not None and old_session is not _ROOT_STAGE_SENTINEL:
+                try:
+                    self._renderer.remove_usd(old_session)
+                except BaseException as exc:  # noqa: BLE001
                     self._add_native_cleanup_obligation(
                         owner="old-session",
                         handle=old_session,
@@ -5957,14 +6994,11 @@ class OvRtxRendererAdapter(RendererAdapter):
                         error=exc,
                     )
                     fault = self._chain_faults(fault, exc)
-        root_removed = True
-        if old_root is not None and old_root is not _ROOT_STAGE_SENTINEL:
-            try:
-                self._renderer.remove_usd(old_root)
-            except BaseException as exc:  # noqa: BLE001
-                if not single_root_api:
-                    # Single-root: benign (already released), root_removed
-                    # stays True so the old snapshot is freed.
+            root_removed = True
+            if old_root is not None and old_root is not _ROOT_STAGE_SENTINEL:
+                try:
+                    self._renderer.remove_usd(old_root)
+                except BaseException as exc:  # noqa: BLE001
                     root_removed = False
                     self._add_native_cleanup_obligation(
                         owner="old-root",
@@ -6164,7 +7198,15 @@ class OvRtxRendererAdapter(RendererAdapter):
                 )
             if need_overlays:
                 self._live_resync_handles = []
-                if not self._sync_ovrtx_root_snapshot_overlay_from_stage():
+                created_prims = self._created_prim_paths()
+                if created_prims:
+                    # The restored root is the root that the references were
+                    # made for, and the stage still has the created prims.
+                    if not self._install_live_prim_references(created_prims):
+                        raise RuntimeError(
+                            "created-prim reference restoration failed"
+                        )
+                elif not self._sync_ovrtx_root_snapshot_overlay_from_stage():
                     add_layer = getattr(self._renderer, "add_usd_layer", None)
                     if callable(add_layer):
                         raise RuntimeError(
@@ -6309,6 +7351,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         self, *, allow_renderer_drop: bool = False
     ) -> None:
         """Remove every native owner or raise while preserving failed ones."""
+        self._note_native_scene_write()
         self._stop_native_frame_pacing("native scene teardown")
         self._ensure_native_cleanup_tracking()
         self._release_retained_output()
@@ -6438,12 +7481,51 @@ class OvRtxRendererAdapter(RendererAdapter):
         if first_fault is not None:
             raise first_fault
 
+    def _note_native_scene_write(self, prim_paths: Optional[Iterable[Any]] = None) -> None:
+        """Record that the renderer's scene can differ from its read of the root file.
+
+        A write to the session layer does not count, because each load
+        replaces that layer. ``None`` stands for any part of the scene.
+        """
+        if prim_paths is not None and all(
+            _stage_change_path_is_session(path) for path in prim_paths
+        ):
+            return
+        self._native_root_unchanged_path = None
+
+    def _can_keep_native_root(
+        self,
+        path: Optional[str],
+        root_usda: Optional[str],
+        *,
+        single_root_api: bool,
+        old_root_handle: Any,
+        old_overlay_handles: list,
+    ) -> bool:
+        """True when a load would open the root that the renderer shows now, unchanged.
+
+        ovrtx keeps the memory of each root that it opens, so each new open
+        of the same file adds memory. The root is kept only when the load
+        opens the same file path (or the same copy of it; a new snapshot or
+        copy has a new path), and nothing outside the session layer was
+        written to the renderer's scene since that root opened.
+        """
+        return bool(
+            single_root_api
+            and path is not None
+            and root_usda is None
+            and path == getattr(self, "_native_root_unchanged_path", None)
+            and old_root_handle is _ROOT_STAGE_SENTINEL
+            and not old_overlay_handles
+        )
+
     def _open_ovrtx_root(
         self,
         path: Optional[str],
         root_layer_content: Optional[str] = None,
     ) -> Any:
         """Load the root USD scene and return a loaded-state token."""
+        self._native_root_unchanged_path = None
         self._release_retained_output()
         open_usd_from_string = getattr(self._renderer, "open_usd_from_string", None)
         if root_layer_content is not None and open_usd_from_string is not None:
@@ -6492,6 +7574,209 @@ class OvRtxRendererAdapter(RendererAdapter):
         if author_owner:
             self._author_render_settings_owner_into_layer(layer)
         return layer.ExportToString()
+
+    def _ovrtx_layer_copies_folder(self) -> str:
+        """Return the folder of the layer copies for ovrtx; make it at the first copy."""
+        directory = getattr(self, "_ovrtx_layer_copies_directory", None)
+        if directory is None:
+            directory = tempfile.mkdtemp(prefix="ovui_widgets_layer_copies_")
+            self._ovrtx_layer_copies_directory = directory
+        return directory
+
+    def _ovrtx_copy_of_layer(
+        self,
+        layer: Any,
+        layer_copies: Mapping[str, str],
+        *,
+        strip_session_root: bool = False,
+        include_render_settings_owner: bool = False,
+    ) -> str:
+        """Write a copy of the root ``layer`` for ovrtx and return the path of the copy.
+
+        In the copy, each arc to a layer in ``layer_copies`` (by the key of
+        its file) names the copy of that layer, and the other relative asset
+        paths are anchored as ``layer`` resolves them, so the files in a .usdz
+        package still resolve. The sublayer timing stays as authored. The
+        copy is named by its content: a later load with the same content
+        names the same file, and ovrtx gives its first read of it without
+        reading the files again.
+        """
+        from pxr import Sdf
+
+        copy = Sdf.Layer.CreateAnonymous(".usda")
+        copy.TransferContent(layer)
+        _modify_asset_paths_keeping_sublayer_offsets(
+            copy,
+            lambda asset_path: self._layer_copy_asset_path(
+                layer, asset_path, layer_copies
+            ),
+        )
+        if strip_session_root:
+            self._strip_session_root_from_layer(copy)
+        if (
+            include_render_settings_owner
+            and self._has_render_settings_owner_opinions()
+        ):
+            self._author_render_settings_owner_into_layer(copy)
+        text = copy.ExportToString()
+        directory = self._ovrtx_layer_copies_folder()
+        path = os.path.join(
+            directory, hashlib.sha256(text.encode("utf-8")).hexdigest()[:32] + ".usda"
+        )
+        if not os.path.exists(path):
+            fd, partial_path = tempfile.mkstemp(suffix=".partial", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(text)
+                os.replace(partial_path, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(partial_path)
+                raise
+        return path
+
+    def _ovrtx_root_naming_changed_files(
+        self,
+        stage: Any,
+        changed_layers: Mapping[str, tuple[Any, bool]],
+        *,
+        strip_session_root: bool,
+        include_render_settings_owner: bool,
+    ) -> tuple[str, Optional[str], frozenset[str]]:
+        """Return ``(root_path, owned_snapshot_path, copy_paths)`` for a stage with changed files.
+
+        ovrtx would draw its first read of the files of ``changed_layers``
+        (see ``_layers_changed_since_ovrtx_read``). Each of these layers, and
+        each layer between the root layer and them, goes to ovrtx as a copy
+        of the layer that the stage has (see
+        ``_write_layer_copies_for_renderer``), and the root layer as a copy
+        that names these copies; ``copy_paths`` are the paths of all these
+        copies. When the layers cannot be copied (the root layer or a layer
+        between has no file, the layers name each other, or a copy cannot be
+        written), the composed stage goes as a snapshot that names no file of
+        the stage; that snapshot is owned by this adapter, and ``copy_paths``
+        is empty. This fallback is reported once, with the cause, and again
+        only after a load without it or for other layers.
+        """
+        root_layer = stage.GetRootLayer()
+        changed_keys = sorted(changed_layers)
+        self._report_changed_layer_files(
+            [
+                changed_layers[key][0].realPath
+                for key in changed_keys
+                if changed_layers[key][1]
+            ]
+        )
+        copies = None
+        cause = "the root layer has no file"
+        if not root_layer.anonymous:
+            try:
+                copies = self._write_layer_copies_for_renderer(stage, changed_keys)
+            except Exception as exc:
+                cause = f"{type(exc).__name__}: {exc}"
+        if copies is None:
+            fallback = (root_layer.identifier, tuple(changed_keys))
+            if fallback != getattr(self, "_reported_layer_copy_fallback", None):
+                self._reported_layer_copy_fallback = fallback
+                print(
+                    "[OvRtxRendererAdapter] the layers of the changed files "
+                    f"{[changed_layers[key][0].realPath for key in changed_keys]} cannot "
+                    f"be copied for the renderer ({cause}); the renderer loads a "
+                    "composed snapshot of the stage",
+                    file=sys.stderr,
+                )
+            snapshot = self._export_composed_stage_snapshot(
+                stage,
+                include_render_settings_owner=include_render_settings_owner,
+            )
+            return snapshot, snapshot, frozenset()
+        # The copy of the root layer is used again while the root layer has no
+        # change notice and the copy would name the same layer copies, so a
+        # large root layer is not converted to text again at each load. A
+        # render setting that the adapter authors into the copy is not in the
+        # root layer, so its change notices do not see it. A copy with such a
+        # setting is written again at each load and is not kept for a later
+        # load: after a reset of the setting, or for another document of the
+        # same file, that copy would give ovrtx the old setting.
+        carries_owner_settings = (
+            include_render_settings_owner
+            and self._has_render_settings_owner_opinions()
+        )
+        root_key = _layer_file_key(root_layer)
+        reuse_key = (root_key, tuple(sorted(copies.items())), strip_session_root)
+        # Read before the copy is written: a change during the write counts
+        # as a change after it, so the next load writes again.
+        change_count = self._layer_change_counts.get(root_key, 0)
+        earlier = getattr(self, "_root_layer_copy", None)
+        if (
+            not carries_owner_settings
+            and earlier is not None
+            and not earlier[0].expired
+            and earlier[0] == root_layer
+            and earlier[1] == change_count
+            and earlier[2] == reuse_key
+            and os.path.isfile(earlier[3])
+        ):
+            root_path = earlier[3]
+        else:
+            root_path = self._ovrtx_copy_of_layer(
+                root_layer,
+                copies,
+                strip_session_root=strip_session_root,
+                include_render_settings_owner=include_render_settings_owner,
+            )
+            self._root_layer_copy = (
+                None
+                if carries_owner_settings
+                else (root_layer, change_count, reuse_key, root_path)
+            )
+        return root_path, None, frozenset(copies.values()) | {root_path}
+
+    def _root_copy_in_temp_folder(self, root_layer: Any) -> tuple[str, Optional[str]]:
+        """Write a copy of a clean root layer for ovrtx, in the temp folder.
+
+        Used when the content of the root file differs from the read that
+        ovrtx keeps. The asset paths of the copy are anchored to the original
+        file, so relative paths and the files in a package resolve as from
+        the original file, and no file is written beside the user's file.
+        ovrtx keeps each file that it reads, so the name of the copy comes
+        from this process, this adapter and the content of the copy: when the
+        same content opens again, ovrtx gets the same path and uses its read
+        of it again.
+
+        Returns the path of the copy and the new file to own. The second
+        value is None when the copy is the snapshot that the current scene
+        already owns; that file stays owned.
+        """
+        from pxr import Sdf, UsdUtils
+
+        copy_layer = Sdf.Layer.CreateAnonymous("ovui_widgets_live_snapshot.usda")
+        copy_layer.TransferContent(root_layer)
+        UsdUtils.ModifyAssetPaths(
+            copy_layer,
+            lambda asset_path: self._anchor_asset_path(root_layer, asset_path),
+        )
+        content = copy_layer.ExportToString().encode("utf-8")
+        digest = hashlib.sha256(content).hexdigest()[:16]
+        path = os.path.join(
+            tempfile.gettempdir(),
+            f"ovui_widgets_live_{os.getpid()}_{id(self):x}_{digest}.usda",
+        )
+        if not os.path.isfile(path):
+            # Written whole under another name first, so a file with this
+            # name always has all of this content.
+            fd, partial_path = tempfile.mkstemp(
+                suffix=".partial", prefix="ovui_widgets_live_"
+            )
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(content)
+                os.replace(partial_path, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(partial_path)
+                raise
+        return path, (None if path == self._owned_tmp_path else path)
 
     def _export_live_root_layer_snapshot(
         self,
@@ -6577,6 +7862,295 @@ class OvRtxRendererAdapter(RendererAdapter):
         # it (replacing any previous owned snapshot) only after every
         # prospective load input has been prepared successfully.
         return tmp_path
+
+    def _layer_copy_asset_path(
+        self,
+        layer: Any,
+        asset_path: str,
+        layer_copies: Mapping[str, str],
+    ) -> str:
+        """Return the asset path to write in a copy of ``layer`` for ovrtx.
+
+        A path to a layer that has a copy for ovrtx (by the key of its file)
+        names the copy. Other paths are anchored to ``layer`` (see
+        ``_anchor_asset_path``).
+        """
+        if not asset_path:
+            return asset_path
+        if layer_copies:
+            from pxr import Sdf
+
+            target = Sdf.Layer.FindRelativeToLayer(layer, asset_path)
+            copy_path = layer_copies.get(_layer_file_key(target))
+            if copy_path is not None:
+                # An asset path: forward slashes on each platform.
+                return copy_path.replace(os.sep, "/")
+        return self._anchor_asset_path(layer, asset_path)
+
+    def _write_layer_copies_for_renderer(
+        self,
+        stage: Any,
+        changed_layer_keys: list[str],
+    ) -> dict[str, str]:
+        """Write a copy of each changed layer file, and of each layer that names one, for ovrtx.
+
+        ovrtx keeps its first read of a file, so the content that the stage
+        has now reaches it only under another path. A copy has the content of
+        the live layer, with its asset paths anchored to the original file and
+        the paths to other copied layers changed to their copies. The copies
+        are in the folder of the layer copies of this adapter. The name of a
+        copy comes from the content of the written file: when the same content
+        loads again, ovrtx gets the same path and keeps no other copy.
+
+        While a layer does not change (no Sdf change notice for it) and the
+        copies that its copy names stay the same, a later load uses its copy
+        again and writes nothing. So a large layer file is written once for
+        each change, not at each load.
+
+        Returns the path of each copy by the key of the original file. Raises
+        when a copy cannot be written, when the layers name each other, or
+        when a layer without a file names a copied layer (ovrtx reads files
+        only); the caller then loads a composed snapshot of the stage.
+        """
+        from pxr import Sdf, Tf
+
+        if not isinstance(getattr(self, "_layer_copies", None), dict):
+            self._layer_copies = {}
+            self._layer_change_counts = {}
+            self._layer_read_states = {}
+        if getattr(self, "_layer_change_listener", None) is None:
+            # Registered before the first copy is written, so that each later
+            # change of a copied layer is counted.
+            self._layer_change_listener = Tf.Notice.RegisterGlobally(
+                Sdf.Notice.LayersDidChange, self._on_layers_did_change
+            )
+        root_layer = stage.GetRootLayer()
+        layers = {}
+        layers_without_file = []
+        for layer in stage.GetUsedLayers():
+            if layer == root_layer:
+                continue
+            key = _layer_file_key(layer)
+            if key is None:
+                layers_without_file.append(layer)
+            else:
+                layers[key] = layer
+
+        def targets(layer: Any) -> list[str]:
+            keys = []
+            for asset_path in layer.GetCompositionAssetDependencies():
+                key = _layer_file_key(
+                    Sdf.Layer.FindRelativeToLayer(layer, asset_path)
+                )
+                if key is not None:
+                    keys.append(key)
+            return keys
+
+        # A layer that names a copied layer is copied too: ovrtx would read
+        # its first read of that layer, which names the original file.
+        copied = set(changed_layer_keys)
+        added = True
+        while added:
+            added = False
+            for key, layer in layers.items():
+                if key not in copied and copied.intersection(targets(layer)):
+                    copied.add(key)
+                    added = True
+        for layer in layers_without_file:
+            if copied.intersection(targets(layer)):
+                raise RuntimeError(
+                    f"the layer {layer.identifier}, which has no file, names a changed file"
+                )
+
+        copies: dict[str, str] = {}
+        visiting: set[str] = set()
+
+        def write_copy(key: str) -> None:
+            if key in copies:
+                return
+            layer = layers[key]
+            if key in visiting:
+                raise RuntimeError(f"{layer.realPath} names itself through other layers")
+            visiting.add(key)
+            layer_targets = targets(layer)
+            for target in layer_targets:
+                if target in copied and target in layers:
+                    write_copy(target)
+            named_copies = tuple(
+                sorted(
+                    (target, copies[target])
+                    for target in set(layer_targets)
+                    if target in copies
+                )
+            )
+            # Read before the copy is written: a change during the write
+            # counts as a change after it, so the next load writes again.
+            change_count = self._layer_change_counts.get(key, 0)
+            earlier = self._layer_copies.get(key)
+            if earlier is not None and (
+                earlier.named_copies != named_copies
+                or not os.path.isfile(earlier.path)
+            ):
+                earlier = None
+            if (
+                earlier is not None
+                and not earlier.layer.expired
+                and earlier.layer == layer
+                and earlier.change_count == change_count
+            ):
+                path = earlier.path
+            else:
+                # After a change notice (for example Reload of a file that
+                # another program only touched), the content can be the same
+                # as that of the earlier copy. A layer with the content of
+                # its file is compared through the digest of the file, so
+                # that the same content is not written again.
+                source_digest = self._layer_file_digest_if_read(key, layer)
+                if (
+                    earlier is not None
+                    and source_digest is not None
+                    and earlier.source_digest == source_digest
+                ):
+                    path = earlier.path
+                else:
+                    path = self._write_layer_copy(layer, copies)
+                self._layer_copies[key] = _LayerCopy(
+                    layer, change_count, named_copies, path, source_digest
+                )
+            copies[key] = path
+            visiting.discard(key)
+
+        for key in sorted(copied):
+            if key in layers:
+                write_copy(key)
+        return copies
+
+    def _write_layer_copy(self, layer: Any, copies: dict[str, str]) -> str:
+        """Write a copy of the live ``layer`` for ovrtx and return its path.
+
+        The copy is written whole under another name first, in the folder of
+        the layer copies, and gets its name from the SHA-256 digest of that
+        file. So a file with the name of a copy always has all of its content.
+        A text layer is copied as text; other layers (binary files, and
+        layers of other formats, such as a .usdz package) are copied in the
+        binary format, so no text conversion of a binary layer is necessary.
+        """
+        from pxr import Sdf
+
+        extension = ".usda" if layer.GetFileFormat().formatId == "usda" else ".usdc"
+        content = Sdf.Layer.CreateAnonymous(f"ovui_widgets_layer_copy{extension}")
+        content.TransferContent(layer)
+        _modify_asset_paths_keeping_sublayer_offsets(
+            content,
+            lambda asset_path: self._layer_copy_asset_path(layer, asset_path, copies),
+        )
+        directory = self._ovrtx_layer_copies_folder()
+        fd, partial_path = tempfile.mkstemp(
+            suffix=extension, prefix="partial_", dir=directory
+        )
+        os.close(fd)
+        try:
+            if not content.Export(partial_path):
+                raise RuntimeError(f"failed to export {partial_path}")
+            digest = hashlib.sha256()
+            with open(partial_path, "rb") as stream:
+                for block in iter(lambda: stream.read(1 << 20), b""):
+                    digest.update(block)
+            path = os.path.join(directory, digest.hexdigest()[:32] + extension)
+            if os.path.isfile(path):
+                # The same content was written before; ovrtx gets that file.
+                self._remove_partial_layer_copy(partial_path)
+            else:
+                os.replace(partial_path, path)
+        except BaseException:
+            self._remove_partial_layer_copy(partial_path)
+            raise
+        return path
+
+    @staticmethod
+    def _remove_partial_layer_copy(partial_path: str) -> None:
+        """Remove a partly written layer copy; report when it cannot be removed."""
+        try:
+            os.unlink(partial_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            LOGGER.warning(
+                "cannot remove the partial layer copy %s (%s: %s); it is removed at shutdown",
+                partial_path,
+                type(exc).__name__,
+                exc,
+            )
+
+    def _on_layers_did_change(self, notice: Any, _sender: Any) -> None:
+        """Count the changes of each layer file, so that a changed layer gets a new copy.
+
+        A layer that is clean after a change read its content from its file
+        (Layers > Reload); the state of the file is recorded for
+        ``_layer_file_digest_if_read``. An edit makes the layer dirty.
+        """
+        counts = self._layer_change_counts
+        read_states = self._layer_read_states
+        for layer in notice.GetLayers():
+            key = _layer_file_key(layer)
+            if key is None:
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            read_states.pop(key, None)
+            if not layer.dirty:
+                try:
+                    read_states[key] = _file_state(_file_of_layer(layer))
+                except OSError:
+                    continue
+
+    def _layer_file_digest_if_read(self, key: str, layer: Any) -> Optional[bytes]:
+        """Return the SHA-256 digest of the file of ``layer`` when the layer has the content of that file.
+
+        That is the case when the layer is clean and its file has the state
+        that it had when the layer last read it (see
+        ``_on_layers_did_change``). Else, and when the file cannot be read,
+        this returns None, and the layer gets a new copy. The file is read
+        in blocks, so a large file needs no large buffer.
+        """
+        read_state = self._layer_read_states.get(key)
+        if read_state is None or layer.dirty:
+            return None
+
+        def state() -> Optional[tuple[int, int, int, int]]:
+            try:
+                return _file_state(_file_of_layer(layer))
+            except OSError:
+                return None
+
+        if state() != read_state:
+            return None
+        digest = hashlib.sha256()
+        try:
+            with open(layer.realPath, "rb") as stream:
+                for block in iter(lambda: stream.read(1 << 20), b""):
+                    digest.update(block)
+        except OSError:
+            return None
+        # A file that another program wrote during the read gives no digest.
+        if state() != read_state:
+            return None
+        return digest.digest()
+
+    @staticmethod
+    def _report_changed_layer_files(real_paths: list[str]) -> None:
+        """Report, once for each file, the layer files that changed after ovrtx read them."""
+        new_reports = [
+            path for path in real_paths if path not in _REPORTED_CHANGED_LAYER_FILES
+        ]
+        if not new_reports:
+            return
+        _REPORTED_CHANGED_LAYER_FILES.update(new_reports)
+        LOGGER.warning(
+            "these layer files changed after the renderer read them: %s; the renderer "
+            "would draw its earlier read of a file again, so it loads copies of their "
+            "layers from the temp folder",
+            ", ".join(new_reports),
+        )
 
     @staticmethod
     def _muted_layer_identifiers(stage: Any) -> tuple[str, ...]:
@@ -6700,13 +8274,66 @@ class OvRtxRendererAdapter(RendererAdapter):
         add_reference = getattr(self._renderer, "add_usd_reference_from_string", None)
         if add_reference is not None:
             try:
-                return add_reference(usda, _SESSION_ROOT_PATH)
+                handle = add_reference(usda, _SESSION_ROOT_PATH)
             except Exception:
                 add_layer = getattr(self._renderer, "add_usd_layer", None)
                 if add_layer is None:
                     raise
-                return add_layer(usda, path_prefix=_SESSION_ROOT_PATH)
-        return self._renderer.add_usd_layer(usda, path_prefix=_SESSION_ROOT_PATH)
+                handle = add_layer(usda, path_prefix=_SESSION_ROOT_PATH)
+        else:
+            handle = self._renderer.add_usd_layer(usda, path_prefix=_SESSION_ROOT_PATH)
+        # A new session layer carries no outline-group membership, so the
+        # anchor is written again here: at scene open, after a viewport
+        # resize, and when a failed load rolls the old scene back.
+        self._apply_selection_outline_anchor()
+        return handle
+
+    def _apply_selection_outline_anchor(self) -> None:
+        """Put the session layer's anchor mesh in the hidden outline group.
+
+        ovrtx 0.5 draws outline members on an image it no longer refines
+        only while a prim that is not hidden is in an outline group. The
+        anchor is that prim. It belongs to the session layer, so hiding,
+        selecting or deselecting a scene prim cannot take it out of the
+        group, and the first selection after a scene open needs no reset.
+
+        A failed write leaves the activation reset armed, which is the
+        behavior without the anchor.
+
+        With native frame pacing, the anchor is written at the first
+        selection, or at a renderer restart for render settings, whichever
+        comes first. With the anchor in a group at the first render, ovrtx
+        builds the outline pass into that render and the scene appears seconds
+        later. Written right after the first frames, it needs a renderer reset
+        and a restart of the rendering session, and the UI frames of the first
+        second slow down.
+
+        Without native frame pacing (no renderer hooks, or no Vulkan
+        presentation) the anchor is written with the scene's session layer.
+        Otherwise the first click resets the renderer on the UI thread: the UI
+        stops and the outline shows late.
+        """
+        if not getattr(self, "_selection_outline_armed", False):
+            if self._native_frame_pacing_available():
+                return
+            self._selection_outline_armed = True
+        self._configure_selection_outline_styles()
+        self._selection_outline_write_error = ""
+        self._selection_outline_anchor_applied = self._write_selection_outline_group(
+            [_SELECTION_OUTLINE_ANCHOR_PATH], _SELECTION_OUTLINE_HIDDEN_GROUP_ID
+        )
+        if self._selection_outline_anchor_applied:
+            self._selection_outline_pass_needs_reset = False
+            return
+        # The next session layer (resize, scene open) tries again.
+        print(
+            "[OvRtxRendererAdapter] selection outline anchor write failed "
+            f"({_SELECTION_OUTLINE_ANCHOR_PATH}): "
+            f"{self._selection_outline_write_error or 'the renderer did not accept the write'}; "
+            "the first selection resets the renderer, and the next session "
+            "layer tries again",
+            file=sys.stderr,
+        )
 
     def _sync_ovrtx_root_snapshot_overlay_from_stage(self) -> bool:
         """Mirror a simple live prim resync without reopening the root.
@@ -6740,6 +8367,469 @@ class OvRtxRendererAdapter(RendererAdapter):
             # `_remove_live_resync_layers` retains every removal failure in
             # this list; never erase those exact retry owners here.
             return False
+
+    def _sync_live_prim_references(
+        self,
+        event: Any,
+        changed_paths: tuple[Any, ...],
+        resynced_paths: tuple[Any, ...],
+    ) -> bool:
+        """Mirror created prims, their edits and their removal without a reopen.
+
+        Each open of a root makes ovrtx keep more process memory, also when
+        it opens the same file or text again. A Create-menu prim reopened the
+        root twice and its Undo once more, so each create and undo kept more
+        memory. ovrtx adds and removes a reference with no such
+        growth. So a prim that the opened root does not have, and that only
+        the root layer defines, is shown as one reference to a copy of its
+        specs, or not given to ovrtx at all when it draws nothing (see
+        :meth:`_prim_draws_nothing`). A later edit of that prim replaces its
+        reference, and its removal removes the reference.
+
+        Returns False with no change to ovrtx when the change touches anything
+        else; the caller then takes the path that it took before.
+        """
+        paths, layout = self._created_change(event, changed_paths, resynced_paths)
+        if paths is None:
+            return False
+        return self._install_live_prim_references(paths, layout)
+
+    def stage_change_keeps_picture(self, event: Any) -> bool:
+        """Whether a stage change event leaves the picture as it is.
+
+        True for the notice of a render setting that the picture does not show
+        or that waits for the next frame (see
+        :meth:`_render_setting_notice_keeps_picture`), and when ``event``
+        changes only created prims that draw nothing, before and after it.
+
+        Such a created-prim change leaves the references that ovrtx shows as
+        they are, so the picture cannot change. ovrtx keeps memory on every
+        step, and a viewport renders its settle frames after each change, so a
+        Create > Xform and its Undo would otherwise add memory each time.
+        Changes of the session layer are never counted here: the render
+        settings of the session follow them.
+        """
+        return (
+            self._render_setting_notice_keeps_picture(event)
+            or self._undrawn_change_layout(event) is not None
+        )
+
+    def _undrawn_change_layout(self, event: Any) -> Optional[tuple[list[Any], list[Any]]]:
+        """``(drawn, undrawn)`` created prims after ``event`` when it leaves ovrtx as it is, else None."""
+        changed_paths = tuple(getattr(event, "changed_paths", ()) or ())
+        resynced_paths = tuple(getattr(event, "resynced_paths", ()) or ())
+        if not (changed_paths or resynced_paths) or any(
+            _stage_change_path_is_session(str(path or ""))
+            for path in (*changed_paths, *resynced_paths)
+        ):
+            return None
+        paths, layout = self._created_change(event, changed_paths, resynced_paths)
+        if paths is None or layout is None:
+            return None
+        drawn, _undrawn = layout
+        shown = list(
+            zip(
+                (str(path) for path in getattr(self, "_live_prim_reference_paths", None) or []),
+                getattr(self, "_live_prim_reference_contents", None) or [],
+            )
+        )
+        if [(str(path), usda) for path, usda in drawn] != shown:
+            return None
+        # A value edit of a prim that ovrtx shows (for example a committed
+        # Translate) goes to ovrtx as a live write, not in the text of its
+        # reference. So the text can be equal again (after an Undo) while
+        # ovrtx still has the edited value: a change that names such a prim
+        # can change the picture.
+        from pxr import Sdf
+
+        shown_roots = [Sdf.Path(path) for path, _usda in shown]
+        for raw_path in (*changed_paths, *resynced_paths):
+            if not str(raw_path or ""):
+                continue
+            prim_path = Sdf.Path(str(raw_path)).GetPrimPath()
+            if any(
+                prim_path.HasPrefix(root) or root.HasPrefix(prim_path)
+                for root in shown_roots
+            ):
+                return None
+        return layout
+
+    def _created_change(
+        self,
+        event: Any,
+        changed_paths: tuple[Any, ...],
+        resynced_paths: tuple[Any, ...],
+    ) -> tuple[Optional[list[Any]], Optional[tuple[list[Any], list[Any]]]]:
+        """``(paths, layout)`` for ``event``: :meth:`_created_prims_after_change` and :meth:`_created_prim_layout`.
+
+        A viewport asks :meth:`stage_change_keeps_picture` and then gives the
+        same event to :meth:`notify_stage_changed`. The result for the last
+        event is kept until the created prims change, so that the opened root
+        is read once for both.
+
+        This is the one place that reports a failure of this step. The result
+        of a failure is ``(None, None)``: the change then takes the path of a
+        change of the opened scene, which reloads the scene for a structural
+        change, and the viewport renders.
+        """
+        memo = getattr(self, "_created_change_memo", None)
+        if memo is not None and memo[0] is event and memo[1] is self._stage:
+            return memo[2]
+        try:
+            paths = self._created_prims_after_change(event, changed_paths, resynced_paths)
+            result = (paths, None if paths is None else self._created_prim_layout(paths))
+        except Exception as error:
+            print(
+                "[OvRtxRendererAdapter] cannot prepare the created prims of a stage "
+                f"change for ovrtx ({type(error).__name__}: {error}); the change "
+                "takes the path of a change of the opened scene, which reloads "
+                "the scene for a structural change",
+                file=sys.stderr,
+            )
+            result = (None, None)
+        self._created_change_memo = (event, self._stage, result)
+        return result
+
+    def _created_prim_paths(self) -> list[Any]:
+        """The created prims that this adapter shows without a reopen: with a reference or not given to ovrtx."""
+        return list(getattr(self, "_live_prim_reference_paths", None) or []) + list(
+            getattr(self, "_undrawn_created_prim_paths", None) or []
+        )
+
+    def _created_prims_after_change(
+        self,
+        event: Any,
+        changed_paths: tuple[Any, ...],
+        resynced_paths: tuple[Any, ...],
+    ) -> Optional[list[Any]]:
+        """The created prims after a change that touches only created prims, or None.
+
+        A created prim is one that the opened root does not have. None when the
+        change touches a prim of the opened root, the layer metadata, when
+        a prim of the opened root is gone from the root layer (a rename or a
+        move), when what ovrtx opened is not known, or when the renderer
+        cannot show created prims with references.
+        """
+        if self._stage is None or self._renderer is None:
+            return None
+        if getattr(self._renderer, "add_usd_layer", None) is not None:
+            # This renderer shows created prims with its root-layer overlay.
+            return None
+        if (
+            getattr(self._renderer, "add_usd_reference_from_string", None) is None
+            or getattr(self._renderer, "remove_usd", None) is None
+        ):
+            return None
+        if getattr(event, "event_type", None) is ChangeEventType.LAYER_INFO:
+            # Layer metadata (for example the default prim) is in the opened root only.
+            return None
+        try:
+            from pxr import Sdf
+        except ImportError:
+            return None
+
+        created = [Sdf.Path(str(path)) for path in self._created_prim_paths()]
+
+        def is_created(path: Any) -> bool:
+            return any(path.HasPrefix(root) for root in created)
+
+        new_paths: list[Any] = []
+        property_owners: list[Any] = []
+        for raw_path in resynced_paths:
+            path_str = str(raw_path or "")
+            if not path_str or _stage_change_path_is_session(path_str):
+                continue
+            path = Sdf.Path(path_str)
+            if not path.IsAbsolutePath():
+                return None
+            if not path.IsPrimPath():
+                property_owners.append(path.GetPrimPath())
+                continue
+            if is_created(path):
+                continue
+            if not self._stage.GetPrimAtPath(path):
+                # A prim of the opened root was removed.
+                return None
+            new_paths.append(path)
+        new_roots = [
+            path
+            for path in new_paths
+            if not any(path != other and path.HasPrefix(other) for other in new_paths)
+        ]
+        for raw_path in changed_paths:
+            path_str = str(raw_path or "")
+            if not path_str or _stage_change_path_is_session(path_str):
+                continue
+            path = Sdf.Path(path_str)
+            if not path.IsAbsolutePath():
+                return None
+            property_owners.append(path.GetPrimPath())
+        for prim_path in property_owners:
+            if not is_created(prim_path) and not any(
+                prim_path.HasPrefix(root) for root in new_roots
+            ):
+                return None
+        if not new_roots and not any(
+            is_created(Sdf.Path(str(path)).GetPrimPath())
+            for path in (*resynced_paths, *changed_paths)
+            if path and not _stage_change_path_is_session(str(path))
+        ):
+            return None
+        if new_roots:
+            opened = self._opened_root_layer()
+            if opened is None or any(opened.GetPrimAtPath(path) for path in new_roots):
+                # ovrtx has such a prim, or what ovrtx opened is not known.
+                return None
+            if self._root_layer_lost_an_opened_prim(opened):
+                # A rename or a move of a prim of the opened root sends a
+                # stage change that names only the new path. ovrtx still has
+                # the prim at the old path, so the change is not a created prim.
+                return None
+            # A reference at a path makes ovrtx add each parent prim that it
+            # does not have, with no type and no values, and ovrtx refuses a
+            # later reference where it has a prim. So a created prim goes to
+            # ovrtx with each parent that the opened root does not have: the
+            # reference is at the highest such parent. For example, the first
+            # Create > Mesh > Torus on a new stage makes /World and
+            # /World/Torus, and the first stage change names only /World/Torus.
+            raised: list[Any] = []
+            for path in new_roots:
+                while (
+                    path.GetParentPath() != Sdf.Path.absoluteRootPath
+                    and not opened.GetPrimAtPath(path.GetParentPath())
+                ):
+                    path = path.GetParentPath()
+                if path not in raised:
+                    raised.append(path)
+            new_roots = [
+                path
+                for path in raised
+                if not any(path != other and path.HasPrefix(other) for other in raised)
+            ]
+            if any(path.HasPrefix(root) for path in created for root in new_roots):
+                # A reference of an earlier created prim is below a new one.
+                return None
+        kept = [path for path in created if self._stage.GetPrimAtPath(path)]
+        return kept + new_roots
+
+    def _root_layer_lost_an_opened_prim(self, opened: Any) -> bool:
+        """Whether the root layer no longer has a prim spec that the opened root ``opened`` has.
+
+        A rename or a move in the Stage Browser removes the specs at the old
+        path, and its stage change names only the new path. The session root
+        and the render settings owner prims that this adapter authors into
+        the opened root are not counted. The prim paths of the opened root
+        are kept until the next open of a root, so that each created prim
+        does not walk the opened root again.
+        """
+        from pxr import Sdf
+
+        payload = getattr(self, "_root_open_payload", None)
+        kept = getattr(self, "_opened_root_prim_paths", None)
+        if kept is None or kept[0] is not payload:
+            skipped = {_RENDER_SETTINGS_OWNER_ROOT_PATH, _RENDER_SETTINGS_OWNER_PATH}
+            paths: list[Any] = []
+
+            def visit(path: Any) -> None:
+                if path.IsPrimPath():
+                    text = str(path)
+                    if text not in skipped and not _stage_change_path_is_session(text):
+                        paths.append(path)
+
+            opened.Traverse(Sdf.Path.absoluteRootPath, visit)
+            kept = self._opened_root_prim_paths = (payload, paths)
+        root_layer = self._stage.GetRootLayer()
+        return any(not root_layer.GetPrimAtPath(path) for path in kept[1])
+
+    def _opened_root_layer(self) -> Any:
+        """The root that ovrtx opened, read again; None when what ovrtx opened is not known.
+
+        ovrtx got the root as text, or opened a file by its path. ovrtx keeps
+        its first read of each file, so the file tells what ovrtx opened only
+        while it has the state that it had when ovrtx opened it. After a save
+        or another change of the file, what ovrtx opened is not known. A read
+        that fails raises.
+        """
+        payload = getattr(self, "_root_open_payload", None)
+        if not payload:
+            return None
+        file_path, root_usda = payload
+        from pxr import Sdf
+
+        if root_usda is not None:
+            opened = Sdf.Layer.CreateAnonymous(".usda")
+            if not opened.ImportFromString(root_usda):
+                raise RuntimeError("the text of the root that ovrtx opened does not parse")
+            return opened
+        opened_state = getattr(self, "_root_open_file_state", None)
+        if opened_state is None or _file_state(str(file_path)) != opened_state:
+            return None
+        opened = Sdf.Layer.OpenAsAnonymous(str(file_path))
+        if opened is None:
+            raise RuntimeError(f"cannot read the root file {file_path!r} that ovrtx opened")
+        return opened
+
+    def _created_prim_reference_usda(self, path: Any) -> Optional[str]:
+        """The layer text that shows the created prim at ``path`` as a reference.
+
+        None when the root layer alone does not give the complete prim: a
+        spec of another layer, a composition arc, or a relationship or
+        connection to a prim outside it.
+        """
+        from pxr import Sdf, Usd, UsdUtils
+
+        prim = self._stage.GetPrimAtPath(path)
+        root_layer = self._stage.GetRootLayer()
+        root_spec = root_layer.GetPrimAtPath(path)
+        if not prim or root_spec is None or root_spec.specifier != Sdf.SpecifierDef:
+            return None
+        for item in Usd.PrimRange.AllPrims(prim):
+            if any(
+                spec.layer.identifier != root_layer.identifier
+                for spec in item.GetPrimStack()
+            ):
+                return None
+            if (
+                item.HasAuthoredReferences()
+                or item.HasAuthoredPayloads()
+                or item.HasAuthoredInherits()
+                or item.HasAuthoredSpecializes()
+                or item.GetVariantSets().GetNames()
+            ):
+                return None
+            for prop in item.GetAuthoredProperties():
+                if isinstance(prop, Usd.Relationship):
+                    links = prop.GetTargets()
+                else:
+                    links = prop.GetConnections()
+                if any(not link.HasPrefix(path) for link in links):
+                    return None
+        layer = Sdf.Layer.CreateAnonymous(".usda")
+        if not Sdf.CopySpec(
+            root_layer, path, layer, Sdf.Path.absoluteRootPath.AppendChild(path.name)
+        ):
+            return None
+        layer.defaultPrim = path.name
+        # Time samples map to stage time as in the root layer.
+        if root_layer.HasTimeCodesPerSecond():
+            layer.timeCodesPerSecond = root_layer.timeCodesPerSecond
+        if root_layer.HasFramesPerSecond():
+            layer.framesPerSecond = root_layer.framesPerSecond
+        # Asset paths resolve as they do from the root layer.
+        UsdUtils.ModifyAssetPaths(
+            layer, lambda asset_path: self._anchor_asset_path(root_layer, asset_path)
+        )
+        return layer.ExportToString()
+
+    def _prim_draws_nothing(self, path: Any) -> bool:
+        """Whether every prim of the subtree at ``path`` has a type that the renderer draws nothing for.
+
+        An Xform, a Scope or an untyped prim, alone or with only such
+        children, has no geometry, light, camera or material: ovrtx would show
+        nothing for it, and outlines and picks find nothing in it. A prim with
+        an applied API schema (for example a light schema) can draw, so it
+        counts as drawn.
+        """
+        from pxr import Usd
+
+        prim = self._stage.GetPrimAtPath(path)
+        return bool(prim) and all(
+            str(item.GetTypeName()) in _UNDRAWN_PRIM_TYPES and not item.GetAppliedSchemas()
+            for item in Usd.PrimRange.AllPrims(prim)
+        )
+
+    def _created_prim_layout(self, paths: list[Any]) -> Optional[tuple[list[Any], list[Any]]]:
+        """``(drawn, undrawn)`` for the created prims ``paths``, or None when one cannot be shown with a reference.
+
+        ``drawn`` holds ``(path, reference text)`` pairs; ``undrawn`` the paths of
+        the prims that draw nothing (:meth:`_prim_draws_nothing`). A prim that draws
+        nothing must still be one that a reference could show, so that it can go
+        to ovrtx when it gets something to draw.
+        """
+        drawn: list[Any] = []
+        undrawn: list[Any] = []
+        for path in paths:
+            usda = self._created_prim_reference_usda(path)
+            if usda is None:
+                return None
+            if self._prim_draws_nothing(path):
+                undrawn.append(path)
+            else:
+                drawn.append((path, usda))
+        return drawn, undrawn
+
+    def _install_live_prim_references(
+        self,
+        paths: list[Any],
+        layout: Optional[tuple[list[Any], list[Any]]] = None,
+    ) -> bool:
+        """Show each created prim of ``paths`` in ovrtx through one reference.
+
+        A prim that draws nothing is not given to ovrtx. ``layout`` is the
+        :meth:`_created_prim_layout` of ``paths`` when the caller has it. The
+        references of earlier created prims are removed first. False when a
+        prim cannot be shown so; the caller then reopens the root, which
+        retires the references that this call kept.
+        """
+        self._created_change_memo = None
+        try:
+            if layout is None:
+                layout = self._created_prim_layout(paths)
+        except Exception as error:
+            print(
+                "[OvRtxRendererAdapter] cannot copy a created prim for ovrtx "
+                f"({type(error).__name__}: {error}); the scene reloads",
+                file=sys.stderr,
+            )
+            return False
+        if layout is None:
+            return False
+        contents, undrawn = layout
+        self._undrawn_created_prim_paths = list(undrawn)
+        self._release_retained_output()
+        try:
+            self._remove_live_resync_layers()
+        except Exception as error:
+            print(
+                "[OvRtxRendererAdapter] cannot remove the reference of a created "
+                f"prim from ovrtx ({type(error).__name__}: {error}); the scene "
+                "reloads",
+                file=sys.stderr,
+            )
+            return False
+        self._live_prim_reference_paths = []
+        self._live_prim_reference_contents = []
+        for path, usda in contents:
+            try:
+                handle = self._renderer.add_usd_reference_from_string(usda, str(path))
+            except Exception as error:
+                print(
+                    f"[OvRtxRendererAdapter] cannot add the created prim {path} "
+                    f"to ovrtx ({type(error).__name__}: {error}); the scene "
+                    "reloads",
+                    file=sys.stderr,
+                )
+                return False
+            self._live_resync_handles.append(handle)
+            self._live_prim_reference_paths.append(path)
+            self._live_prim_reference_contents.append(usda)
+        try:
+            had_lights = bool(getattr(self, "_scene_has_lights", False))
+            self._scene_has_lights = _stage_has_any_light(self._stage)
+            if self._scene_has_lights != had_lights:
+                # The fallback dome light of the session layer follows the scene lights.
+                self._reinject_session_layer()
+            self._latest_point_cloud_frames.clear()
+            self._reset_render_timing_state()
+            self._reapply_selection_outline_after_live_resync()
+        except Exception as error:
+            print(
+                "[OvRtxRendererAdapter] cannot update ovrtx after a created prim "
+                f"changed ({type(error).__name__}: {error}); the scene reloads",
+                file=sys.stderr,
+            )
+            return False
+        return True
 
     @staticmethod
     def _usd_value_to_write_payload(value: Any) -> Any:
@@ -7017,11 +9107,79 @@ class OvRtxRendererAdapter(RendererAdapter):
             _render_setting_owner_path(stage, descriptor),
         )
 
+    def _write_render_setting_keeping_picture(
+        self,
+        descriptor: RenderSettingDescriptor,
+        value: Any,
+    ) -> bool:
+        """Give the renderer a setting that the picture does not show, with no new frames.
+
+        False, with nothing written, when the change needs a new picture (see
+        :meth:`_render_setting_change_keeps_picture`) or this renderer does
+        not take a live write: the caller then writes it the usual way. A
+        value that the renderer already has is not written again. Otherwise
+        the render worker is only paused, and resumes without rendering. The
+        step result stays valid: a live attribute write is not a renderer
+        mutation (the camera is written the same way at each frame).
+        """
+
+        if not self._render_setting_change_keeps_picture(descriptor, value):
+            return False
+        owner_stage = self._render_setting_owner_stage_for(descriptor)
+        product_path = _render_setting_owner_path(owner_stage, descriptor)
+        attr_name = str(descriptor.metadata.get("attr_name") or "")
+        if not product_path or not attr_name:
+            return False
+        if not _render_setting_value_unchanged(descriptor, value):
+            self._stop_native_frame_pacing(
+                "render setting mutation", pause_render=True, keep_picture=True
+            )
+            if not self._renderer_reads_render_settings_from_fabric():
+                return False
+            renderer = getattr(self, "_renderer", None)
+            writer = getattr(renderer, "write_attribute", None)
+            if not callable(writer):
+                return False
+            writer(
+                prim_paths=[product_path],
+                attribute_name=attr_name,
+                tensor=self._render_setting_value_to_write_payload(descriptor, value),
+            )
+        self._note_published_render_setting(descriptor)
+        # notify_stage_changed knows the USD notice of these writes by their paths.
+        kept = getattr(self, "_kept_picture_setting_paths", None) or set()
+        self._kept_picture_setting_paths = kept | {f"{product_path}.{attr_name}"}
+        return True
+
+    def _deliver_render_setting(
+        self,
+        descriptor: RenderSettingDescriptor,
+        value: Any,
+    ) -> bool:
+        """Give the renderer a setting value; True when the viewport renders nothing for it.
+
+        True also when the value waits for the next frame
+        (:meth:`_defer_render_setting`): that frame shows the stored picture
+        of the new settings or gives the renderer the value and renders.
+        """
+
+        if self._defer_render_setting(descriptor, value):
+            return True
+        # The settings that wait reach the renderer first, in their order.
+        self._apply_deferred_render_settings()
+        keeps_picture = self._write_render_setting_to_ovrtx(descriptor, value)
+        self._note_renderer_setting_value(descriptor, value)
+        return keeps_picture
+
     def _write_render_setting_to_ovrtx(
         self,
         descriptor: RenderSettingDescriptor,
         value: Any,
-    ) -> None:
+    ) -> bool:
+        """Give the renderer a setting value now; True when the picture on screen stays as it is."""
+
+        if self._write_render_setting_keeping_picture(descriptor, value):
+            return True
         self._stop_native_frame_pacing("render setting mutation")
         renderer = getattr(self, "_renderer", None)
         owner_scope = _render_setting_owner_scope(descriptor)
@@ -7034,6 +9192,9 @@ class OvRtxRendererAdapter(RendererAdapter):
         if not product_path or not attr_name:
             raise RuntimeError("Render setting target is missing.")
         self._release_retained_output()
+        # The setting can belong to a render product of the scene, also while
+        # the session's own product is active.
+        self._note_native_scene_write([product_path])
         if owner_scope == _RENDER_SETTINGS_OWNER_SCOPE:
             # The renderer reads globally owned settings from a UsdPrim on the
             # stage it opened, so the opinion only becomes effective once that
@@ -7043,32 +9204,301 @@ class OvRtxRendererAdapter(RendererAdapter):
             if not self._reload_live_root_snapshot():
                 raise RuntimeError("Render setting delivery failed.")
             self._reset_render_timing_state()
-            return
+            return False
         if descriptor.requirement is RenderSettingRequirement.RENDERER_RESTART:
-            reset = getattr(renderer, "reset", None)
             if product_path.startswith(f"{_SESSION_ROOT_PATH}/"):
-                if callable(reset):
-                    reset()
-                self._reinject_session_layer()
-            elif not self._reload_live_root_snapshot():
+                self._restart_for_render_settings(renderer_restart=True)
+                return False
+            if not self._reload_live_root_snapshot():
                 raise RuntimeError("Renderer restart failed.")
             self._reset_render_timing_state()
-            return
-        writer(
-            prim_paths=[product_path],
-            attribute_name=attr_name,
-            tensor=self._render_setting_value_to_write_payload(descriptor, value),
-        )
-        # The owned session RenderProduct is what the renderer actually
-        # consumes these settings from, so the value only becomes effective
-        # once the session is recomposed; the live column write above alone
-        # is not observed for RenderProduct settings.
+            return False
+        written_live = False
+        if getattr(self, "_render_setting_batch_depth", 0) and not getattr(
+            self, "_rendered_since_load", True
+        ):
+            # Nothing of this stage is rendered yet: the recomposition at the
+            # end of the batch gives the renderer the value, and a live write
+            # would only wait for the stage to finish loading.
+            pass
+        else:
+            writer(
+                prim_paths=[product_path],
+                attribute_name=attr_name,
+                tensor=self._render_setting_value_to_write_payload(descriptor, value),
+            )
+            written_live = True
         self._note_published_render_setting(descriptor)
+        if written_live and self._renderer_reads_render_settings_from_fabric():
+            # This renderer reads render settings from Fabric and finds each
+            # change there, so the write above gives it the value and it starts
+            # a new picture itself. A reset and a recomposed session would also
+            # make it build its views and their DLSS state again, and NVIDIA
+            # NGX keeps memory for each such build.
+            return False
+        # Otherwise the owned session RenderProduct is what the renderer
+        # actually consumes these settings from, so the value only becomes
+        # effective once the session is recomposed; the live column write
+        # above alone is not observed for RenderProduct settings.
         reset = getattr(renderer, "reset", None)
         if callable(reset):
+            self._restart_for_render_settings()
+        return False
+
+    def _render_setting_change_keeps_picture(
+        self,
+        descriptor: RenderSettingDescriptor,
+        value: Any,
+    ) -> bool:
+        """Whether a setting change leaves the picture on screen as it is.
+
+        ovrtx keeps memory for each frame that it renders, so a change that
+        the picture does not show renders no frames. A change that keeps the
+        effective value (for example the reset of a render mode that was set
+        to its default) changes nothing for the renderer: no restart, no
+        frames. Eco Mode only says when
+        the renderer stops refining a still picture, and under the
+        ``on_change`` policy the viewport stops a still picture after its
+        settle frames anyway. A change of Eco Mode renders again only when
+        Eco Mode stopped the picture on screen early and the change lets the
+        renderer refine it further (Eco Mode off, or a higher frame limit).
+        Early means fewer frames than the renderer's default frame limit,
+        after which the renderer itself treats a still picture as final.
+        Called before the render worker is paused: it reads USD, the declared
+        schema and the pacing status only.
+        """
+
+        attr_name = str(descriptor.metadata.get("attr_name") or "")
+        if (
+            _render_setting_owner_scope(descriptor) == _RENDER_SETTINGS_OWNER_SCOPE
+            or not getattr(self, "_rendered_since_load", False)
+        ):
+            return False
+        if _render_setting_value_unchanged(descriptor, value):
+            return True
+        if (
+            attr_name not in (_ECO_MODE_ENABLED_ATTR, _ECO_MODE_FRAME_LIMIT_ATTR)
+            or descriptor.requirement is RenderSettingRequirement.RENDERER_RESTART
+        ):
+            return False
+        product_path = str(descriptor.metadata.get("render_product_path") or "") or None
+        value_state = getattr(descriptor, "value_state", None)
+        before = self._eco_mode_state(
+            product_path, attr_name, getattr(value_state, "current_value", None)
+        )
+        after = self._eco_mode_state(product_path, attr_name, value)
+        if before is None or after is None:
+            return False
+        policy, settle = getattr(self, "_still_frame_policy", None) or ("continuous", 0)
+        marker = self._rendered_frames_marker()
+        picture = getattr(self, "_eco_mode_picture_state", None)
+        if picture is None or marker is None or marker != getattr(
+            self, "_eco_mode_picture_marker", None
+        ):
+            # Frames were rendered since the last Eco Mode change: the picture
+            # on screen was refined with the Eco Mode before this change.
+            picture = before
+
+        def refining_frames(state: tuple[bool, int]) -> int:
+            enabled, limit = state
+            return min(settle, limit) if enabled else settle
+
+        wanted = refining_frames(after)
+        final = self._eco_mode_final_frames()
+        if final is not None:
+            wanted = min(wanted, final)
+        keeps = policy != "on_change" or refining_frames(picture) >= wanted
+        self._eco_mode_picture_state = picture if keeps else after
+        self._eco_mode_picture_marker = marker
+        return keeps
+
+    @staticmethod
+    def _eco_mode_final_frames() -> Optional[int]:
+        """The declared default Eco Mode frame limit; ``None`` when the schema does not declare it.
+
+        After that many frames without a change, the renderer itself stops
+        refining a still picture: it treats the picture as final.
+        """
+
+        default = (_render_setting_builtin_spec(_ECO_MODE_FRAME_LIMIT_ATTR) or {}).get("default")
+        if isinstance(default, (bool, np.bool_)) or not isinstance(default, (int, np.integer)):
+            _report_once(
+                "eco mode default frame limit",
+                f"the render settings schema declares no default for {_ECO_MODE_FRAME_LIMIT_ATTR!r} "
+                f"(it has {default!r}); the fallback for an Eco Mode change is the settle frames "
+                "of the viewport: the picture renders again when Eco Mode stopped it before them",
+            )
+            return None
+        return max(int(default), _ECO_MODE_MIN_FRAME_LIMIT)
+
+    def _eco_mode_state(
+        self, product_path: Optional[str], changed_attr: str, changed_value: Any
+    ) -> Optional[tuple[bool, int]]:
+        """``(enabled, frame limit)`` of Eco Mode, ``changed_attr`` at ``changed_value``.
+
+        ``None`` when a value is unknown.
+        """
+
+        values = {}
+        for attr in (_ECO_MODE_ENABLED_ATTR, _ECO_MODE_FRAME_LIMIT_ATTR):
+            values[attr] = (
+                changed_value
+                if attr == changed_attr
+                else self.read_render_setting_value(attr, render_product_path=product_path)
+            )
+        enabled = values[_ECO_MODE_ENABLED_ATTR]
+        limit = values[_ECO_MODE_FRAME_LIMIT_ATTR]
+        case = ("eco mode values", product_path)
+        if (
+            not isinstance(enabled, (bool, np.bool_))
+            or isinstance(limit, (bool, np.bool_))
+            or not isinstance(limit, (int, np.integer))
+        ):
+            _report_once(
+                case,
+                f"the Eco Mode values of the render product {product_path!r} are not known "
+                f"({_ECO_MODE_ENABLED_ATTR}={enabled!r}, {_ECO_MODE_FRAME_LIMIT_ATTR}={limit!r}); "
+                "the fallback is a new picture for the Eco Mode change",
+            )
+            return None
+        _end_report(case)
+        return bool(enabled), max(int(limit), _ECO_MODE_MIN_FRAME_LIMIT)
+
+    def _rendered_frames_marker(self) -> Any:
+        """A value that changes when this adapter's renderer renders a frame; ``None`` when unknown.
+
+        The synchronous steps are counted here; the frames of the native
+        render worker are counted in the pacing status, per session and epoch.
+        """
+
+        steps = getattr(self, "_synchronous_steps", 0)
+        native_ui = self._frame_pacing_bindings()
+        if native_ui is None:
+            # Without native frame pacing every frame is a synchronous step.
+            return (steps,)
+        try:
+            status = dict(native_ui._get_native_frame_pacing_status())
+        except Exception as error:
+            _report_once(
+                "native pacing status for eco mode",
+                f"reading the native frame pacing status failed: {type(error).__name__}: {error}; "
+                "an Eco Mode change counts the picture on screen as refined with the Eco Mode "
+                "before the change",
+            )
+            return None
+        _end_report("native pacing status for eco mode")
+        return (
+            steps,
+            status.get("session_token"),
+            status.get("metrics_epoch"),
+            status.get("renderer_completions"),
+        )
+
+    def _renderer_reads_render_settings_from_fabric(self) -> bool:
+        """Whether the renderer reads render settings from Fabric and finds their changes there.
+
+        The loaded renderer library tells it through its Carb settings: it reads
+        the render-setting attributes from Fabric and not from USD. Such a
+        renderer gets a setting from a live attribute write. When the library
+        cannot tell or says no, a setting change keeps the renderer reset and
+        the recomposed session: this fallback is reported with its cause.
+        """
+
+        if getattr(self, "_renderer", None) is None or _ovrtx is None:
+            return False
+        try:
+            fabric = read_carb_bool(_ovrtx, _FABRIC_RENDER_SETTINGS_KEY)
+            usd = read_carb_bool(_ovrtx, _USD_RENDER_SETTINGS_KEY)
+        except OvrtxCarbSettingsError as error:
+            cause = str(error)
+        else:
+            if fabric is True and usd is not True:
+                _end_report("render settings from Fabric")
+                return True
+            cause = (
+                f"the renderer has {_FABRIC_RENDER_SETTINGS_KEY}="
+                f"{'not a bool' if fabric is None else fabric} and {_USD_RENDER_SETTINGS_KEY}="
+                f"{'not a bool' if usd is None else usd}"
+            )
+        _report_once(
+            "render settings from Fabric",
+            "the fallback for render setting changes is a renderer reset and a new session "
+            f"layer, because it is not known that the renderer reads them from Fabric: {cause}",
+        )
+        return False
+
+    @contextlib.contextmanager
+    def render_setting_batch(self) -> Iterator[None]:
+        """Apply the render settings written inside with one restart.
+
+        A setting of the session RenderProduct takes effect when the renderer
+        resets and the session layer is recomposed. Loading the settings of a
+        scene writes dozens of them; inside this block they share one reset,
+        one recomposition and one settings-changed event at the end, so the
+        first render of a scene is not delayed by one of each per setting.
+        """
+
+        self._render_setting_batch_depth = getattr(self, "_render_setting_batch_depth", 0) + 1
+        if self._render_setting_batch_depth == 1:
+            self._render_setting_batch_catalogs = {}
+        try:
+            yield
+        finally:
+            self._render_setting_batch_depth -= 1
+            if self._render_setting_batch_depth == 0:
+                self._render_setting_batch_catalogs = None
+                try:
+                    pending = getattr(self, "_render_setting_batch_pending", None)
+                    if pending:
+                        self._render_setting_batch_pending = None
+                        self._restart_for_render_settings(renderer_restart=pending == "restart")
+                finally:
+                    if getattr(self, "_render_setting_batch_publish", False):
+                        self._render_setting_batch_publish = False
+                        # The changes of the batch said whether they keep the picture.
+                        self._publish_render_settings_change(keeps_picture=True)
+
+    def _drop_kept_render_settings_catalogs(self) -> None:
+        """Forget the catalog descriptions of the batch: the state changed."""
+
+        kept = getattr(self, "_render_setting_batch_catalogs", None)
+        if kept:
+            kept.clear()
+
+    def _restart_for_render_settings(self, renderer_restart: bool = False) -> None:
+        """Reset the renderer and recompose the session layer, or defer it to the end of a batch.
+
+        Before the renderer has rendered anything of the loaded stage there is
+        no history to discard, so a setting that needs no renderer restart
+        takes effect with the recomposition alone. The settings that a scene
+        stores are loaded at that point, and the reset would only delay the
+        first render.
+        """
+
+        if getattr(self, "_render_setting_batch_depth", 0) > 0:
+            if renderer_restart or getattr(self, "_render_setting_batch_pending", None) != "restart":
+                self._render_setting_batch_pending = "restart" if renderer_restart else "warmup"
+            return
+        # Ownership: reset invalidates retained output handles.
+        self._release_retained_output()
+        renderer = self._renderer
+        reset = getattr(renderer, "reset", None)
+        history = renderer_restart or getattr(self, "_rendered_since_load", True)
+        if history and callable(reset):
+            if not getattr(self, "_selection_outline_armed", False):
+                # This reset also starts the selection outline pass.
+                self._selection_outline_armed = True
+                self._apply_selection_outline_anchor()
             reset()
-            self._reinject_session_layer()
-            self._reset_render_timing_state()
+            # Counted for the stored pictures of render-settings states (_leave_settled_picture).
+            self._settled_restarts = getattr(self, "_settled_restarts", 0) + 1
+            if getattr(self, "_selection_outline_anchor_applied", False):
+                self._selection_outline_pass_needs_reset = False
+            self._frame_pacing_first_frame_native = True
+            self._frame_pacing_start_delay = _NATIVE_FIRST_FRAME_DELAY_FRAMES
+            self._frame_pacing_needs_sync_step = False
+        self._reinject_session_layer()
+        self._reset_render_timing_state()
 
     def _session_camera_setting_lines(self) -> Tuple[str, ...]:
         """Authored public render settings owned by the session Camera."""
@@ -7105,16 +9535,26 @@ class OvRtxRendererAdapter(RendererAdapter):
             or not owner_path
         ):
             return ()
-        try:
-            prim = stage.GetPrimAtPath(owner_path)
-        except Exception:
-            return ()
-        if not prim or not prim.IsValid():
-            return ()
-        lines: list[str] = []
         # Only restate defaults for settings this owner actually carries; a
         # RenderProduct default must never be emitted onto the Camera.
         is_product = owner_path == self._render_product_path
+        # The scene's stored render settings come first, so a value authored
+        # on the session prim later still wins. They are stated even before
+        # the session prim exists: a newly opened scene has no RenderProduct
+        # yet.
+        stored = stored_render_setting_lines(
+            stage.GetRootLayer().customLayerData.get("renderSettings") or {}
+        )
+        lines: list[str] = [
+            f"            {line}"
+            for line in stored["RenderProduct" if is_product else "Camera"]
+        ]
+        try:
+            prim = stage.GetPrimAtPath(owner_path)
+        except Exception:
+            return tuple(lines)
+        if not prim or not prim.IsValid():
+            return tuple(lines)
         ledger = (
             getattr(self, "_published_render_settings", ()) if restate_published else ()
         )
@@ -7189,6 +9629,8 @@ class OvRtxRendererAdapter(RendererAdapter):
                 # Camera schema scalars/vectors are float32, not the generic
                 # Python float64 payload. One row corresponds to one prim.
                 payload = np.asarray([value], dtype=np.float32)
+            elif self._stage_change_live_safe_geometry_path(sdf_path):
+                payload = np.asarray([value], dtype=np.float64)
             elif self._stage_change_live_safe_input_path(sdf_path):
                 dtype, width = _LIVE_INPUT_DTYPES[str(attribute.GetTypeName())]
                 payload = np.ascontiguousarray(
@@ -7202,17 +9644,107 @@ class OvRtxRendererAdapter(RendererAdapter):
                 tensor=payload,
             )
             return True
-        except Exception:
+        except Exception as error:
+            print(
+                f"[OvRtxRendererAdapter] live write of {sdf_path} to ovrtx "
+                f"failed: {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
             return False
+
+    def _live_value_edit_sync_decision(
+        self,
+        event: Any,
+        changed_paths: tuple[Any, ...],
+        resynced_paths: tuple[Any, ...],
+    ) -> str | None:
+        """Classify ``event`` when only a live value write can follow, else ``None``.
+
+        ``None`` means the caller classifies the event itself: it is empty,
+        it only changes the session layer, or it touches the render settings
+        of the active product. Those keep the full stop of the native
+        session.
+        """
+        paths = changed_paths + resynced_paths
+        if not paths or all(_stage_change_path_is_session(path) for path in paths):
+            return None
+        if _stage_change_touches_public_render_settings(
+            paths, self.get_active_render_product_path() or ""
+        ) or self._stage_change_affects_active_product(resynced_paths):
+            return None
+        try:
+            from pxr import Sdf
+        except ImportError:
+            return None
+        return self._stage_change_sync_decision(
+            event, changed_paths, resynced_paths, Sdf
+        )
+
+    def _render_setting_notice_keeps_picture(self, event: Any) -> bool:
+        """Whether a stage change event is a render-setting notice that leaves the picture as it is.
+
+        True for the notice of a render setting that this adapter gave the
+        renderer itself and that changes nothing the picture shows (see
+        :meth:`_render_setting_change_keeps_picture`), or that waits for the
+        next frame (see :meth:`_defer_render_setting`); the viewport then
+        requests no new frames for it. The answer does not depend on the order
+        in which the adapter and the viewport receive the event.
+        """
+
+        if event is not None and event is getattr(self, "_kept_picture_stage_event", None):
+            return True
+        kept_paths = getattr(self, "_kept_picture_setting_paths", None)
+        paths = tuple(getattr(event, "changed_paths", ()) or ()) + tuple(
+            getattr(event, "resynced_paths", ()) or ()
+        )
+        return bool(kept_paths and paths and all(str(path) in kept_paths for path in paths))
 
     def notify_stage_changed(self, event: Any) -> None:
         """Mirror live USD edits into ovrtx."""
-        if self._stage is None or self._renderer is None:
+        if self._keep_stage_event_for_rebuild(event):
             return
-        self._stop_native_frame_pacing("stage change publication")
+        keeps_picture = self._render_setting_notice_keeps_picture(event)
+        self._kept_picture_setting_paths = None
+        self._kept_picture_stage_event = event if keeps_picture else None
         changed_paths = tuple(getattr(event, "changed_paths", ()) or ())
         resynced_paths = tuple(getattr(event, "resynced_paths", ()) or ())
         paths = changed_paths + resynced_paths
+        if keeps_picture:
+            self._drop_kept_render_settings_catalogs()
+            if self._stage is None or self._renderer is None:
+                return
+            self._stop_native_frame_pacing(
+                "stage change publication", pause_render=True, keep_picture=True
+            )
+            self._publish_render_settings_change(keeps_picture=True)
+            return
+        self._drop_kept_render_settings_catalogs()
+        undrawn_layout = self._undrawn_change_layout(event)
+        if undrawn_layout is not None:
+            # Only created prims that draw nothing changed (see stage_change_keeps_picture):
+            # ovrtx keeps its references, and the picture needs no new step.
+            self._undrawn_created_prim_paths = list(undrawn_layout[1])
+            self._created_change_memo = None
+            return
+        self._request_still_frame()
+        if self._stage is None or self._renderer is None:
+            return
+        # A stage edit parks the native render worker; it does not stop the
+        # session. A value edit that ovrtx takes in place (a slider drag on a
+        # light intensity or a transform) only needs the worker parked while
+        # Python writes it, and the next frame resumes the session. A stop
+        # here made every edit of a drag pay a full session restart on the UI
+        # thread (tens of milliseconds, a visible stall). After a structural
+        # edit or a layer mute (a rename, a delete, their Undo and Redo), the
+        # renderer builds the scene again after a reload (see
+        # _reload_live_root_snapshot): the paused presenter keeps the last
+        # picture on screen for all that time, where a stop shows a black
+        # viewport. A render-setting or render-product change below still
+        # stops the session itself.
+        sync_decision = self._live_value_edit_sync_decision(
+            event, changed_paths, resynced_paths
+        )
+        self._stop_native_frame_pacing("stage change publication", pause_render=True)
         self._discard_grouped_frames(paths)
         # External stage edits (other editors, USD undo/redo) that touch a
         # public RenderProduct setting — or resync/remove/replace the active
@@ -7222,9 +9754,14 @@ class OvRtxRendererAdapter(RendererAdapter):
         if _stage_change_touches_public_render_settings(
             paths, self.get_active_render_product_path() or ""
         ) or self._stage_change_affects_active_product(resynced_paths):
+            # A render setting changed outside this adapter's own writes.
+            self._forget_renderer_setting_values()
             self._publish_render_settings_change()
         if paths and all(_stage_change_path_is_session(path) for path in paths):
             return
+        # Every route below (a live write, an overlay, a root snapshot) can
+        # change the renderer's scene.
+        self._note_native_scene_write()
         if not paths:
             paths = tuple(str(prim.GetPath()) for prim in self._stage.TraverseAll())
         try:
@@ -7247,22 +9784,31 @@ class OvRtxRendererAdapter(RendererAdapter):
             fan_out_roots = set(
                 (event.visibility_delta or {}).get("authored") or ()
             )
-        sync_decision = self._stage_change_sync_decision(
-            event,
-            changed_paths,
-            resynced_paths,
-            Sdf,
-        )
+        if sync_decision is None:
+            sync_decision = self._stage_change_sync_decision(
+                event,
+                changed_paths,
+                resynced_paths,
+                Sdf,
+            )
+        if sync_decision != _STAGE_CHANGE_SYNC_LIVE:
+            # The change can add, remove or retarget a PointInstancer.
+            self._point_instancer_prototype_cache = None
         if sync_decision == _STAGE_CHANGE_SYNC_OVERLAY:
             if self._sync_ovrtx_root_snapshot_overlay_from_stage():
                 return
-            if self._reload_live_root_snapshot():
+            if self._sync_live_prim_references(event, changed_paths, resynced_paths):
+                return
+            if self._reload_for_stage_change():
                 return
         elif sync_decision == _STAGE_CHANGE_SYNC_RELOAD:
-            if self._reload_live_root_snapshot():
+            if self._sync_live_prim_references(event, changed_paths, resynced_paths):
+                return
+            if self._reload_for_stage_change():
                 return
         seen_visibility: set[str] = set()
         seen_transform: set[str] = set()
+        changed_transforms: list[tuple[Any, str]] = []
         live_write_failed = False
         for path in paths:
             try:
@@ -7310,7 +9856,7 @@ class OvRtxRendererAdapter(RendererAdapter):
                     and _stage_change_path_affects_transform(sdf_path)
                 ):
                     seen_transform.add(path_str)
-                    self._write_prim_transform_to_ovrtx(prim, path_str)
+                    changed_transforms.append((prim, path_str))
                 if sdf_path.IsPropertyPath():
                     written = self._write_property_to_ovrtx(prim, sdf_path)
                     if written and sdf_path.name in _LIVE_CAMERA_ATTRIBUTE_TYPES:
@@ -7319,14 +9865,24 @@ class OvRtxRendererAdapter(RendererAdapter):
                         # those again on the next frame instead of trusting the
                         # cache (reopened views otherwise rendered ~1.3x zoomed).
                         self._last_pushed_camera_intrinsics = None
-                    if not written and self._stage_change_live_safe_input_path(sdf_path):
+                    if not written and (
+                        self._stage_change_live_safe_input_path(sdf_path)
+                        or self._stage_change_live_safe_geometry_path(sdf_path)
+                    ):
                         # The value was classified live but OVRTX refused it:
                         # reload rather than keep rendering a stale value.
                         live_write_failed = True
             except Exception:
                 continue
+        if changed_transforms:
+            self._write_prim_transforms_to_ovrtx(changed_transforms)
         if live_write_failed:
-            self._reload_live_root_snapshot()
+            print(
+                "[OvRtxRendererAdapter] a live value write failed; the scene "
+                "reloads so that the Viewport shows the authored value",
+                file=sys.stderr,
+            )
+            self._reload_for_stage_change()
 
     def _stage_change_live_safe_visibility_path(
         self, sdf_module: Any, path: Any, authored: Any = ()
@@ -7453,6 +10009,7 @@ class OvRtxRendererAdapter(RendererAdapter):
             or name.startswith(self._non_rendering_prefixes())
             or self._stage_change_live_safe_camera_path(path)
             or self._stage_change_live_safe_input_path(path)
+            or self._stage_change_live_safe_geometry_path(path)
         )
 
     def _stage_change_live_safe_camera_path(self, path: Any) -> bool:
@@ -7479,6 +10036,77 @@ class OvRtxRendererAdapter(RendererAdapter):
         except Exception:
             return False
 
+    def _stage_change_live_safe_geometry_path(self, path: Any) -> bool:
+        """Accept the size attribute of an existing implicit shape for a live write.
+
+        A shape that a PointInstancer or native instancing uses is not live:
+        ovrtx draws its instances from a copy, so a write to the shape itself
+        leaves the instances at the old size. Such an edit reloads the scene.
+        """
+        if not path.IsPropertyPath():
+            return False
+        from pxr import Sdf, Tf, Usd
+
+        try:
+            attribute = self._stage.GetObjectAtPath(path)
+            if not (
+                isinstance(attribute, Usd.Attribute)
+                and not attribute.IsCustom()
+                and str(attribute.GetTypeName()) == "double"
+                and attribute.GetName()
+                in _LIVE_GEOMETRY_ATTRIBUTES.get(
+                    str(attribute.GetPrim().GetTypeName()), ()
+                )
+                and all(
+                    isinstance(spec, Sdf.AttributeSpec)
+                    for spec in attribute.GetPropertyStack()
+                )
+                and attribute.Get() is not None
+            ):
+                return False
+            prim = attribute.GetPrim()
+            if prim.IsInstanceProxy() or prim.IsInPrototype():
+                return False
+            return not self._prim_is_point_instancer_prototype(prim)
+        except Tf.ErrorException:
+            return False
+
+    def _prim_is_point_instancer_prototype(self, prim: Any) -> bool:
+        """Whether ``prim`` is in a PointInstancer or in one of its prototypes."""
+        from pxr import UsdGeom
+
+        prototype_paths = self._point_instancer_prototype_paths()
+        current = prim
+        while current and not current.IsPseudoRoot():
+            if current.GetPath() in prototype_paths or current.IsA(
+                UsdGeom.PointInstancer
+            ):
+                return True
+            current = current.GetParent()
+        return False
+
+    def _point_instancer_prototype_paths(self) -> frozenset:
+        """The prototype targets of every PointInstancer of the stage.
+
+        The set is kept until the stage is loaded or released, or until a
+        change that is not a live value edit (:meth:`notify_stage_changed`
+        drops it), so a drag on a shape size does not walk the stage at each
+        edit.
+        """
+        cached = getattr(self, "_point_instancer_prototype_cache", None)
+        if cached is not None:
+            return cached
+        from pxr import Usd, UsdGeom
+
+        paths = set()
+        for prim in self._stage.Traverse(Usd.PrimAllPrimsPredicate):
+            if prim.IsA(UsdGeom.PointInstancer):
+                paths.update(
+                    UsdGeom.PointInstancer(prim).GetPrototypesRel().GetForwardedTargets()
+                )
+        self._point_instancer_prototype_cache = frozenset(paths)
+        return self._point_instancer_prototype_cache
+
     def _stage_change_sync_decision(
         self,
         event: Any,
@@ -7493,7 +10121,9 @@ class OvRtxRendererAdapter(RendererAdapter):
         the visible full-root reload churn. Destructive or structural changes
         still reload the live root snapshot through ``load_stage`` so deletes,
         schema/API changes, property edits, layer updates, and stale session
-        roots are reflected with main's session-root stripping path.
+        roots are reflected with main's session-root stripping path. Before
+        an overlay or a reload, ``notify_stage_changed`` tries
+        ``_sync_live_prim_references`` for prims created after the root opened.
         """
         event_type = getattr(event, "event_type", None)
         if event_type is ChangeEventType.LAYER_INFO:
@@ -7582,6 +10212,8 @@ class OvRtxRendererAdapter(RendererAdapter):
                     continue
                 if self._stage_change_live_safe_input_path(sdf_path):
                     continue
+                if self._stage_change_live_safe_geometry_path(sdf_path):
+                    continue
                 if property_name == "visibility":
                     # Name shape alone is not visibility semantics: only a
                     # genuine live ATTRIBUTE (or an adapter-proven removed
@@ -7644,6 +10276,294 @@ class OvRtxRendererAdapter(RendererAdapter):
         except Exception:
             return False
 
+    def _reload_for_stage_change(self) -> bool:
+        """Reload the live root for a stage edit; its first step does not block the UI thread.
+
+        The first step after the reload builds the whole scene again in ovrtx
+        (tens of seconds on a large scene). :meth:`render_frame` runs it as an
+        operation and returns no new picture until it is done (see
+        :meth:`_rebuild_step_runs`).
+        """
+        if not self._reload_live_root_snapshot():
+            return False
+        self._rebuild_step_due = True
+        return True
+
+    def scene_update_pending(self) -> bool:
+        """See :meth:`RendererAdapter.scene_update_pending`."""
+        return bool(
+            getattr(self, "_rebuild_step_due", False)
+            or getattr(self, "_rebuild_step", None) is not None
+        )
+
+    def _rebuild_step_runs(self) -> bool:
+        """Start or poll the rebuild step of a stage-edit reload; ``True`` while it runs.
+
+        This call never waits. As the first ordinary step after a load, the
+        rebuild step runs under a host memory watch. The shader file scan of
+        that ordinary step does not run beside it: the scan reads the stage,
+        and the UI thread can now edit the stage while the step runs, so the
+        files are read after the step (see :meth:`_after_first_frames`). A
+        failed start or a failed step is reported like a failed ordinary
+        step, and the frame then steps as usual.
+
+        A pick in flight takes its result from the next step. Then the
+        ordinary step runs, so that the pick gets the result it waits for.
+        """
+        if getattr(self, "_rebuild_step_due", False):
+            self._rebuild_step_due = False
+            if getattr(self, "_in_flight_pick_queries", None):
+                return False
+            now = time.perf_counter()
+            dt = max(_MIN_DT, min(_MAX_DT, now - self._dt_clock))
+            self._dt_clock = now
+            self._rendered_since_load = True
+            scope = contextlib.ExitStack()
+            if not getattr(self, "_first_step_done", False):
+                scope.enter_context(HostMemoryWatch("the first native step"))
+            try:
+                self._rebuild_step = self._renderer.step_async(
+                    render_products=self._render_products_for_step(),
+                    delta_time=dt,
+                )
+            except Exception as exc:
+                scope.close()
+                record_step_failure(exc)
+                return False
+            self._rebuild_step_scope = scope
+            return True
+        return not self._finish_rebuild_step(wait_s=0.0)
+
+    def _finish_rebuild_step(self, *, wait_s: Optional[float]) -> bool:
+        """Take the result of the rebuild step when it is done; ``True`` when no step runs now.
+
+        ``wait_s`` is the longest time that this call waits, for the step and
+        for the fetch of its result together: ``0`` only looks, and ``None``
+        waits as long as the step runs, as every ovrtx call does while the
+        step runs. When the step is done but its result is not fetched in
+        time, the result stays for the next call. The picture of the step is
+        not shown: the next ordinary step renders the current camera. A pick
+        queued while the step ran takes its result from that next step.
+        """
+        step = getattr(self, "_rebuild_step", None)
+        if step is None:
+            return True
+        deadline = None if wait_s is None else time.monotonic() + wait_s
+
+        def time_left_ns() -> Optional[int]:
+            if deadline is None:
+                return None
+            return max(0, int((deadline - time.monotonic()) * 1e9))
+
+        try:
+            if callable(getattr(step, "wait", None)):
+                # The ovrtx operation; when it is done, its result to fetch.
+                step = step.wait(timeout_ns=time_left_ns())
+                if step is None:
+                    return False
+                self._rebuild_step = step
+            products = step.fetch(timeout_ns=time_left_ns())
+            if products is None:
+                return False
+            self._rebuild_step = None
+        except Exception as exc:
+            self._rebuild_step = None
+            self._close_rebuild_step_scope()
+            record_step_failure(exc)
+            self._mark_point_cloud_requests_stale(
+                "step_failed",
+                "Renderer step failed before PointCloud extraction.",
+            )
+            self._mark_render_var_output_requests_stale(
+                "step_failed",
+                "Renderer step failed before RenderVar output extraction.",
+            )
+            return True
+        self._close_rebuild_step_scope()
+        self._first_step_done = True
+        self._request_still_frame()
+        self._extract_requested_point_cloud_frames(products)
+        self._extract_requested_render_var_output_frames(products)
+        return True
+
+    def _close_rebuild_step_scope(self) -> None:
+        """End the host memory watch of the rebuild step."""
+        scope, self._rebuild_step_scope = getattr(self, "_rebuild_step_scope", None), None
+        if scope is not None:
+            scope.close()
+
+    def _finish_rebuild_step_before_shutdown(self) -> None:
+        """Wait at most :data:`_REBUILD_STEP_SHUTDOWN_TIMEOUT_S` for a rebuild step that still runs.
+
+        ovrtx cannot cancel the step, and the renderer must not be released
+        while it runs. When the limit runs out, the step is reported and
+        :class:`BackgroundTaskStuckError` is raised: the renderer and the step
+        stay, and the application exit fails. A later shutdown call does not
+        wait again; it only looks whether the step has ended.
+        """
+        self._rebuild_step_due = False
+        if getattr(self, "_rebuild_step", None) is None:
+            return
+        expired = getattr(self, "_rebuild_step_shutdown_expired", False)
+        if self._finish_rebuild_step(wait_s=0.0 if expired else _REBUILD_STEP_SHUTDOWN_TIMEOUT_S):
+            return
+        self._rebuild_step_shutdown_expired = True
+        message = (
+            "the renderer step that builds the scene again after a stage edit did not end in "
+            f"{_REBUILD_STEP_SHUTDOWN_TIMEOUT_S:.0f} s at shutdown; the renderer is not released"
+        )
+        LOGGER.error(message)
+        raise BackgroundTaskStuckError(message)
+
+    def _answer_kept_picks_as_misses(self) -> None:
+        """Answer each viewport pick kept during a rebuild step as a miss, and forget it.
+
+        A kept pick belongs to the document that was loaded when the user
+        clicked. When another document is loaded, or at shutdown, it is not
+        sent: its callback gets a miss, as a pick in flight does
+        (:meth:`_dispatch_pending_pick_misses`). Every callback runs; the
+        first error of a callback is raised after them, with the later ones
+        attached.
+        """
+        picks = list(getattr(self, "_deferred_picks", None) or [])
+        self._deferred_picks = []
+        first_fault: Optional[BaseException] = None
+        for kind, _coordinates, callback, _name in picks:
+            try:
+                if kind == "point":
+                    callback(None, None)
+                else:
+                    callback([])
+            except BaseException as fault:  # noqa: BLE001 - raised after the other callbacks
+                first_fault = self._chain_faults(first_fault, fault)
+        if first_fault is not None:
+            raise first_fault
+
+    def _keep_stage_event_for_rebuild(self, event: Any) -> bool:
+        """Keep ``event`` while the rebuild step runs or earlier kept events wait.
+
+        Any ovrtx call would wait for the rebuild step. The kept events go to
+        ovrtx in their order when the step is done
+        (:meth:`_send_kept_renderer_work`). Returns ``True`` when ``event``
+        was kept.
+        """
+        kept = getattr(self, "_deferred_stage_events", None)
+        if kept is None:
+            kept = self._deferred_stage_events = []
+        if not (self.scene_update_pending() or kept):
+            return False
+        kept.append((self._stage, event))
+        self._request_still_frame()
+        if not getattr(self, "_rebuild_step_due", False) and self._finish_rebuild_step(wait_s=0.0):
+            self._send_kept_renderer_work()
+        return True
+
+    def _keep_selection_for_rebuild(self, paths: List[str]) -> bool:
+        """Keep the newest selection while the rebuild step runs; ``True`` when kept.
+
+        The outline write would wait for the step. The kept selection is
+        written again in full when the step is done.
+        """
+        if not self.scene_update_pending():
+            return False
+        self._selected_paths = list(dict.fromkeys(str(p) for p in (paths or []) if p))
+        self._selection_highlight_deferred = True
+        return True
+
+    def _keep_pick_for_rebuild(
+        self, kind: str, coordinates: tuple, callback: Any, name: Optional[str]
+    ) -> bool:
+        """Keep a viewport pick while the rebuild step runs or kept edits wait; ``True`` when kept.
+
+        The pick query would wait for the step. The kept pick is sent after
+        the kept stage edits, so it resolves against the scene with them. When
+        the kept picks are sent, a newer point pick under the same name
+        replaces an older one, as :meth:`pick` replaces one in flight. The
+        kept pick belongs to the document that is loaded now: another
+        document and shutdown answer it as a miss
+        (:meth:`_answer_kept_picks_as_misses`).
+        """
+        if not (self.scene_update_pending() or getattr(self, "_deferred_stage_events", None)):
+            return False
+        kept = getattr(self, "_deferred_picks", None)
+        if kept is None:
+            kept = self._deferred_picks = []
+        kept.append((kind, coordinates, callback, name))
+        self._still_frame_requested = True
+        return True
+
+    def _has_kept_renderer_work(self) -> bool:
+        """Whether stage events, an outline, picks or transform restores wait for ovrtx."""
+        return bool(
+            getattr(self, "_deferred_stage_events", None)
+            or getattr(self, "_selection_highlight_deferred", False)
+            or getattr(self, "_deferred_picks", None)
+            or getattr(self, "_deferred_transform_restores", None)
+        )
+
+    def _send_kept_renderer_work(self) -> None:
+        """Give ovrtx the work kept during a rebuild step.
+
+        The stage events go first, in their order. An event that reloads the
+        scene again starts a new rebuild step, and the later work waits for
+        that step. The events of a stage that is no longer loaded are dropped:
+        the load of the current stage gave ovrtx all of its state. Then the
+        selection outline, the live-transform restores and the viewport picks
+        follow, so that a pick resolves against the scene with every kept
+        edit.
+        """
+        events = list(getattr(self, "_deferred_stage_events", None) or [])
+        self._deferred_stage_events = []
+        for stage, event in events:
+            if stage is not self._stage:
+                continue
+            try:
+                self.notify_stage_changed(event)
+            except Exception as exc:  # noqa: BLE001 - reported; the later kept edits still go
+                print(
+                    "[OvRtxRendererAdapter] a stage edit kept while the scene was built "
+                    f"again did not reach the renderer: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+        if getattr(self, "_selection_highlight_deferred", False):
+            self._selection_highlight_deferred = False
+            try:
+                self.set_selection_highlight(
+                    list(getattr(self, "_selected_paths", []) or []),
+                    force_reapply=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - reported; the frame goes on
+                print(
+                    "[OvRtxRendererAdapter] the selection outline kept while the scene was "
+                    f"built again was not written: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+        restores = list(dict.fromkeys(getattr(self, "_deferred_transform_restores", None) or []))
+        self._deferred_transform_restores = []
+        if restores:
+            try:
+                self.clear_live_local_transforms(restores)
+            except Exception as exc:  # noqa: BLE001 - reported; the frame goes on
+                print(
+                    "[OvRtxRendererAdapter] the transforms kept while the scene was built "
+                    f"again were not restored: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+        picks = list(getattr(self, "_deferred_picks", None) or [])
+        self._deferred_picks = []
+        for kind, coordinates, callback, name in picks:
+            try:
+                if kind == "point":
+                    self.pick(*coordinates, callback, name)
+                else:
+                    self.pick_rect(*coordinates, callback)
+            except Exception as exc:  # noqa: BLE001 - reported; the later kept picks still go
+                print(
+                    "[OvRtxRendererAdapter] a viewport pick kept while the scene was built "
+                    f"again was not sent: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+
     def _write_local_transform_matrix_to_ovrtx(
         self,
         path_str: str,
@@ -7702,13 +10622,33 @@ class OvRtxRendererAdapter(RendererAdapter):
         return np.ascontiguousarray(local, dtype=np.float64).reshape(1, 4, 4)
 
     def set_live_local_transform(self, path: str, matrix: Matrix4d) -> bool:
-        """Push a prim-local transform preview into ovrtx without authoring USD."""
+        """Push a prim-local transform preview into ovrtx without authoring USD.
+
+        While a rebuild step runs (:meth:`scene_update_pending`), the preview
+        is declined: the write would wait for the step. The edit that the drag
+        authors at its end still reaches ovrtx.
+        """
+        self._request_still_frame()
+        if self.scene_update_pending():
+            return False
+        self._note_native_scene_write([str(path)])
         self._stop_native_frame_pacing("live transform preview")
         self._discard_grouped_frames([str(path)])
         return self._write_local_transform_matrix_to_ovrtx(str(path), matrix)
 
     def clear_live_local_transforms(self, paths: List[str]) -> None:
-        """Restore ovrtx transforms for ``paths`` from the authoritative USD stage."""
+        """Restore ovrtx transforms for ``paths`` from the authoritative USD stage.
+
+        While a rebuild step runs, the paths are kept and restored when it is
+        done.
+        """
+        self._request_still_frame()
+        if self.scene_update_pending():
+            kept = getattr(self, "_deferred_transform_restores", None)
+            if kept is None:
+                kept = self._deferred_transform_restores = []
+            kept.extend(str(path) for path in paths or [] if path)
+            return None
         self._stop_native_frame_pacing("live transform restore")
         self._discard_grouped_frames([str(path) for path in paths or []])
         stage = getattr(self, "_stage", None)
@@ -7725,6 +10665,66 @@ class OvRtxRendererAdapter(RendererAdapter):
             if prim and prim.IsValid():
                 self._write_prim_transform_to_ovrtx(prim, path_str)
         return None
+
+    def _write_prim_transforms_to_ovrtx(self, prims: list[tuple[Any, str]]) -> None:
+        """Write the local transforms of ``(prim, path)`` pairs in one ovrtx call.
+
+        Each ovrtx write call has a fixed cost, so one call for all prims that
+        a stage change moved costs much less than one call for each prim.
+        ovrtx writes the prims that it has and skips a path that is not in its
+        scene, as it did for one call per prim. A prim whose local transform
+        cannot be computed and a failed call are reported, once while the same
+        failures repeat, and again after a change that had no failure.
+        """
+        from pxr import UsdGeom
+
+        renderer = getattr(self, "_renderer", None)
+        writer = getattr(renderer, "write_attribute", None)
+        semantic = getattr(getattr(_ovrtx, "Semantic", None), "XFORM_MAT4x4", None)
+        if not callable(writer) or semantic is None:
+            return
+        paths: list[str] = []
+        matrices: list[Any] = []
+        # (what failed, error type) identifies a failure; the text names the cause.
+        failures: list[tuple[tuple[str, str], str]] = []
+        for prim, path_str in prims:
+            try:
+                xformable = UsdGeom.Xformable(prim)
+                if not path_str or not xformable:
+                    continue
+                matrices.append(xformable.GetLocalTransformation())
+            except Exception as exc:
+                failures.append((
+                    (str(path_str), type(exc).__name__),
+                    f"the local transform of {path_str} cannot be computed "
+                    f"({type(exc).__name__}: {exc})",
+                ))
+                continue
+            paths.append(str(path_str))
+        if paths:
+            try:
+                tensor = np.ascontiguousarray(np.asarray(matrices, dtype=np.float64))
+                writer(
+                    prim_paths=paths,
+                    attribute_name="omni:xform",
+                    tensor=tensor,
+                    semantic=semantic,
+                )
+            except Exception as exc:
+                failures.append((
+                    ("omni:xform write", type(exc).__name__),
+                    f"the ovrtx write of the transforms of {len(paths)} moved prims "
+                    f"failed ({type(exc).__name__}: {exc})",
+                ))
+        failure = tuple(key for key, _text in failures) or None
+        if failure is not None and failure != getattr(self, "_reported_transform_write_failure", None):
+            print(
+                "[OvRtxRendererAdapter] "
+                + "; ".join(text for _key, text in failures)
+                + "; the Viewport shows the previous positions of these prims",
+                file=sys.stderr,
+            )
+        self._reported_transform_write_failure = failure
 
     def _write_prim_transform_to_ovrtx(self, prim: Any, path_str: str) -> None:
         try:
@@ -7775,6 +10775,21 @@ class OvRtxRendererAdapter(RendererAdapter):
         # the viewport overlay. It is valid for exactly the UI composition
         # following that render and never survives into the next raw intent.
         self._frame_pacing_presented_snapshot = None
+        last_frame_kept = bool(getattr(self, "_still_frame_kept", False))
+        self._still_frame_kept = False
+        self._frame_service_active = True
+        # While ovrtx builds the scene again after a stage edit, every ovrtx
+        # call would wait for it: return no new picture, so the viewport keeps
+        # the one on screen and the UI thread runs on. With native frame
+        # pacing, the paused session keeps presenting that picture.
+        if self._renderer is not None:
+            if self._rebuild_step_runs():
+                return None
+            if self._has_kept_renderer_work():
+                self._send_kept_renderer_work()
+                if self._rebuild_step_runs():
+                    return None
+        self._service_render_settings_publish()
         if self._stage is None or self._usd_handle is None:
             return np.zeros((int(height), int(width), 4), dtype=np.uint8)
         if width <= 0 or height <= 0:
@@ -7797,6 +10812,40 @@ class OvRtxRendererAdapter(RendererAdapter):
         # Lifecycle/mutation paths stop and drain the borrower first, set the
         # synchronous-step latch, and come through the historical path below
         # once before pacing can restart.
+        if not getattr(self, "_selection_outline_armed", False) or getattr(
+            self, "_outline_pass_settle_after", None
+        ) is not None:
+            self._start_selection_outline_pass(view_matrix)
+        # Before the native publication below returns: with native frame
+        # pacing, no frame of this scene comes through the Python step.
+        self._service_render_diagnostics()
+        # A render-settings state that returns shows its stored picture, and
+        # waiting settings reach the renderer before it renders.
+        settled = self._settled_picture_frame(
+            width, height, view_matrix, proj_matrix, last_frame_kept
+        )
+        if settled is not None:
+            return settled
+        if (
+            getattr(self, "_frame_pacing_first_frame_native", False)
+            and not self._frame_pacing_token
+            and getattr(self, "_frame_pacing_start_delay", 0) > 0
+            and self._frame_pacing_eligible()
+        ):
+            # The frame that applied the setting is already long. Starting the
+            # native session takes tens of milliseconds more, so it starts a
+            # frame or two later, and the two do not make one long pause.
+            self._frame_pacing_start_delay -= 1
+            return None
+        if getattr(self, "_frame_pacing_first_frame_native", False):
+            # A reset replaced the session camera, which holds the session
+            # defaults. The synchronous step below would write the viewport's
+            # lens before it renders. The native worker renders this first
+            # frame, so write the lens first, while Python still owns the
+            # renderer.
+            self._prepare_camera_for_native_first_frame(
+                width, height, proj_matrix
+            )
         if self._publish_native_frame(width, height, view_matrix, proj_matrix):
             return None
 
@@ -7846,18 +10895,23 @@ class OvRtxRendererAdapter(RendererAdapter):
                 return self._record_successful_frame(
                     grouped[1], int(width), int(height)
                 )
+        still = self._still_frame(
+            width, height, view_matrix, proj_matrix, runtime_camera_path
+        )
+        if still is not None:
+            return still
         self._apply_camera_projection(proj_matrix)
-        # 1) Resolution change: debounced reinject of the session layer.
-        # Rapid drag-resize events within a 200 ms window collapse into a
-        # single reinject every 250 ms to avoid ovrtx churn; isolated
-        # resizes apply on the same frame. We run the reinject FIRST so
-        # the per-frame ``write_attribute`` pushes below land on the
-        # current session-layer handle and survive the same step. If
-        # the order were inverted, the reinject would replace the
-        # session and the writes would land on a now-detached handle —
-        # ovrtx would render the reinjected USDA defaults instead of
-        # the live values.
+        # 1) Resolution change: a new size goes to the render product when it
+        # has settled (_RESIZE_SETTLE_S); then only its resolution is written.
+        # This runs FIRST: when ovrtx refuses that write, the session layer is
+        # composed again, and the per-frame ``write_attribute`` pushes below
+        # must land on the new session-layer handle in the same step. In the
+        # other order they would land on a detached handle, and ovrtx would
+        # render the defaults of the new session layer, not the live values.
         self._apply_resolution_if_allowed((int(width), int(height)))
+        kept = self._picture_kept_for_resize(width, height)
+        if kept is not None:
+            return kept
 
         # 2) Mirror camera values into ovrtx Fabric for the camera that the
         # active render product can actually consume. The owned session
@@ -7868,7 +10922,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         # are not re-authored, so when one is active the selected scene
         # camera receives the world-space runtime write instead. In both
         # cases, user camera prims stay read-only on the pxr/USD side.
-        # Issue #22 — keep the intrinsics push paired with the xform push so
+        # Keep the intrinsics push paired with the xform push so
         # the rendered image and the omni.ui.scene overlay use the same
         # camera.
         world_tensor = self._runtime_camera_xform(
@@ -7899,12 +10953,25 @@ class OvRtxRendererAdapter(RendererAdapter):
         dt = max(_MIN_DT, min(_MAX_DT, now - self._dt_clock))
         self._dt_clock = now
         render_product_paths = self._render_products_for_step()
+        self._rendered_since_load = True
         try:
-            products = self._renderer.step(
-                render_products=render_product_paths,
-                delta_time=dt,
-            )
-        except Exception:
+            # The first native step compiles every material and can grow host
+            # memory without bound on a large scene: watch it and warn.
+            with contextlib.ExitStack() as first_step_scope:
+                if not getattr(self, "_first_step_done", False):
+                    first_step_scope.enter_context(HostMemoryWatch("the first native step"))
+                    first_step_scope.enter_context(self._shader_file_scan())
+                products = self._renderer.step(
+                    render_products=render_product_paths,
+                    delta_time=dt,
+                )
+            self._first_step_done = True
+            self._synchronous_steps = getattr(self, "_synchronous_steps", 0) + 1
+            # Texture-streaming and device-memory totals (read-only; at most once a second).
+            note_renderer_diagnostics(getattr(self, "_renderer_totals_handle", None))
+        except Exception as exc:
+            # A failed step must not look like a normal black frame.
+            record_step_failure(exc)
             # exceptional transition: never trust the retained container
             # across a failed step (renderer state is suspect).
             self._release_retained_output()
@@ -7923,6 +10990,7 @@ class OvRtxRendererAdapter(RendererAdapter):
             return np.zeros((int(height), int(width), 4), dtype=np.uint8)
 
         self._frame_pacing_needs_sync_step = False
+        self._frame_pacing_first_frame_native = False
         self._frame_pacing_size = (int(width), int(height))
         self._frame_pacing_projection = np.ascontiguousarray(
             proj_matrix, dtype=np.float64
@@ -7942,16 +11010,24 @@ class OvRtxRendererAdapter(RendererAdapter):
         if not self._in_flight_pick_queries or pacing_pick_snapshot is not None:
             self._frame_pacing_pick_generated = False
             self._frame_pacing_pick_association_unavailable = False
-        if self._native_render_is_paused() and pacing_pick_snapshot is not None:
+        # While the native session is paused it still owns the provider's
+        # stable descriptor and presentation key. Publishing this synchronous
+        # LdrColor through the ImageBridge would replace them during the UI
+        # frame. The next native publication would then release a descriptor
+        # already captured in ImGui draw data before Vulkan submits it, and a
+        # resume at the same size never installs the key again, so the native
+        # frames would stop reaching the viewport and the last synchronous
+        # image (with its old selection outlines) would stay on screen.
+        if self._native_render_is_paused():
             return None
         self._extract_requested_point_cloud_frames(products)
         self._extract_requested_render_var_output_frames(products)
 
-        # When the debounce defers a resolution change, ovrtx still
-        # renders at ``self._last_resolution`` — potentially smaller or
-        # larger than ``(width, height)``. ``_extract_ldr_color`` uses the
-        # CPU path for those mismatch frames so ``_normalize_rgba`` can
-        # pad/crop safely before ImageBridge sees the requested size.
+        # While a new size waits until it settles, ovrtx still renders at
+        # ``self._last_resolution``, which can be smaller or larger than
+        # ``(width, height)``. ``_extract_ldr_color`` uses the CPU path for
+        # those frames, so that ``_normalize_rgba`` scales the image to the
+        # requested size before ImageBridge sees it.
         if overlap is None or grouped_key is not None or not self._ldr_overlap_allowed():
             if overlap is not None:
                 # Gated frame (livestream / zero-copy / LdrColor output
@@ -7997,11 +11073,741 @@ class OvRtxRendererAdapter(RendererAdapter):
         )
         return self._record_successful_frame(output, int(width), int(height))
 
+    def set_render_policy(self, policy: str, settle_frames: int) -> None:
+        """See :meth:`RendererAdapter.set_render_policy` (the synchronous step path).
+
+        A change of the settle frames alone does not forget the stored
+        settled pictures: the viewport sets them from the render
+        mode and its sample target, which are render settings, so they belong
+        to the settings state on screen. That state keeps its settle frames
+        (:meth:`_settled_frames_of`), and a stored picture counts as settled
+        only when it was finished with at least that many frames.
+        """
+        value = (str(policy), max(0, int(settle_frames)))
+        previous = getattr(self, "_still_frame_policy", None)
+        if value != previous:
+            self._still_frame_policy = value
+            if previous is not None and previous[0] == value[0] == "on_change" and value[1] > 0:
+                self._still_frame_requested = True
+            else:
+                self._request_still_frame()
+        if value[0] == "on_change":
+            frames = getattr(self, "_settled_state_frames", None)
+            if frames is None:
+                frames = self._settled_state_frames = {}
+            frames[self._render_settings_state()] = value[1]
+
+    def _settled_frames_of(self, settings: tuple) -> int:
+        """The settle frames of a settings state: what the viewport set while it was on screen, else the current ones."""
+
+        _policy, settle = getattr(self, "_still_frame_policy", None) or ("continuous", 0)
+        return int((getattr(self, "_settled_state_frames", None) or {}).get(settings, settle))
+
+    def last_frame_unchanged(self) -> bool:
+        """See :meth:`RendererAdapter.last_frame_unchanged`: the kept picture of :meth:`_still_frame`."""
+        return bool(getattr(self, "_still_frame_kept", False))
+
+    def request_render(self) -> None:
+        """Step again, then the settle frames, for a change the camera does not show."""
+        self._request_still_frame()
+
+    def _request_still_frame(self) -> None:
+        """Step again under the ``on_change`` policy: something changed the picture.
+
+        Any change other than the render settings that this adapter keeps
+        for the next frame (:meth:`_defer_render_setting`) can change every
+        picture, so the stored settled pictures are forgotten.
+        """
+
+        self._still_frame_requested = True
+        if not getattr(self, "_render_settings_replay_depth", 0):
+            self._forget_settled_pictures()
+
+    # ── Settled pictures of render-settings states ──
+    #
+    # ovrtx keeps memory for each frame that it renders and for each renderer
+    # restart. Undo and Redo of Render Settings > Reset Settings move between
+    # the same settings states, and each move rendered a new picture (and
+    # restarted the renderer for a render mode change). A setting change now
+    # waits for the next frame. That frame shows the stored picture of the new
+    # settings state when the scene is unchanged, and gives the renderer
+    # nothing; otherwise it gives the renderer the waiting settings and renders
+    # as before. The picture on screen is stored when a change comes, also
+    # before it settles; while a stored picture is on screen, the renderer
+    # finishes such a picture with steps that are not shown. So each settings
+    # state is rendered to its settle frames a bounded number of times, however
+    # fast Undo and Redo come.
+
+    def _settled_pictures_enabled(self) -> bool:
+        """Whether a setting change may wait for the next frame and show a stored picture."""
+
+        policy, settle = getattr(self, "_still_frame_policy", None) or ("continuous", 0)
+        return bool(
+            policy == "on_change"
+            and settle > 0
+            and getattr(self, "_rendered_since_load", False)
+            and self._renderer is not None
+            and self._stage is not None
+            and getattr(self._renderer, "_attached_ovstage", None) is None
+            and len(getattr(self, "_render_product_group", ()) or ()) <= 1
+            and getattr(self, "_livestream", None) is None
+        )
+
+    def _settled_pictures_store(self) -> SettledPictures:
+        pictures = getattr(self, "_settled_pictures", None)
+        if pictures is None:
+            pictures = SettledPictures(_SETTLED_PICTURES_LIMIT, _SETTLED_PICTURES_MAX_BYTES)
+            self._settled_pictures = pictures
+        return pictures
+
+    def _forget_settled_pictures(self) -> None:
+        """Forget the stored pictures: the next scene has a new generation.
+
+        The setting values that the renderer has stay known: a camera change,
+        a selection, a stage edit or a reload of the same stage does not change
+        them. They are forgotten too when another document is loaded or a
+        stage edit from outside this adapter changes a render setting
+        (:meth:`_forget_renderer_setting_values`).
+        """
+
+        self._settled_generation = getattr(self, "_settled_generation", 0) + 1
+        pictures = getattr(self, "_settled_pictures", None)
+        if pictures is not None:
+            pictures.clear()
+        # A stored picture on screen stays until the next frame: its scene no
+        # longer matches, and that frame leaves it (_leave_settled_picture).
+        self._settled_capture = None
+        self._settled_job = None
+        self._settled_job_failed = None
+        self._settled_change_on_screen = None
+
+    def _forget_renderer_setting_values(self) -> None:
+        """Forget the setting values that the renderer has: their next states start from here."""
+
+        self._renderer_setting_values = {}
+        self._settled_state_frames = {}
+        self._forget_settled_pictures()
+
+    def _render_setting_target(self, descriptor: RenderSettingDescriptor) -> Optional[tuple[str, str]]:
+        """``(prim path, attribute name)`` that the renderer reads the setting from."""
+
+        owner_stage = self._render_setting_owner_stage_for(descriptor)
+        path = _render_setting_owner_path(owner_stage, descriptor)
+        attr_name = str(descriptor.metadata.get("attr_name") or "")
+        if not path or not attr_name:
+            return None
+        return str(path), attr_name
+
+    def _note_renderer_setting_value(self, descriptor: RenderSettingDescriptor, value: Any) -> None:
+        """Record a value that the renderer has now (the settings state of the stored pictures)."""
+
+        target = self._render_setting_target(descriptor)
+        if target is None:
+            return
+        values = getattr(self, "_renderer_setting_values", None)
+        if values is None:
+            values = {}
+            self._renderer_setting_values = values
+        values[target] = _render_setting_value_key(value)
+
+    def _render_settings_state(self, *, waiting: bool = True) -> tuple:
+        """The settings state that the stored pictures are keyed by.
+
+        The values written since the stored pictures were last forgotten;
+        with ``waiting`` the values of the waiting settings replace the
+        renderer's. Two equal states mean the same settings for the renderer.
+        """
+
+        values = dict(getattr(self, "_renderer_setting_values", None) or {})
+        if waiting:
+            for target, (_descriptor, value) in (
+                getattr(self, "_deferred_render_settings", None) or {}
+            ).items():
+                values[target] = _render_setting_value_key(value)
+        return tuple(sorted(values.items()))
+
+    def _defer_render_setting(self, descriptor: RenderSettingDescriptor, value: Any) -> bool:
+        """Keep a setting change for the next frame (:meth:`_settled_picture_frame`).
+
+        False, with nothing kept, when the change must reach the renderer now:
+        stored pictures are off, the setting is globally owned (its delivery
+        reopens the stage and can fail), or its delivery could fail later. A
+        value that returns to the renderer's value no longer waits.
+        """
+
+        if not self._settled_pictures_enabled():
+            return False
+        if _render_setting_owner_scope(descriptor) == _RENDER_SETTINGS_OWNER_SCOPE:
+            return False
+        target = self._render_setting_target(descriptor)
+        if target is None:
+            return False
+        path, attr_name = target
+        if descriptor.requirement is RenderSettingRequirement.RENDERER_RESTART:
+            if not path.startswith(f"{_SESSION_ROOT_PATH}/"):
+                return False
+        else:
+            renderer = self._renderer
+            writer = getattr(renderer, "write_attribute", None)
+            if not callable(writer):
+                return False
+        deferred = getattr(self, "_deferred_render_settings", None)
+        if deferred is None:
+            deferred = {}
+            self._deferred_render_settings = deferred
+        if not deferred and getattr(self, "_settled_hold", None) is None:
+            # How far the picture on screen is for the settings that the
+            # renderer has, before the notice of this change pauses the render
+            # worker: it is stored first.
+            self._settled_change_on_screen = self._settled_picture_on_screen(
+                bool(getattr(self, "_still_frame_kept", False))
+            )
+        # The first change since the last frame says the renderer's value.
+        first = deferred.get(target, (descriptor, None))[0]
+        if _render_setting_value_unchanged(first, value):
+            deferred.pop(target, None)
+        else:
+            deferred[target] = (first, value)
+        self._note_published_render_setting(descriptor)
+        # notify_stage_changed knows the USD notice of this change by its path.
+        kept = getattr(self, "_kept_picture_setting_paths", None) or set()
+        self._kept_picture_setting_paths = kept | {f"{path}.{attr_name}"}
+        return True
+
+    def _apply_deferred_render_settings(self) -> None:
+        """Give the renderer the settings that wait for the next frame, with one restart at most."""
+
+        deferred = getattr(self, "_deferred_render_settings", None)
+        if not deferred:
+            return
+        self._deferred_render_settings = {}
+        failed = False
+        self._render_settings_replay_depth = getattr(self, "_render_settings_replay_depth", 0) + 1
+        try:
+            with self.render_setting_batch():
+                for descriptor, value in deferred.values():
+                    try:
+                        self._write_render_setting_to_ovrtx(descriptor, value)
+                    except Exception as error:
+                        failed = True
+                        print(
+                            "[OvRtxRendererAdapter] giving the renderer the render "
+                            f"setting {descriptor.setting_id!r} failed: "
+                            f"{type(error).__name__}: {error}; the renderer restarts "
+                            "with the settings of the stage",
+                            file=sys.stderr,
+                        )
+                    else:
+                        self._note_renderer_setting_value(descriptor, value)
+                if failed:
+                    self._restart_for_render_settings(renderer_restart=True)
+        finally:
+            self._render_settings_replay_depth -= 1
+        if failed:
+            self._forget_settled_pictures()
+
+    def _settled_scene_key(
+        self, width: int, height: int, view_matrix: Any, proj_matrix: Any
+    ) -> tuple:
+        """Everything but the render settings that a stored picture is valid for.
+
+        The parts of the key of :meth:`_still_frame` and a generation that
+        :meth:`_forget_settled_pictures` increases at every other change.
+        """
+
+        return (
+            int(width),
+            int(height),
+            np.asarray(view_matrix, dtype=np.float64).tobytes(),
+            np.asarray(proj_matrix, dtype=np.float64).tobytes(),
+            str(self._runtime_camera_path() or ""),
+            str(getattr(self, "_render_product_path", "") or ""),
+            id(self._renderer),
+            id(self._stage),
+            tuple(getattr(self, "_last_resolution", None) or ()),
+            tuple(getattr(self, "_loaded_muted_layer_identifiers", ()) or ()),
+            getattr(self, "_settled_generation", 0),
+        )
+
+    def _settled_work_waits(self) -> bool:
+        """Work that needs a renderer step: no stored picture is shown for it."""
+
+        return bool(
+            getattr(self, "_frame_pacing_pick_snapshot", None) is not None
+            or not getattr(self, "_first_step_done", False)
+            or getattr(self, "_in_flight_pick_queries", None)
+            or getattr(self, "_point_cloud_requests", None)
+            or getattr(self, "_render_var_output_requests", None)
+            or getattr(self, "_material_check_requests", None)
+            or getattr(self, "_outline_pass_settle_after", None) is not None
+        )
+
+    def _settled_picture_on_screen(self, last_frame_kept: bool) -> Optional[str]:
+        """How far the picture on screen is, for the camera and settings that the renderer has.
+
+        ``"settled"``: with native frame pacing the render worker waits with no
+        render due; without it, the last frame was the kept picture of
+        :meth:`_still_frame` (``last_frame_kept``). ``"partial"``: a frame of
+        these settings is on screen and the renderer still refines it.
+        ``None``: nothing of these settings is surely on screen.
+        """
+
+        token = int(getattr(self, "_frame_pacing_token", 0) or 0)
+        if not token:
+            # The last synchronous step shows these settings unless a renderer
+            # change waits for its first step.
+            output = getattr(self, "_still_frame_output", None)
+            if output is not None and not isinstance(output, np.ndarray):
+                _report_once(
+                    "stored pictures of GPU frames",
+                    f"the picture on screen is a GPU frame ({type(output).__name__}), which the "
+                    "stored pictures of render-settings states cannot keep; the fallback is a new "
+                    "render of each settings state that comes back",
+                )
+            if (
+                not isinstance(output, np.ndarray)
+                or getattr(self, "_frame_pacing_first_frame_native", False)
+                or getattr(self, "_frame_pacing_needs_sync_step", False)
+                or getattr(self, "_still_frame_requested", False)
+            ):
+                return None
+            return "settled" if last_frame_kept else "partial"
+        if self._native_render_is_paused() or getattr(
+            self, "_frame_pacing_first_frame_native", False
+        ):
+            return None
+        native_ui = self._frame_pacing_bindings()
+        if native_ui is None:
+            return None
+        try:
+            status = dict(native_ui._get_native_frame_pacing_status())
+        except Exception as error:
+            _report_once(
+                "native pacing status for stored pictures",
+                f"reading the native frame pacing status failed: {type(error).__name__}: {error}; "
+                "the picture on screen is not stored before the setting change, and its settings "
+                "state renders again when it comes back",
+            )
+            return None
+        _end_report("native pacing status for stored pictures")
+        if status.get("session_token") != token:
+            return None
+        if "render_idle" not in status:
+            # An ovui without this status never says idle: its pictures stay partial.
+            _report_once(
+                "native pacing render_idle",
+                "the native frame pacing status of this ovui has no render_idle; the fallback "
+                "counts each stored picture as partial, and the renderer finishes it again with "
+                "steps that are not shown",
+            )
+        if status.get("render_idle") is True:
+            return "settled"
+        return "partial" if int(status.get("real_render_completions") or 0) > 0 else None
+
+    def _store_settled_picture(
+        self, scene: tuple, settings: tuple, width: int, height: int, *, settled: bool = True
+    ) -> None:
+        """Store the picture on screen, of the settings that the renderer has.
+
+        The native render worker shows its pictures itself: it is paused, and
+        one synchronous step gives the same picture as a CPU image. The
+        paused worker resumes without rendering.
+        """
+
+        if self._uses_owned_render_product() and tuple(
+            getattr(self, "_last_resolution", None) or ()
+        ) != (int(width), int(height)):
+            return
+        if not getattr(self, "_frame_pacing_token", 0):
+            picture = getattr(self, "_still_frame_output", None)
+        else:
+            self._stop_native_frame_pacing(
+                "settled picture", pause_render=True, keep_picture=True
+            )
+            picture = self._step_cpu_picture(width, height)
+        if isinstance(picture, np.ndarray):
+            _policy, settle = getattr(self, "_still_frame_policy", None) or ("continuous", 0)
+            # The settle frames of the settings on screen now, unless the
+            # viewport gave that state its own.
+            frames = getattr(self, "_settled_state_frames", None)
+            if frames is None:
+                frames = self._settled_state_frames = {}
+            frames.setdefault(settings, int(settle))
+            self._put_settled_picture(scene, settings, picture, settled=settled, frames=int(settle))
+
+    def _put_settled_picture(
+        self, scene: tuple, settings: tuple, picture: np.ndarray, *, settled: bool, frames: int
+    ) -> None:
+        """Store ``picture``; a picture larger than the store is reported, and its state renders again."""
+
+        if int(picture.nbytes) > _SETTLED_PICTURES_MAX_BYTES:
+            height, width = picture.shape[:2]
+            _report_once(
+                "stored picture size",
+                f"a picture of {width}x{height} ({picture.nbytes / 2**20:.0f} MiB) is larger than "
+                f"the {_SETTLED_PICTURES_MAX_BYTES // 2**20} MiB of the stored pictures of "
+                "render-settings states; the fallback is a new render of its settings state "
+                "when it comes back",
+            )
+        self._settled_pictures_store().put(scene, settings, picture, settled=settled, frames=frames)
+
+    def _step_renderer(self) -> Any:
+        """One synchronous step of the camera that the renderer has; its products, or ``None``."""
+
+        now = time.perf_counter()
+        dt = max(_MIN_DT, min(_MAX_DT, now - self._dt_clock))
+        self._dt_clock = now
+        try:
+            products = self._renderer.step(
+                render_products=self._render_products_for_step(),
+                delta_time=dt,
+            )
+        except Exception as exc:
+            record_step_failure(exc)
+            return None
+        self._synchronous_steps = getattr(self, "_synchronous_steps", 0) + 1
+        return products
+
+    def _step_cpu_picture(self, width: int, height: int) -> Optional[np.ndarray]:
+        """One synchronous step of the camera that the renderer has; its LdrColor as a CPU image."""
+
+        products = self._step_renderer()
+        if products is None:
+            return None  # record_step_failure reported the failed step
+        product_path = str(self._render_product_path)
+        try:
+            product = products[product_path]
+            render_var = self._ldr_render_var(product.frames[0])
+            if render_var is None:
+                raise LookupError(f"the step gave no {_LDR_VAR_NAME} output")
+            with render_var.map(device=_ovrtx.Device.CPU) as mapping:
+                image = _copy_tensor_to_host(_mapped_render_var_tensor(mapping))
+        except Exception as error:
+            _report_once(
+                "copy of a stored picture",
+                f"copying the picture of the render product {product_path!r} to the CPU failed: "
+                f"{type(error).__name__}: {error}; this picture of its render settings is not "
+                "stored or finished",
+            )
+            return None
+        _end_report("copy of a stored picture")
+        return _normalize_rgba(image, int(width), int(height))
+
+    def _write_settled_job_camera(
+        self, width: int, height: int, view_matrix: Any, proj_matrix: Any
+    ) -> bool:
+        """Give the renderer the camera of this frame, as the synchronous step of :meth:`render_frame` does.
+
+        A renderer restart (the render mode) replaced the session camera, so a
+        step after it needs the lens too. The next frame that leaves the stored
+        picture steps synchronously once before native frame pacing starts.
+        False, reported, when the camera write fails: then no step may run for
+        a stored picture, because the renderer can have another camera.
+        """
+
+        self._apply_camera_projection(proj_matrix)
+        self._apply_resolution_if_allowed((int(width), int(height)))
+        camera_path = self._runtime_camera_path()
+        self._frame_pacing_needs_sync_step = True
+        try:
+            self._renderer.write_attribute(
+                prim_paths=[camera_path],
+                attribute_name="omni:xform",
+                tensor=self._runtime_camera_xform(
+                    _view_to_ovrtx_transform(view_matrix), camera_path
+                ),
+                semantic=_ovrtx.Semantic.XFORM_MAT4x4,
+            )
+        except Exception as error:
+            _report_once(
+                "camera of a step that is not shown",
+                f"writing the camera {camera_path} for a step that is not shown failed: "
+                f"{type(error).__name__}: {error}; that step does not run, so no picture is "
+                "stored or read under a camera that the renderer may not have",
+            )
+            return False
+        _end_report("camera of a step that is not shown")
+        self._push_camera_intrinsics(proj_matrix, camera_path)
+        self._frame_pacing_first_frame_native = False
+        self._frame_pacing_start_delay = 0
+        return True
+
+    def _advance_settled_job(
+        self,
+        scene: tuple,
+        settings: tuple,
+        width: int,
+        height: int,
+        view_matrix: Any,
+        proj_matrix: Any,
+    ) -> Optional[np.ndarray]:
+        """While a stored picture is on screen, finish a settled picture with one step that is not shown.
+
+        The renderer first finishes the settings that it has (the user left
+        them before their picture settled). Then, when the picture on screen
+        is partial, the renderer gets its settings and renders it. Each job
+        steps the settle frames once, so the frames of each settings state are
+        bounded however fast Undo and Redo come. Returns the settled picture
+        of the settings on screen when it is done.
+        """
+
+        pictures = self._settled_pictures_store()
+        renderer_state = self._render_settings_state(waiting=False)
+        job = getattr(self, "_settled_job", None)
+        if job is not None and job[:2] != (scene, renderer_state):
+            job = None
+        if job is None:
+            if not pictures.settled(scene, renderer_state, self._settled_frames_of(renderer_state)):
+                job_state = renderer_state
+            elif not pictures.settled(scene, settings, self._settled_frames_of(settings)):
+                # The renderer is free: it renders the partial picture on screen again.
+                self._apply_deferred_render_settings()
+                job_state = self._render_settings_state(waiting=False)
+            else:
+                self._settled_job = None
+                return None
+            if (scene, job_state) == getattr(self, "_settled_job_failed", None):
+                return None
+            if not self._write_settled_job_camera(width, height, view_matrix, proj_matrix):
+                # Not again for these settings and this scene (reported).
+                self._settled_job_failed = (scene, job_state)
+                return None
+            # The settle frames of the job's own settings state.
+            job = (scene, job_state, self._settled_frames_of(job_state) + 1)
+        job_scene, job_state, steps_left = job
+        if steps_left > 1:
+            products = self._step_renderer()
+            del products
+            self._settled_job = (job_scene, job_state, steps_left - 1)
+            return None
+        self._settled_job = None
+        picture = self._step_cpu_picture(width, height)
+        if picture is None:
+            # Not again for these settings and this scene: the step failed (reported).
+            self._settled_job_failed = (job_scene, job_state)
+            return None
+        self._put_settled_picture(
+            job_scene, job_state, picture, settled=True, frames=self._settled_frames_of(job_state)
+        )
+        return picture if job_state == settings else None
+
+    def _show_settled_picture(
+        self, scene: tuple, settings: tuple, picture: np.ndarray, width: int, height: int
+    ) -> np.ndarray:
+        """Show a stored picture: the render worker stops, the viewport shows CPU images."""
+
+        if getattr(self, "_frame_pacing_token", 0):
+            self._stop_native_frame_pacing("settled picture", keep_picture=True)
+        self._settled_hold = (scene, settings, picture)
+        return self._record_successful_frame(picture, int(width), int(height))
+
+    def _leave_settled_picture(self) -> None:
+        """Give the renderer the waiting settings; the frame renders as before.
+
+        When a stored picture was on screen and the settings restart the
+        renderer (the render mode), and the native render worker would render
+        the first frame, the long first step after the restart runs as the
+        rebuild operation (:meth:`_rebuild_step_runs`): the stored picture
+        stays on screen until it is done, where the native first frame left
+        the viewport empty for about two seconds.
+        """
+
+        was_holding = getattr(self, "_settled_hold", None) is not None
+        self._settled_hold = None
+        self._settled_job = None
+        self._settled_change_on_screen = None
+        restarts = getattr(self, "_settled_restarts", 0)
+        self._apply_deferred_render_settings()
+        if (
+            was_holding
+            and getattr(self, "_settled_restarts", 0) != restarts
+            and not getattr(self, "_frame_pacing_token", 0)
+            and getattr(self, "_frame_pacing_first_frame_native", False)
+            and self._frame_pacing_eligible()
+        ):
+            self._rebuild_step_due = True
+
+    def _give_settings_on_screen_before_pick(self) -> None:
+        """Give the renderer the settings of the picture on screen before a pick query is queued.
+
+        Settings that wait for the next frame (a stored picture on screen)
+        would reach the renderer after the query, and a renderer restart for
+        them (the render mode) drops the queued query: the click selected
+        nothing. When the first step after that restart runs as the rebuild
+        operation, the pick is kept until it is done
+        (:meth:`_keep_pick_for_rebuild`).
+        """
+
+        if getattr(self, "_settled_hold", None) is not None or getattr(
+            self, "_deferred_render_settings", None
+        ):
+            self._leave_settled_picture()
+
+    def _settled_picture_frame(
+        self, width: int, height: int, view_matrix: Any, proj_matrix: Any, last_frame_kept: bool
+    ) -> Optional[np.ndarray]:
+        """The stored picture that this frame shows, or ``None`` to render as before.
+
+        A settings state that returns with the same scene shows its stored
+        picture again: nothing is given to the renderer for it. Another state
+        gets the waiting settings and renders; its settled picture is stored.
+        The picture on screen just before a setting change is stored too, for
+        the settings that the renderer still has, also when it is not settled
+        yet: the renderer finishes it while a stored picture is on screen (see
+        :meth:`_advance_settled_job`). ``last_frame_kept``: the last frame was
+        the kept picture of :meth:`_still_frame`.
+        """
+
+        if not self._settled_pictures_enabled() or self._settled_work_waits():
+            self._leave_settled_picture()
+            self._settled_capture = None
+            self._settled_last_scene = None
+            return None
+        scene = self._settled_scene_key(width, height, view_matrix, proj_matrix)
+        # The picture on screen shows the camera of the last frame.
+        camera_unchanged = scene == getattr(self, "_settled_last_scene", None)
+        self._settled_last_scene = scene
+        pictures = self._settled_pictures_store()
+        pictures.keep_scene(scene)
+        hold = getattr(self, "_settled_hold", None)
+        if hold is not None and hold[0] != scene:
+            self._leave_settled_picture()
+            return None
+        deferred = getattr(self, "_deferred_render_settings", None)
+        capture = getattr(self, "_settled_capture", None)
+        if hold is None and not deferred and capture is None:
+            return None
+        settings = self._render_settings_state()
+        if hold is not None and hold[1] == settings:
+            picture = self._advance_settled_job(
+                scene, settings, width, height, view_matrix, proj_matrix
+            )
+            if picture is not None:
+                return self._show_settled_picture(scene, settings, picture, width, height)
+            self._still_frame_kept = True
+            return hold[2]
+        if hold is None and not deferred:
+            if capture != (scene, settings):
+                self._settled_capture = None
+            elif camera_unchanged and self._settled_picture_on_screen(last_frame_kept) == "settled":
+                self._settled_capture = None
+                self._store_settled_picture(scene, settings, width, height)
+            return None
+        if hold is None:
+            on_screen = getattr(self, "_settled_change_on_screen", None)
+            self._settled_change_on_screen = None
+            before = self._render_settings_state(waiting=False)
+            if (
+                on_screen
+                and camera_unchanged
+                and not pictures.settled(scene, before, self._settled_frames_of(before))
+            ):
+                self._store_settled_picture(
+                    scene, before, width, height, settled=on_screen == "settled"
+                )
+        picture = pictures.get(scene, settings)
+        if picture is not None:
+            return self._show_settled_picture(scene, settings, picture, width, height)
+        self._leave_settled_picture()
+        self._settled_capture = (scene, self._render_settings_state())
+        return None
+
+    def _still_frame_work_waits(self) -> bool:
+        """Whether work waits for the next step: then a still camera still steps."""
+        return bool(
+            getattr(self, "_frame_pacing_token", 0)
+            or getattr(self, "_frame_pacing_needs_sync_step", False)
+            or getattr(self, "_frame_pacing_pick_snapshot", None) is not None
+            or not getattr(self, "_first_step_done", False)
+            or getattr(self, "_in_flight_pick_queries", None)
+            or getattr(self, "_point_cloud_requests", None)
+            or getattr(self, "_render_var_output_requests", None)
+            or getattr(self, "_livestream", None) is not None
+            or getattr(self, "_render_settings_publish_job", None) is not None
+            or getattr(self, "_material_check_requests", None)
+            or getattr(self, "_outline_pass_settle_after", None) is not None
+            or len(getattr(self, "_render_product_group", ()) or ()) > 1
+        )
+
+    def _still_frame(
+        self,
+        width: int,
+        height: int,
+        view_matrix: Any,
+        proj_matrix: Any,
+        runtime_camera_path: Any,
+    ) -> Any:
+        """The output of the last step when this frame needs no step, else ``None``.
+
+        Under the ``on_change`` policy (:meth:`set_render_policy`) a frame
+        steps for a changed camera, size, render product, renderer or stage,
+        a request (:meth:`request_render`, a stage edit, a selection, a
+        renderer-side write), then for the settle frames, and while work
+        waits for a step (:meth:`_still_frame_work_waits`). A frame that
+        needs no step returns the same output object again, so the viewport
+        keeps its picture and ovrtx keeps no new memory. Under
+        the frame overlap a step shows the image of the step before it, so
+        the first such frame shows the newest step, with no new step: the
+        kept picture is the newest camera for every settle count, also zero.
+        """
+        policy, settle = getattr(self, "_still_frame_policy", None) or ("continuous", 0)
+        overlap = getattr(self, "_ldr_overlap", None)
+        key = (
+            int(width),
+            int(height),
+            np.asarray(view_matrix, dtype=np.float64).tobytes(),
+            np.asarray(proj_matrix, dtype=np.float64).tobytes(),
+            str(runtime_camera_path or ""),
+            str(getattr(self, "_render_product_path", "") or ""),
+            id(self._renderer),
+            id(self._stage),
+            tuple(getattr(self, "_last_resolution", None) or ()),
+            tuple(getattr(self, "_loaded_muted_layer_identifiers", ()) or ()),
+        )
+        last = getattr(self, "_still_frame_output", None)
+        # A debounced resize commits the new resolution on a later step.
+        resize_waits = self._uses_owned_render_product() and tuple(
+            getattr(self, "_last_resolution", None) or ()
+        ) != (int(width), int(height))
+        changed = (
+            policy != "on_change"
+            or getattr(self, "_still_frame_requested", True)
+            or key != getattr(self, "_still_frame_key", None)
+            or last is None
+            or resize_waits
+            or self._still_frame_work_waits()
+            # The overlap may not show its newest step now: step again.
+            or (
+                overlap is not None
+                and overlap.has_unshown_step()
+                and not self._ldr_overlap_allowed()
+            )
+        )
+        self._still_frame_key = key
+        self._still_frame_requested = False
+        if changed:
+            self._still_frame_settle_left = settle
+            return None
+        left = int(getattr(self, "_still_frame_settle_left", 0) or 0)
+        if left > 0:
+            self._still_frame_settle_left = left - 1
+            return None
+        if overlap is not None and overlap.has_unshown_step():
+            newest = overlap.present_retained(
+                lambda retained: self._extract_ldr_color(
+                    retained, int(width), int(height)
+                )
+            )
+            return self._record_successful_frame(newest, int(width), int(height))
+        self._still_frame_kept = True
+        return last
+
     def _record_successful_frame(
         self, output: Any, width: int, height: int
     ) -> Any:
         """Record a frame produced by a renderer step for inspector state."""
 
+        self._still_frame_output = output
         self._successful_frame_count = int(getattr(self, "_successful_frame_count", 0) or 0) + 1
         if isinstance(output, np.ndarray):
             self._last_frame_shape = tuple(int(value) for value in output.shape)
@@ -8435,13 +12241,27 @@ class OvRtxRendererAdapter(RendererAdapter):
             },
         )
 
+    def _prepare_camera_for_native_first_frame(
+        self, width: int, height: int, proj_matrix: Any
+    ) -> None:
+        """Write the projection, resolution and lens that a reset or a reload dropped.
+
+        Python owns the renderer only when no native session runs or the
+        session is paused.
+        """
+        if self._frame_pacing_token and not self._native_render_is_paused():
+            return
+        self._apply_camera_projection(proj_matrix)
+        self._apply_resolution_if_allowed((int(width), int(height)))
+        self._push_camera_intrinsics(proj_matrix, self._runtime_camera_path())
+
     def _push_camera_intrinsics(self, proj_matrix: Any, camera_path: str) -> None:
         """Push focalLength / h_aperture / v_aperture to ovrtx Fabric.
 
         ``UsdGeomCamera`` declares these as ``float`` (32-bit), so we
         send a length-1 ``float32`` tensor per attribute. On any failure
         the call is swallowed — the renderer keeps rendering with the
-        previous frame's values and the next frame retries. Issue #22.
+        previous frame's values and the next frame retries.
         """
         try:
             from ovui_data_adapters.openusd._camera_writer import (
@@ -8491,44 +12311,167 @@ class OvRtxRendererAdapter(RendererAdapter):
             self._camera_projection_mode = previous
 
     def _apply_resolution_if_allowed(self, target: Tuple[int, int]) -> None:
-        """Commit ``target`` to ovrtx Fabric iff the debounce policy allows.
+        """Give the owned render product the viewport size when that size has settled.
 
-        Policy (the viewport behavior):
+        * The first size after construction or after a timing reset applies at once.
+        * A later new size applies when the viewport asked for the same size for
+          ``_RESIZE_SETTLE_S``. A window resize asks for a new size on many frames,
+          and the first ovrtx step at a new resolution is slow and runs on the UI
+          thread. So the first frame after a maximize shows the window at its new
+          size at once (before, the new window area stayed black during that slow
+          step), and a drag of the window border applies the size once, when the
+          drag stops, not at each step.
 
-        * If the request equals the last committed resolution, do nothing.
-        * Otherwise measure the delta. A "big" delta is >8 px on either
-          axis; we compute ``actively_resizing`` from the *prior*
-          ``_last_big_delta_time`` before updating it with the current
-          frame, so a single isolated jump is never "actively resizing"
-          against itself — it must have at least one big-delta predecessor
-          within ``_RESIZE_ACTIVE_WINDOW_S`` to qualify.
-        * "Actively resizing" means a prior big delta was seen within
-          ``_RESIZE_ACTIVE_WINDOW_S``. During active resize, throttle
-          reinjects to one per ``_RESIZE_DEBOUNCE_S``. When not active,
-          apply immediately — including sub-threshold deltas after the
-          active window expires.
-
-        When the write is deferred, the render step below still runs —
-        ovrtx renders at ``_last_resolution`` and ``_normalize_rgba`` in
-        the caller pads/crops the returned frame to the requested
-        ``(width, height)`` so the on-screen image stays coherent.
+        While a size waits, the render step still runs: ovrtx renders at
+        ``_last_resolution``, and ``_normalize_rgba`` in the caller scales the
+        frame to the requested ``(width, height)``.
         """
         if not self._uses_owned_render_product():
             return
+        request = getattr(self, "_resize_request", None)
         if target == self._last_resolution:
+            self._resize_request = target
             return
         now = self._clock()
-        dw = abs(target[0] - self._last_resolution[0])
-        dh = abs(target[1] - self._last_resolution[1])
-        big_delta = dw > _RESIZE_BIG_DELTA_PX or dh > _RESIZE_BIG_DELTA_PX
-        actively_resizing = (now - self._last_big_delta_time) < _RESIZE_ACTIVE_WINDOW_S
-        if big_delta:
-            self._last_big_delta_time = now
-        throttle_ok = (now - self._last_reinject_time) >= _RESIZE_DEBOUNCE_S
-        if (not actively_resizing) or throttle_ok:
-            self._last_resolution = target
-            self._last_reinject_time = now
-            self._reinject_session_layer()
+        if target != request:
+            if request is not None and (
+                now - getattr(self, "_resize_request_time", -math.inf) >= _RESIZE_SETTLE_S
+            ):
+                # An isolated size change: a maximize, a restore, or the start of
+                # a drag. See _picture_kept_for_resize.
+                self._resize_hold_frame = True
+            self._resize_request = target
+            self._resize_request_time = now
+            if request is not None:
+                return
+        elif now - getattr(self, "_resize_request_time", -math.inf) < _RESIZE_SETTLE_S:
+            return
+        self._apply_owned_render_product_resolution(target)
+
+    def _picture_kept_for_resize(self, width: int, height: int) -> Any:
+        """The picture on screen, fitted to the new size, for an isolated size change.
+
+        The frame in which the window gets a new size also makes the new
+        swapchain, so it is slower than others. Until that frame is presented,
+        the new window area is black. So the first frame of an isolated size
+        change (a maximize, a restore, the start of a drag) does no renderer
+        step and no upload: it gives the picture on screen again, scaled to the
+        new size, and the viewport keeps its texture (:meth:`last_frame_unchanged`).
+        The next frame renders as usual. Returns ``None`` for every other frame,
+        and with native frame pacing, which owns the picture of a paused session.
+        """
+        if not getattr(self, "_resize_hold_frame", False):
+            return None
+        self._resize_hold_frame = False
+        shown = getattr(self, "_still_frame_output", None)
+        if getattr(self, "_frame_pacing_token", 0) or not isinstance(shown, np.ndarray):
+            return None
+        self._still_frame_kept = True
+        self._still_frame_requested = True
+        return _normalize_rgba(shown, int(width), int(height))
+
+    def _apply_owned_render_product_resolution(self, target: Tuple[int, int]) -> None:
+        """Change only the resolution of the owned render product.
+
+        The resolution changes in ovrtx and in the session layer of the USD stage
+        (picking reads it there). The ovrtx session layer is not removed and added
+        again, so its camera, lights and outline anchor stay as they are, and the
+        stage gets one change of one value.
+
+        After the write, the rendering history of the renderer is cleared, as the
+        ovstage adapter does after its resolution write. The history holds the
+        frames of the old size; the next frames would build on it, and the picture
+        would stay smeared and ghosted after the renderer settles. Before this
+        change, the new session layer of each size change started with no history.
+
+        When ovrtx refuses the write, the failure is reported and the session layer
+        is composed again with the new resolution. When that also fails, the old
+        resolution stays recorded, so that a later frame tries again; otherwise the
+        viewport would have no render product (a black image) until the next size
+        change. When the history cannot be cleared, the failure is reported and the
+        session layer is composed again, which starts with no history.
+        """
+        previous = self._last_resolution
+        self._last_resolution = target
+        self._release_retained_output()
+        try:
+            self._renderer.write_attribute(
+                prim_paths=[self._render_product_path],
+                attribute_name="resolution",
+                tensor=np.array([[int(target[0]), int(target[1])]], dtype=np.int32),
+            )
+        except Exception as error:
+            print(
+                "[OvRtxRendererAdapter] the resolution write "
+                f"{int(target[0])}x{int(target[1])} to the render product "
+                f"{self._render_product_path} failed ({type(error).__name__}: {error}); "
+                "the session layer is composed again with the new resolution",
+                file=sys.stderr,
+            )
+            try:
+                self._reinject_session_layer()
+            except BaseException:
+                self._last_resolution = previous
+                raise
+            return
+        self._author_owned_session_render_product_resolution_value(target)
+        try:
+            self._renderer.reset()
+        except Exception as error:
+            print(
+                "[OvRtxRendererAdapter] the renderer reset after the resolution change "
+                f"to {int(target[0])}x{int(target[1])} failed "
+                f"({type(error).__name__}: {error}); the session layer is composed "
+                "again, so that no frame of the old size remains in the picture",
+                file=sys.stderr,
+            )
+            try:
+                self._reinject_session_layer()
+            except BaseException:
+                self._last_resolution = previous
+                raise
+            return
+        if not getattr(self, "_selection_outline_previous_paths", set()) and not getattr(
+            self, "_selection_outline_anchor_applied", False
+        ):
+            # A reset while no outline membership is applied leaves the outline
+            # pass inactive for later writes; re-arm the activation reset, as
+            # after a new session layer.
+            self._selection_outline_pass_needs_reset = True
+
+    def _author_owned_session_render_product_resolution_value(
+        self,
+        resolution: Tuple[int, int],
+    ) -> None:
+        """Write only a changed ``resolution`` of the owned render product to the session layer.
+
+        A window resize then sends one small stage change, and no new definition
+        of the render product, its camera or its render var. A missing render
+        product is authored in full.
+        """
+        if self._stage is None or not self._uses_owned_render_product():
+            return
+        width, height = int(resolution[0]), int(resolution[1])
+        try:
+            from pxr import Gf, Usd, UsdRender
+
+            prim = self._stage.GetPrimAtPath(self._render_product_path)
+            if not prim or not prim.IsA(UsdRender.Product):
+                self._author_owned_session_render_product_resolution((width, height))
+                return
+            product = UsdRender.Product(prim)
+            value = Gf.Vec2i(width, height)
+            if product.GetResolutionAttr().Get() == value:
+                return
+            with Usd.EditContext(self._stage, self._stage.GetSessionLayer()):
+                product.CreateResolutionAttr().Set(value)
+        except Exception as error:
+            print(
+                f"[OvRtxRendererAdapter] the resolution {width}x{height} of the render "
+                f"product {self._render_product_path} was not written to the session "
+                f"layer ({type(error).__name__}: {error}); the stage keeps the old value",
+                file=sys.stderr,
+            )
 
     def _reinject_session_layer(self) -> None:
         """Re-compose the OvGear session layer after a resolution change."""
@@ -8585,7 +12528,9 @@ class OvRtxRendererAdapter(RendererAdapter):
             self._clear_current_native_cleanup_diagnostic(
                 "current-session-install", _SESSION_INSTALL_SENTINEL
             )
-        if not getattr(self, "_selection_outline_previous_paths", set()):
+        if not getattr(self, "_selection_outline_previous_paths", set()) and not getattr(
+            self, "_selection_outline_anchor_applied", False
+        ):
             # Recomposing with no applied membership leaves the outline pass
             # inactive for later writes; re-arm the activation reset.
             self._selection_outline_pass_needs_reset = True
@@ -8651,12 +12596,13 @@ class OvRtxRendererAdapter(RendererAdapter):
         those images always take the CPU path, because the zero-copy and
         livestream consumers follow the active product only.
         """
+        wanted = product_path or self._render_product_path
         try:
-            product = products[product_path or self._render_product_path]
-        except Exception:
-            return np.zeros((height, width, 4), dtype=np.uint8)
+            product = products[wanted]
+        except Exception as exc:
+            return self._missing_output_frame(width, height, f"no output for product {wanted}: {type(exc).__name__}: {exc}")
         if not getattr(product, "frames", None):
-            return np.zeros((height, width, 4), dtype=np.uint8)
+            return self._missing_output_frame(width, height, f"product {wanted} has no frame")
         frame_out = product.frames[0]
         render_vars = getattr(frame_out, "render_vars", None) or {}
         rv = render_vars.get(_LDR_VAR_NAME)
@@ -8671,7 +12617,7 @@ class OvRtxRendererAdapter(RendererAdapter):
                 None,
             )
         if rv is None:
-            return np.zeros((height, width, 4), dtype=np.uint8)
+            return self._missing_output_frame(width, height, f"product {wanted} has no {_LDR_VAR_NAME}")
 
         state = self._zero_copy_state if product_path is None else None
         from ovui_data_adapters.common._render_product_stream import for_current_product
@@ -8777,6 +12723,192 @@ class OvRtxRendererAdapter(RendererAdapter):
             )
         return _normalize_rgba(arr, width, height)
 
+    def verify_materials_live(self, path_prefix: str = "", limit: int = 500) -> dict[str, Any]:
+        """Draw each material beside a flat reference in THIS renderer and compare them.
+
+        Each material is drawn on a copy of the geometry prim that the scene binds to it, so the
+        renderer draws the original material instance (see ``render_probe``). The copies and the
+        reference cubes are added to the renderer that shows the application's scene and removed
+        again. Call it on the thread that renders. Returns the result (``materials``, ``mismatches``,
+        ``failures``, ``unverified``); an event is recorded for each failure and each material that
+        cannot be checked.
+        """
+
+        if self._stage is None or self._usd_handle is None:
+            raise RuntimeError("no scene is loaded; there is nothing to check")
+        if not hasattr(self._renderer, "clone_usd"):
+            raise RuntimeError("this ovrtx has no Renderer.clone_usd; the material check cannot copy the scene geometry")
+        live = live_plan(self._stage, path_prefix, limit)
+        if not live.todo:
+            live.cleanup()
+            return record_result(live.judge({}))
+        self._stop_native_frame_pacing("live material check")
+        self._release_retained_output()
+        self._note_native_scene_write()
+        handle = None
+        images = {}
+        try:
+            handle = self._renderer.add_usd_reference_from_string(live.layer_text, LIVE_PREFIX)
+            semantic = _ovrtx.Semantic.XFORM_MAT4x4
+            for target, source, matrix in live.clones:
+                self._renderer.clone_usd(source, [target])
+                self._renderer.write_attribute(
+                    prim_paths=[target], attribute_name="omni:xform",
+                    tensor=np.ascontiguousarray(np.asarray([matrix], dtype=np.float64)), semantic=semantic,
+                )
+            for product in live.products:
+                output = None
+                for _ in range(4):
+                    output = self._renderer.step(render_products={product}, delta_time=_MIN_DT)
+                images[product] = extract_images(output[product].frames[0], _ovrtx.Device.CPU)
+                output = None
+        finally:
+            if handle is not None:
+                self._renderer.remove_usd(handle)
+            live.cleanup()
+        result = record_result(live.judge(images))
+        root = self._stage.GetRootLayer()
+        result["stage_dirty"] = bool(root.dirty)
+        if root.dirty:
+            LOGGER.warning("the stage has unsaved edits; the expected colours come from the edited stage")
+        return result
+
+    def request_material_check(self, path_prefix: str = "", limit: int = 500) -> concurrent.futures.Future:
+        """Ask for the material check of the loaded scene. It runs at the next frame, on the thread that renders.
+
+        Returns a future with the result of :meth:`verify_materials_live` (or its error). A future that is
+        cancelled before that frame leaves the queue and is never run.
+        """
+
+        return self._material_check_requests.request(path_prefix, limit)
+
+    def _service_render_diagnostics(self) -> None:
+        """The diagnostics work of a frame, on the thread that renders: the checks that ``material_verify`` asked for,
+        the checks after the first frames, and the late renderer failures that name only a file.
+
+        ``render_frame`` calls it before it publishes a camera to native frame pacing, so it runs also when the native
+        worker draws the viewport. A check stops native pacing first (see :meth:`verify_materials_live`).
+        """
+
+        requests = getattr(self, "_material_check_requests", None)
+        if requests:
+            requests.run(self.verify_materials_live)
+        if getattr(self, "_first_step_done", False) and (
+            getattr(self, "_file_check_due", False) or getattr(self, "_live_check_due", False)
+        ):
+            self._after_first_frames()
+        linker = getattr(self, "_file_linker", None)
+        if linker is not None:
+            linker.poll()
+        refusal = getattr(self, "_strict_refusal", None)
+        if refusal is not None:
+            # Strict mode: a scene that is shown wrong is not shown at all. A host that catches the
+            # error of one frame (USD Workbench does) gets it again at every frame.
+            raise refusal
+
+    def describe_materials(self, path_prefix: str = "", limit: int = 500) -> dict[str, Any]:
+        """The report of each material of the loaded stage (see ``render_material_report``)."""
+
+        if self._stage is None:
+            raise RuntimeError("no scene is loaded; there is nothing to describe")
+        return describe_materials(self._stage, path_prefix, limit=limit)
+
+    @contextlib.contextmanager
+    def _shader_file_scan(self) -> Iterator[None]:
+        """Read the files that the shaders of the stage name while the first native step runs.
+
+        The first step compiles the scene for seconds. This adapter has no queued render: ``render_frame`` runs on
+        the thread that edits the stage, and that thread waits in the step while the renderer works on its own copy
+        of the scene. So nothing writes the stage while the scan reads it, and the scan costs no time of a frame.
+        The thread is joined when the step returns.
+        """
+
+        stage = getattr(self, "_stage", None)
+        if not getattr(self, "_file_check_due", False) or stage is None or not hasattr(stage, "Traverse"):
+            yield
+            return
+        found: dict[str, Any] = {}
+
+        def scan() -> None:
+            try:
+                found["files"] = shader_files(stage)
+            except Exception as exc:  # noqa: BLE001 - reported by _after_first_frames
+                found["error"] = exc
+
+        thread = threading.Thread(target=scan, name="ovui-shader-file-scan", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            thread.join()
+            self._scanned_shader_files = found
+
+    def _after_first_frames(self) -> None:
+        """After the first frame of a scene: check the files of its shaders, then the materials when asked.
+
+        A missing file is a failure (the renderer does not always say it), and a renderer failure that named only
+        a file names its materials too. The material check draws extra frames, so it runs only when
+        ``OVUI_VERIFY_MATERIALS`` asks for it; a failure is loud and strict mode refuses the scene.
+        """
+
+        if self._file_check_due:
+            self._file_check_due = False
+            scanned, self._scanned_shader_files = getattr(self, "_scanned_shader_files", None), None
+            try:
+                stage = getattr(self, "_stage", None)
+                if scanned and "error" in scanned:
+                    raise scanned["error"]
+                files = scanned["files"] if scanned else (
+                    shader_files(stage) if stage is not None and hasattr(stage, "Traverse") else None
+                )
+                if files is not None:
+                    record_file_events(files)
+                    # A failure that the renderer reports later (a texture that fails to load) names them too.
+                    self._file_linker = FileEventLinker(files)
+                else:
+                    # No files to explain a renderer line about a texture: it is a failure, as the renderer wrote it.
+                    settle_body_resources(None)
+            except Exception as exc:  # noqa: BLE001 - reported; the scene keeps rendering
+                LOGGER.error("the missing-file check could not run: %s: %s", type(exc).__name__, exc)
+                record_scene_failure(f"the missing-file check could not run: {type(exc).__name__}: {exc}", "unverified",
+                                     names=False)
+                settle_body_resources(None)
+        if not self._live_check_due:
+            return
+        self._live_check_due = False
+        mode = verify_mode()
+        try:
+            result = self.verify_materials_live()
+        except Exception as exc:  # noqa: BLE001 - reported; strict mode raises it
+            LOGGER.error("the material check could not run: %s: %s", type(exc).__name__, exc)
+            record_scene_failure(f"the material check could not run: {type(exc).__name__}: {exc}", "unverified", names=False)
+            if mode == "strict":
+                raise
+            return
+        if result["unverified"]:
+            LOGGER.warning(
+                "%d material(s) could not be checked and are not known to be right: %s",
+                len(result["unverified"]), ", ".join(result["unverified"][:10]),
+            )
+        if result["failures"]:
+            LOGGER.error("The renderer shows this scene wrong: %s", failure_summary(result))
+            if mode == "strict":
+                self._strict_refusal = MaterialMismatchError(
+                    f"the renderer shows this scene wrong: {failure_summary(result)} "
+                    "(OVUI_VERIFY_MATERIALS=strict refuses this scene)"
+                )
+                raise self._strict_refusal
+
+    @staticmethod
+    def _missing_output_frame(width: int, height: int, reason: str) -> np.ndarray:
+        """A black frame for a step that gave no image. It is reported: the cause is usually in the native log."""
+
+        record_scene_failure(
+            f"the renderer returned no image ({reason}); see the native renderer log for the cause",
+            names=False,
+        )
+        return np.zeros((height, width, 4), dtype=np.uint8)
+
     @staticmethod
     def _ldr_render_var(frame_out: Any) -> Any:
         render_vars = getattr(frame_out, "render_vars", None) or {}
@@ -8860,7 +12992,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         paths: List[str],
         *,
         force_reapply: bool = False,
-    ) -> None:
+    ) -> bool:
         """Drive ovrtx's native selection-outline state for selected prims.
 
         Tracks ``_selection_outline_previous_paths`` defensively: clears
@@ -8872,9 +13004,32 @@ class OvRtxRendererAdapter(RendererAdapter):
         says they were already outlined; use it after renderer layer
         replacement because ovrtx outline attributes may have been
         dropped while this adapter's cache still contains the selection.
+
+        While a rebuild step runs (:meth:`scene_update_pending`), the outline
+        of the newest selection goes to ovrtx when the step is done.
+
+        Returns False, with no write and no step, when nothing was selected or
+        outlined before and nothing can be outlined now: the picture cannot
+        change (a selection of a prim that draws nothing reaches the adapter
+        as an empty list; see :meth:`_outline_stays_empty`). True otherwise.
         """
+        if self._outline_stays_empty(paths):
+            return False
+        self._request_still_frame()
+        # A newer selection or clear replaces any held outline refresh.
+        self._outline_pass_pending_refresh = False
+        if self._keep_selection_for_rebuild(paths):
+            return True
         if not self._native_render_is_paused():
-            self._stop_native_frame_pacing("selection highlight mutation")
+            # The outline writes below only need the native render worker
+            # parked; the next frame resumes the session. A selection that
+            # starts the outline pass resets the renderer below: after a
+            # stop, the next frame would render on the UI thread and wait for
+            # the long first render after that reset. A stop would also show a
+            # black viewport until a new picture comes, for all of a rebuild
+            # when the selection changes just before a structural edit (a
+            # Delete clears the selection first).
+            self._stop_native_frame_pacing("selection highlight mutation", pause_render=True)
         self._grouped_frames = {}  # Shared images predate the new outline.
         selected = list(dict.fromkeys(str(p) for p in (paths or []) if p))
         self._selected_paths = selected
@@ -8937,6 +13092,127 @@ class OvRtxRendererAdapter(RendererAdapter):
         }
         if current & new_previous:
             self._ensure_selection_outline_pass_active()
+        return True
+
+    def _outline_stays_empty(self, paths: Any) -> bool:
+        """Whether nothing is selected or outlined now and ``paths`` outlines nothing.
+
+        A path of a prim that the stage does not have outlines nothing: for
+        example the selected Xform that an Undo of Create > Xform removed.
+        """
+        if (
+            getattr(self, "_selected_paths", None)
+            or getattr(self, "_selection_outline_previous_paths", None)
+            or getattr(self, "_outline_pass_pending_refresh", False)
+        ):
+            return False
+        return not any(self._stage_may_have_prim(path) for path in paths or [] if path)
+
+    def _stage_may_have_prim(self, path: Any) -> bool:
+        """False only when the stage surely has no prim at ``path``."""
+        stage = getattr(self, "_stage", None)
+        get_prim = getattr(stage, "GetPrimAtPath", None)
+        if get_prim is None:
+            return True
+        try:
+            return bool(get_prim(str(path)))
+        except Exception as error:
+            # Counted as a prim: the outline is written, as for any prim.
+            print(
+                f"[OvRtxRendererAdapter] cannot look up {str(path)!r} in the stage "
+                f"for the selection outline ({type(error).__name__}: {error}); "
+                "the outline is written for it",
+                file=sys.stderr,
+            )
+            return True
+
+    def _deliver_held_outline_refresh(self) -> None:
+        """Run a held outline refresh for the current selection, if one is held."""
+
+        if not getattr(self, "_outline_pass_pending_refresh", False):
+            return
+        self._outline_pass_pending_refresh = False
+        self.refresh_selection_highlight(list(getattr(self, "_selected_paths", []) or []))
+
+    def _start_selection_outline_pass(self, view_matrix: Any = None) -> None:
+        """Start the selection outline pass when the viewport is idle after start-up.
+
+        The first selection would otherwise reset the renderer while the user
+        waits for its outline, and right after the scene's first frames the
+        reset holds the start-up. Once the scene has been shown for
+        ``_OUTLINE_PASS_AFTER_S`` and the camera has been still for
+        ``_OUTLINE_PASS_STILL_S``, the render worker pauses, the anchor joins
+        the hidden outline group and the renderer resets, as main did right
+        after the first frames. When the worker has shown three frames after
+        the reset, the session restarts once, as after any selection: a
+        session that only resumes after a reset renders at a fraction of its
+        rate. The restart renders one frame on the UI thread, while nobody
+        uses the viewport.
+        """
+        token = getattr(self, "_frame_pacing_token", 0)
+        settle_after = getattr(self, "_outline_pass_settle_after", None)
+        if not token:
+            self._outline_pass_settle_after = None
+            # The session ended before the restart: refresh now.
+            self._deliver_held_outline_refresh()
+            return
+        if getattr(self, "_in_flight_pick_queries", None):
+            # A click is being picked: the selection starts the pass.
+            return
+        native_ui = self._frame_pacing_bindings()
+        try:
+            status = dict(native_ui._get_native_frame_pacing_status()) if native_ui is not None else {}
+        except Exception:
+            return
+        presented = int(status.get("presented_renderer_frames") or 0)
+        if settle_after is _SETTLE_AFTER_SHOWN_FRAMES:
+            # Set by a selection that reset the renderer.
+            self._outline_pass_settle_after = settle_after = presented + 3
+        if settle_after is not None:
+            if presented >= settle_after:
+                self._outline_pass_settle_after = None
+                self._stop_native_frame_pacing("selection outline pass started")
+                self._deliver_held_outline_refresh()
+            return
+        if getattr(self, "_selection_outline_armed", False) or presented <= 0:
+            return
+        now = time.perf_counter()
+        shown_at = getattr(self, "_outline_pass_shown_at", None)
+        if shown_at is None:
+            self._outline_pass_shown_at = shown_at = now
+        if view_matrix is not None:
+            view = np.asarray(view_matrix, dtype=np.float64)
+            last_view = getattr(self, "_outline_pass_last_view", None)
+            if last_view is None or last_view.shape != view.shape or not np.array_equal(last_view, view):
+                self._outline_pass_last_view = view.copy()
+                self._outline_pass_still_since = now
+        still_since = getattr(self, "_outline_pass_still_since", now)
+        if now - shown_at < _OUTLINE_PASS_AFTER_S or now - still_since < _OUTLINE_PASS_STILL_S:
+            return
+        self._selection_outline_armed = True
+        if getattr(self, "_renderer", None) is None or not getattr(
+            self, "_selection_outline_pass_needs_reset", False
+        ):
+            return
+        self._stop_native_frame_pacing("selection outline activation", pause_render=True)
+        self._apply_selection_outline_anchor()
+        if not getattr(self, "_selection_outline_anchor_applied", False):
+            return
+        # Ownership: reset invalidates retained output handles.
+        self._release_retained_output()
+        reset = getattr(self._renderer, "reset", None)
+        if not callable(reset):
+            return
+        try:
+            reset()
+        except Exception:
+            self._selection_outline_pass_needs_reset = True
+            return
+        self._selection_outline_pass_needs_reset = False
+        if getattr(self, "_frame_pacing_token", 0):
+            # The worker keeps one render in flight, so the frame after the
+            # reset is shown third; the restart then waits for no long render.
+            self._outline_pass_settle_after = presented + 3
 
     def _ensure_selection_outline_pass_active(self) -> None:
         """Run the one-shot outline-pass activation reset once membership exists.
@@ -8948,6 +13224,12 @@ class OvRtxRendererAdapter(RendererAdapter):
         """
         if not getattr(self, "_selection_outline_pass_needs_reset", False):
             return
+        if not getattr(self, "_selection_outline_armed", False):
+            # The first selection starts the pass: the anchor joins the group
+            # with this reset, so later session layers keep the pass.
+            self._selection_outline_armed = True
+            self._apply_selection_outline_anchor()
+            self._selection_outline_pass_needs_reset = True
         # Ownership: reset invalidates retained output handles.
         self._release_retained_output()
         reset = getattr(self._renderer, "reset", None)
@@ -8958,6 +13240,10 @@ class OvRtxRendererAdapter(RendererAdapter):
         except Exception:
             return
         self._selection_outline_pass_needs_reset = False
+        if getattr(self, "_frame_pacing_token", 0):
+            # The session resumes after this reset; restart it once the
+            # frames after the reset are shown, as the idle start does.
+            self._outline_pass_settle_after = _SETTLE_AFTER_SHOWN_FRAMES
 
     def _mark_selection_outline_state_stale(
         self,
@@ -9005,8 +13291,25 @@ class OvRtxRendererAdapter(RendererAdapter):
         accepted by the renderer bookkeeping before it is visible. This refresh
         path preserves normal clear handling but writes every current selected
         path again after the next rendered frame.
+
+        Nothing is written, and no step follows, when nothing is selected or
+        outlined and ``paths`` outlines nothing (:meth:`_outline_stays_empty`).
         """
 
+        if self._outline_stays_empty(paths):
+            return
+        if self._keep_selection_for_rebuild(paths):
+            return
+        if getattr(self, "_outline_pass_settle_after", None) is not None and getattr(
+            self, "_frame_pacing_token", 0
+        ):
+            # The renderer was reset for the outline pass and the session
+            # renders the long first frames after it. Taking the renderer now
+            # would wait for them; the refresh runs right after the session
+            # restart that follows those frames, for the selection current
+            # then.
+            self._outline_pass_pending_refresh = True
+            return
         if not self._native_render_is_paused():
             self._stop_native_frame_pacing("selection highlight refresh")
         self._grouped_frames = {}  # Shared images predate the new outline.
@@ -9047,6 +13350,11 @@ class OvRtxRendererAdapter(RendererAdapter):
         prior callback. The prior query's result is still drained from
         ovrtx by :meth:`_dispatch_pending_pick_results` so a rapid
         second click cannot inherit the canceled query's hit.
+
+        While a rebuild step runs (:meth:`scene_update_pending`), the pick is
+        kept and sent when the step is done; it resolves after that. The
+        renderer first gets the settings of a stored picture on screen
+        (:meth:`_give_settings_on_screen_before_pick`).
         """
         if (
             self._stage is None
@@ -9055,6 +13363,11 @@ class OvRtxRendererAdapter(RendererAdapter):
             or not hasattr(self._renderer, "enqueue_pick_query")
         ):
             callback(None, None)
+            return
+        self._give_settings_on_screen_before_pick()
+        if self._keep_pick_for_rebuild(
+            "point", (x, y), callback, str(query_name or "viewport_click")
+        ):
             return
         self._stop_native_frame_pacing(
             "pick query", capture_selected_camera=True, pause_render=True
@@ -9097,6 +13410,125 @@ class OvRtxRendererAdapter(RendererAdapter):
         self._pick_enqueue_count += 1
         self._last_pick_pixel_rect = (left, top, right, bottom)
 
+    def query_surface(self, x: float, y: float) -> int:
+        """Ask for the surface point under render NDC ``(x, y)``; 0 when not available.
+
+        The query rides on the next paced render step, so unlike :meth:`pick`
+        it never pauses native frame pacing; a render is requested for it, so
+        an idle on-change session renders once more. :meth:`surface_hit`
+        returns the answer a frame or two later. While a stored picture of a
+        render-settings state is on screen, the render worker is stopped: the
+        answer then comes at once from a step that is not shown
+        (:meth:`_query_surface_under_stored_picture`).
+        """
+        bindings = self._frame_pacing_bindings()
+        query = getattr(bindings, "_native_frame_pacing_query_surface", None)
+        if not callable(query):
+            return 0
+        if not self._frame_pacing_token and getattr(self, "_settled_hold", None) is not None:
+            return self._query_surface_under_stored_picture(x, y)
+        self._held_surface_answer = None
+        if not self._frame_pacing_token:
+            return 0
+        left, top, right, bottom = self._ndc_rect_to_pick_pixels(x, y, x, y)
+        width, height = (max(1, int(size)) for size in self._pick_resolution())
+        number = int(query(left / width, top / height, right / width, bottom / height))
+        request = getattr(bindings, "_native_frame_pacing_request_render", None)
+        if number and callable(request):
+            request(self._frame_pacing_token)
+        return number
+
+    def _query_surface_under_stored_picture(self, x: float, y: float) -> int:
+        """Answer :meth:`query_surface` at once while a stored picture is on screen.
+
+        The stored picture has the camera, the size and the stage that the
+        renderer has; only render settings can differ, and they do not move a
+        surface. One synchronous step with a pick query, which is not shown,
+        gives the surface point under the cursor, so the zoom, the orbit and
+        the pan anchor on the visible surface as with a running render worker.
+        The renderer keeps its settings: the next camera change gives it the
+        settings on screen, as before. The answers are numbered apart from the
+        native queries, so that one is never taken for the other.
+        """
+        number = max(int(getattr(self, "_held_surface_query", 0) or 0), _HELD_SURFACE_QUERY_BASE) + 1
+        self._held_surface_query = number
+        self._held_surface_answer = (number, None)
+        point = self._surface_point_under_stored_picture(x, y)
+        self._held_surface_answer = (number, point)
+        return number
+
+    def _surface_point_under_stored_picture(self, x: float, y: float) -> Optional[tuple]:
+        """The surface point under render NDC ``(x, y)`` in stage units; ``None`` for no surface (or a reported failure)."""
+
+        fallback = "the navigation uses the point at the target's depth"
+        renderer = self._renderer
+        enqueue = getattr(renderer, "enqueue_pick_query", None)
+        if not callable(enqueue):
+            _report_once(
+                "surface query under a stored picture",
+                f"the renderer has no pick query for the surface under the cursor; {fallback}",
+            )
+            return None
+        scene = self._settled_hold[0]
+        width, height = int(scene[0]), int(scene[1])
+        view = np.frombuffer(scene[2], dtype=np.float64).reshape(4, 4)
+        projection = np.frombuffer(scene[3], dtype=np.float64).reshape(4, 4)
+        if not self._write_settled_job_camera(width, height, view, projection):
+            return None
+        # The flag of the native surface query: ovrtx gives the world position of the hit.
+        flags = getattr(_ovrtx, "OVRTX_PICK_FLAG_INCLUDE_TRACKED_INFO", None)
+        try:
+            left, top, right, bottom = self._ndc_rect_to_pick_pixels(x, y, x, y)
+            rect = self._pick_pixels_to_query_rect(left, top, right, bottom)
+            if flags is None:
+                enqueue(self._render_product_path, *rect)
+            else:
+                enqueue(self._render_product_path, *rect, flags=int(flags))
+        except Exception as error:
+            _report_once(
+                "surface query under a stored picture",
+                "asking the renderer for the surface under the cursor failed: "
+                f"{type(error).__name__}: {error}; {fallback}",
+            )
+            return None
+        products = self._step_renderer()
+        if products is None:
+            # record_step_failure reported the failed step.
+            _report_once(
+                "surface query under a stored picture",
+                f"the step for the surface under the cursor failed; {fallback}",
+            )
+            return None
+        _end_report("surface query under a stored picture")
+        scale = _stage_units_per_meter(self._stage)
+        hits = self._read_pick_hits(products)
+        if not hits:
+            return None
+        path, meters = hits[0]
+        if meters is not None:
+            return tuple(float(value) * scale for value in meters)
+        # As for a click: ray-cast the hit prim in USD with the camera of the picture.
+        point = _pick_surface_point(self._stage, path, view, projection, x, y)
+        _report_once(
+            "surface position under a stored picture",
+            f"the renderer gave no position for the surface {path} under the cursor; the "
+            "fallback is a ray cast of that prim in USD"
+            + ("" if point is not None else f", which found no point, so {fallback}"),
+        )
+        return point
+
+    def surface_hit(self) -> tuple:
+        """``(query, world point or None)`` of the newest answered :meth:`query_surface`."""
+        held = getattr(self, "_held_surface_answer", None)
+        if held is not None:
+            return held
+        hit = getattr(self._frame_pacing_bindings(), "_native_frame_pacing_surface_hit", None)
+        query, meters = hit() if callable(hit) else (0, None)
+        if meters is None:
+            return query, None
+        scale = _stage_units_per_meter(self._stage)
+        return query, tuple(value * scale for value in meters)
+
     def cancel_pick(self, query_name: str) -> None:
         """Cancel any in-flight point-pick callback registered under ``query_name``.
 
@@ -9104,12 +13536,14 @@ class OvRtxRendererAdapter(RendererAdapter):
         still surface a result on the next frame; only the Python
         callback is suppressed. The result slot is preserved in the
         FIFO so it gets drained before any replacement query's callback
-        is dispatched.
+        is dispatched. A pick kept during a rebuild step under that name is
+        not sent.
         """
-        self._cancel_in_flight_point(
-            str(query_name or "viewport_click"),
-            _PICK_CANCEL_EXPLICIT,
-        )
+        name = str(query_name or "viewport_click")
+        kept = getattr(self, "_deferred_picks", None)
+        if kept:
+            kept[:] = [pick for pick in kept if not (pick[0] == "point" and pick[3] == name)]
+        self._cancel_in_flight_point(name, _PICK_CANCEL_EXPLICIT)
 
     def _cancel_in_flight_point(self, name: str, reason: str) -> None:
         for entry in self._in_flight_pick_queries:
@@ -9125,7 +13559,10 @@ class OvRtxRendererAdapter(RendererAdapter):
         y1: float,
         callback: Callable[[List[str]], None],
     ) -> None:
-        """Enqueue an ovrtx rectangle pick; callback resolves after next frame."""
+        """Enqueue an ovrtx rectangle pick; callback resolves after next frame.
+
+        While a rebuild step runs, the pick is kept and sent when it is done.
+        """
         if (
             self._stage is None
             or self._usd_handle is None
@@ -9133,6 +13570,9 @@ class OvRtxRendererAdapter(RendererAdapter):
             or not hasattr(self._renderer, "enqueue_pick_query")
         ):
             callback([])
+            return
+        self._give_settings_on_screen_before_pick()
+        if self._keep_pick_for_rebuild("rect", (x0, y0, x1, y1), callback, None):
             return
         self._stop_native_frame_pacing(
             "rectangle pick query", capture_selected_camera=True, pause_render=True
@@ -9172,6 +13612,13 @@ class OvRtxRendererAdapter(RendererAdapter):
         renderer = getattr(self, "_renderer", None)
         setter = getattr(renderer, "set_selection_group_styles", None)
         if setter is None:
+            if renderer is not None and not getattr(self, "_selection_outline_styles_missing_reported", False):
+                self._selection_outline_styles_missing_reported = True
+                print(
+                    "[OvRtxRendererAdapter] selection outline styles not set: "
+                    "missing ovrtx API ovrtx.Renderer.set_selection_group_styles",
+                    file=sys.stderr,
+                )
             return
         self._release_retained_output()
         try:
@@ -9187,7 +13634,18 @@ class OvRtxRendererAdapter(RendererAdapter):
                     "fill_color": _SELECTION_OUTLINE_FILL,
                 }
             )
-            setter({_SELECTION_OUTLINE_GROUP_ID: style})
+            hidden = (0.0, 0.0, 0.0, 0.0)
+            hidden_style = (
+                style_cls(outline_color=hidden, fill_color=hidden)
+                if style_cls is not None
+                else {"outline_color": hidden, "fill_color": hidden}
+            )
+            setter(
+                {
+                    _SELECTION_OUTLINE_GROUP_ID: style,
+                    _SELECTION_OUTLINE_HIDDEN_GROUP_ID: hidden_style,
+                }
+            )
         except Exception:
             return
         self._selection_outline_styles_configured = True
@@ -9207,6 +13665,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         renderer = getattr(self, "_renderer", None)
         if renderer is None or not paths:
             return False
+        self._note_native_scene_write(paths)
         # ovrtx 0.4 removed the ``omni:selectionOutlineGroup``
         # attribute mechanism (and its module-level attribute-name constant);
         # per-prim outline membership goes through a dedicated renderer API.
@@ -9227,7 +13686,8 @@ class OvRtxRendererAdapter(RendererAdapter):
         if group_setter is not None:
             try:
                 group_setter(list(paths), int(group_id))
-            except Exception:
+            except Exception as exc:
+                self._selection_outline_write_error = f"{type(exc).__name__}: {exc}"
                 return False
             self._selection_outline_attribute_writes = (
                 getattr(self, "_selection_outline_attribute_writes", 0) + 1
@@ -9245,7 +13705,8 @@ class OvRtxRendererAdapter(RendererAdapter):
                 # renderer resolves the operation (void ops return True)
                 # and raises on completion failure.
                 completed = wait() if callable(wait) else True
-            except Exception:
+            except Exception as exc:
+                self._selection_outline_write_error = f"{type(exc).__name__}: {exc}"
                 return False
             if completed is None:
                 return False
@@ -9255,6 +13716,15 @@ class OvRtxRendererAdapter(RendererAdapter):
             return True
         writer = getattr(renderer, "write_attribute", None)
         if writer is None:
+            if not getattr(self, "_selection_outline_group_missing_reported", False):
+                self._selection_outline_group_missing_reported = True
+                print(
+                    "[OvRtxRendererAdapter] selection outline not written: missing ovrtx API "
+                    "ovrtx.Renderer.set_selection_outline_group_strings, "
+                    "ovrtx.Renderer.set_selection_outline_group_strings_async and "
+                    "ovrtx.Renderer.write_attribute",
+                    file=sys.stderr,
+                )
             return False
         attr_name = getattr(
             _ovrtx,
@@ -9700,8 +14170,13 @@ class OvRtxRendererAdapter(RendererAdapter):
         renderer = getattr(self, "_renderer", None)
         public_resolver = getattr(renderer, "resolve_prim_path_id", None)
         if public_resolver is not None:
+            # A newer ovrtx accepts only its PrimPath handle; a previous one takes the integer.
+            prim_path_type = getattr(_ovrtx, "PrimPath", None)
+            prim_path = int(prim_path_id)
             try:
-                path = public_resolver(int(prim_path_id))
+                path = public_resolver(
+                    prim_path if prim_path_type is None else prim_path_type(prim_path)
+                )
             except Exception:
                 path = None
             path = str(path or "")
@@ -9729,9 +14204,23 @@ class OvRtxRendererAdapter(RendererAdapter):
         their closures are released deterministically — otherwise a
         viewport-tear-down with picks in flight would retain those
         callbacks (and whatever they captured) until GC eventually
-        cleared the renderer adapter.
+        cleared the renderer adapter. Picks kept during a rebuild step get
+        a miss too. A rebuild step that still runs is waited for with a time
+        limit (:meth:`_finish_rebuild_step_before_shutdown`); when the limit
+        runs out, nothing is released and the shutdown raises.
         """
+        kept_pick_fault: Optional[BaseException] = None
+        try:
+            self._answer_kept_picks_as_misses()
+        except BaseException as error:  # noqa: BLE001 - raised after the teardown below
+            kept_pick_fault = error
+        try:
+            self._finish_rebuild_step_before_shutdown()
+        except BaseException as error:  # noqa: BLE001 - the step runs on: release nothing
+            raise self._chain_faults(error, kept_pick_fault)
         self._stop_native_frame_pacing("renderer shutdown")
+        self._deferred_render_settings = {}
+        self._forget_settled_pictures()
         # Ownership: a retained step-result container must never outlive the
         # native renderer handle (dropping ``_renderer`` below is the LAST
         # reference and triggers native teardown).
@@ -9740,7 +14229,7 @@ class OvRtxRendererAdapter(RendererAdapter):
         # output is unconditionally released (enforced by the ownership
         # audit).  A release failure aborts before any teardown mutation.
         self._release_retained_output()
-        first_fault: Optional[BaseException] = None
+        first_fault: Optional[BaseException] = kept_pick_fault
         try:
             self._dispatch_pending_pick_misses()
         except BaseException as error:  # noqa: BLE001
@@ -9798,11 +14287,20 @@ class OvRtxRendererAdapter(RendererAdapter):
                 raise error
             raise RuntimeError("native renderer shutdown remains unresolved")
 
+        # The material-message callback is removed while the renderer system still runs.
+        stop_material_messages(self)
         # ``ovrtx.Renderer.__del__`` destroys the GPU handle — dropping
         # instrumentation's cached references as well lets the refcount fall
         # to zero and trigger the destructor.
         get_instrumentation().release_renderer(self)
         self._renderer = None
+        self._renderer_totals_handle = None
+        self._native_root_unchanged_path = None
+        # The renderer is gone: stop the log reader after it reads the last lines.
+        try:
+            release_native_log(self)
+        except BaseException as error:  # noqa: BLE001
+            first_fault = self._chain_faults(first_fault, error)
         if restore is not None:
             snapshot = restore.prospective_snapshot
             if snapshot is not None:
@@ -9824,12 +14322,78 @@ class OvRtxRendererAdapter(RendererAdapter):
                     raise error
             self._native_restore_obligation = None
         self._drop_owned_tmp_path()
+        self._remove_ovrtx_layer_copies()
         self._stage = None
+        self._point_instancer_prototype_cache = None
         self._loaded_muted_layer_identifiers = ()
         self._discard_render_settings_owner()
         self._refresh_native_cleanup_state()
         if first_fault is not None:
             raise first_fault
+
+    def _release_ovrtx_layer_copies_except(self, keep: frozenset[str]) -> None:
+        """Remove the layer copies that the loaded scene does not name.
+
+        Each copy is named by its content, so a later load that needs the
+        same content writes it again under the same name, and ovrtx uses its
+        read of that name.
+        """
+        directory = getattr(self, "_ovrtx_layer_copies_directory", None)
+        if directory is None:
+            return
+        keep_names = {os.path.basename(path) for path in keep}
+        self._layer_copies = {
+            key: copy
+            for key, copy in getattr(self, "_layer_copies", {}).items()
+            if os.path.basename(copy.path) in keep_names
+        }
+        root_copy = getattr(self, "_root_layer_copy", None)
+        if root_copy is not None and os.path.basename(root_copy[3]) not in keep_names:
+            self._root_layer_copy = None
+        try:
+            names = os.listdir(directory)
+        except OSError as error:
+            print(
+                f"[OvRtxRendererAdapter] listing the layer copies in {directory} "
+                f"failed: {type(error).__name__}: {error}; they are removed at shutdown",
+                file=sys.stderr,
+            )
+            return
+        for name in names:
+            if name in keep_names:
+                continue
+            try:
+                os.unlink(os.path.join(directory, name))
+            except OSError as error:
+                print(
+                    "[OvRtxRendererAdapter] removing the layer copy "
+                    f"{os.path.join(directory, name)} failed: "
+                    f"{type(error).__name__}: {error}; it is removed at shutdown",
+                    file=sys.stderr,
+                )
+
+    def _remove_ovrtx_layer_copies(self) -> None:
+        """Remove the folder of the layer copies, after the renderer is gone."""
+        listener = getattr(self, "_layer_change_listener", None)
+        if listener is not None:
+            listener.Revoke()
+            self._layer_change_listener = None
+        self._layer_copies = {}
+        self._layer_change_counts = {}
+        self._layer_read_states = {}
+        self._root_layer_copy = None
+        directory = getattr(self, "_ovrtx_layer_copies_directory", None)
+        if directory is None:
+            return
+        self._ovrtx_layer_copies_directory = None
+        try:
+            shutil.rmtree(directory)
+        except OSError as error:
+            print(
+                f"[OvRtxRendererAdapter] removing the layer copies in {directory} "
+                f"failed: {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
 
     def _drop_owned_tmp_path(self) -> None:
         """Remove the anonymous-stage tempfile if we own one."""
@@ -9841,6 +14405,21 @@ class OvRtxRendererAdapter(RendererAdapter):
             # Best effort — file may already be gone if someone swept /tmp.
             pass
         self._owned_tmp_path = None
+
+
+def _gather_rgba(rgba: np.ndarray, y_idx: np.ndarray, x_idx: np.ndarray) -> np.ndarray:
+    """Return the rows ``y_idx`` and the columns ``x_idx`` of an ``(H, W, 4)`` uint8 image.
+
+    Each pixel moves as one 32-bit value, not as four bytes: the same result as
+    ``rgba[y_idx][:, x_idx]`` in about a tenth of the time. While a new viewport
+    size waits (``_RESIZE_SETTLE_S``) every frame is scaled to the new size, and
+    the first of these frames is the first frame after a window resize or
+    maximize: a slow scale delays it, and the new window area stays black longer.
+    """
+    rows, columns = rgba.shape[0], rgba.shape[1]
+    pixels = np.ascontiguousarray(rgba).view(np.uint32).reshape(rows, columns)
+    picked = np.take(np.take(pixels, y_idx, axis=0), x_idx, axis=1)
+    return picked.view(np.uint8).reshape(len(y_idx), len(x_idx), 4)
 
 
 def _normalize_rgba(arr: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -9874,5 +14453,5 @@ def _normalize_rgba(arr: np.ndarray, width: int, height: int) -> np.ndarray:
             return np.zeros((height, width, 4), dtype=np.uint8)
         y_idx = np.linspace(0, h - 1, int(height)).round().astype(np.intp)
         x_idx = np.linspace(0, w - 1, int(width)).round().astype(np.intp)
-        return np.ascontiguousarray(arr[y_idx[:, None], x_idx[None, :], :])
+        return _gather_rgba(arr, y_idx, x_idx)
     return np.ascontiguousarray(arr)

@@ -26,6 +26,8 @@ test -n "$PYTHON_BIN" || { echo "python3 not found" >&2; exit 1; }
 
 export OVUI_WIDGETS_REQUIRE_OVRTX=1
 export OVRTX_SKIP_USD_CHECK=1
+# Optional Carb settings for ovrtx, applied before the first renderer (/path/key=value; entries split by ";" or new lines):
+# export OVUI_OVRTX_CARB_SETTINGS='/persistent/app/material/materialx/disableDeduplication=true'
 export PYTHONPATH=$TRIAL_ROOT:$REPO/skills/omniverse-ui-inspector:$REPO/ovui-widgets:$REPO/ovui-data-adapters:$REPO/ovui/python:$OVRTX_ROOT/python:$USD_INSTALL/lib/python:${PYTHONPATH:-}
 export LD_LIBRARY_PATH=$USD_INSTALL/lib:$OVRTX_RUNTIME:${LD_LIBRARY_PATH:-}
 ```

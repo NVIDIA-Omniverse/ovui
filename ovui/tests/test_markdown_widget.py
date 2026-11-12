@@ -147,7 +147,7 @@ class TestMarkdownWidget(OmniUiTest):
         await self.finalize_test_no_image()
 
     async def test_glyph_forms_do_not_depend_on_atlas_bake_order(self):
-        """A character must render the same whether or not
+        """a character must render the same whether or not
         the font atlas had already rasterized it.
 
         The widget used to ask the atlas "is this glyph loaded?" to decide

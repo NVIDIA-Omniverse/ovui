@@ -27,6 +27,7 @@ forwarder remains so existing tests that import ``build_attribute_row``
 directly keep passing.
 """
 
+import dataclasses
 import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
@@ -34,11 +35,13 @@ from urllib.parse import unquote
 import omni.ui as ui
 from omni.ui import color as cl
 from ovui_data_adapters.common import AttributeMetadata, PropertyAdapter
+from ovui_data_adapters.common.matrix_transform import decompose_matrix
 
 from ovui_widgets.common.icon_caches import provider
 from ovui_widgets.property.group_widget import _CHEVRON_DOWN
 from ovui_widgets.property.models import AttributeModelBase
 from ovui_widgets.property.parts import ControlStateIndicator, HighlightLabel
+from ovui_widgets.property.parts.control_state import build_empty_state_slot
 
 # Property-row pixel height. ``ui.HStack(height=…)`` cannot accept a
 # ``_ShadeName`` token directly (the omni.ui FloatStore proxy), so the
@@ -92,6 +95,18 @@ def _set_matching_value_field_focused(
         if widget is not None and getattr(widget, "model", None) is widget_model:
             _set_value_field_focused(widget, focused)
             return
+
+
+def _end_or_cancel_edit(model: AttributeModelBase, widget_model: Any) -> None:
+    """End the edit of ``model``, or cancel it when the field took Escape.
+
+    A cancelled edit leaves no undo step and no change: the adapter puts
+    back the exact value from before the edit.
+    """
+    if widget_model.is_edit_cancelled():
+        model.cancel_edit()
+    else:
+        model.end_edit()
 
 
 def _ignore_mouse_events(widget: Any) -> Any:
@@ -322,7 +337,35 @@ def _drag_kwargs_from_metadata(prop: AttributeMetadata) -> Dict[str, Any]:
     return kwargs
 
 
-class FloatAttributeRow:
+class _ShowStoredValueAfterEdit:
+    """Mixin for a float row whose model can refuse a typed value.
+
+    While the user types, the drag field keeps the typed text, and on each
+    frame it gives the number of that text again when the number differs
+    from the widget value. So after a refusal the row does not set the
+    widget value during the edit: it shows the stored value when the edit
+    ends.
+    The class supplies ``_model`` and ``_show_stored_value``.
+    """
+
+    _show_stored_after_edit = False
+
+    def _typed_value_not_stored(self) -> None:
+        if self._model.editing:
+            self._show_stored_after_edit = True
+        else:
+            self._show_stored_value()
+
+    def _end_model_edit(self, widget_model: Any) -> None:
+        try:
+            _end_or_cancel_edit(self._model, widget_model)
+        finally:
+            if self._show_stored_after_edit and not self._model.editing:
+                self._show_stored_after_edit = False
+                self._show_stored_value()
+
+
+class FloatAttributeRow(_ShowStoredValueAfterEdit):
     """Label + FloatDrag for a single float attribute."""
 
     def __init__(
@@ -386,14 +429,22 @@ class FloatAttributeRow:
     def _on_value_changed(self, widget_model: Any) -> None:
         if self._updating:
             return
-        self._model.set_value(widget_model.get_value_as_float())
+        if not self._model.set_value(
+            widget_model.get_value_as_float(), field=self._prop.display_name
+        ):
+            self._typed_value_not_stored()
 
     def _on_end_edit(self, widget_model: Any) -> None:
         _set_value_field_focused(self._widget, False)
-        self._model.end_edit()
+        self._end_model_edit(widget_model)
 
     def _on_model_value_changed(self) -> None:
-        if self._widget is None or self._model.editing or self._updating:
+        if self._model.editing:
+            return
+        self._show_stored_value()
+
+    def _show_stored_value(self) -> None:
+        if self._widget is None or self._updating:
             return
         value = self._model.get_value()
         if value is None:
@@ -408,7 +459,7 @@ class FloatAttributeRow:
 _VEC_CHANNEL_LETTERS = ("X", "Y", "Z", "W")
 
 
-class _VecFloatRow:
+class _VecFloatRow(_ShowStoredValueAfterEdit):
     """Label + N× FloatDrag (X/Y/…/W) for float vector attributes.
 
     Shared base for ``Vec2FloatAttributeRow`` (n=2), ``Vec3FloatAttributeRow``
@@ -525,14 +576,23 @@ class _VecFloatRow:
         current = self._model.get_value()
         base = list(current) if current is not None else [0.0] * self._n_components
         base[index] = widget_model.get_value_as_float()
-        self._model.set_value(tuple(base))
+        # Only this channel is written: each selected prim keeps its own
+        # values in the other channels.
+        field = f"{self._prop.display_name} {self._channel_letters[index]}"
+        if not self._model.set_component_value(index, tuple(base), field=field):
+            self._typed_value_not_stored()
 
     def _on_end_edit(self, widget_model: Any) -> None:
         _set_matching_value_field_focused(self._widgets, widget_model, False)
-        self._model.end_edit()
+        self._end_model_edit(widget_model)
 
     def _on_model_value_changed(self) -> None:
-        if self._model.editing or self._updating:
+        if self._model.editing:
+            return
+        self._show_stored_value()
+
+    def _show_stored_value(self) -> None:
+        if self._updating:
             return
         value = self._model.get_value()
         if value is None:
@@ -692,7 +752,9 @@ class _VecIntRow:
         current = self._model.get_value()
         base = list(current) if current is not None else [0] * self._n_components
         base[index] = widget_model.get_value_as_int()
-        self._model.set_value(tuple(base))
+        # Only this channel is written: each selected prim keeps its own
+        # values in the other channels.
+        self._model.set_component_value(index, tuple(base))
 
     def _on_end_edit(self, widget_model: Any) -> None:
         _set_matching_value_field_focused(self._widgets, widget_model, False)
@@ -869,8 +931,9 @@ class _ColorFloatRow(_VecFloatRow):
         # the dragged FloatDrag widgets unclobbered — but the swatch is a
         # display-only preview, so it should always track the current model
         # value. Refreshing after super() covers both:
-        # * edits driven by ``_on_component_changed`` → model.set_value →
-        #   this callback (base early-returns, swatch still repaints);
+        # * edits driven by ``_on_component_changed`` →
+        #   model.set_component_value → this callback (base early-returns,
+        #   swatch still repaints);
         # * external backing changes (base updates all widgets, swatch
         #   repaints once at the end).
         super()._on_model_value_changed()
@@ -905,7 +968,7 @@ class Color4fAttributeRow(_ColorFloatRow):
 _MATRIX_SUPPORTED_DIMS = (2, 3, 4)
 
 
-class MatrixAttributeRow:
+class MatrixAttributeRow(_ShowStoredValueAfterEdit):
     """Label + N×N grid of FloatDrag cells for ``matrix2d`` / ``matrix3d`` /
     ``matrix4d`` attributes.
 
@@ -1032,14 +1095,22 @@ class MatrixAttributeRow:
         current = self._model.get_value()
         base = list(current) if current is not None else [0.0] * self._n_cells
         base[index] = widget_model.get_value_as_float()
-        self._model.set_value(tuple(base))
+        row, column = divmod(index, self._n_dim)
+        field = f"{self._prop.display_name} row {row + 1}, column {column + 1}"
+        if not self._model.set_value(tuple(base), field=field):
+            self._typed_value_not_stored()
 
     def _on_end_edit(self, widget_model: Any) -> None:
         _set_matching_value_field_focused(self._widgets, widget_model, False)
-        self._model.end_edit()
+        self._end_model_edit(widget_model)
 
     def _on_model_value_changed(self) -> None:
-        if self._model.editing or self._updating:
+        if self._model.editing:
+            return
+        self._show_stored_value()
+
+    def _show_stored_value(self) -> None:
+        if self._updating:
             return
         value = self._model.get_value()
         if value is None:
@@ -1050,6 +1121,152 @@ class MatrixAttributeRow:
                 if widget is None or i >= len(value):
                     continue
                 widget.model.set_value(float(value[i]))
+        finally:
+            self._updating = False
+
+
+# The rows above the 4x4 grid of a matrix transform operation: the part of
+# the matrix that each row edits and its label.
+_MATRIX_TRANSFORM_PART_ROWS = (
+    ("translate", "Translate"),
+    ("rotate", "Rotate"),
+    ("scale", "Scale"),
+)
+
+
+class MatrixTransformAttributeRow(MatrixAttributeRow):
+    """Translate, Rotate and Scale fields above the 4x4 grid of a matrix
+    transform operation (``xformOp:transform``).
+
+    The fields show the parts of the matrix (see
+    :mod:`ovui_data_adapters.common.matrix_transform`): Rotate is in
+    degrees, X first, then Y, then Z, as the ``rotateXYZ`` operation. An
+    edit of one field writes the matrix through the same attribute model as
+    the grid, with :meth:`PropertyAdapter.set_matrix_part_value`: each
+    selected object keeps its own matrix in the other parts and channels, and
+    one edit is one undo step. When an edit ends, the grid and the fields
+    show the stored matrix again.
+    """
+
+    def __init__(
+        self,
+        prop: AttributeMetadata,
+        adapter: PropertyAdapter,
+        match: str = "",
+    ) -> None:
+        self._part_widgets: Dict[str, List[Optional[ui.FloatDrag]]] = {
+            part: [None, None, None] for part, _label in _MATRIX_TRANSFORM_PART_ROWS
+        }
+        self._part_labels: List[HighlightLabel] = []
+        self._part_overlay_labels: List[ui.Label] = []
+        # The matrix at the start of the active field edit.
+        self._part_edit_start: Optional[tuple] = None
+        super().__init__(prop, adapter, n_dim=4, match=match)
+
+    def _build_ui(self) -> None:
+        mixed = self._model.is_ambiguous
+        readonly = self._model.is_readonly
+        component_width = _component_value_width(3, include_channel_labels=True)
+        with ui.VStack(spacing=2):
+            for part, label_text in _MATRIX_TRANSFORM_PART_ROWS:
+                with ui.HStack(height=_ATTRIBUTE_ROW_HEIGHT, spacing=2):
+                    self._part_labels.append(
+                        _build_attribute_label_slot(
+                            dataclasses.replace(self._prop, display_name=label_text),
+                            self._match,
+                        )
+                    )
+                    with ui.HStack(width=_VALUE_COLUMN_WIDTH, spacing=_COMPONENT_SPACING):
+                        for index, letter in enumerate(_VEC_CHANNEL_LETTERS[:3]):
+                            if index > 0:
+                                _build_component_separator()
+                            ui.Label(
+                                letter,
+                                width=_COMPONENT_LABEL_WIDTH,
+                                style_type_name_override=f"Property.ChannelLabel.{letter}",
+                                name="mixed" if mixed else "",
+                            )
+                            with ui.ZStack(width=component_width):
+                                widget = ui.FloatDrag(
+                                    style_type_name_override=_VALUE_FIELD_STYLE,
+                                )
+                                widget.enabled = not readonly
+                                self._part_widgets[part][index] = widget
+                                widget.model.add_begin_edit_fn(self._on_part_begin_edit)
+                                widget.model.add_value_changed_fn(
+                                    lambda m, p=part, i=index: self._on_part_changed(m, p, i)
+                                )
+                                widget.model.add_end_edit_fn(self._on_part_end_edit)
+                                self._part_overlay_labels.append(
+                                    ui.Label(
+                                        "Mixed",
+                                        alignment=ui.Alignment.CENTER,
+                                        style_type_name_override="Property.MixedOverlay",
+                                        visible=mixed,
+                                    )
+                                )
+                    # The state icon of the attribute is on the grid row.
+                    build_empty_state_slot()
+            super()._build_ui()
+        self._show_part_values()
+
+    def _all_part_widgets(self) -> List[Optional[ui.FloatDrag]]:
+        return [widget for widgets in self._part_widgets.values() for widget in widgets]
+
+    def _on_part_begin_edit(self, widget_model: Any) -> None:
+        _set_matching_value_field_focused(self._all_part_widgets(), widget_model, True)
+        if not self._model.editing:
+            current = self._model.get_value()
+            self._part_edit_start = tuple(current) if current is not None else None
+        self._model.begin_edit()
+
+    def _on_part_changed(self, widget_model: Any, part: str, index: int) -> None:
+        if self._updating:
+            return
+        value = widget_model.get_value_as_float()
+        start = self._part_edit_start if self._model.editing else None
+        if start is None:
+            current = self._model.get_value()
+            start = tuple(current) if current is not None else None
+        label = dict(_MATRIX_TRANSFORM_PART_ROWS)[part]
+        field = f"{label} {_VEC_CHANNEL_LETTERS[index]}"
+        if not self._model.set_matrix_part_value(part, index, value, start, field=field):
+            self._typed_value_not_stored()
+
+    def _on_part_end_edit(self, widget_model: Any) -> None:
+        _set_matching_value_field_focused(self._all_part_widgets(), widget_model, False)
+        try:
+            self._end_model_edit(widget_model)
+        finally:
+            if not self._model.editing:
+                self._part_edit_start = None
+                # The fields show the form of the stored matrix again, for
+                # example Rotate Y 120 as X 180, Y 60, Z 180.
+                self._show_stored_value()
+
+    def _show_stored_value(self) -> None:
+        super()._show_stored_value()
+        self._show_part_values()
+
+    def _show_part_values(self) -> None:
+        """Show the parts of the stored matrix.
+
+        A part that the matrix cannot give (Rotate and Scale of a matrix with
+        a value that is not a finite number) shows nan, as the grid shows
+        such a value; an edit of it is refused with the cause.
+        """
+        if self._updating:
+            return
+        value = self._model.get_value()
+        if value is None or len(value) != 16:
+            return
+        parts = decompose_matrix(value)
+        self._updating = True
+        try:
+            for part, widgets in self._part_widgets.items():
+                for index, widget in enumerate(widgets):
+                    if widget is not None:
+                        widget.model.set_value(float(getattr(parts, part)[index]))
         finally:
             self._updating = False
 
@@ -1572,8 +1789,11 @@ class RelationshipAttributeRow:
     * 1 target → the path string verbatim.
     * N targets → ``", "``-joined summary.
 
-    The StringField is instantiated with ``read_only=True`` so the user
-    can copy target paths but not type new ones. A modal target picker
+    The StringField is instantiated with ``read_only=True`` and disabled,
+    the same look as every other read-only row: a click shows no text
+    cursor and does not take keyboard focus, so the field does not seem
+    to accept typed text. Copy Value and Copy Attribute
+    Path stay in the row's right-click menu. A modal target picker
     (§9.8 ``RelationshipTargetPicker``) lands in a later phase — Step
     3.7 is display-only.
 
@@ -1617,6 +1837,7 @@ class RelationshipAttributeRow:
                     read_only=True,
                     style_type_name_override=_VALUE_FIELD_STYLE,
                 )
+                self._widget.enabled = False
                 self._widget.model.set_value(
                     _format_relationship_targets(self._model.get_value())
                 )

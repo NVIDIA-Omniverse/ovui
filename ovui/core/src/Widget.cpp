@@ -1054,6 +1054,9 @@ void Widget::forceWidthDirty(SizeDirtyReason reason)
     }
 
     m_data->m_widthEvaluated = false;
+    // Mark dirty before recursing so a cyclic parent chain stops at the early-out above.
+    m_data->m_dirtyWidth = reason;
+
     auto parent = this->getParent();
     // Python edits also run between ImGui frames, when no context is current.
     // The platform lifetime distinguishes that normal state from late GC after
@@ -1062,8 +1065,6 @@ void Widget::forceWidthDirty(SizeDirtyReason reason)
     {
         parent->forceWidthDirty(SizeDirtyReason::eChildDirty);
     }
-
-    m_data->m_dirtyWidth = reason;
 }
 
 void Widget::forceHeightDirty(SizeDirtyReason reason)
@@ -1081,14 +1082,15 @@ void Widget::forceHeightDirty(SizeDirtyReason reason)
     }
 
     m_data->m_heightEvaluated = false;
+    // Mark dirty before recursing so a cyclic parent chain stops at the early-out above.
+    m_data->m_dirtyHeight = reason;
+
     auto parent = this->getParent();
     // Guard: same as forceWidthDirty — skip parent propagation during shutdown.
     if (parent && PlatformRegistry::instance().platform())
     {
         parent->forceHeightDirty(SizeDirtyReason::eChildDirty);
     }
-
-    m_data->m_dirtyHeight = reason;
 }
 
 void Widget::forceRasterDirty(BakeDirtyReason reason)
@@ -1097,6 +1099,16 @@ void Widget::forceRasterDirty(BakeDirtyReason reason)
     {
         return;
     }
+
+    // A re-entered widget means the parent chain loops; stop before the stack overflows.
+    if (OMNIUI_UNLIKELY(m_data->m_forceRasterDirtyGuard))
+    {
+        OMNIUI_LOG_WARN_ONCE(
+            "Widget::forceRasterDirty: cycle detected in the parent chain of widget '%s', stopping the propagation",
+            this->getIdentifier().c_str());
+        return;
+    }
+    m_data->m_forceRasterDirtyGuard = true;
 
     // Pass it to the parent
     Widget* parent = this->getParent();
@@ -1112,7 +1124,7 @@ void Widget::forceRasterDirty(BakeDirtyReason reason)
                 OMNIUI_LOG_WARN("Widget::forceRasterDirty: Parent widget has changed during the call");
                 return;
             }
-            if (reason == BakeDirtyReason::eEditBegan || reason == BakeDirtyReason::eEditEnded)
+            else if (reason == BakeDirtyReason::eEditBegan || reason == BakeDirtyReason::eEditEnded)
             {
                 sharedParent->forceRasterDirty(reason);
             }
@@ -1127,6 +1139,8 @@ void Widget::forceRasterDirty(BakeDirtyReason reason)
             }
         }
     }
+
+    m_data->m_forceRasterDirtyGuard = false;
 }
 
 void Widget::forceWidthDirty()

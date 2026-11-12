@@ -149,6 +149,29 @@ def test_numeric_drag_authors_native_intermediates_and_undoes_as_one_edit(
     assert adapter.get_value("radius") == pytest.approx(original)
 
 
+def test_numeric_edit_ending_on_start_value_records_no_undo_step(
+    ovstage_scene: OvstageScene,
+) -> None:
+    undo_manager = UndoManager()
+    adapter = OvstagePropertyAdapter(
+        ovstage_scene,
+        [_SPHERE_PATH],
+        undo_manager=undo_manager,
+    )
+    stage = ovstage_scene._stage
+    original = _unpack_double(stage, _SPHERE_PATH, "radius")
+
+    # Typing 9 then Escape: the field writes 9, then the start value.
+    adapter.begin_edit("radius")
+    adapter.set_value("radius", 9.0)
+    assert _unpack_double(stage, _SPHERE_PATH, "radius") == pytest.approx(9.0)
+    adapter.set_value("radius", original)
+    adapter.end_edit("radius")
+
+    assert undo_manager.can_undo() is False
+    assert _unpack_double(stage, _SPHERE_PATH, "radius") == pytest.approx(original)
+
+
 def test_runtime_safe_write_notifies_property_subscribers_after_ovstage_poll(
     ovstage_scene: OvstageScene,
 ) -> None:
@@ -213,3 +236,81 @@ def test_native_array_property_write_persists_exactly(
     adapter.set_value("faceVertexIndices", (2, 1, 0))
 
     assert adapter.get_value("faceVertexIndices") == (2, 1, 0)
+
+
+
+_TWO_CAMERAS_USDA = """#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def Camera "CameraA"
+    {
+        float2 clippingRange = (1, 1000)
+    }
+
+    def Camera "CameraB"
+    {
+        float2 clippingRange = (5, 2000)
+    }
+}
+"""
+
+
+def _clipping_range(stage: Any, path: str) -> tuple[float, ...]:
+    return struct.unpack("<2f", _raw(stage, path, "clippingRange"))
+
+
+def test_one_channel_write_keeps_the_other_channel_of_each_prim(
+    tmp_path: pathlib.Path,
+    ovstage_runtime: Any,
+) -> None:
+    scene_path = tmp_path / "two_cameras.usda"
+    scene_path.write_text(_TWO_CAMERAS_USDA)
+    session = create_provider_session(runtime=ovstage_runtime)
+    scene = session.open_stage(str(scene_path))
+    try:
+        undo_manager = UndoManager()
+        paths = ["/World/CameraA", "/World/CameraB"]
+        adapter = OvstagePropertyAdapter(scene, paths, undo_manager=undo_manager)
+        stage = scene._stage
+        assert adapter.get_per_component_ambiguity("clippingRange") == [True, True]
+
+        adapter.begin_edit("clippingRange")
+        adapter.set_component_value("clippingRange", 0, 3.0)
+        adapter.end_edit("clippingRange")
+
+        assert _clipping_range(stage, paths[0]) == pytest.approx((3.0, 1000.0))
+        assert _clipping_range(stage, paths[1]) == pytest.approx((3.0, 2000.0))
+        assert adapter.get_per_component_ambiguity("clippingRange") == [False, True]
+        # The vector of the first camera: the row shows X = 3 and Y "Mixed".
+        assert adapter.get_value("clippingRange") == pytest.approx((3.0, 1000.0))
+
+        undo_manager.undo()
+        assert _clipping_range(stage, paths[0]) == pytest.approx((1.0, 1000.0))
+        assert _clipping_range(stage, paths[1]) == pytest.approx((5.0, 2000.0))
+    finally:
+        session.shutdown_scene()
+
+
+
+def test_a_matrix_part_write_of_a_transform_matrix_is_refused_with_the_cause(
+    ovstage_scene: OvstageScene,
+) -> None:
+    """ovstage refuses writes of its transform matrices (localMatrix) through
+    the property surface, so the Translate, Rotate and Scale edit of a
+    matrix is refused too, with the cause and with no write."""
+    adapter = OvstagePropertyAdapter(ovstage_scene, [_SPHERE_PATH])
+    stage = ovstage_scene._stage
+    before = _raw(stage, _SPHERE_PATH, "localMatrix")
+    assert adapter.get_attribute_metadata("localMatrix").type_name == "matrix4d"
+
+    with pytest.raises(
+        NotImplementedError, match="transform-control properties are not editable"
+    ):
+        adapter.set_matrix_part_value("localMatrix", "translate", 0, 5.0)
+
+    assert _raw(stage, _SPHERE_PATH, "localMatrix") == before

@@ -25,7 +25,7 @@ bridge accepts that range and clamps it to the ovui-indexable range
 a one-time WARN; subsequent out-of-range traffic is silent so a
 mis-sized client cannot flood the log.
 
-This module is the **skeleton** (issue #34, Step 3.2). The pre-tick
+This module is the **skeleton**. The pre-tick
 drain loop (Step 3.3), mouse-button enum mapping (Step 3.4), modifier
 disconnect cleanup (Step 3.5), and ``Server`` callback wiring (Step
 3.6) layer on top of this state object.

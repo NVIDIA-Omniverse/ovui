@@ -1046,6 +1046,8 @@ class TestApplicationDeleteKeyDispatch:
         content_calls: List[str] = []
 
         class _Content:
+            is_focused = True
+
             def delete_selected(self) -> None:
                 content_calls.append("content")
 
@@ -1066,3 +1068,9 @@ class TestApplicationDeleteKeyDispatch:
 
         app._on_key_pressed(app_module._KEY_DELETE, 0, True)
         assert content_calls == ["content"]
+
+        # Without Content Browser focus the key must not reach it.
+        content_calls.clear()
+        app._content_window.is_focused = False
+        app._on_key_pressed(app_module._KEY_DELETE, 0, True)
+        assert content_calls == []

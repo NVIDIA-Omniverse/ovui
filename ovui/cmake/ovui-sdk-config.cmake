@@ -29,7 +29,9 @@ if(NOT TARGET ovui::core)
         INTERFACE_COMPILE_DEFINITIONS IMGUI_NVIDIA
         INTERFACE_COMPILE_FEATURES cxx_std_17)
     if(WIN32)
-        set_target_properties(ovui::core PROPERTIES IMPORTED_IMPLIB "${_ovui_sdk}/lib/ovui.lib")
+        # The wheel's modules use pybind11's type registry key without the compiler version (ovui/CMakeLists.txt).
+        set_target_properties(ovui::core PROPERTIES IMPORTED_IMPLIB "${_ovui_sdk}/lib/ovui.lib"
+            INTERFACE_COMPILE_DEFINITIONS "IMGUI_NVIDIA;PYBIND11_BUILD_ABI=\"\"")
     endif()
 endif()
 if(NOT TARGET ovui::scene)

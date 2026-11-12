@@ -19,7 +19,6 @@ add_library(imgui ${OVUI_IMGUI_LIBRARY_TYPE}
     ${OVUI_IMGUI_ROOT}/imgui/imgui_widgets.cpp
     ${OVUI_IMGUI_ROOT}/imgui/imgui_demo.cpp
     ${OVUI_IMGUI_ROOT}/imgui/imgui_kit_compat.cpp
-    ${OVUI_IMGUI_ROOT}/imgui/imgui_ovrtx_compat.cpp
     ${OVUI_IMGUI_ROOT}/imgui/misc/freetype/imgui_freetype.cpp
 )
 target_include_directories(imgui PUBLIC
@@ -36,13 +35,15 @@ if(WIN32)
     target_compile_definitions(imgui PUBLIC "IMGUI_IMPL_API=")
     target_compile_definitions(imgui PRIVATE "IMGUI_API=__declspec(dllexport)"
         INTERFACE "IMGUI_API=__declspec(dllimport)")
-    # Avoid colliding with the older ImGui DLL loaded by OVRTX.
+    # Its own name, so it never collides with another program's imgui.dll.
     set_target_properties(imgui PROPERTIES
         RUNTIME_OUTPUT_NAME ovui_imgui
         RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}"
         ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}")
 elseif(NOT EMSCRIPTEN)
     target_compile_definitions(imgui PUBLIC "IMGUI_API=__attribute__((visibility(\"default\")))")
+    # Its own name, so it never collides with another program's libimgui.so.
+    set_target_properties(imgui PROPERTIES LIBRARY_OUTPUT_NAME ovui_imgui)
 endif()
 
 # --- glad (generated OpenGL loader) ---

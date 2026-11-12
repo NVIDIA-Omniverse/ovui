@@ -20,7 +20,14 @@ import pytest
 
 from ovui_widgets.app.testing import MockLayerStackAdapter
 from ovui_widgets.common.testing.mock_layer_stack import ROOT_LAYER_IDENTIFIER
-from ovui_widgets.layers import LayerDelegate, LayerModel
+from ovui_widgets.layers import (
+    LayerDelegate,
+    LayerModel,
+    LayerNameValueModel,
+    LocalMuteValueModel,
+    LockValueModel,
+    SaveValueModel,
+)
 
 
 def _can_build_frame() -> bool:
@@ -55,16 +62,30 @@ class TestConstruction:
 class TestColumnConstants:
     """Column ID contract must stay in lockstep with the model / window."""
 
-    def test_column_ids_match_plan_order(self) -> None:
-        # LAYERS-PLAN Step 17 freezes the order as
-        # name · live · save · local-mute · global-mute · latest · lock.
-        assert LayerDelegate.COL_NAME == 0
-        assert LayerDelegate.COL_LIVE == 1
-        assert LayerDelegate.COL_SAVE == 2
-        assert LayerDelegate.COL_LOCAL_MUTE == 3
-        assert LayerDelegate.COL_GLOBAL_MUTE == 4
-        assert LayerDelegate.COL_LATEST == 5
-        assert LayerDelegate.COL_LOCK == 6
+    def test_column_ids_read_the_matching_model_columns(self) -> None:
+        # The delegate paints each column from the model's value model for
+        # the same column id, so the two must agree on what each id holds.
+        model = LayerModel(MockLayerStackAdapter())
+        try:
+            root = model.root_item
+            assert isinstance(
+                model.get_item_value_model(root, LayerDelegate.COL_NAME),
+                LayerNameValueModel,
+            )
+            assert isinstance(
+                model.get_item_value_model(root, LayerDelegate.COL_SAVE),
+                SaveValueModel,
+            )
+            assert isinstance(
+                model.get_item_value_model(root, LayerDelegate.COL_LOCAL_MUTE),
+                LocalMuteValueModel,
+            )
+            assert isinstance(
+                model.get_item_value_model(root, LayerDelegate.COL_LOCK),
+                LockValueModel,
+            )
+        finally:
+            model.destroy()
 
     def test_column_ids_cover_full_range(self) -> None:
         ids = {

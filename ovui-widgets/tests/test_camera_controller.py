@@ -13,6 +13,7 @@ from ovui_widgets.viewport.camera_controller import (
     _look_at,
     _perspective,
 )
+from ovui_widgets.viewport.camera_inertia import TumbleInertia
 
 
 class TestDefaultState:
@@ -319,3 +320,96 @@ class TestExactPolePoses:
         after_right, after_up = self._screen_basis(cam)
         assert np.dot(before_right, after_right) > 0.9
         assert np.dot(before_up, after_up) > 0.9
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TestMotionInTime:
+    def test_each_matrix_shows_the_camera_at_its_hand_over_time(self):
+        cam = CameraController()
+        cam.state.elevation = 0.0
+        cam.clock = clock = _Clock()
+        inertia = TumbleInertia(cam, time_constant=1.0e9)  # a constant 1 rad/s turn
+        cam.processes = [inertia]
+        cam.get_matrices(100, 100)
+        inertia.start(1.0, 0.0)
+        for now in (0.016, 0.020):
+            clock.now = now
+            view, _ = cam.get_matrices(100, 100, np.float64)
+        # The view turned by exactly the time to its own hand-over.
+        reference = CameraController()
+        reference.state.elevation = 0.0
+        reference.orbit(0.020, 0.0)
+        expected, _ = reference.get_matrices(100, 100, np.float64)
+        np.testing.assert_allclose(view, expected, atol=1e-9)
+
+    def test_a_step_plays_evenly_over_its_duration(self):
+        cam = CameraController()
+        cam.clock = clock = _Clock()
+        cam.smooth("orbit", 0.4, 0.0, duration=0.04)
+        turned = []
+        for _ in range(4):
+            clock.now += 0.01
+            cam.get_matrices(100, 100)
+            turned.append(cam.state.azimuth)
+        np.testing.assert_allclose(turned, [0.1, 0.2, 0.3, 0.4])
+
+    def test_smoothing_eases_and_the_zoom_glides_faster(self):
+        cam = CameraController()
+        cam.clock = clock = _Clock()
+        cam.smoothing_half_life = 0.06
+        cam.zoom_glide_half_life = 0.04
+        cam.smooth("orbit", 1.0, 0.0)
+        cam.smooth("dolly", math.log(0.5))
+        clock.now = 0.06
+        cam.get_matrices(100, 100)
+        assert cam.state.azimuth == pytest.approx(0.5)
+        assert math.log(cam.state.distance / 5.0) == pytest.approx(math.log(0.5) * (1.0 - 0.5 ** 1.5))
+
+    def test_the_pan_is_not_smoothed(self):
+        cam = CameraController()
+        cam.clock = _Clock()
+        cam.smoothing_half_life = 0.06
+        cam.smooth("pan", 1.0, 0.0)
+        assert cam.state.target[0] != 0.0
+
+    def test_focus_stops_every_motion(self):
+        cam = CameraController()
+        cam.clock = clock = _Clock()
+        cam.smoothing_half_life = 0.06
+        inertia = TumbleInertia(cam, time_constant=1.0)
+        cam.processes = [inertia]
+        cam.get_matrices(100, 100)
+        inertia.start(2.0, 0.0)
+        cam.smooth("orbit", 1.0, 0.0)
+        cam.focus([1.0, 2.0, 3.0], 4.0)
+        azimuth = cam.state.azimuth
+        clock.now = 1.0
+        cam.get_matrices(100, 100)
+        assert cam.state.azimuth == azimuth  # neither the coast nor the queued step moves it
+        assert cam.state.target == [1.0, 2.0, 3.0]
+
+    def test_float64_matrices(self):
+        cam = CameraController()
+        cam.state.target = [1.0e6 + 0.123456, 0.0, 0.0]
+        view, proj = cam.get_matrices(100, 100, np.float64)
+        assert view.dtype == np.float64 and proj.dtype == np.float64
+        eye = -view[:3, :3].T @ view[:3, 3]
+        np.testing.assert_allclose(eye, cam._get_eye(), rtol=0.0, atol=1.0e-8)
+
+
+class TestCursorPoint:
+    @pytest.mark.parametrize("vertical", [1.0, -1.0])
+    def test_the_cursor_point_is_under_the_cursor_even_straight_down_or_up(self, vertical):
+        cam = CameraController()
+        cam.set_pose(eye=[0.0, 10.0 * vertical, 0.0], target=[0.0, 0.0, 0.0], up_axis="Y")
+        point = cam.cursor_point(0.5, -0.25, 2.0)
+        view, proj = cam.get_matrices(200, 100, np.float64)
+        clip = proj @ view @ np.append(point, 1.0)
+        np.testing.assert_allclose(clip[:2] / clip[3], (0.5, -0.25), atol=1e-9)

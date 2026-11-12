@@ -19,11 +19,9 @@ Each holder registers a zero-arg clear callback here at import time;
 :meth:`Application.shutdown` calls :func:`clear_all` to invoke every
 registered callback.
 
-Issue #35, Step 2.
-
 ``provider()`` and ``_PROVIDER_CACHE`` were elevated from
-:mod:`ovui_widgets.stage.widget.stage_icons` to this shared module in Issue #31
-Step 5 so that any widget package (e.g. ``ovui_widgets.property``) can call
+:mod:`ovui_widgets.stage.widget.stage_icons` to this shared module so that
+any widget package (e.g. ``ovui_widgets.property``) can call
 ``provider()`` without creating a cross-widget import dependency.
 """
 from __future__ import annotations
@@ -142,7 +140,7 @@ def clear_all() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Process-wide RasterImageProvider cache (Issue #31 Step 5)
+# Process-wide RasterImageProvider cache
 # ---------------------------------------------------------------------------
 # Elevated from ovui_widgets.stage.widget.stage_icons so that any widget package
 # (e.g. ovui_widgets.property) can call provider() without a cross-widget import.

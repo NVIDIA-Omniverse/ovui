@@ -578,7 +578,7 @@ class StageWidget:
                 return
             if not self._is_count_event(event):
                 return
-            self._refresh_footer_counts()
+            self._request_footer_counts()
 
         return (subscribe(_on_count_event), footer_epoch)
 
@@ -645,9 +645,52 @@ class StageWidget:
                 return
             if not self._is_count_event(event):
                 return
-            self._refresh_footer_counts()
+            self._request_footer_counts()
 
         self._footer_adapter_sub = subscribe(_on_count_event)
+
+    def _request_footer_counts(self) -> None:
+        """Refresh the footer counts once on the next frame.
+
+        A recount walks every prim of the stage: about 0.4 s on a stage of
+        51,000 prims. Undo or Redo of an eye click on a multi-selection
+        sends one change event for each selected prim, so a recount for
+        each event froze the window for many seconds. All count events
+        before the next frame now share one recount; the window draws the
+        footer only at a frame, so it shows the same counts. When the
+        recount cannot be scheduled (no application scheduler, or the
+        scheduler fails), the recount runs at once. This fallback is
+        reported with its cause when it starts or when its cause changes,
+        not again for each event while it continues.
+        """
+        if getattr(self, "_footer_refresh_pending", False):
+            return
+        self._footer_refresh_pending = True
+        try:
+            from ovui_widgets.common import scheduler as _scheduler
+
+            _scheduler.call_later(0.0, self._run_requested_footer_counts)
+        except RuntimeError as exc:
+            cause = f"{type(exc).__name__}: {exc}"
+            if cause != getattr(self, "_footer_schedule_failure", None):
+                self._footer_schedule_failure = cause
+                from ovui_widgets.common.error_reporter import ErrorReporter
+
+                ErrorReporter.log_warning(
+                    "Stage",
+                    "Cannot schedule the footer recount for the next frame "
+                    f"({cause}). The footer is recounted at once instead.",
+                )
+            self._run_requested_footer_counts()
+        except BaseException:
+            self._footer_refresh_pending = False
+            raise
+        else:
+            self._footer_schedule_failure = None
+
+    def _run_requested_footer_counts(self) -> None:
+        self._footer_refresh_pending = False
+        self._refresh_footer_counts()
 
     def _refresh_footer_counts(self) -> None:
         """Refresh the pinned footer using live adapter hierarchy data."""

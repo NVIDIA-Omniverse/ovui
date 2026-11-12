@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Solid filled cube — concrete prim definition (Sdf.SpecifierDef) -->
+  <g stroke="#1F2123" stroke-width="0.6" stroke-linejoin="round">
+    <!-- Top face (lightest) -->
+    <polygon points="8,2 13,4.5 8,7 3,4.5" fill="#C7D3E6"/>
+    <!-- Left face (mid) -->
+    <polygon points="3,4.5 8,7 8,13 3,10.5" fill="#8FA2BF"/>
+    <!-- Right face (darkest) -->
+    <polygon points="13,4.5 8,7 8,13 13,10.5" fill="#6B7E9E"/>
+  </g>
+</svg>

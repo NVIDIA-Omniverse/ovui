@@ -164,6 +164,19 @@ ui.Button("Delete",   style_type_name_override="FileBrowser.ActionButton", name=
 - Use `name` for a property-level variant of an existing type that should inherit everything else.
 - Combine both when you have several variants of a domain-specific category in the same view.
 
+## Style types that ovui sets for you
+
+Some standard widgets do not use their class name as their style type:
+
+| Widgets | Style type |
+|---|---|
+| `StringField`, `IntField`, `FloatField`, and the other fields | `Field` |
+| `FloatSlider`, `IntSlider`, `UIntSlider`, `FloatDrag`, `IntDrag`, `UIntDrag` | `Slider` |
+
+- Put the default look of these widgets under `Field` and `Slider`. A key such as `StringField` or `FloatDrag` does not style a default widget. It styles only a widget that sets `style_type_name_override` to that name.
+- To find the style type of a widget, read `widget.style_type_name_override`. When it is empty, the style type is the class name.
+- A `CollapsableFrame` draws its default header (the title and the arrow) with the style type `CollapsableFrame`. Its inner header and body frames also use `CollapsableFrame`, also when the frame has its own `style_type_name_override`. So `color` under `CollapsableFrame` is the color of the default title and arrow, and `padding` under `CollapsableFrame` is the inner padding of every collapsable frame. The outer frame reads `margin` from its own style type.
+
 ## `ui.style.default`: the application-wide default
 
 Every widget queries `ui.style.default` when resolving properties. Set a complete style dictionary here and every window in the application inherits those defaults:

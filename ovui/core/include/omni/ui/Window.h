@@ -448,6 +448,24 @@ public:
     OMNIUI_API
     void setActive(bool active);
 
+    /**
+     * @brief Set the Python module name that constructed this Window (e.g. "omni.kit.window.console").
+     *
+     * Populated from the Python binding by inspecting the caller's frame at `ui.Window(...)`
+     * construction. Used by Workspace::onWindowFirstInteraction so click events can be attributed
+     * back to the originating extension without per-extension code; resolution of module name to
+     * extension id happens on the Python side via the extension manager. Empty string means
+     * "unknown" (e.g. created from C++ or from interactive console).
+     */
+    OMNIUI_API
+    void setOwnerModule(const std::string& moduleName);
+
+    /**
+     * @brief Get the Python module name that constructed this Window. Empty when unknown.
+     */
+    OMNIUI_API
+    const std::string& getOwnerModule() const;
+
 protected:
     struct WindowData;
     /**
@@ -533,9 +551,39 @@ private:
     bool _updateFocusState();
 
     /**
+     * @brief Detect a mouse click inside this Window's content area. Fires
+     * Workspace::onWindowFirstInteraction at most once per Window lifetime so the omni.ui
+     * extension-usage telemetry hook can emit a single event per (window, extension) per
+     * session.
+     *
+     * Must only be called between ImGui::Begin and ImGui::End for this Window so that
+     * `ImGui::IsWindowHovered` / `ImGui::IsMouseClicked` resolve against the right window.
+     */
+    void _detectFirstInteraction();
+
+    /**
      * @brief draw tooltip
      */
     void _drawTooltip(std::string& tooltip);
+
+    /**
+     * @brief Drive the position of the borderless OS window that this Window was detached into,
+     * from a drag of the ImGui title bar.
+     *
+     * Only used when /exts/omni.ui/Window/detachedDecorations is off, which is the default: the OS
+     * window is then created with Decorations::eNone, leaving the window manager no title bar to
+     * drag. With the setting on the WM moves the window and this is not called.
+     *
+     * Never used for a Window on a virtual app window -- omni.ui.scene hosts its widgets that way
+     * -- which has no OS window to position at all.
+     *
+     * @param canStartDrag Whether a new drag may begin this frame, i.e. whether the cursor is over
+     *        the title bar. An in-progress drag continues regardless, so the move does not stop
+     *        the moment the cursor leaves the title bar.
+     *
+     * Must only be called between ImGui::Begin and ImGui::End for this Window.
+     */
+    void _updateOSWindowDrag(bool canStartDrag);
 
 protected:
     std::unique_ptr<WindowData> m_data;

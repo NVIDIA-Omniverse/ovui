@@ -75,14 +75,20 @@ class RenameController:
         name = new_name.strip()
         current = self._adapter.get_display_name(self._active_item.adapter_item)
         if name and name != current:
-            try:
-                self._adapter.rename(self._active_item.adapter_item, name)
-            except Exception as exc:
-                from ovui_widgets.common.error_reporter import ErrorReporter
+            from ovui_widgets.common.error_reporter import ErrorReporter
 
+            try:
+                used = self._adapter.rename(self._active_item.adapter_item, name)
+            except Exception as exc:
                 ErrorReporter.show_error(
                     f"Cannot rename prim: {type(exc).__name__}: {exc}"
                 )
+            else:
+                if used != name:
+                    ErrorReporter.show_warning(
+                        f"'{name}' is not a valid prim name. "
+                        f"The prim is renamed to '{used}'."
+                    )
         self._end_rename()
 
     def cancel_rename(self) -> None:

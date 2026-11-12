@@ -226,6 +226,7 @@
 //#define IMGUI_IMPL_OPENGL_DEBUG
 #ifdef IMGUI_IMPL_OPENGL_DEBUG
 #include <stdio.h>
+// logging: allow printf - Standalone ImGui code has no Carbonite logging dependency.
 #define GL_CALL(_CALL)      do { _CALL; GLenum gl_err = glGetError(); if (gl_err != 0) fprintf(stderr, "GL error 0x%x returned from '%s'.\n", gl_err, #_CALL); } while (0)  // Call with error check
 #else
 #define GL_CALL(_CALL)      _CALL   // Call without error check
@@ -255,6 +256,8 @@ struct ImGui_ImplOpenGL3_Data
     bool            HasClipOrigin;
     bool            UseBufferSubData;
     ImVector<char>  TempBuffer;
+    ImVector<ImDrawVert> FrameVtxBuffer; // ovui: the vertices of all draw lists of one RenderDrawData() call
+    ImVector<ImDrawIdx>  FrameIdxBuffer; // ovui: the indices of all draw lists of one RenderDrawData() call
 
     ImGui_ImplOpenGL3_Data() { memset((void*)this, 0, sizeof(*this)); }
 };
@@ -303,6 +306,7 @@ bool ImGui_ImplOpenGL3_InitLoader()
 #ifdef IMGUI_IMPL_OPENGL_LOADER_IMGL3W
     if (glGetIntegerv == nullptr && imgl3wInit() != 0)
     {
+        // logging: allow printf - Standalone ImGui code has no Carbonite logging dependency.
         fprintf(stderr, "Failed to initialize OpenGL loader!\n");
         return false;
     }
@@ -376,6 +380,7 @@ bool    ImGui_ImplOpenGL3_Init(const char* glsl_version)
 #endif
 
 #ifdef IMGUI_IMPL_OPENGL_DEBUG
+    // logging: allow printf - Standalone ImGui code has no Carbonite logging dependency.
     printf("GlVersion = %d, \"%s\"\nGlProfileIsCompat = %d\nGlProfileMask = 0x%X\nGlProfileIsES2/IsEs3 = %d/%d\nGL_VENDOR = '%s'\nGL_RENDERER = '%s'\n", bd->GlVersion, gl_version_str, bd->GlProfileIsCompat, bd->GlProfileMask, bd->GlProfileIsES2, bd->GlProfileIsES3, (const char*)glGetString(GL_VENDOR), (const char*)glGetString(GL_RENDERER)); // [DEBUG]
 #endif
 
@@ -614,9 +619,49 @@ void    ImGui_ImplOpenGL3_RenderDrawData(ImDrawData* draw_data)
     ImVec2 clip_off = draw_data->DisplayPos;         // (0,0) unless using multi-viewports
     ImVec2 clip_scale = draw_data->FramebufferScale; // (1,1) unless using retina display which are often (2,2)
 
+    // ovui patch (issue #518): upload the vertices and the indices of all draw lists with one glBufferData() call
+    // each, once for each call of this function. Upstream calls glBufferData() for each draw list, so the same two
+    // buffers get a new data store several times in one frame while earlier draws of the frame still use them. With
+    // the NVIDIA OpenGL driver on Windows that kept about 16 KB of private memory for each frame and never released
+    // it while the windows stayed open. glDrawElementsBaseVertex() (OpenGL 3.2) finds each draw list in the shared
+    // buffers. Older OpenGL, and the glBufferSubData() path, keep the upstream upload for each draw list.
+    bool upload_once = false;
+#ifdef IMGUI_IMPL_OPENGL_MAY_HAVE_VTX_OFFSET
+    if (bd->GlVersion >= 320 && !bd->UseBufferSubData)
+    {
+        upload_once = true;
+        int total_vtx_count = 0;
+        int total_idx_count = 0;
+        for (const ImDrawList* draw_list : draw_data->CmdLists)
+        {
+            total_vtx_count += draw_list->VtxBuffer.Size;
+            total_idx_count += draw_list->IdxBuffer.Size;
+        }
+        bd->FrameVtxBuffer.resize(total_vtx_count);
+        bd->FrameIdxBuffer.resize(total_idx_count);
+        ImDrawVert* vtx_dst = bd->FrameVtxBuffer.Data;
+        ImDrawIdx* idx_dst = bd->FrameIdxBuffer.Data;
+        for (const ImDrawList* draw_list : draw_data->CmdLists)
+        {
+            if (draw_list->VtxBuffer.Size > 0)
+                memcpy(vtx_dst, draw_list->VtxBuffer.Data, (size_t)draw_list->VtxBuffer.Size * sizeof(ImDrawVert));
+            if (draw_list->IdxBuffer.Size > 0)
+                memcpy(idx_dst, draw_list->IdxBuffer.Data, (size_t)draw_list->IdxBuffer.Size * sizeof(ImDrawIdx));
+            vtx_dst += draw_list->VtxBuffer.Size;
+            idx_dst += draw_list->IdxBuffer.Size;
+        }
+        GL_CALL(glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)total_vtx_count * (int)sizeof(ImDrawVert), (const GLvoid*)bd->FrameVtxBuffer.Data, GL_STREAM_DRAW));
+        GL_CALL(glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)total_idx_count * (int)sizeof(ImDrawIdx), (const GLvoid*)bd->FrameIdxBuffer.Data, GL_STREAM_DRAW));
+    }
+#endif
+    int global_vtx_offset = 0; // ovui: where the current draw list starts in the shared buffers (upload_once)
+    int global_idx_offset = 0;
+
     // Render command lists
     for (const ImDrawList* draw_list : draw_data->CmdLists)
     {
+      if (!upload_once)
+      {
         // Upload vertex/index buffers
         // - OpenGL drivers are in a very sorry state nowadays....
         //   During 2021 we attempted to switch from glBufferData() to orphaning+glBufferSubData() following reports
@@ -647,6 +692,7 @@ void    ImGui_ImplOpenGL3_RenderDrawData(ImDrawData* draw_data)
             GL_CALL(glBufferData(GL_ARRAY_BUFFER, vtx_buffer_size, (const GLvoid*)draw_list->VtxBuffer.Data, GL_STREAM_DRAW));
             GL_CALL(glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx_buffer_size, (const GLvoid*)draw_list->IdxBuffer.Data, GL_STREAM_DRAW));
         }
+      }
 
         for (int cmd_i = 0; cmd_i < draw_list->CmdBuffer.Size; cmd_i++)
         {
@@ -675,11 +721,16 @@ void    ImGui_ImplOpenGL3_RenderDrawData(ImDrawData* draw_data)
                 GL_CALL(glBindTexture(GL_TEXTURE_2D, (GLuint)(intptr_t)pcmd->GetTexID()));
 #ifdef IMGUI_IMPL_OPENGL_MAY_HAVE_VTX_OFFSET
                 if (bd->GlVersion >= 320)
-                    GL_CALL(glDrawElementsBaseVertex(GL_TRIANGLES, (GLsizei)pcmd->ElemCount, sizeof(ImDrawIdx) == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, (void*)(intptr_t)(pcmd->IdxOffset * sizeof(ImDrawIdx)), (GLint)pcmd->VtxOffset));
+                    GL_CALL(glDrawElementsBaseVertex(GL_TRIANGLES, (GLsizei)pcmd->ElemCount, sizeof(ImDrawIdx) == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, (void*)(intptr_t)((global_idx_offset + pcmd->IdxOffset) * sizeof(ImDrawIdx)), (GLint)(global_vtx_offset + pcmd->VtxOffset)));
                 else
 #endif
                 GL_CALL(glDrawElements(GL_TRIANGLES, (GLsizei)pcmd->ElemCount, sizeof(ImDrawIdx) == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT, (void*)(intptr_t)(pcmd->IdxOffset * sizeof(ImDrawIdx))));
             }
+        }
+        if (upload_once)
+        {
+            global_vtx_offset += draw_list->VtxBuffer.Size;
+            global_idx_offset += draw_list->IdxBuffer.Size;
         }
     }
 
@@ -822,12 +873,14 @@ static bool CheckShader(GLuint handle, const char* desc)
     glGetShaderiv(handle, GL_COMPILE_STATUS, &status);
     glGetShaderiv(handle, GL_INFO_LOG_LENGTH, &log_length);
     if ((GLboolean)status == GL_FALSE)
+        // logging: allow printf - Standalone ImGui code has no Carbonite logging dependency.
         fprintf(stderr, "ERROR: ImGui_ImplOpenGL3_CreateDeviceObjects: failed to compile %s! With GLSL: %s\n", desc, bd->GlslVersionString);
     if (log_length > 1)
     {
         ImVector<char> buf;
         buf.resize((int)(log_length + 1));
         glGetShaderInfoLog(handle, log_length, nullptr, (GLchar*)buf.begin());
+        // logging: allow printf - Standalone ImGui code has no Carbonite logging dependency.
         fprintf(stderr, "%s\n", buf.begin());
     }
     return (GLboolean)status == GL_TRUE;
@@ -841,12 +894,14 @@ static bool CheckProgram(GLuint handle, const char* desc)
     glGetProgramiv(handle, GL_LINK_STATUS, &status);
     glGetProgramiv(handle, GL_INFO_LOG_LENGTH, &log_length);
     if ((GLboolean)status == GL_FALSE)
+        // logging: allow printf - Standalone ImGui code has no Carbonite logging dependency.
         fprintf(stderr, "ERROR: ImGui_ImplOpenGL3_CreateDeviceObjects: failed to link %s! With GLSL %s\n", desc, bd->GlslVersionString);
     if (log_length > 1)
     {
         ImVector<char> buf;
         buf.resize((int)(log_length + 1));
         glGetProgramInfoLog(handle, log_length, nullptr, (GLchar*)buf.begin());
+        // logging: allow printf - Standalone ImGui code has no Carbonite logging dependency.
         fprintf(stderr, "%s\n", buf.begin());
     }
     return (GLboolean)status == GL_TRUE;

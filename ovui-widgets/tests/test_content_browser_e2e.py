@@ -30,10 +30,6 @@ import pytest
 from ovui_widgets.app.application import Application
 from ovui_widgets.common.selection import SelectionBus
 
-pytest.importorskip(
-    "pxr", reason="USD Python bindings required for E2E stage round-trip",
-)
-
 
 @pytest.fixture(autouse=True)
 def _reset_singletons():

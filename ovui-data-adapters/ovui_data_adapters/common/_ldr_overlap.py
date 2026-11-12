@@ -195,6 +195,31 @@ class LdrOverlapState:
             self.release(clear_presentation=True)
             raise
 
+    def has_unshown_step(self) -> bool:
+        """Whether the retained step result is newer than the presented image."""
+        return self.retained_products is not None and not self.retained_consumed
+
+    def present_retained(self, extract: Callable[[Any], Any]) -> Any:
+        """Present the retained step result now, with no new step.
+
+        A still viewer stops stepping after a change, and the newest step
+        result is then retained but not shown. This shows it and keeps the
+        container retained and consumed (an ovrtx render var must not be
+        mapped twice). Returns ``None`` when no step result waits.
+        """
+        if not self.has_unshown_step():
+            return None
+        try:
+            image = extract(self.retained_products)
+        except Exception:
+            self.release(clear_presentation=True)
+            raise
+        self.retained_consumed = True
+        if isinstance(image, np.ndarray):
+            self.last_image = image
+        self.presented_snapshot = self.retained_snapshot
+        return image
+
     def _retain(self, products: Any, key: Any, snapshot: CameraSnapshot,
                 *, consumed: bool) -> None:
         self.retained_products = products

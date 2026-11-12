@@ -8,9 +8,6 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
-import pytest
-
-pytest.importorskip("pxr", reason="OpenUSD runtime is unavailable")
 from pxr import Sdf, Usd, UsdGeom
 
 from ovui_data_adapters.common import (
@@ -82,13 +79,20 @@ def test_openusd_provider_session_create_helpers_delegate_to_stage_adapter() -> 
             )
 
     class _SelectionBus:
+        def __init__(self) -> None:
+            self.published: list[tuple[list[str], str]] = []
+
         def get_snapshot(self) -> SimpleNamespace:
             return SimpleNamespace(paths=lambda: ["/World/Selected"])
+
+        def publish(self, paths: list[str], source: str) -> None:
+            self.published.append((paths, source))
 
     adapter = _StageAdapter()
     app = SimpleNamespace(_stage_adapter=adapter, selection_bus=_SelectionBus())
 
     assert session.create_mesh_prim(app, "Cube") is prim
+    assert app.selection_bus.published == [(["/World/Cube"], "create_menu")]
 
     assert adapter.requests == [
         CreateRequest(
@@ -157,6 +161,9 @@ def test_openusd_provider_session_create_helpers_use_public_backend_contract() -
     class _SelectionBus:
         def get_snapshot(self) -> SimpleNamespace:
             return SimpleNamespace(paths=lambda: ["/World/Selected"])
+
+        def publish(self, paths: list[str], source: str) -> None:
+            pass
 
     class _PublicBackendApp:
         def __init__(self, adapter: _StageAdapter) -> None:

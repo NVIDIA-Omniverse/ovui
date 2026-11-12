@@ -95,16 +95,15 @@ class TestCuda:
             raise RuntimeError(f"cudaDeviceSynchronize rc={rc}")
 
 
-def has_gpu_with_swap_kernel() -> bool:
-    """True iff a usable GPU + CUDA runtime + NVRTC + libcuda are
-    present, AND the swap kernel can be compiled and loaded. Tests
-    gated on this skip cleanly on CPU-only hosts."""
+def has_cuda_gpu() -> bool:
+    """True iff a usable GPU + CUDA library (cudart) are present. Tests
+    gated on this skip cleanly on CPU-only hosts. The swap kernel needs
+    only the driver, so a kernel that cannot load fails such a test
+    (issue 510)."""
     try:
         cu = TestCuda()
         ptr = cu.malloc(16)
         cu.free(ptr)
-        from ovui_data_adapters.openusd import _swap_kernel
-        _swap_kernel.warm_up()
         return True
     except Exception:
         return False

@@ -166,7 +166,8 @@ def test_public_decision_matches_notify(stage):
         ("/Cam.focalLength", True),
         ("/Cube.xformOp:translate", True),
         ("/Cube.visibility", True),
-        ("/Cube.size", False),
+        ("/Cube.size", True),
+        ("/Cube.purpose", False),
         ("/Key.inputs:texture:file", False),
         ("/Cube", False),
     ],
@@ -216,3 +217,114 @@ def test_camera_center_of_interest_never_reloads_the_scene(stage):
     adapter.non_rendering_property_prefixes = ()  # also without any host-declared prefixes
     assert decide(adapter, "/OvuiViews/Cameras/primary.omni:kit:centerOfInterest") == "live"
     assert adapter.property_updates_live("/OvuiViews/Cameras/primary.omni:kit:centerOfInterest")
+
+
+@pytest.mark.parametrize(
+    "prim_type, attribute, expected",
+    [
+        ("Cube", "size", "live"),
+        ("Sphere", "radius", "live"),
+        ("Cylinder", "radius", "live"),
+        ("Cylinder", "height", "live"),
+        ("Cone", "height", "live"),
+        ("Capsule", "radius", "live"),
+        ("Cylinder", "axis", "reload"),  # token, not a size
+        ("Cube", "purpose", "reload"),
+        ("Mesh", "extent", "reload"),
+    ],
+)
+def test_implicit_shape_sizes_are_live_and_other_geometry_reloads(prim_type, attribute, expected):
+    from pxr import Usd
+
+    stage = Usd.Stage.CreateInMemory()
+    prim = stage.DefinePrim("/Shape", prim_type)
+    if prim_type == "Mesh":
+        prim.CreateAttribute("extent", Sdf.ValueTypeNames.Float3Array).Set([(0, 0, 0), (1, 1, 1)])
+    adapter = adapter_for(stage)
+    assert decide(adapter, f"/Shape.{attribute}") == expected
+
+
+def test_a_custom_size_attribute_on_another_prim_type_stays_structural():
+    from pxr import Usd
+
+    stage = Usd.Stage.CreateInMemory()
+    stage.DefinePrim("/Other", "Xform").CreateAttribute("size", Sdf.ValueTypeNames.Double, custom=True).Set(1.0)
+    adapter = adapter_for(stage)
+    assert decide(adapter, "/Other.size") == "reload"
+
+
+def test_a_cube_size_edit_is_written_as_float64_without_a_reload():
+    from pxr import Usd, UsdGeom
+
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Cube.Define(stage, "/Cube").CreateSizeAttr(2.0)
+    adapter = adapter_for(stage)
+    stage.GetAttributeAtPath("/Cube.size").Set(2.98)
+    adapter.notify_stage_changed(
+        ChangeEvent(("/Cube.size",), (), ChangeEventType.INFO_CHANGE)
+    )
+    adapter._reload_live_root_snapshot.assert_not_called()
+    (call,) = adapter._renderer.write_attribute.call_args_list
+    assert call.kwargs["attribute_name"] == "size"
+    assert call.kwargs["prim_paths"] == ["/Cube"]
+    assert call.kwargs["tensor"].dtype == np.float64
+    assert call.kwargs["tensor"].tolist() == [2.98]
+
+
+def _point_instancer_stage(cube_path):
+    from pxr import UsdGeom
+
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Cube.Define(stage, cube_path).CreateSizeAttr(1.0)
+    instancer = UsdGeom.PointInstancer.Define(stage, "/World/Instancer")
+    instancer.CreatePrototypesRel().SetTargets([cube_path])
+    instancer.CreateProtoIndicesAttr([0, 0])
+    instancer.CreatePositionsAttr([(-2, 0, 0), (2, 0, 0)])
+    return stage
+
+
+@pytest.mark.parametrize(
+    "cube_path", ["/World/Instancer/Prototypes/Cube", "/World/Cube"]
+)
+def test_a_size_edit_of_a_point_instancer_prototype_reloads_the_scene(cube_path):
+    # ovrtx draws the instances from a copy of the prototype: a live write to
+    # the Cube left both instances at the old size.
+    stage = _point_instancer_stage(cube_path)
+    adapter = adapter_for(stage)
+    stage.GetAttributeAtPath(f"{cube_path}.size").Set(2.0)
+    adapter.notify_stage_changed(
+        ChangeEvent((f"{cube_path}.size",), (), ChangeEventType.INFO_CHANGE)
+    )
+    adapter._reload_live_root_snapshot.assert_called_once()
+    adapter._renderer.write_attribute.assert_not_called()
+
+
+def test_a_shape_that_becomes_a_prototype_reloads_on_its_next_size_edit():
+    from pxr import UsdGeom
+
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Cube.Define(stage, "/World/Cube").CreateSizeAttr(1.0)
+    instancer = UsdGeom.PointInstancer.Define(stage, "/World/Instancer")
+    adapter = adapter_for(stage)
+    assert decide(adapter, "/World/Cube.size") == "live"
+    instancer.CreatePrototypesRel().SetTargets(["/World/Cube"])
+    adapter.notify_stage_changed(
+        ChangeEvent(("/World/Instancer.prototypes",), (), ChangeEventType.INFO_CHANGE)
+    )
+    assert decide(adapter, "/World/Cube.size") == "reload"
+
+
+def test_a_failed_shape_size_write_is_reported_and_reloads_the_scene(capsys):
+    from pxr import UsdGeom
+
+    stage = Usd.Stage.CreateInMemory()
+    UsdGeom.Cube.Define(stage, "/Cube").CreateSizeAttr(2.0)
+    adapter = adapter_for(stage)
+    adapter._renderer.write_attribute.side_effect = RuntimeError("size refused")
+    stage.GetAttributeAtPath("/Cube.size").Set(3.0)
+    adapter.notify_stage_changed(
+        ChangeEvent(("/Cube.size",), (), ChangeEventType.INFO_CHANGE)
+    )
+    adapter._reload_live_root_snapshot.assert_called_once()
+    error = capsys.readouterr().err
+    assert "/Cube.size" in error and "RuntimeError: size refused" in error

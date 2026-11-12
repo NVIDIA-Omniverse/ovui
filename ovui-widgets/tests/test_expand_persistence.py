@@ -165,6 +165,18 @@ class TestResolvePath:
         second = model.resolve_path("/World/Geometry")
         assert first is second
 
+    def test_resolve_cached_item_does_not_look_up_the_adapter(
+        self, model, adapter, monkeypatch,
+    ):
+        first = model.resolve_path("/World/Geometry")
+        lookups = []
+        lookup = adapter.get_item_at_path
+        monkeypatch.setattr(
+            adapter, "get_item_at_path", lambda p: lookups.append(p) or lookup(p),
+        )
+        assert model.resolve_path("/World/Geometry") is first
+        assert lookups == []
+
 
 class TestExpansionSurvivesMutation:
     """After an adapter change, items reachable from paths the user had

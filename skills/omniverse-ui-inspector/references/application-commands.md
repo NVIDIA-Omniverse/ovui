@@ -157,3 +157,25 @@ the original screenshot-before → actual input → screenshot-after discipline.
 Neither scene inspection nor direct picking makes an API test screenshot-driven
 UI evidence. Use the existing HTTP `POST /checkpoint` for a correlated state and
 capture registration when needed; it shares the normal state opt-in gate.
+
+## Commands from an installed Python module
+
+A Python module can add commands to every attached application without a change
+to ovui or to the application. Declare an entry point in the group
+`ovui.inspector_commands`. Its value is a callable `factory(application) ->
+iterable[Command]`. `attach_application` calls each entry after it registers the
+application's own commands. A command with a name that is already registered is
+skipped, so an application keeps its own command. An entry that fails is reported
+on stderr and in `health` (`contribution_error`); the other entries and the
+Inspector keep working.
+
+`ovui-data-adapters-common` declares `render_diagnostics`, which adds
+`render_diagnostics`, `material_verify` and `gpu_memory` (category `diagnostics`,
+read-only).
+
+## Status from an installed Python module
+
+An entry point in the group `ovui.inspector_status` is `callable() -> dict`. `health` shows each
+result under `extensions` (the entry name is the key). When a result has `"degraded": true`, the
+`status` of `health` is `degraded`. A provider that raises is shown as degraded with the error.
+`ovui-data-adapters-common` uses it to show render failures.

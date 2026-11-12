@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Split circle: two half-discs at different intensities convey
+       "values disagree across selection". -->
+  <path d="M8 1.5a6.5 6.5 0 0 1 0 13z" fill="#E89020"/>
+  <path d="M8 1.5a6.5 6.5 0 0 0 0 13z" fill="#E89020" fill-opacity="0.35"/>
+  <circle cx="8" cy="8" r="6.5" fill="none" stroke="#E89020" stroke-width="1"/>
+</svg>

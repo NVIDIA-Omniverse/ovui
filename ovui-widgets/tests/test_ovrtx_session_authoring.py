@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import pytest
 
-pxr = pytest.importorskip("pxr")
 from ovui_data_adapters.openusd._session_authoring import (  # noqa: E402
     DEFAULT_RESOLUTION,
     LDR_SOURCE_NAME,

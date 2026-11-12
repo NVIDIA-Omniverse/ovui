@@ -12,12 +12,6 @@ if(NOT OMNIUI_HEADLESS_ONLY)
     find_package(OpenGL REQUIRED)
 endif()
 find_package(Vulkan QUIET)
-if(Vulkan_FOUND)
-    find_package(ovrtx CONFIG QUIET
-        HINTS
-            "$ENV{OVRTX_ROOT}/public/tools/dev"
-    )
-endif()
 
 # GLFW is optional when building headless-only
 if(NOT OMNIUI_HEADLESS_ONLY)
@@ -47,11 +41,25 @@ set(STANDALONE_SOURCES
     src/GlfwPlatform.cpp
     src/StandaloneGlyphManager.cpp
     src/StandaloneInit.cpp
+    src/PngZlibCompress.cpp
     src/StandaloneWindowCallbackManager.cpp
     src/Win32WindowTitle.cpp
     ${IMGUI_BACKEND_DIR}/imgui_impl_glfw.cpp
     ${IMGUI_BACKEND_DIR}/imgui_impl_opengl3.cpp
 )
+
+# SVG reader and painter (project code). With OMNIUI_ENABLE_SVG=OFF a
+# rasterizer that draws nothing is registered in its place: .svg images stay
+# empty, and each URL logs one error with the cause.
+if(OMNIUI_ENABLE_SVG)
+    list(APPEND STANDALONE_SOURCES
+        src/StandaloneSvgRasterizer.cpp
+        src/StandaloneSvgDocument.cpp
+        src/StandaloneSvgRender.cpp
+    )
+else()
+    list(APPEND STANDALONE_SOURCES src/StandaloneSvgOffRasterizer.cpp)
+endif()
 
 # Vulkan backend sources (conditional)
 if(Vulkan_FOUND)
@@ -59,6 +67,7 @@ if(Vulkan_FOUND)
         src/VulkanBackend.cpp
         src/VulkanByteImageGpu.cpp
         src/NativeFramePacing.cpp
+        src/NativeFrameReady.cpp
         src/StreamingVulkan.cpp
         src/HeadlessVulkanPlatform.cpp
         ${IMGUI_BACKEND_DIR}/imgui_impl_vulkan.cpp
@@ -80,24 +89,6 @@ if(WIN32)
     target_link_libraries(win32_window_title_test PRIVATE user32)
     add_test(NAME win32_window_title COMMAND win32_window_title_test)
     set_tests_properties(win32_window_title PROPERTIES TIMEOUT 30)
-endif()
-
-# Native ovrtx frame pacing is optional at build time. The renderer library is
-# resolved dynamically at runtime; the headers must expose the consumed ABI.
-# An explicit cache path wins so wheel/runtime builds never capture a host path.
-# The hints name header-only packages on the build machine (e.g. the ovrtx
-# wheel), so a cross build must not re-root them into the target sysroot.
-set(OMNIUI_OVRTX_INCLUDE_DIR "" CACHE PATH "Directory containing a usable ovrtx/ovrtx.h public C ABI")
-if(NOT OMNIUI_OVRTX_INCLUDE_DIR)
-    find_path(OMNIUI_OVRTX_DISCOVERED_INCLUDE_DIR ovrtx/ovrtx.h
-        HINTS
-            "$ENV{OVRTX_ROOT}/include"
-            "$ENV{OVRTX_INCLUDE_DIR}"
-        NO_CMAKE_FIND_ROOT_PATH
-    )
-    if(OMNIUI_OVRTX_DISCOVERED_INCLUDE_DIR)
-        set(OMNIUI_OVRTX_INCLUDE_DIR "${OMNIUI_OVRTX_DISCOVERED_INCLUDE_DIR}")
-    endif()
 endif()
 
 # CUDA-Vulkan interop (conditional -- requires both Vulkan and CUDA)
@@ -156,6 +147,9 @@ add_library(omniui_standalone SHARED ${STANDALONE_SOURCES})
 option(OMNIUI_ENABLE_NATIVE_TIMING_SCOPES
     "Compile the optional native timing scopes into the standalone build" ON)
 target_sources(ovui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/NativeTiming.cpp")
+# The renderer slot of native frame pacing. It belongs to the core library so
+# that an optional package can fill it before the standalone backend starts.
+target_sources(ovui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/NativeFramePacingHooks.cpp")
 target_include_directories(ovui PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 if(OMNIUI_ENABLE_NATIVE_TIMING_SCOPES)
     target_compile_definitions(ovui PRIVATE OMNIUI_HAS_NATIVE_TIMING_SCOPES=1)
@@ -174,6 +168,10 @@ target_include_directories(omniui_standalone
         # in core/src and are otherwise private to libovui.
         ${CMAKE_SOURCE_DIR}/core/src
 )
+
+if(OMNIUI_ENABLE_SVG)
+    target_compile_definitions(omniui_standalone PRIVATE OMNIUI_HAS_SVG=1)
+endif()
 
 # Inherit ovui's public includes (platform interfaces)
 target_link_libraries(omniui_standalone
@@ -206,49 +204,6 @@ if(Vulkan_FOUND)
     target_compile_definitions(omniui_standalone PRIVATE OMNIUI_HAS_VULKAN=1)
     target_include_directories(omniui_standalone PRIVATE ${Vulkan_INCLUDE_DIRS})
     target_link_libraries(omniui_standalone PRIVATE Vulkan::Vulkan)
-
-    if(OMNIUI_OVRTX_INCLUDE_DIR AND
-       EXISTS "${OMNIUI_OVRTX_INCLUDE_DIR}/ovrtx/ovrtx_types.h")
-        include(CheckCXXSourceCompiles)
-        set(CMAKE_REQUIRED_INCLUDES "${OMNIUI_OVRTX_INCLUDE_DIR}")
-        unset(OMNIUI_OVRTX_FRAME_PACING_CAPABLE CACHE)
-        check_cxx_source_compiles([=[
-            #include <ovrtx/ovrtx.h>
-            template <typename T>
-            auto render_var_name(const T& output, int) -> decltype(output.source_name) {
-                return output.source_name;
-            }
-            template <typename T>
-            auto render_var_name(const T& output, long) -> decltype(output.render_var_name) {
-                return output.render_var_name;
-            }
-            int main() {
-                ovrtx_binding_desc_t binding{};
-                ovrtx_input_buffer_t input{};
-                ovrtx_render_product_set_outputs_t outputs{};
-                ovrtx_render_product_render_var_output_t render_var{};
-                ovrtx_render_var_output_t mapped{};
-                (void)binding.prim_list;
-                (void)binding.attribute_name;
-                (void)input.tensors;
-                (void)outputs.outputs;
-                (void)render_var_name(render_var, 0);
-                (void)render_var.output_handle;
-                (void)mapped.map_handle;
-                return 0;
-            }
-        ]=] OMNIUI_OVRTX_FRAME_PACING_CAPABLE)
-        unset(CMAKE_REQUIRED_INCLUDES)
-        if(OMNIUI_OVRTX_FRAME_PACING_CAPABLE)
-            target_compile_definitions(omniui_standalone PRIVATE OMNIUI_HAS_OVRTX_FRAME_PACING=1)
-            target_include_directories(omniui_standalone PRIVATE "${OMNIUI_OVRTX_INCLUDE_DIR}")
-            message(STATUS "required ovrtx public interfaces found - enabling native frame pacing coordinator")
-        else()
-            message(STATUS "ovrtx headers lack required interfaces - native frame pacing coordinator will fail closed")
-        endif()
-    else()
-        message(STATUS "ovrtx public headers not found - native frame pacing coordinator will fail closed")
-    endif()
 endif()
 
 
@@ -282,7 +237,7 @@ if(OMNIUI_HAS_CUDA_INTEROP)
 endif()
 
 # ---------------------------------------------------------------------------
-# EGL headless OpenGL support (OMNIUI_HEADLESS_GL — issue #24)
+# EGL headless OpenGL support (OMNIUI_HEADLESS_GL)
 # All CMakeLists.txt if() guards use if(OMNIUI_HEADLESS_GL), not if(OMNIUI_HAS_EGL).
 # OMNIUI_HAS_EGL=1 is a C++ compile definition only, not a CMake variable.
 # ---------------------------------------------------------------------------
@@ -499,6 +454,32 @@ if(Vulkan_FOUND AND CUDAToolkit_FOUND)
     endif()
     message(STATUS "byte_image_gpu_dispatch_test target added (CUDA byte-image dispatch-layer test)")
 
+    # Upload results on the real device: refused uploads are reported and keep
+    # the previous pixels, completion is reported, the failure hook works.
+    add_executable(byte_image_gpu_status_test
+        tests/byte_image_gpu_status_test.cpp
+    )
+    target_compile_definitions(byte_image_gpu_status_test PRIVATE
+        OMNIUI_HAS_VULKAN=1
+        OMNIUI_HAS_CUDA=1
+        IMGUI_NVIDIA
+    )
+    target_include_directories(byte_image_gpu_status_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${OVUI_IMGUI_ROOT}/imgui
+    )
+    target_link_libraries(byte_image_gpu_status_test PRIVATE
+        omniui_standalone
+        ovui
+        imgui
+        Vulkan::Vulkan
+        CUDA::cudart
+    )
+    if(NOT WIN32 AND NOT APPLE)
+        set_target_properties(byte_image_gpu_status_test PROPERTIES INSTALL_RPATH "$ORIGIN")
+    endif()
+    message(STATUS "byte_image_gpu_status_test target added (upload results on a real device)")
+
     # All-format pixel round-trip test — loops a 128x128 CUDA buffer
     # through every supported PixelFormat (8-bit + R/RG/RGB/RGBA float)
     # and verifies the bytes that come back out of the VkImage.
@@ -531,7 +512,8 @@ if(Vulkan_FOUND AND CUDAToolkit_FOUND)
     add_test(NAME byte_image_gpu_test COMMAND byte_image_gpu_test)
     add_test(NAME byte_image_gpu_dispatch_test COMMAND byte_image_gpu_dispatch_test)
     add_test(NAME byte_image_gpu_format_test COMMAND byte_image_gpu_format_test)
-    set_tests_properties(byte_image_gpu_test byte_image_gpu_dispatch_test byte_image_gpu_format_test
+    add_test(NAME byte_image_gpu_status_test COMMAND byte_image_gpu_status_test)
+    set_tests_properties(byte_image_gpu_test byte_image_gpu_dispatch_test byte_image_gpu_format_test byte_image_gpu_status_test
         PROPERTIES TIMEOUT 120)
 
     # Headless linear-buffer export test — issue-34 Step 0.7. Renders a
@@ -559,6 +541,41 @@ if(Vulkan_FOUND AND CUDAToolkit_FOUND)
     add_test(NAME test_headless_linear_export COMMAND test_headless_linear_export)
     set_tests_properties(test_headless_linear_export PROPERTIES TIMEOUT 60)
     message(STATUS "test_headless_linear_export target added (issue-34 Step 0.7)")
+
+    # A paced image that becomes complete late, on a stream of its own: ovui's
+    # copy must wait for the image's completion event.
+    add_executable(native_frame_ready_test
+        tests/native_frame_ready_test.cpp
+    )
+    target_include_directories(native_frame_ready_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(native_frame_ready_test PRIVATE
+        omniui_standalone
+        CUDA::cudart
+    )
+    if(NOT WIN32 AND NOT APPLE)
+        set_target_properties(native_frame_ready_test PROPERTIES INSTALL_RPATH "$ORIGIN")
+    endif()
+    add_test(NAME native_frame_ready_test COMMAND native_frame_ready_test)
+    set_tests_properties(native_frame_ready_test PROPERTIES TIMEOUT 60)
+endif()
+
+# A fake renderer slot for native frame pacing. Python tests load it with ctypes:
+# tests/test_native_frame_pacing_upload.py needs its CUDA images, and
+# tests/test_native_frame_pacing_resume.py needs host copies only, so it is also
+# built without the CUDA toolkit (then it offers host copies only).
+if(Vulkan_FOUND)
+    add_library(omniui_fake_frame_source MODULE tests/fake_frame_source.cpp)
+    target_include_directories(omniui_fake_frame_source PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/core/include
+    )
+    if(CUDAToolkit_FOUND)
+        target_compile_definitions(omniui_fake_frame_source PRIVATE OMNIUI_FAKE_FRAME_SOURCE_CUDA=1)
+        target_link_libraries(omniui_fake_frame_source PRIVATE CUDA::cudart)
+    endif()
+    set_target_properties(omniui_fake_frame_source PROPERTIES PREFIX "lib")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -616,7 +633,7 @@ if(Vulkan_FOUND)
 endif()
 
 # ==============================================================================
-# EGL headless unit test (only when OMNIUI_HEADLESS_GL is ON — issue #24 E2)
+# EGL headless unit test (only when OMNIUI_HEADLESS_GL is ON)
 # ==============================================================================
 if(OMNIUI_HEADLESS_GL)
     add_executable(test_egl_platform_unit tests/test_egl_platform_unit.cpp)
@@ -656,6 +673,19 @@ if(OMNIUI_HEADLESS_GL)
         ENVIRONMENT "OMNIUI_HEADLESS=1;OMNIUI_HEADLESS_GL=1;OMNIUI_EGL_FORCE_SURFACELESS=1")
     message(STATUS "test_egl_texture_upload target added (E8 texture upload test)")
 
+    # Upload ids and device masks of the OpenGL backend that headless EGL
+    # registers: eEnqueued on submit, completed only behind a signaled fence,
+    # a second device is refused.
+    add_executable(test_egl_upload_completion tests/test_egl_upload_completion.cpp)
+    target_link_libraries(test_egl_upload_completion PRIVATE omniui_standalone glad)
+    if(NOT WIN32 AND NOT APPLE)
+        set_target_properties(test_egl_upload_completion PROPERTIES INSTALL_RPATH "$ORIGIN")
+    endif()
+    add_test(NAME egl_upload_completion COMMAND test_egl_upload_completion)
+    set_tests_properties(egl_upload_completion PROPERTIES
+        ENVIRONMENT "OMNIUI_HEADLESS=1;OMNIUI_HEADLESS_GL=1")
+    message(STATUS "test_egl_upload_completion target added")
+
     # All-format fromGpu test for OpenGLByteImageGpu — loops a 128x128 CUDA
     # buffer through every supported PixelFormat (8-bit + R/RG/RGB/RGBA
     # float) across both direct-interop and PBO paths, verifying the bytes
@@ -691,4 +721,32 @@ if(OMNIUI_HEADLESS_GL)
     set_tests_properties(headless_egl PROPERTIES
         ENVIRONMENT "OMNIUI_HEADLESS=1;OMNIUI_HEADLESS_GL=1;OMNIUI_EGL_FORCE_SURFACELESS=1")
     message(STATUS "headless_egl_test target added (C1 EGL integration test)")
+endif()
+
+# ==============================================================================
+# Presentation-key mode drawn by a real headless renderer. One executable, one
+# ctest test for each renderer that the build has: EGL (presentation_key_render)
+# and Vulkan (presentation_key_render_vulkan). The CI jobs of both renderers select
+# their test by name and check that it is registered.
+# ==============================================================================
+if(OMNIUI_HEADLESS_GL OR Vulkan_FOUND)
+    add_executable(presentation_key_render_test tests/test_presentation_key_render.cpp)
+    target_link_libraries(presentation_key_render_test PRIVATE omniui_standalone stb)
+    target_include_directories(presentation_key_render_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/core/src
+        ${OVUI_IMGUI_ROOT}/imgui)
+    if(NOT WIN32 AND NOT APPLE)
+        set_target_properties(presentation_key_render_test PROPERTIES INSTALL_RPATH "$ORIGIN")
+    endif()
+    if(OMNIUI_HEADLESS_GL)
+        add_test(NAME presentation_key_render COMMAND presentation_key_render_test /tmp/presentation_key_render_ctest.png)
+        set_tests_properties(presentation_key_render PROPERTIES
+            ENVIRONMENT "OMNIUI_HEADLESS=1;OMNIUI_HEADLESS_GL=1;OMNIUI_EGL_FORCE_SURFACELESS=1")
+    endif()
+    if(Vulkan_FOUND)
+        add_test(NAME presentation_key_render_vulkan COMMAND presentation_key_render_test /tmp/presentation_key_render_vulkan_ctest.png)
+        set_tests_properties(presentation_key_render_vulkan PROPERTIES
+            ENVIRONMENT "OMNIUI_HEADLESS=1;OMNIUI_BACKEND=vulkan")
+    endif()
 endif()

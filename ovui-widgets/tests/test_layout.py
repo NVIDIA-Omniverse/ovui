@@ -210,7 +210,7 @@ class TestCollectLayoutIncludesContent:
 class TestSplitIniIsDpiAware:
     """``_build_split_ini`` must scale every dock dimension by the
     runtime DPI. Writing it at DPI 1.0 on a 200% display pins the side
-    panels at logical half-width, which is the reported regression.
+    panels at logical half-width, which is the layout regression covered here.
     """
 
     def _build_at_dpi(self, scale: float) -> str:

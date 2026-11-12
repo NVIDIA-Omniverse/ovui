@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import pytest
 
-pxr = pytest.importorskip("pxr")
 from pxr import Sdf, Usd, UsdGeom  # noqa: E402
 
 from ovui_data_adapters.common import ChangeEventType, VisibilityState  # noqa: E402
@@ -594,6 +593,13 @@ class TestRendererCoarseRootFanOut:
         assert "/World/Group/GC" not in written
 
 
+def _eye_toggle(adapter, stage, path, visible):
+    """The Stage Browser eye: one group around an own-only edit."""
+    adapter.begin_undo_group("Toggle Visibility")
+    adapter.set_own_visibility(stage.GetPrimAtPath(path), visible)
+    adapter.end_undo_group()
+
+
 class TestPredictionSupportGate:
     def test_unsupported_runtime_takes_whole_layer_mode(self, monkeypatch):
         from ovui_data_adapters.openusd import commands as commands_mod
@@ -601,12 +607,148 @@ class TestPredictionSupportGate:
         assert commands_mod.prediction_runtime_supported() is True
         monkeypatch.setattr(commands_mod, "_PREDICTION_SUPPORTED", False)
         stage, undo, adapter, _events, _s = _fixture()
+        _toggle(adapter, stage, "/World", False)
         baseline = stage.GetSessionLayer().ExportToString()
-        _toggle(adapter, stage, "/World/Cube", False)
+        # MakeVisible under a hidden ancestor: only its walk mirrors the
+        # pinned OpenUSD algorithm.
+        _toggle(adapter, stage, "/World/Cube", True)
         command = undo._undo_stack[-1]._commands[0]
         assert command._mode == "B"   # frozen decision: unsupported -> Mode B
         undo.undo()
         assert stage.GetSessionLayer().ExportToString() == baseline
+
+    def test_eye_edits_replay_only_their_target_on_any_usd_version(
+        self, monkeypatch
+    ):
+        # Regression: on an OpenUSD other than the pinned one, as in the
+        # report, the eye's hide took the whole-layer mode. A hide and
+        # an own-only show write the target alone on every version, so
+        # Undo restores the eye's own opinion and keeps an unrelated edit
+        # that a whole-layer replay would revert.
+        from ovui_data_adapters.openusd import commands as commands_mod
+
+        monkeypatch.setattr(commands_mod, "_PREDICTION_SUPPORTED", False)
+        stage, undo, adapter, _events, _s = _fixture()
+        cube = UsdGeom.Imageable(stage.GetPrimAtPath("/World/Cube"))
+        _eye_toggle(adapter, stage, "/World/Cube", False)
+        assert undo._undo_stack[-1]._commands[0].replays_targeted_specs()
+        assert cube.ComputeVisibility() == UsdGeom.Tokens.invisible
+        sphere = UsdGeom.Sphere(stage.GetPrimAtPath("/World/Sphere"))
+        sphere.CreateRadiusAttr().Set(5.0)   # outside the undo history
+        undo.undo()
+        assert cube.ComputeVisibility() == UsdGeom.Tokens.inherited
+        assert sphere.GetRadiusAttr().Get() == 5.0
+        undo.redo()
+        assert cube.ComputeVisibility() == UsdGeom.Tokens.invisible
+        assert sphere.GetRadiusAttr().Get() == 5.0
+        _eye_toggle(adapter, stage, "/World/Cube", True)   # own-only show
+        assert undo._undo_stack[-1]._commands[0].replays_targeted_specs()
+        assert cube.ComputeVisibility() == UsdGeom.Tokens.inherited
+        undo.undo()
+        undo.undo()
+        session = stage.GetSessionLayer()
+        assert session.GetPropertyAtPath("/World/Cube.visibility") is None
+        assert sphere.GetRadiusAttr().Get() == 5.0
+
+
+class TestEyeToggleLayerCopies:
+    """Regression: a whole-layer copy costs time proportional to the layer.
+
+    On a 50,000-mesh layer each copy took about a second of the UI thread.
+    One eye toggle copies the layer once (its group keeps the copy to
+    restore a failed group), and Undo and Redo of a targeted toggle copy
+    nothing.
+    """
+
+    @pytest.mark.parametrize("pinned_usd", (True, False))
+    def test_toggle_copies_once_and_undo_redo_never(
+        self, monkeypatch, pinned_usd
+    ):
+        from ovui_data_adapters.openusd import commands as commands_mod
+
+        monkeypatch.setattr(
+            commands_mod, "_PREDICTION_SUPPORTED", pinned_usd)
+        stage, undo, adapter, _events, _s = _fixture()
+        copies: list = []
+        export = Sdf.Layer.ExportToString
+        transfer = Sdf.Layer.TransferContent
+
+        def counted_export(layer, *args):
+            copies.append(("ExportToString", layer.identifier))
+            return export(layer, *args)
+
+        def counted_transfer(layer, source):
+            copies.append(("TransferContent", source.identifier))
+            return transfer(layer, source)
+
+        monkeypatch.setattr(Sdf.Layer, "ExportToString", counted_export)
+        monkeypatch.setattr(Sdf.Layer, "TransferContent", counted_transfer)
+        cube = UsdGeom.Imageable(stage.GetPrimAtPath("/World/Cube"))
+        _eye_toggle(adapter, stage, "/World/Cube", False)
+        assert cube.ComputeVisibility() == UsdGeom.Tokens.invisible
+        assert copies == [
+            ("ExportToString", stage.GetSessionLayer().identifier)]
+        copies.clear()
+        undo.undo()
+        assert cube.ComputeVisibility() == UsdGeom.Tokens.inherited
+        undo.redo()
+        assert cube.ComputeVisibility() == UsdGeom.Tokens.invisible
+        assert copies == []
+
+    @pytest.mark.parametrize("pinned_usd", (True, False))
+    def test_multi_selection_toggle_copies_once(self, monkeypatch, pinned_usd):
+        # Regression: an eye click with several selected prims copied the
+        # whole layer once for each prim. With 20 selected camera rigs on
+        # a 51,000-prim layer, the window froze for about 19 seconds.
+        from ovui_data_adapters.openusd import commands as commands_mod
+
+        monkeypatch.setattr(
+            commands_mod, "_PREDICTION_SUPPORTED", pinned_usd)
+        stage, undo, adapter, events, _s = _fixture()
+        copies: list = []
+        export = Sdf.Layer.ExportToString
+
+        def counted_export(layer, *args):
+            copies.append(layer.identifier)
+            return export(layer, *args)
+
+        monkeypatch.setattr(Sdf.Layer, "ExportToString", counted_export)
+        paths = ("/World/Cube", "/World/Sphere", "/World/Pyramid",
+                 "/World/Group/GC")
+        prims = [UsdGeom.Imageable(stage.GetPrimAtPath(p)) for p in paths]
+
+        def eye_click(visible):
+            # The Stage Browser eye on a multi-selection: one group, one
+            # own-only edit for each selected prim.
+            adapter.begin_undo_group("Toggle Visibility")
+            for path in paths:
+                adapter.set_own_visibility(stage.GetPrimAtPath(path), visible)
+            adapter.end_undo_group()
+
+        for visible, token in ((False, UsdGeom.Tokens.invisible),
+                               (True, UsdGeom.Tokens.inherited)):
+            copies.clear()
+            events.clear()
+            eye_click(visible)
+            assert [p.ComputeVisibility() for p in prims] == [token] * 4
+            assert copies == [stage.GetSessionLayer().identifier]
+            # One merged event that still proves a visibility-only change,
+            # so the Viewport and the Stage Browser keep their fast path.
+            assert len(events) == 1
+            delta = events[0].visibility_delta
+            assert set(delta["authored"]) == set(paths)
+            assert delta["proven"] is True
+            assert delta.get("precise", True) is True
+            assert events[0].resynced_paths == ()
+        undo.undo()
+        assert [p.ComputeVisibility() for p in prims] == (
+            [UsdGeom.Tokens.invisible] * 4)
+        undo.undo()
+        assert [p.ComputeVisibility() for p in prims] == (
+            [UsdGeom.Tokens.inherited] * 4)
+        undo.redo()
+        assert [p.ComputeVisibility() for p in prims] == (
+            [UsdGeom.Tokens.invisible] * 4)
 
 
 class TestSharedManagerGroupOwnership:
@@ -2017,8 +2159,8 @@ class TestMixedChangedPathRendererRouting:
                 elif mutation == "rel_retarget":
                     sphere.GetRelationship(
                         "material:binding").SetTargets(["/World/Cube"])
-                else:  # unsupported attribute form: foreign radius change
-                    UsdGeom.Sphere(sphere).GetRadiusAttr().Set(9.0)
+                else:  # unsupported attribute form: foreign purpose change
+                    UsdGeom.Sphere(sphere).GetPurposeAttr().Set("guide")
 
         key = Tf.Notice.Register(Usd.Notice.ObjectsChanged, reentrant, stage)
         try:

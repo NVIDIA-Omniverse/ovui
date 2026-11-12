@@ -18,6 +18,7 @@
 #include <omni/ui/scene/Transform.h>
 
 #include "AbstractContainerData.h"
+#include "DragFollow.h"
 
 OMNIUI_SCENE_NAMESPACE_OPEN_SCOPE
 
@@ -36,7 +37,25 @@ struct Transform::TransformData : public AbstractContainer::AbstractContainerDat
 Transform::Transform(const Matrix44& transform)
     : AbstractContainer(new TransformData(transform))
 {
+    this->_setScaleToChangedFn([this](const auto&) { this->_markWritten(); });
+    this->_setLookAtChangedFn([this](const auto&) { this->_markWritten(); });
     this->setTransform(transform);
+}
+
+void Transform::setTransform(Matrix44 const& value)
+{
+    if (checkIfEqual(m_transform, value))
+    {
+        return;
+    }
+
+    {
+        DragFollow::Write write(this);
+        write.noteTransform(this, m_transform, value);
+        m_transform = value;
+        this->_markWritten();
+    }
+    m__setTransformChangedFnCallbacks(value);
 }
 
 Transform::Transform()
@@ -196,6 +215,7 @@ void Transform::setBasis(std::shared_ptr<TransformBasis> basis)
     }
 
     data.m_basis = basis;
+    this->_markWritten();
 }
 
 void Transform::_dirtyTransform()

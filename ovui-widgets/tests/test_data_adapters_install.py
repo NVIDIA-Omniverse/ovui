@@ -28,29 +28,11 @@ from __future__ import annotations
 import os
 import pathlib
 import subprocess
-import sys
 import venv
-
-import pytest
 
 MONOREPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 COMMON_PROJECT = MONOREPO_ROOT / "ovui-data-adapters" / "dist" / "common"
 SERVICES_PROJECT = MONOREPO_ROOT / "ovui-data-adapters" / "dist" / "services"
-
-
-def _has_venv_module() -> bool:
-    """Return True only if ``python -m venv`` is available in this interpreter."""
-    proc = subprocess.run(
-        [sys.executable, "-c", "import venv"],
-        capture_output=True,
-    )
-    return proc.returncode == 0
-
-
-pytestmark = pytest.mark.skipif(
-    not _has_venv_module(),
-    reason="python -m venv not available in this interpreter",
-)
 
 
 def _create_venv(tmp_path: pathlib.Path) -> tuple[str, str]:

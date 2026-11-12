@@ -22,6 +22,9 @@ AbstractShape::AbstractShapeData::~AbstractShapeData()
 AbstractShape::AbstractShape(AbstractShapeData* dataPtr)
     : m_data(dataPtr ? dataPtr : new AbstractShapeData)
 {
+    // A shape draws into its container's buffer. In a caching SceneView, refill that buffer when the shape is hidden
+    // or shown, as a non-caching view does every frame. Without caching this does nothing.
+    this->_setVisibleChangedFn([this](const bool&) { this->forceDirty(DirtyReason::kDirtyReasonContentChanged); });
 }
 
 AbstractShape::~AbstractShape()
@@ -128,6 +131,25 @@ void AbstractShape::_cacheGesturePayload(const Vector3 origin,
     }
 }
 
+
+bool AbstractShape::_getFollowReport(Vector3&) const
+{
+    return false;
+}
+
+void AbstractShape::_captureBaseline() const
+{
+}
+
+void AbstractShape::_dirtyAppearance()
+{
+    this->_forceDirty(DirtyReason::kDirtyReasonContentChanged);
+}
+
+void AbstractShape::_holdPayloadBaseline(bool hold) const
+{
+    m_data->m_baselineHeld = hold;
+}
 
 void AbstractShape::_setParent(const AbstractContainer* const& parent)
 {

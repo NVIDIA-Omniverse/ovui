@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-pxr = pytest.importorskip("pxr")
+from ovui_data_adapters.common import VisibilityState  # noqa: E402
 from ovui_data_adapters.openusd.stage_adapter import UsdStageAdapter  # noqa: E402
 from ovui_data_adapters.services.undo import UndoManager  # noqa: E402
 from pxr import Usd, UsdGeom  # noqa: E402
@@ -140,6 +140,47 @@ class TestPerItemInvalidation:
         assert None not in changed
 
 
+class TestEyeUnderHiddenAncestor:
+    """Regression: the eye of a row under a hidden ancestor writes that row only."""
+
+    @staticmethod
+    def _authored(stage, path):
+        attr = UsdGeom.Imageable(stage.GetPrimAtPath(path)).GetVisibilityAttr()
+        return attr.Get() if attr.HasAuthoredValue() else None
+
+    def test_eye_toggles_own_value_and_keeps_ancestor_and_siblings(self):
+        stage, undo, adapter, model, changed, _s = _fixture()
+        _toggle(adapter, stage, "/World", False)
+        eye = model.get_item_value_model(model.resolve_path("/World/Sphere"), 2)
+        siblings = ("/World/Cube", "/World/Pyramid", "/World/Group")
+
+        def click():  # StageDelegate's toggle_visibility
+            eye.set_value(not eye.get_value_as_bool())
+
+        def sphere_state():
+            return adapter.compute_visibility(stage.GetPrimAtPath("/World/Sphere"))
+
+        assert sphere_state() is VisibilityState.INHERITED_INVISIBLE
+        changed.clear()
+        click()
+        assert self._authored(stage, "/World/Sphere") == UsdGeom.Tokens.invisible
+        assert sphere_state() is VisibilityState.INVISIBLE
+        assert "/World/Sphere" in changed
+
+        click()  # MakeVisible would show /World and hide every sibling
+        assert self._authored(stage, "/World/Sphere") == UsdGeom.Tokens.inherited
+        assert sphere_state() is VisibilityState.INHERITED_INVISIBLE
+        assert self._authored(stage, "/World") == UsdGeom.Tokens.invisible
+        assert all(self._authored(stage, path) is None for path in siblings)
+
+        undo.undo()
+        assert self._authored(stage, "/World/Sphere") == UsdGeom.Tokens.invisible
+        undo.redo()
+        assert self._authored(stage, "/World/Sphere") == UsdGeom.Tokens.inherited
+        assert self._authored(stage, "/World") == UsdGeom.Tokens.invisible
+        assert all(self._authored(stage, path) is None for path in siblings)
+
+
 class TestFooterEventLifecycle:
     """Exactly-once footer counts through the widget's adapter subscription."""
 
@@ -212,6 +253,131 @@ class TestFooterEventLifecycle:
         before = len(adapter._subscribers)
         widget.destroy()
         assert len(adapter._subscribers) < before
+
+    def test_undo_of_multi_selection_eye_counts_once_per_frame(self, capsys):
+        # Regression: Undo of an eye click on 20 selected prims sends one
+        # event for each prim. Each event recounted every prim of the
+        # stage, so on 51,000 prims the window froze for about 9 seconds.
+        from ovui_widgets.common import scheduler as widget_scheduler
+
+        queued: list = []
+
+        def _next_frame(_delay, callback):
+            queued.append(callback)
+            return widget_scheduler.CallbackHandle(0.0, callback)
+
+        stage, undo, adapter, _model, _changed, _s = _fixture()
+        widget_scheduler.set_call_later(_next_frame)
+        widget = self._widget(adapter)
+        try:
+            while queued:
+                queued.pop(0)()
+            walks = []
+            original = widget._compute_stage_counts
+            widget._compute_stage_counts = lambda: (
+                walks.append(1) or original())
+            paths = ("/World/Cube", "/World/Sphere", "/World/Pyramid")
+            adapter.begin_undo_group("Toggle Visibility")
+            for path in paths:
+                adapter.set_own_visibility(stage.GetPrimAtPath(path), False)
+            adapter.end_undo_group()
+            while queued:
+                queued.pop(0)()
+            assert len(walks) == 1
+            # Sphere/Deep is hidden through its parent.
+            assert widget._footer_hidden_label.text == "USD · 4 hidden"
+            walks.clear()
+            undo.undo()   # one change event for each of the three prims
+            assert walks == []
+            assert len(queued) == 1
+            while queued:
+                queued.pop(0)()
+            assert len(walks) == 1
+            assert widget._footer_hidden_label.text == "USD · 0 hidden"
+            walks.clear()
+            undo.redo()
+            while queued:
+                queued.pop(0)()
+            assert len(walks) == 1
+            assert widget._footer_hidden_label.text == "USD · 4 hidden"
+            # A scheduler that works uses no fallback, so nothing is reported.
+            assert "footer recount" not in capsys.readouterr().err
+        finally:
+            widget_scheduler.set_call_later(None)
+            widget.destroy()
+
+    @pytest.mark.parametrize("scheduler_state", ["absent", "failing"])
+    def test_footer_recount_scheduling_failure_is_reported(
+            self, scheduler_state, capsys):
+        # When the footer recount cannot be scheduled for the next frame,
+        # the widget recounts at once. This fallback must be reported with
+        # the failed operation and its cause: one line when it starts, not
+        # one line for each event.
+        from ovui_widgets.common import scheduler as widget_scheduler
+
+        def _failing_scheduler(_delay, _callback):
+            raise RuntimeError("the frame loop is stopped")
+
+        broken = _failing_scheduler if scheduler_state == "failing" else None
+        queued: list = []
+
+        def _next_frame(_delay, callback):
+            queued.append(callback)
+            return widget_scheduler.CallbackHandle(0.0, callback)
+
+        def _reports():
+            return [
+                line for line in capsys.readouterr().err.splitlines()
+                if "footer recount" in line
+            ]
+
+        stage, _undo, adapter, _model, _changed, _s = _fixture()
+        widget_scheduler.set_call_later(broken)
+        widget = self._widget(adapter)
+        try:
+            capsys.readouterr()
+            walks = []
+            original = widget._compute_stage_counts
+            widget._compute_stage_counts = lambda: (
+                walks.append(1) or original())
+            _toggle(adapter, stage, "/World/Cube", False)
+            # The fallback still recounts at once.
+            assert len(walks) == 1
+            assert widget._footer_hidden_label.text == "USD · 1 hidden"
+            reports = _reports()
+            cause = (
+                "No scheduler registered" if scheduler_state == "absent"
+                else "the frame loop is stopped"
+            )
+            assert len(reports) == 1
+            assert reports[0].startswith("[WARNING] [Stage] ")
+            assert f"RuntimeError: {cause}" in reports[0]
+            assert "recounted at once instead" in reports[0]
+            # The same fallback continues: recount at once, no new line.
+            _toggle(adapter, stage, "/World/Cube", True)
+            assert len(walks) == 2
+            assert widget._footer_hidden_label.text == "USD · 0 hidden"
+            assert _reports() == []
+            # A scheduler that works ends the fallback without a line.
+            widget_scheduler.set_call_later(_next_frame)
+            _toggle(adapter, stage, "/World/Cube", False)
+            assert len(walks) == 2
+            assert len(queued) == 1
+            queued.pop(0)()
+            assert len(walks) == 3
+            assert widget._footer_hidden_label.text == "USD · 1 hidden"
+            assert _reports() == []
+            # The fallback starts again, so it is reported again.
+            widget_scheduler.set_call_later(broken)
+            _toggle(adapter, stage, "/World/Cube", True)
+            assert len(walks) == 4
+            assert widget._footer_hidden_label.text == "USD · 0 hidden"
+            reports = _reports()
+            assert len(reports) == 1
+            assert f"RuntimeError: {cause}" in reports[0]
+        finally:
+            widget_scheduler.set_call_later(None)
+            widget.destroy()
 
 
 class TestProviderAndReplayClassification:

@@ -222,7 +222,7 @@ cl.shade(cl("#1F1F1F"), light=cl("#D0D0D0"), name="stage_default_prim_pill_backg
 # ---------------------------------------------------------------------------
 cl.shade(cl("#3E652F"), light=cl("#76A371"), name="layers_row_edit_target")
 cl.shade(cl("#222222"), light=cl("#D6D6D6"), name="layers_row_hover")
-# Group D (audit issue #5) — selected rows reuse the shared
+# Group D — selected rows reuse the shared
 # ``treeview_selection`` token so Stage and Layers paint identically on
 # selection. The former ``layers_row_selected`` (#5A5A5A) duplicated the
 # role at a different shade and has been removed.

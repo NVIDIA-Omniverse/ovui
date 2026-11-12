@@ -249,6 +249,7 @@ TreeView has item-model drag/drop:
 Reference drag/drop patterns:
 
 - Stage hierarchy validates reparent operations before allowing drop.
+- When the adapter refuses a reparent with a reason (`StageAdapter.get_reparent_refusal_reason`, for example a move into a native USD instance, whose children USD does not show), the Stage hierarchy shows no drop target but lets the release reach `drop()`, which shows the reason in the status bar and changes nothing.
 - Layers tree supports both item sources and string/file payloads.
 - Drop-visual controllers store transient valid/rejected target state; delegates paint overlays by reading that state.
 - Hover validation must clear stale drop visuals when the source/target becomes invalid.

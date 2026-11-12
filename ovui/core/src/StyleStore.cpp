@@ -39,14 +39,11 @@ ColorStore::ColorStore()
     // Extended colors
     m_store.emplace_back("aliceblue", 0xfffff8f0, true);
     m_store.emplace_back("antiquewhite", 0xffd7ebfa, true);
-    // m_store.emplace_back("aqua", 0xffffff00, true);
     m_store.emplace_back("aquamarine", 0xffd4ff7f, true);
     m_store.emplace_back("azure", 0xfffffff0, true);
     m_store.emplace_back("beige", 0xffdcf5f5, true);
     m_store.emplace_back("bisque", 0xffc4e4ff, true);
-    // m_store.emplace_back("black", 0xff000000, true);
     m_store.emplace_back("blanchedalmond", 0xffcdebff, true);
-    // m_store.emplace_back("blue", 0xffff0000, true);
     m_store.emplace_back("blueviolet", 0xffe22b8a, true);
     m_store.emplace_back("brown", 0xff2a2aa5, true);
     m_store.emplace_back("burlywood", 0xff87b8de, true);
@@ -85,13 +82,10 @@ ColorStore::ColorStore()
     m_store.emplace_back("firebrick", 0xff2222b2, true);
     m_store.emplace_back("floralwhite", 0xfff0faff, true);
     m_store.emplace_back("forestgreen", 0xff228b22, true);
-    // m_store.emplace_back("fuchsia", 0xffff00ff, true);
     m_store.emplace_back("gainsboro", 0xffdcdcdc, true);
     m_store.emplace_back("ghostwhite", 0xfffff8f8, true);
     m_store.emplace_back("gold", 0xff00d7ff, true);
     m_store.emplace_back("goldenrod", 0xff20a5da, true);
-    // m_store.emplace_back("gray", 0xff808080, true);
-    // m_store.emplace_back("green", 0xff008000, true);
     m_store.emplace_back("greenyellow", 0xff2fffad, true);
     m_store.emplace_back("grey", 0xff808080, true);
     m_store.emplace_back("honeydew", 0xfff0fff0, true);
@@ -119,11 +113,9 @@ ColorStore::ColorStore()
     m_store.emplace_back("lightslategrey", 0xff998877, true);
     m_store.emplace_back("lightsteelblue", 0xffdec4b0, true);
     m_store.emplace_back("lightyellow", 0xffe0ffff, true);
-    // m_store.emplace_back("lime", 0xff00ff00, true);
     m_store.emplace_back("limegreen", 0xff32cd32, true);
     m_store.emplace_back("linen", 0xffe6f0fa, true);
     m_store.emplace_back("magenta", 0xffff00ff, true);
-    // m_store.emplace_back("maroon", 0xff000080, true);
     m_store.emplace_back("mediumaquamarine", 0xffaacd66, true);
     m_store.emplace_back("mediumblue", 0xffcd0000, true);
     m_store.emplace_back("mediumorchid", 0xffd355ba, true);
@@ -138,9 +130,7 @@ ColorStore::ColorStore()
     m_store.emplace_back("mistyrose", 0xffe1e4ff, true);
     m_store.emplace_back("moccasin", 0xffb5e4ff, true);
     m_store.emplace_back("navajowhite", 0xffaddeff, true);
-    // m_store.emplace_back("navy", 0xff800000, true);
     m_store.emplace_back("oldlace", 0xffe6f5fd, true);
-    // m_store.emplace_back("olive", 0xff008080, true);
     m_store.emplace_back("olivedrab", 0xff238e6b, true);
     m_store.emplace_back("orange", 0xff00a5ff, true);
     m_store.emplace_back("orangered", 0xff0045ff, true);
@@ -155,8 +145,6 @@ ColorStore::ColorStore()
     m_store.emplace_back("pink", 0xffcbc0ff, true);
     m_store.emplace_back("plum", 0xffdda0dd, true);
     m_store.emplace_back("powderblue", 0xffe6e0b0, true);
-    // m_store.emplace_back("purple", 0xff800080, true);
-    // m_store.emplace_back("red", 0xff0000ff, true);
     m_store.emplace_back("rosybrown", 0xff8f8fbc, true);
     m_store.emplace_back("royalblue", 0xffe16941, true);
     m_store.emplace_back("saddlebrown", 0xff13458b, true);
@@ -165,7 +153,6 @@ ColorStore::ColorStore()
     m_store.emplace_back("seagreen", 0xff578b2e, true);
     m_store.emplace_back("seashell", 0xffeef5ff, true);
     m_store.emplace_back("sienna", 0xff2d52a0, true);
-    // m_store.emplace_back("silver", 0xffc0c0c0, true);
     m_store.emplace_back("skyblue", 0xffebce87, true);
     m_store.emplace_back("slateblue", 0xffcd5a6a, true);
     m_store.emplace_back("slategray", 0xff908070, true);
@@ -174,15 +161,12 @@ ColorStore::ColorStore()
     m_store.emplace_back("springgreen", 0xff7fff00, true);
     m_store.emplace_back("steelblue", 0xffb48246, true);
     m_store.emplace_back("tan", 0xff8cb4d2, true);
-    // m_store.emplace_back("teal", 0xff808000, true);
     m_store.emplace_back("thistle", 0xffd8bfd8, true);
     m_store.emplace_back("tomato", 0xff4763ff, true);
     m_store.emplace_back("turquoise", 0xffd0e040, true);
     m_store.emplace_back("violet", 0xffee82ee, true);
     m_store.emplace_back("wheat", 0xffb3def5, true);
-    // m_store.emplace_back("white", 0xffffffff, true);
     m_store.emplace_back("whitesmoke", 0xfff5f5f5, true);
-    // m_store.emplace_back("yellow", 0xff00ffff, true);
     m_store.emplace_back("yellowgreen", 0xff32cd9a, true);
 
     m_store.emplace_back("transparent", 0x0, true);

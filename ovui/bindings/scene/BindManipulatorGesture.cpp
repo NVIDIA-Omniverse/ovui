@@ -86,8 +86,6 @@ void wrapManipulatorGesture(module& m)
                      Py_TYPE(v_h.inst) != v_h.type->type);
              },
              detail::is_new_style_constructor())
-        .def("__repr__",
-             [](const std::shared_ptr<ManipulatorGesture>& self) -> std::string { return "<ManipulatorGesture " + (self ? self->getName(): "") + ">"; })
-        .def_property_readonly("sender", &ManipulatorGesture::getSender, OMNIUI_PYBIND_DOC_ManipulatorGesture_getSender)
+       .def_property_readonly("sender", &ManipulatorGesture::getSender, OMNIUI_PYBIND_DOC_ManipulatorGesture_getSender)
         /**/;
 }

@@ -84,13 +84,16 @@ class TestInvertedReadSemantics:
         vm = model.get_item_value_model(cube, 2)
         assert vm.get_value_as_bool() is True
 
-    def test_inherited_invisible_reads_true(self, model, adapter):
+    def test_inherited_invisible_reads_false(self, model, adapter):
+        # Regression: hidden only through an ancestor is not hidden itself;
+        # the eye stays open and the state tells the inherited case apart.
         geometry = _item(model, "/World/Geometry")
         geometry.adapter_item.visible = False
         sphere = _item(model, "/World/Geometry/Sphere")
         assert adapter.compute_visibility(sphere.adapter_item) == VisibilityState.INHERITED_INVISIBLE
         vm = model.get_item_value_model(sphere, 2)
-        assert vm.get_value_as_bool() is True
+        assert vm.get_value_as_bool() is False
+        assert vm.get_visibility_state() is VisibilityState.INHERITED_INVISIBLE
 
     def test_get_value_as_int_mirrors_bool(self, model):
         sphere = _item(model, "/World/Geometry/Sphere")

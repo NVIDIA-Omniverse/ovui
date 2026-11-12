@@ -44,8 +44,12 @@ struct Scene::SceneData
     std::shared_ptr<GestureManager> m_defaultGestureManager;
     std::vector<std::shared_ptr<GestureManager>> m_gestureManagers;
 
-    // All the managers of the children
+    // All the managers of the children, in the order of collection. When two
+    // managers want the same input, this order decides which one gets it.
     std::unordered_set<GestureManager*> m_cachedManagers;
+    // shared_ptr keeps the managers of m_cachedManagers alive for the frame,
+    // preventing use-after-free if a callback destroys a shape.
+    std::vector<std::shared_ptr<GestureManager>> m_cachedManagersAlive;
     std::unordered_set<AbstractGesture*> m_cachedGestures;
 };
 
@@ -75,6 +79,7 @@ void Scene::destroy()
     data.m_selectionCollectionRequested = data.m_hasSelectionGroups = false;
     data.m_cachedGestures.clear();
     data.m_cachedManagers.clear();
+    data.m_cachedManagersAlive.clear();
     AbstractContainer::destroy();
 }
 
@@ -95,16 +100,30 @@ void Scene::_preDrawContent(
     // TODO: We need to clean and keep the capacity
     auto& cacheManagers = data.m_cachedManagers;
     cacheManagers.clear();
-    // Get all the managers
+    data.m_cachedManagersAlive.clear();
+    // Keep shared_ptrs to the managers so they stay alive for the frame.
+    // Any manager in cacheManagers was inserted via gesture->getManager().get() in
+    // AbstractShape::_collectManagers, so it has at least one tracked gesture
+    // whose shared_ptr<GestureManager> we can recover.
     if (this->isVisible())
     {
         this->_collectManagers(cacheManagers);
+        std::unordered_set<AbstractGesture*> gestures;
+        for (auto* raw : cacheManagers)
+        {
+            gestures.clear();
+            raw->_collectGestures(gestures);
+            if (!gestures.empty())
+            {
+                data.m_cachedManagersAlive.push_back((*gestures.begin())->getManager());
+            }
+        }
     }
-    for (auto* manager : cacheManagers)
+    for (auto& manager : cacheManagers)
     {
         manager->setView(projection, view, { width, height });
     }
-    for (auto* manager : cacheManagers)
+    for (auto& manager : cacheManagers)
     {
         manager->preProcess(input);
     }
@@ -122,7 +141,7 @@ void Scene::_drawContent(const Matrix44& projection, const Matrix44& view)
     cachedGestures.clear();
 
     {
-        for (auto* manager : data.m_cachedManagers)
+        for (auto& manager : cachedManagers)
         {
             manager->_collectGestures(cachedGestures);
         }
@@ -156,7 +175,7 @@ void Scene::_drawContent(const Matrix44& projection, const Matrix44& view)
             }
         };
 
-        for (auto* manager : cachedManagers)
+        for (auto& manager : cachedManagers)
         {
             filterPrevented(allGestures);
             manager->prevent(allGestures);
@@ -164,7 +183,7 @@ void Scene::_drawContent(const Matrix44& projection, const Matrix44& view)
     }
 
     {
-        for (auto* manager : cachedManagers)
+        for (auto& manager : cachedManagers)
         {
             manager->process();
         }
@@ -191,7 +210,7 @@ void Scene::_postDrawContent(const Matrix44& projection, const Matrix44& view)
 
     SceneData& data = _getData<SceneData>();
 
-    for (auto* manager : data.m_cachedManagers)
+    for (auto& manager : data.m_cachedManagers)
     {
         manager->postProcess();
     }
@@ -199,6 +218,9 @@ void Scene::_postDrawContent(const Matrix44& projection, const Matrix44& view)
     AbstractContainer::_postDrawContent(projection, view);
 
     data.m_drawList->endFrame();
+    data.m_cachedManagers.clear();
+    data.m_cachedManagersAlive.clear();
+    data.m_cachedGestures.clear();
     // Existing scenes incur no extra walk. Explicit-policy scenes recollect even
     // with cached geometry: visibility and destruction need not dirty root buffers.
     if (data.m_depthCollectionRequested || data.m_hasDepthPolicies)

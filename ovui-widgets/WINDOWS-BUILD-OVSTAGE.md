@@ -206,13 +206,13 @@ Verify OpenUSD:
 & $env:PYTHON_BIN -c "import os; os.add_dll_directory(os.environ['USD_INSTALL_ROOT'] + r'\lib'); from pxr import Usd; print(Usd.GetVersion())"
 ```
 
-## Install ovrtx 0.3.0
+## Install ovrtx
 
 ```powershell
 Push-Location $env:OVRTX_ROOT
 git checkout main
 git pull --ff-only
-Get-Content python\pyproject.toml | Select-String 'version = "0.3.0"'
+Get-Content python\pyproject.toml | Select-String '^version'
 Pop-Location
 
 & $env:PYTHON_BIN -m pip install -e "$env:OVRTX_ROOT\python"

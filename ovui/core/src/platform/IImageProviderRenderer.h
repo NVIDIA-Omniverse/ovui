@@ -32,6 +32,30 @@ public:
     /// Check if the renderer's present thread is enabled.
     virtual bool isPresentThreadEnabled(void* renderer) = 0;
 
+    /// What the renderer knows about one presentation key.
+    enum class PresentationKeyState
+    {
+        /// The renderer keeps no per-key state (a renderer that is not updated).
+        eUnknown,
+        /// The renderer replaces the key with a drawable before its back end reads the draw data.
+        eMapped,
+        /// The key has no drawable: never notified, retired, or sent with an invalid frame.
+        eUnmapped,
+    };
+
+    /// Report the state of one key. ImageProvider does not return an unmapped key and uses the
+    /// texture reference instead, so a live feed of another provider cannot keep a dead key in use.
+    /// For an unknown key the provider keeps key mode, so a renderer that is not updated keeps its
+    /// valid presentation. The draw guard of the standalone back ends removes every key command
+    /// whose state is not eMapped, because those back ends read a texture id as a texture name or
+    /// as a Vulkan descriptor and have no key table.
+    virtual PresentationKeyState presentationKeyState(void* renderer, uint64_t key)
+    {
+        (void)renderer;
+        (void)key;
+        return PresentationKeyState::eUnknown;
+    }
+
     /// Result of ensuring a GPU resource on the target device with texture info.
     struct EnsureResourceResult
     {

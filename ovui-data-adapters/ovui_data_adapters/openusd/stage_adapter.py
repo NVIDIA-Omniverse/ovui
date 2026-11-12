@@ -125,6 +125,29 @@ def _is_live_prim(item: Any) -> bool:
         return False
 
 
+def _moves_into_own_subtree(items: List[Any], new_parent: Any) -> bool:
+    """Return ``True`` when ``new_parent`` is one of ``items`` or below one of them."""
+    new_parent_path = new_parent.GetPath()
+    return any(new_parent_path.HasPrefix(item.GetPath()) for item in items)
+
+
+def _instance_refusal_reason(new_parent: Any) -> str:
+    """Return why a prim moved under ``new_parent`` would not be shown, or ``""``.
+
+    USD does not compose children that a layer authors under a native
+    instance root or under a prim inside an instance, so a prim moved there
+    leaves the tree and the viewport.
+    """
+    if not _is_live_prim(new_parent):
+        return ""
+    name = new_parent.GetName()
+    if new_parent.IsInstance():
+        return f"{name} is an instance, and USD does not show prims under an instance"
+    if new_parent.IsInstanceProxy():
+        return f"{name} is inside an instance, and USD does not show prims under an instance"
+    return ""
+
+
 def _choice_for_prim(prim: Any) -> StageChoice:
     path = str(prim.GetPath())
     return StageChoice(path=path, display_name=path)
@@ -912,7 +935,7 @@ def _core_material_bindable_selection_paths(
         if sdf_path is None or sdf_path == Sdf.Path.absoluteRootPath:
             continue
         prim = stage.GetPrimAtPath(sdf_path)
-        if prim and prim.IsValid():
+        if prim and prim.IsValid() and not prim.IsInstanceProxy():
             paths.append(str(sdf_path))
     return tuple(paths)
 
@@ -936,6 +959,19 @@ def _core_material_binding_targets(
             )
             continue
         prim = stage.GetPrimAtPath(sdf_path)
+        if prim and prim.IsValid() and prim.IsInstanceProxy():
+            # USD does not allow authoring on an instance proxy.
+            skipped.append(str(selection_path))
+            warnings.append(
+                CoreMaterialWarning(
+                    code="instance_proxy",
+                    message=(
+                        "Selection target is an instance proxy, which cannot take a "
+                        f"material binding, and was skipped: {selection_path}"
+                    ),
+                )
+            )
+            continue
         if prim and prim.IsValid():
             targets.append(prim)
             continue
@@ -1554,14 +1590,47 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
         return VisibilityState.VISIBLE
 
     def set_visibility(self, item: AdapterItem, visible: bool) -> None:
+        self._author_visibility(item, visible, own_only=False)
+
+    def set_own_visibility(self, item: AdapterItem, visible: bool) -> None:
+        """Author visibility on ``item`` only.
+
+        ``set_visibility(item, True)`` uses ``UsdGeomImageable.MakeVisible``,
+        which also shows hidden ancestors and hides their other children.
+        This method authors ``item`` alone: under a hidden ancestor it stays
+        hidden through that ancestor.
+        """
+        self._author_visibility(item, visible, own_only=True)
+
+    def _author_visibility(
+        self, item: AdapterItem, visible: bool, own_only: bool
+    ) -> None:
         if not self.can_edit_visibility(item):
             raise ValueError(f"Visibility is not editable for {item.GetPath()}")
         from ovui_data_adapters.common import CommandCancelled
         from ovui_data_adapters.openusd import SetVisibilityCommand
-        cmd = SetVisibilityCommand(item, visible, adapter=self)
-        self._ensure_scope_baseline()
+        cmd = SetVisibilityCommand(item, visible, adapter=self, own_only=own_only)
+        # Nothing authors between the scope baseline and the attempt
+        # baseline (both only read the stage), so a baseline that this
+        # call has just captured is also the attempt's: the layer text is
+        # exported once, not twice.
+        fresh_baseline = self._ensure_scope_baseline()
+        # In an open scope (an eye click on a multi-selection) the scope
+        # keeps the whole-layer copy taken before its first item, and a
+        # failed item restores the whole group from it. A later item whose
+        # command writes only its own visibility specs (Mode A) then takes
+        # no copy of its own: each copy costs time proportional to the
+        # layer, about a second on a 50,000-prim layer, so one copy per
+        # item froze the window for many seconds on a large selection.
+        scope = self._visibility_scope
+        in_scope = scope is not None and not scope["closed"]
         attempt = self._begin_visibility_attempt(
-            cmd.predicted_write_prims(), command=cmd
+            cmd.predicted_write_prims(), command=cmd,
+            fresh_baseline=fresh_baseline,
+            layer_baselines=(
+                fresh_baseline is not None
+                or not (in_scope and cmd.authors_targeted_specs())
+            ),
         )
         try:
             self._push(cmd)
@@ -1591,21 +1660,25 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
             for resynced, changed in self._visibility_attempts[-1]["segments"]
         )
 
-    def _ensure_scope_baseline(self) -> None:
+    def _ensure_scope_baseline(self) -> Optional[tuple]:
         """First-touch whole-layer baseline for the active scope's target layer.
 
         Captured before any member authoring so a scope abort can compensate
         the complete group and prove every affected layer field-identical to
-        its pre-scope state.
+        its pre-scope state. Returns the ``(layer, text)`` pair when this
+        call captured it, else None (no open scope, or an earlier member
+        already captured the layer, possibly before later authoring).
         """
         scope = self._visibility_scope
         if scope is None or scope["closed"]:
-            return
+            return None
         layer = self._stage.GetEditTarget().GetLayer()
         key = layer.identifier
         if key in scope["baselines"]:
-            return
-        scope["baselines"][key] = (layer, layer.ExportToString())
+            return None
+        baseline = (layer, layer.ExportToString())
+        scope["baselines"][key] = baseline
+        return baseline
 
     def is_imageable(self, item: AdapterItem) -> bool:
         """Live composed-USD read: does inherited visibility apply to item?"""
@@ -1645,8 +1718,19 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
             self._operation_window_depth -= 1
 
     def _begin_visibility_attempt(
-        self, predicted_prims: Any, command: Any = None
+        self, predicted_prims: Any, command: Any = None,
+        fresh_baseline: Optional[tuple] = None,
+        layer_baselines: bool = True,
     ) -> dict:
+        """Open an attempt.
+
+        ``fresh_baseline`` is a ``(layer, text)`` pair exported by the
+        caller with no authoring since; it is reused as that layer's
+        operation baseline. ``layer_baselines=False`` takes no whole-layer
+        text at all: the whole-layer proofs of the attempt are then
+        unprovable, so a failure flushes its genuine segments and a bare
+        resync routes structurally (both conservative).
+        """
         boundary_paths: set = set()
         topology_paths: set = set()
         for path in predicted_prims:
@@ -1693,23 +1777,31 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
         # opinions (and the inert scaffolding hosting them) is NOTHING.
         # An uncapturable baseline poisons the proof (conservative).
         op_baselines: dict = {}
-        op_baseline_ok = True
+        op_baseline_ok = layer_baselines
         op_layers: list = []
         layers_fn = getattr(command, "operation_layers", None)
-        if callable(layers_fn):
+        if layer_baselines and callable(layers_fn):
             try:
                 op_layers = [
                     layer for layer in layers_fn() if layer is not None
                 ]
             except Exception:
                 op_baseline_ok = False
-        if not op_layers and self._stage is not None:
+        if layer_baselines and not op_layers and self._stage is not None:
             try:
                 op_layers = [self._stage.GetEditTarget().GetLayer()]
             except Exception:
                 op_baseline_ok = False
         for layer in op_layers:
             try:
+                if (
+                    fresh_baseline is not None
+                    and fresh_baseline[0].identifier == layer.identifier
+                ):
+                    op_baselines[layer.identifier] = (
+                        layer, fresh_baseline[1]
+                    )
+                    continue
                 op_baselines[layer.identifier] = (
                     layer, layer.ExportToString()
                 )
@@ -2479,9 +2571,19 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
         self._maybe_complete_deferred_dispose()
 
     def run_visibility_command_edge(self, command: Any, edge_fn: Any) -> None:
-        """Bracket a command undo/redo edge (invoked outside ``_push``)."""
+        """Bracket a command undo/redo edge (invoked outside ``_push``).
+
+        A command that replays only its own targeted specs (Mode A) gets no
+        whole-layer baseline: that copy costs time proportional to the
+        layer on every Undo and Redo, while a targeted replay touches only
+        the predicted visibility specs.
+        """
         hint = getattr(command, "edge_hint_prims", command.predicted_write_prims)
-        attempt = self._begin_visibility_attempt(hint(), command=command)
+        targeted = getattr(command, "replays_targeted_specs", None)
+        attempt = self._begin_visibility_attempt(
+            hint(), command=command,
+            layer_baselines=not (callable(targeted) and targeted()),
+        )
         try:
             edge_fn()
         except BaseException as exc:
@@ -2680,33 +2782,62 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
     def rename(self, item: AdapterItem, new_name: str) -> str:
         from ovui_data_adapters.openusd import NamespaceEditCommand
         old_path = item.GetPath()
-        new_path = old_path.GetParentPath().AppendChild(new_name)
+        # A text that is not a prim name, for example "a b/c", gives no path,
+        # and a move to no path removes the prim. Use a valid name made from
+        # the text, as the ovstage adapter does.
+        name = new_name
+        if not Sdf.Path.IsValidIdentifier(name):
+            name = self.normalize_name(new_name)
+        if not Sdf.Path.IsValidIdentifier(name):
+            raise ValueError(f"No valid prim name can be made from '{new_name}'")
+        new_path = old_path.GetParentPath().AppendChild(name)
+        if new_path == old_path:
+            return name
+        # Refuse a move that cannot be done before it goes on the undo stack,
+        # so that the Stage Browser shows why it failed and not a rename.
+        # A move onto a prim of another layer would merge the two prims.
+        if self._stage.GetPrimAtPath(new_path):
+            made = "" if name == new_name else f" ('{new_name}' gives the name '{name}')"
+            raise ValueError(f"The prim {new_path} already exists{made}")
         layer = self._stage.GetEditTarget().GetLayer()
-        cmd = NamespaceEditCommand(layer, old_path, new_path)
+        batch = Sdf.BatchNamespaceEdit()
+        batch.Add(old_path, new_path)
+        # CanApply gives True, or (False, details) with the reasons.
+        answer = layer.CanApply(batch)
+        if answer is not True:
+            reasons = "; ".join(detail.reason for detail in answer[1])
+            raise ValueError(
+                f"The layer {layer.GetDisplayName()} cannot rename {old_path} "
+                f"to '{name}': {reasons}"
+            )
+        cmd = NamespaceEditCommand(layer, old_path, new_path, stage=self._stage)
         self._push(cmd)
         self._notify(ChangeEvent(
-            changed_paths=(),
+            changed_paths=tuple(str(path) for path in cmd.retargeted_paths),
             resynced_paths=(str(new_path),),
             event_type=ChangeEventType.RESYNC,
         ))
-        return new_name
+        return name
 
     def normalize_name(self, name: str) -> str:
-        return _NAME_RE.sub("_", name)
+        normalized = _NAME_RE.sub("_", name)
+        if normalized[:1].isdigit():
+            normalized = "_" + normalized
+        return normalized
 
     # ── Drag-drop / reparent ──────────────────────────────────────────────────
 
     def can_reparent(self, items: List[AdapterItem], new_parent: AdapterItem) -> bool:
-        new_parent_path = new_parent.GetPath()
-        for item in items:
-            item_path = item.GetPath()
-            # Cannot reparent into self
-            if item_path == new_parent_path:
-                return False
-            # Cannot reparent into a descendant of the item
-            if new_parent_path.HasPrefix(item_path):
-                return False
-        return True
+        if _moves_into_own_subtree(items, new_parent):
+            return False
+        return not _instance_refusal_reason(new_parent)
+
+    def get_reparent_refusal_reason(
+        self, items: List[AdapterItem], new_parent: AdapterItem
+    ) -> str:
+        if _moves_into_own_subtree(items, new_parent):
+            return ""
+        return _instance_refusal_reason(new_parent)
 
     def reparent(
         self,
@@ -2724,15 +2855,21 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
             target_parent_path = new_parent.GetPath().GetParentPath()
 
         moved_paths = []
+        retargeted_paths: list = []
         for item in items:
             old_path = item.GetPath()
             new_path = target_parent_path.AppendChild(old_path.name)
             moved_paths.append(str(new_path))
-            cmd = NamespaceEditCommand(layer, old_path, new_path)
+            cmd = NamespaceEditCommand(layer, old_path, new_path, stage=self._stage)
             self._push(cmd)
+            # A later item can move a property that an earlier move retargeted.
+            retargeted_paths = [
+                path.ReplacePrefix(old_path, new_path) for path in retargeted_paths
+            ]
+            retargeted_paths.extend(cmd.retargeted_paths)
 
         self._notify(ChangeEvent(
-            changed_paths=(),
+            changed_paths=tuple(dict.fromkeys(str(path) for path in retargeted_paths)),
             resynced_paths=tuple(moved_paths),
             event_type=ChangeEventType.RESYNC,
         ))
@@ -3511,8 +3648,7 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
         child_name = _create_child_name(request.requested_name, material.default_name)
         material_path = _create_unique_child_path(self._stage, scope_path, child_name)
 
-        snapshot = _create_snapshot_layer(edit_target_layer)
-        try:
+        def _author() -> tuple[Any, tuple[str, ...], tuple[CoreMaterialWarning, ...]]:
             _, scope_error = _create_ensure_parent(
                 self._stage,
                 scope_path,
@@ -3526,12 +3662,22 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
             )
             if prim is None or not prim.IsValid():
                 raise RuntimeError(f"Core material create did not author {material_path}")
+            return prim, created_paths, warnings
+
+        from ovui_data_adapters.openusd import CreatePrimCommand
+
+        cmd = CreatePrimCommand(self._stage, f"Create {material.label}", _author)
+        try:
+            if self._undo_manager is not None:
+                self._undo_manager.push(cmd)
+            else:
+                cmd.do()
         except Exception as exc:
-            _create_restore_layer(edit_target_layer, snapshot)
             return _core_material_error(
                 f"Core material create failed: {exc}",
                 CoreMaterialErrorCode.CREATE_FAILED,
             )
+        prim, created_paths, warnings = cmd.result
 
         primary_path = str(prim.GetPath())
         self._notify(ChangeEvent(
@@ -3927,9 +4073,10 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
 
         child_name = _create_child_name(request.requested_name, material.default_name)
         material_path = _create_unique_child_path(self._stage, scope_path, child_name)
-        snapshot = _create_snapshot_layer(edit_target_layer)
         failure_code = CoreMaterialErrorCode.CREATE_FAILED
-        try:
+
+        def _author() -> tuple[Any, tuple[str, ...], tuple[CoreMaterialWarning, ...], Any]:
+            nonlocal failure_code
             _, scope_error = _create_ensure_parent(
                 self._stage,
                 scope_path,
@@ -3949,8 +4096,17 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
                 targets,
                 binding_strength,
             )
+            return prim, created_paths, create_warnings, bound_paths
+
+        from ovui_data_adapters.openusd import CreatePrimCommand
+
+        cmd = CreatePrimCommand(self._stage, f"Create {material.label}", _author)
+        try:
+            if self._undo_manager is not None:
+                self._undo_manager.push(cmd)
+            else:
+                cmd.do()
         except Exception as exc:
-            _create_restore_layer(edit_target_layer, snapshot)
             message = f"Core material create-and-bind failed: {exc}"
             failed_paths = (
                 tuple(str(prim.GetPath()) for prim in targets)
@@ -3971,6 +4127,7 @@ class UsdStageAdapter(StageAdapter, CreateActionsAdapter, CoreMaterialsAdapter):
                     *binding_warnings,
                 ),
             )
+        prim, created_paths, create_warnings, bound_paths = cmd.result
 
         primary_path = str(prim.GetPath())
         self._notify(ChangeEvent(

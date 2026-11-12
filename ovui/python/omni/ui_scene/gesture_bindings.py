@@ -1,22 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Shared variant: works in both Kit (carb available) and standalone (no carb).
-#
-# When carb is present:
-#   * Mouse/modifier constants come from carb.input (preserves existing Kit
-#     behavior where tests compare against carb.input.MouseInput enum values).
-#   * String bindings are resolved via carb.settings with a tree-change
-#     subscription so a change rebuilds the manipulator's gestures.
-#   * Diagnostics go through carb.log_error / carb.log_warn.
-#
-# When carb is not importable (standalone):
-#   * Local integer constants stand in for carb.input values. Their numeric
-#     values match the ImGui / GestureModifiers.h conventions carb also uses.
-#   * String bindings degrade to an empty-dict no-op (no settings backend).
+# By default:
+#   * Mouse buttons and modifier flags are the ImGui / GestureModifiers.h values.
+#   * String bindings cannot be resolved (there is no settings store) and fall
+#     back to empty bindings.
 #   * Diagnostics go through the stdlib logging module.
 #
-__all__ = ["GestureBinding", "GestureBindings", "GestureBindingManipulator"]
+# A host application, such as Kit, can give its own constants, logging and
+# settings store with set_host(). ovui itself imports no host module.
+#
+__all__ = ["GestureBinding", "GestureBindings", "GestureBindingManipulator", "set_host"]
 
 import importlib
 import logging
@@ -28,48 +22,56 @@ from .scene import AbstractGesture, Manipulator
 
 _log = logging.getLogger(__name__)
 
-try:
-    import carb
-    import carb.input
-    _HAVE_CARB = True
-except ImportError:
-    carb = None  # type: ignore[assignment]
-    _HAVE_CARB = False
+# Mouse button indices — match ImGui conventions:
+#   LEFT_BUTTON  = 0
+#   RIGHT_BUTTON = 1
+#   MIDDLE_BUTTON= 2
+_LEFT_BUTTON   = 0
+_RIGHT_BUTTON  = 1
+_MIDDLE_BUTTON = 2
+# Keyboard modifier flag bits — match GestureModifiers.h:
+_MOD_SHIFT = 1 << 0
+_MOD_CTRL  = 1 << 1
+_MOD_ALT   = 1 << 2
+_MOD_SUPER = 1 << 3
+
+# The settings store of the host: an object with get(key), subscribe(key,
+# callback) -> handle and unsubscribe(handle). None when there is no store.
+_settings = None
 
 
-if _HAVE_CARB:
-    _LEFT_BUTTON   = carb.input.MouseInput.LEFT_BUTTON
-    _RIGHT_BUTTON  = carb.input.MouseInput.RIGHT_BUTTON
-    _MIDDLE_BUTTON = carb.input.MouseInput.MIDDLE_BUTTON
-    _MOD_SHIFT = carb.input.KEYBOARD_MODIFIER_FLAG_SHIFT
-    _MOD_CTRL  = carb.input.KEYBOARD_MODIFIER_FLAG_CONTROL
-    _MOD_ALT   = carb.input.KEYBOARD_MODIFIER_FLAG_ALT
-    _MOD_SUPER = carb.input.KEYBOARD_MODIFIER_FLAG_SUPER
+def _log_error(msg: str) -> None:
+    _log.error(msg)
 
-    def _log_error(msg: str) -> None:
-        carb.log_error(msg)
 
-    def _log_warn(msg: str) -> None:
-        carb.log_warn(msg)
-else:
-    # Mouse button indices — match ImGui (and carb.input.MouseInput) conventions:
-    #   LEFT_BUTTON  = 0
-    #   RIGHT_BUTTON = 1
-    #   MIDDLE_BUTTON= 2
-    _LEFT_BUTTON   = 0
-    _RIGHT_BUTTON  = 1
-    _MIDDLE_BUTTON = 2
-    # Keyboard modifier flag bits — match GestureModifiers.h and carb::input values:
-    _MOD_SHIFT = 1 << 0
-    _MOD_CTRL  = 1 << 1
-    _MOD_ALT   = 1 << 2
-    _MOD_SUPER = 1 << 3
+def _log_warn(msg: str) -> None:
+    _log.warning(msg)
 
-    def _log_error(msg: str) -> None:
-        _log.error(msg)
 
-    def _log_warn(msg: str) -> None:
-        _log.warning(msg)
+def set_host(*, mouse_buttons=None, modifiers=None, log_error=None, log_warn=None, settings=None) -> None:
+    """Use the input constants, logging and settings store of a host application.
+
+    Args:
+        mouse_buttons: (left, right, middle) button values.
+        modifiers: (shift, ctrl, alt, super) modifier flag values.
+        log_error, log_warn: Functions that take one message.
+        settings: An object with get(key), subscribe(key, callback) -> handle
+            and unsubscribe(handle). String bindings are looked up in it, and a
+            manipulator rebuilds its gestures when its key changes.
+    """
+    global _LEFT_BUTTON, _RIGHT_BUTTON, _MIDDLE_BUTTON
+    global _MOD_SHIFT, _MOD_CTRL, _MOD_ALT, _MOD_SUPER
+    global _log_error, _log_warn, _settings
+    if mouse_buttons is not None:
+        _LEFT_BUTTON, _RIGHT_BUTTON, _MIDDLE_BUTTON = mouse_buttons
+    if modifiers is not None:
+        _MOD_SHIFT, _MOD_CTRL, _MOD_ALT, _MOD_SUPER = modifiers
+    if log_error is not None:
+        _log_error = log_error
+    if log_warn is not None:
+        _log_warn = log_warn
+    if settings is not None:
+        _settings = settings
 
 
 class GestureBinding(tuple):
@@ -92,16 +94,16 @@ class GestureBindings:
 
         Args:
             bindings (dict|str): A dictionary mapping gesture names to their key bindings or a string
-                key. In Kit, string keys are looked up via carb.settings; in standalone, string keys
-                cannot be resolved and fall back to empty bindings.
+                key. String keys are looked up in the settings store given to set_host(); without
+                one they cannot be resolved and fall back to empty bindings.
             gesture_module: (str|None): The name of the module where the gestures are defined.
         """
         if isinstance(bindings, str):
-            if _HAVE_CARB:
-                bindings = carb.settings.get_settings().get(bindings)
+            if _settings is not None:
+                bindings = _settings.get(bindings)
             else:
                 _log_warn(
-                    f"GestureBindings: settings key '{bindings}' cannot be resolved in standalone mode; "
+                    f"GestureBindings: settings key '{bindings}' cannot be resolved without a settings store; "
                     "using empty bindings. Pass a dict instead."
                 )
                 bindings = {}
@@ -217,13 +219,13 @@ class GestureBindingManipulator(Manipulator):
         Constructor
 
         Args:
-            bindings (dict|str): Bindings to use for the manipulator's gestures.  In Kit, a string
-                settings key is subscribed via carb.settings and bindings rebuild when the key
-                changes.  In standalone, string keys are not backed and fall back to empty.
+            bindings (dict|str): Bindings to use for the manipulator's gestures.  A string
+                settings key is subscribed in the settings store given to set_host(), and bindings
+                rebuild when the key changes.  Without a store, string keys fall back to empty.
             *args, **kwargs: Additional arguments to pass to the base class.
         """
         super().__init__(*args, **kwargs)
-        self.__carb_sub = None
+        self.__settings_sub = None
         self.__bindings_dirty = True
         self.bindings = bindings
 
@@ -242,12 +244,12 @@ class GestureBindingManipulator(Manipulator):
                 self.__bindings = self.get_default_bindings()
             bindings = self.__bindings
             if isinstance(bindings, str):
-                if _HAVE_CARB:
-                    bindings = carb.settings.get_settings().get(bindings)
+                if _settings is not None:
+                    bindings = _settings.get(bindings)
                 else:
                     _log_warn(
                         f"GestureBindingManipulator: settings key '{bindings}' "
-                        "cannot be resolved in standalone mode."
+                        "cannot be resolved without a settings store."
                     )
                     bindings = {}
             self.__gestures = self._build_gestures(bindings, *args, **kwargs)
@@ -267,23 +269,22 @@ class GestureBindingManipulator(Manipulator):
         self.__bindings = bindings
         self.__bindings_dirty = True
         if isinstance(self.__bindings, str):
-            if _HAVE_CARB:
-                settings = carb.settings.get_settings()
-                if self.__carb_sub:
-                    settings.unsubscribe_to_change_events(self.__carb_sub)
-                    self.__carb_sub = None
-                self.__carb_sub = settings.subscribe_to_tree_change_events(
+            if _settings is not None:
+                if self.__settings_sub:
+                    _settings.unsubscribe(self.__settings_sub)
+                    self.__settings_sub = None
+                self.__settings_sub = _settings.subscribe(
                     self.__bindings, partial(self.__bindings_changed, weakref.ref(self))
                 )
             else:
                 _log_warn(
                     f"GestureBindingManipulator: settings key '{self.__bindings}' "
-                    "cannot be subscribed in standalone mode. Pass a dict directly."
+                    "cannot be subscribed without a settings store. Pass a dict directly."
                 )
-        elif self.__carb_sub:
-            if _HAVE_CARB:
-                carb.settings.get_settings().unsubscribe_to_change_events(self.__carb_sub)
-            self.__carb_sub = None
+        elif self.__settings_sub:
+            if _settings is not None:
+                _settings.unsubscribe(self.__settings_sub)
+            self.__settings_sub = None
         self.invalidate()
 
     @staticmethod
@@ -297,10 +298,10 @@ class GestureBindingManipulator(Manipulator):
         """Destroys the manipulator instance."""
         self.__bindings = None
         self.__gestures = None
-        if self.__carb_sub:
-            if _HAVE_CARB:
-                carb.settings.get_settings().unsubscribe_to_change_events(self.__carb_sub)
-            self.__carb_sub = None
+        if self.__settings_sub:
+            if _settings is not None:
+                _settings.unsubscribe(self.__settings_sub)
+            self.__settings_sub = None
 
         spr_destroy = getattr(super(), "destroy", None)
         if spr_destroy:

@@ -512,7 +512,7 @@ SELECTOR_TOKENS: list[tuple[str, str, str]] = [
     # transparent setting has no other side effect.
     ("Layers.TreeView", "secondary_color", "transparent"),
     ("Layers.TreeView.Row::row_bg:hovered", "background_color", "layers_row_hover"),
-    # Group D (audit issue #5) — selected row uses the shared
+    # Group D (audit the regression) — selected row uses the shared
     # ``treeview_selection`` token so Stage + Layers paint identically.
     ("Layers.TreeView.Row::row_bg:selected", "background_color", "treeview_selection"),
     ("Layers.TreeView.Row::row_bg_edit_target", "background_color", "layers_row_edit_target"),
@@ -571,7 +571,7 @@ SELECTOR_TOKENS: list[tuple[str, str, str]] = [
     # show up. The delegate / widget still uses the entry at paint time;
     # it simply cannot be asserted via ``ui.style.default`` dict access, so
     # the focused variant is excluded from this resolution matrix.
-    # Group C (audit issue #6) — both chrome strips now sit on the
+    # Group C (audit the regression) — both chrome strips now sit on the
     # panel-primary fill so they flow into the tree body; the
     # 1-px FilterSeparator / FooterSeparator rules supply the dividers.
     ("Layers.Toolbar", "background_color", "background_primary"),
@@ -754,7 +754,7 @@ PRIMARY_CONTRAST_PAIRS = [
     ("text_secondary", "background_primary", 3.0),
     # state: selected row — primary text on selected strip. Group D
     # consolidated the row-selection colour onto the shared
-    # ``treeview_selection`` token (audit issue #5).
+    # ``treeview_selection`` token (audit the regression).
     ("text_primary", "treeview_selection", 3.0),
     # state: hovered row — primary text on hovered strip
     ("text_primary", "layers_row_hover", 3.0),

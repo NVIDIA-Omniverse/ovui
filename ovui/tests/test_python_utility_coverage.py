@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import os
+import subprocess
 import sys
 import types
 import unittest
@@ -21,40 +23,31 @@ if str(_PYTHON) not in sys.path:
     sys.path.insert(0, str(_PYTHON))
 
 
-try:  # pragma: no cover - import guard for partial worktrees.
-    import omni.ui as ui  # noqa: E402
-    from omni.ui import _compat  # noqa: E402
-    from omni.ui import abstract_shade  # noqa: E402
-    from omni.ui import color_utils  # noqa: E402
-    from omni.ui import constant_utils  # noqa: E402
-    from omni.ui import markdown_styles  # noqa: E402
-    from omni.ui import singleton  # noqa: E402
-    from omni.ui import standalone as ui_standalone  # noqa: E402
-    from omni.ui import testing as ui_testing  # noqa: E402
-    from omni.ui import url_utils  # noqa: E402
-    from omni.ui_scene import compatibility as scene_compatibility  # noqa: E402
-    from omni.ui_scene import gesture_bindings  # noqa: E402
-
-    _HAVE_UI = True
-except Exception:  # noqa: BLE001 - tolerate source-only import failures.
-    _HAVE_UI = False
+import omni.ui as ui  # noqa: E402
+from omni.ui import abstract_shade  # noqa: E402
+from omni.ui import color_utils  # noqa: E402
+from omni.ui import constant_utils  # noqa: E402
+from omni.ui import markdown_styles  # noqa: E402
+from omni.ui import singleton  # noqa: E402
+from omni.ui import standalone as ui_standalone  # noqa: E402
+from omni.ui import testing as ui_testing  # noqa: E402
+from omni.ui import url_utils  # noqa: E402
+from omni.ui_scene import compatibility as scene_compatibility  # noqa: E402
+from omni.ui_scene import gesture_bindings  # noqa: E402
 
 
-if _HAVE_UI:
+class _MemoryShade(abstract_shade.AbstractShade):
+    def __init__(self):
+        super().__init__()
+        object.__setattr__(self, "values", {})
 
-    class _MemoryShade(abstract_shade.AbstractShade):
-        def __init__(self):
-            super().__init__()
-            object.__setattr__(self, "values", {})
+    def _find(self, name):
+        return self.values.get(name)
 
-        def _find(self, name):
-            return self.values.get(name)
-
-        def _store(self, name, value):
-            self.values[name] = value
+    def _store(self, name, value):
+        self.values[name] = value
 
 
-@unittest.skipUnless(_HAVE_UI, "omni.ui not available")
 class TestShadeAndColorUtilities(unittest.TestCase):
     def test_abstract_shade_set_get_alias_dependencies_and_generated_names(self):
         shade = _MemoryShade()
@@ -146,7 +139,6 @@ class TestShadeAndColorUtilities(unittest.TestCase):
         self.assertEqual(calls, [1])
 
 
-@unittest.skipUnless(_HAVE_UI, "omni.ui not available")
 class TestMarkdownStyleBranches(unittest.TestCase):
     def test_normalization_aliases_and_invalid_name(self):
         self.assertEqual(markdown_styles._normalize_name(None), "black")
@@ -231,7 +223,6 @@ class _FakeUiInput:
         return self.fallback_result
 
 
-@unittest.skipUnless(_HAVE_UI, "omni.ui not available")
 class TestTestingHelpers(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.fake_ui = _FakeUiInput()
@@ -316,15 +307,49 @@ class TestTestingHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("capture", "/tmp/old.png"), self.fake_ui.calls)
 
 
-@unittest.skipUnless(_HAVE_UI, "omni.ui not available")
 class TestCompatAndNamespaceUtilities(unittest.TestCase):
-    def test_standalone_settings_and_step_frame(self):
-        _compat.set_setting("/test/value", 123)
-        self.assertEqual(_compat.get_setting("/test/value"), 123)
-        self.assertEqual(_compat.get_setting("/test/missing", "fallback"), "fallback")
-        self.assertIsNone(_compat.subscribe_to_change("/test/value", lambda *_: None))
-        self.assertIsNone(_compat.unsubscribe_to_change(None))
-        self.assertIsNone(_compat.step_frame(3))
+    def test_import_with_kit_modules_installed_uses_none_of_them(self):
+        # Kit's carb and omni.kit.app may be installed next to ovui. Importing
+        # ovui must not use them: Kit gives what it needs through set_host().
+        script = r"""
+import importlib.machinery, sys, types
+used = []
+class KitModule(types.ModuleType):
+    def __getattr__(self, name):
+        used.append(f"{self.__name__}.{name}")
+        raise AttributeError(name)
+for name in ("carb", "carb.settings", "carb.input", "omni.kit", "omni.kit.app"):
+    module = KitModule(name)
+    module.__spec__ = importlib.machinery.ModuleSpec(name, None)
+    sys.modules[name] = module
+import omni.ui as ui
+import omni.ui_scene.gesture_bindings
+print("USED", used)
+"""
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "USED []")
+
+    def test_host_gpu_foundation_types_are_used_when_present(self):
+        # A host such as Kit has omni.gpu_foundation_factory: ui.RpResource is
+        # its type, as before. Without it, ui.RpResource is ovui's placeholder.
+        # ui.TextureFormat stays ovui's own in both cases, as before.
+        script = r"""
+import sys, types
+host = types.ModuleType("omni.gpu_foundation_factory")
+class RpResource: pass
+class TextureFormat: pass
+host.RpResource, host.TextureFormat = RpResource, TextureFormat
+sys.modules["omni.gpu_foundation_factory"] = host
+import omni.ui as ui
+print(ui.RpResource is RpResource, ui.TextureFormat is ui._ui.TextureFormat)
+"""
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "True True")
+        self.assertNotEqual(ui.RpResource.__module__, "omni.gpu_foundation_factory")
 
     def test_add_to_namespace_lifetime_and_none(self):
         module = types.SimpleNamespace(__name__="package.demo")
@@ -430,7 +455,6 @@ class _FakeStandaloneBackend:
         return self.resize_streaming_result
 
 
-@unittest.skipUnless(_HAVE_UI, "omni.ui not available")
 class TestStandaloneHelpers(unittest.TestCase):
     def setUp(self):
         self.fake_ui = _FakeStandaloneBackend()
@@ -596,7 +620,6 @@ class TestStandaloneHelpers(unittest.TestCase):
         self.assertIn(("shutdown_streaming",), self.fake_ui.calls)
 
 
-@unittest.skipUnless(_HAVE_UI, "omni.ui_scene not available")
 class TestGestureBindings(unittest.TestCase):
     def test_parse_binding_buttons_modifiers_and_invalid_token(self):
         bindings = gesture_bindings.GestureBindings({})
@@ -605,6 +628,42 @@ class TestGestureBindings(unittest.TestCase):
         self.assertEqual(binding.modifiers, 0xFFFFFFFF)
         with self.assertRaises(RuntimeError):
             bindings.parse_binding("LeftButton Unknown")
+
+    def test_a_host_gives_its_constants_and_settings_store(self):
+        class Settings:
+            def __init__(self):
+                self.values = {"/bindings": {"Pan": "MiddleButton Alt"}}
+                self.subscriptions = []
+
+            def get(self, key):
+                return self.values.get(key)
+
+            def subscribe(self, key, callback):
+                self.subscriptions.append((key, callback))
+                return len(self.subscriptions)
+
+            def unsubscribe(self, handle):
+                self.subscriptions[handle - 1] = None
+
+        names = ("_LEFT_BUTTON", "_RIGHT_BUTTON", "_MIDDLE_BUTTON", "_MOD_SHIFT", "_MOD_CTRL",
+                 "_MOD_ALT", "_MOD_SUPER", "_log_error", "_log_warn", "_settings")
+        saved = {name: getattr(gesture_bindings, name) for name in names}
+        self.addCleanup(lambda: [setattr(gesture_bindings, n, v) for n, v in saved.items()])
+        settings = Settings()
+        gesture_bindings.set_host(
+            mouse_buttons=(10, 11, 12), modifiers=(16, 32, 64, 128), settings=settings
+        )
+
+        bindings = gesture_bindings.GestureBindings("/bindings")
+        self.assertIn("Pan", bindings)
+        binding = bindings.parse_binding(bindings["Pan"])
+        self.assertEqual(binding.mouse_buttons, [12])
+        self.assertEqual(binding.modifiers, 64)
+
+        manipulator = gesture_bindings.GestureBindingManipulator("/bindings")
+        self.assertEqual([key for key, _ in settings.subscriptions], ["/bindings"])
+        manipulator.destroy()
+        self.assertEqual(settings.subscriptions, [None])
 
     def test_instantiators_from_callable_dict_module_globals_and_failures(self):
         class DemoGesture:
@@ -676,8 +735,6 @@ class TestGestureBindings(unittest.TestCase):
         self.assertEqual(binding.mouse_buttons, [0])
 
     def test_string_bindings_in_standalone_warn_and_empty(self):
-        if gesture_bindings._HAVE_CARB:
-            self.skipTest("standalone warning branch only")
         with self.assertLogs(gesture_bindings._log, level="WARNING") as logs:
             bindings = gesture_bindings.GestureBindings("/settings/path")
         self.assertNotIn("anything", bindings)
@@ -711,7 +768,6 @@ class TestGestureBindings(unittest.TestCase):
         manipulator.destroy()
 
 
-@unittest.skipUnless(_HAVE_UI, "omni.ui_scene not available")
 class TestSceneCompatibilityHelpers(unittest.TestCase):
     def test_add_compatibility_for_property_method_and_alias(self):
         class Demo:

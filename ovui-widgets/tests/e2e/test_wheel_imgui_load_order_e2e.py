@@ -5,8 +5,8 @@
 
 ovui and ovrtx both ship a library named imgui, and a process holds only one.
 A user script that constructs ``ovrtx.Renderer()`` and imports ``omni.ui``
-must work whichever comes first. Earlier releases failed in both orders
-or when the renderer came first ("DLL load failed while
+must work whichever comes first. Before the fix, rc16 failed in both orders
+and rc19 still failed when the renderer came first ("DLL load failed while
 importing _standalone" on Windows, "undefined symbol: _ZN10ImDrawListD1Ev" on
 Linux). Each order runs in a fresh process with only the installed wheels.
 """

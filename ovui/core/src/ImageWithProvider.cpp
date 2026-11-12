@@ -7,6 +7,7 @@
 #include "platform/Log.h"
 #include "platform/PlatformRegistry.h"
 #include "platform/IUiFileIO.h"
+#include "ImageProvider/ImageProviderThreads.h"
 
 #include <imgui/imgui.h>
 #include <imgui/imgui_internal.h>
@@ -336,6 +337,12 @@ void ImageWithProvider::_populateImageProvidersFromStyles()
 
 void ImageWithProvider::_drawContent(float elapsedTime)
 {
+    // Changes given with ImageProvider::publishOnUiThread() run once per frame, before the lock of this
+    // widget is taken: a change can run any code. The standalone platforms run them before any window is
+    // drawn; then this does nothing. A host that does not call ImageProvider::applyPublishedUpdates()
+    // itself gets them here, before the first image of the frame.
+    applyPublishedUpdatesOncePerFrame();
+
     // It's not the best way to load the image in draw cycle because the first frame the widget will be empty. But
     // it's good because it will be lazy loaded when the widget appears on the visible area.
     if (!m_overrideStyleImages && (m_updateStyleImages || this->_hasStyleUrlChanged()))

@@ -107,8 +107,9 @@ def copy_group(
     "copy → click elsewhere → copy again → paste" pastes the second
     snapshot's values.
 
-    Ambiguous attributes (``adapter.is_ambiguous`` True → ``get_value``
-    returns ``None``) are stored as ``None`` so a subsequent Paste
+    Ambiguous attributes (``adapter.is_ambiguous`` True) are stored as
+    ``None``, also when ``get_value`` gives the vector of the first
+    object, so a subsequent Paste
     into a non-ambiguous selection can decide to skip them — see
     :func:`paste_group`. Kit's Step 4.3 analogue does the same: the
     clipboard records what Copy saw, Paste type-checks on the way back.
@@ -118,7 +119,9 @@ def copy_group(
     """
     snapshot: Dict[str, Any] = {}
     for prop in iter_group_props(group):
-        snapshot[prop.name] = adapter.get_value(prop.name)
+        snapshot[prop.name] = (
+            None if adapter.is_ambiguous(prop.name) else adapter.get_value(prop.name)
+        )
     _CLIPBOARD[clipboard_id] = snapshot
     return snapshot
 
@@ -280,6 +283,7 @@ def show_group_context_menu(
     x: float,
     y: float,
     clipboard_id: str = DEFAULT_CLIPBOARD_ID,
+    undo_manager: Any = None,
 ) -> Any:
     """Build and show the three-item context menu at ``(x, y)``.
 
@@ -304,6 +308,15 @@ def show_group_context_menu(
     paste_enabled = can_paste(adapter, group, clipboard_id)
     reset_enabled = can_reset(adapter, group)
 
+    def _one_undo_step(label: str, action: Any) -> None:
+        if undo_manager is not None:
+            undo_manager.begin_group(label)
+        try:
+            action()
+        finally:
+            if undo_manager is not None:
+                undo_manager.end_group()
+
     menu = create_flat_menu()
     with menu:
         ui.MenuItem(
@@ -313,12 +326,16 @@ def show_group_context_menu(
         ui.MenuItem(
             f"Paste All Property Values in {group_label}",
             enabled=paste_enabled,
-            triggered_fn=lambda: paste_group(adapter, group, clipboard_id),
+            triggered_fn=lambda: _one_undo_step(
+                "Paste All", lambda: paste_group(adapter, group, clipboard_id)
+            ),
         )
         ui.MenuItem(
             f"Reset All Property Values in {group_label}",
             enabled=reset_enabled,
-            triggered_fn=lambda: reset_group(adapter, group),
+            triggered_fn=lambda: _one_undo_step(
+                "Reset All", lambda: reset_group(adapter, group)
+            ),
         )
     menu.show_at(float(x), float(y))
     return menu

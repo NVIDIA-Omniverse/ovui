@@ -181,8 +181,8 @@ class CameraManipulator(sc.Manipulator):
     ``register_camera_gestures`` helper with a proper ``sc.Manipulator``
     subclass. Instantiated inside ``with sc.SceneView().scene:``; the draw
     loop calls :meth:`on_build`, which emits an ``sc.Screen(gestures=...)``
-    covering the viewport. The four gesture instances (tumble/pan/look/zoom)
-    are constructed eagerly in ``__init__`` so callers and tests can wire
+    covering the viewport. The gesture instances (one drag per bound
+    button, the wheel zoom) are constructed eagerly in ``__init__`` so callers and tests can wire
     references (e.g., flight-keyboard RMB polling) before the first draw
     fires, and are reused across successive ``on_build`` invalidations.
 
@@ -205,6 +205,10 @@ class CameraManipulator(sc.Manipulator):
         flight_keyboard: Optional[Any] = None,
         tumble_inertia: Optional[Any] = None,
         generation: Any = None,
+        *,
+        bindings: Optional[Iterable[Any]] = None,
+        surface: Optional[Any] = None,
+        options: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
         # Lazy imports keep this module's import graph flat: camera_gesture,
@@ -212,12 +216,11 @@ class CameraManipulator(sc.Manipulator):
         # camera_manipulator, so importing them at module scope here would
         # cycle.
         from ovui_widgets.viewport.camera_gesture import (
-            MOD_ALT,
-            MOUSE_LEFT,
-            LookGesture,
-            PanGesture,
-            TumbleGesture,
+            MOD_ANY,
+            FlySpeedScrollGesture,
+            NavigationGesture,
             ZoomScrollGesture,
+            parse_bindings,
         )
 
         self._camera = camera_controller
@@ -228,66 +231,53 @@ class CameraManipulator(sc.Manipulator):
         self._flight_keyboard = flight_keyboard
         self._tumble_inertia = tumble_inertia
 
-        self._tumble = TumbleGesture(
-            self._camera,
+        # One drag gesture per mouse button (Omniverse Kit's layout unless
+        # ``bindings`` says otherwise, see ``camera_gesture.parse_bindings``).
+        # A button with a plain binding takes every modifier state and picks
+        # the binding of the held modifiers, or the plain one.
+        bindings = list(bindings) if bindings is not None else parse_bindings()
+        modes_by_button: dict = {}
+        for mode, button, mods in bindings:
+            if mode != "fly":
+                modes_by_button.setdefault(button, {})[mods] = mode
+        shared = dict(
             model=self._model,
-            viewport_size_fn=self._viewport_size_fn,
-            inertia=self._tumble_inertia,
+            viewport_size_fn=viewport_size_fn,
             generation=generation,
+            inertia=tumble_inertia,
+            surface=surface,
+            flight_keyboard=flight_keyboard,
+            options=options,
         )
-        # Alt+LMB tumble alias — Maya/Kit/Houdini muscle memory. Shares the
-        # same TumbleInertia instance as the RMB binding; exclusivity is
-        # enforced by ``_AngularDragGesture._on_began`` which calls
-        # ``self._inertia.stop()`` on every drag begin, so a coast started
-        # by one binding is preempted by a fresh drag from either binding.
-        self._tumble_alt = TumbleGesture(
-            self._camera,
-            model=self._model,
-            viewport_size_fn=self._viewport_size_fn,
-            inertia=self._tumble_inertia,
-            mouse_button=MOUSE_LEFT,
-            modifiers=MOD_ALT,
-            generation=generation,
-        )
-        self._pan = PanGesture(
-            self._camera,
-            model=self._model,
-            viewport_size_fn=self._viewport_size_fn,
-            generation=generation,
-        )
-        self._look = LookGesture(
-            self._camera,
-            model=self._model,
-            viewport_size_fn=self._viewport_size_fn,
-            generation=generation,
+        drags_by_button: dict = {}
+        for button, modes in modes_by_button.items():
+            groups = [(MOD_ANY, modes)] if 0 in modes else [(mods, {mods: mode}) for mods, mode in modes.items()]
+            drags_by_button[button] = [
+                NavigationGesture(camera_controller, mouse_button=button, modifiers=mods, modes=group, **shared)
+                for mods, group in groups
+            ]
+        self._drags: List[Any] = [drag for drags in drags_by_button.values() for drag in drags]
+        self._tumble, self._pan, self._look, self._dolly = (
+            next((drag for drag in self._drags if mode in drag.modes.values()), None)
+            for mode in ("orbit", "pan", "look", "dolly")
         )
         self._zoom = ZoomScrollGesture(
-            self._camera, model=self._model, generation=generation
+            self._camera, model=self._model, generation=generation,
+            viewport_size_fn=self._viewport_size_fn, surface=surface, options=options,
         )
-        # Order: the original four match the old ``register_camera_gestures``
-        # return list (callers that unpack ``tumble, pan, look, zoom`` keep
-        # working). The Alt+LMB tumble alias is appended at the end so the
-        # existing index-based assertions in tests/test_camera_manipulator.py
-        # still hold for indices 0-3.
-        self._camera_gestures: List[Any] = [
-            self._tumble,
-            self._pan,
-            self._look,
-            self._zoom,
-            self._tumble_alt,
-        ]
+        self._camera_gestures: List[Any] = [*self._drags, self._zoom]
 
         if self._flight_keyboard is not None:
-            # RMB-held polling: FlightModeKeyboard.is_flying returns True when
-            # either tumble or look gesture reports ``is_active`` — i.e., a
-            # live RMB drag. Wiring happens here (rather than in on_build) so
-            # the keyboard sees the gesture refs before the first key event.
-            #
-            # The Alt+LMB tumble alias is *intentionally excluded* from this
-            # tuple. Including it would make Alt+LMB-drag-plus-W spuriously
-            # trigger flight mode — not the user's intent. RMB-held remains
-            # the only flight-mode trigger.
-            self._flight_keyboard.set_rmb_gestures((self._tumble, self._look))
+            # The fly button: held with a fly key it flies, and its wheel
+            # sets the fly speed. Wiring happens here (rather than in
+            # on_build) so the keyboard sees the gestures before the first
+            # key event.
+            fly_buttons = {button for mode, button, _ in bindings if mode == "fly"}
+            self._flight_keyboard.set_rmb_gestures(
+                [drag for button in fly_buttons for drag in drags_by_button.get(button, ())]
+            )
+            for button in fly_buttons:
+                self._camera_gestures.append(FlySpeedScrollGesture(self._flight_keyboard, generation, button))
 
         super().__init__(model=self._model, **kwargs)
 
@@ -299,24 +289,22 @@ class CameraManipulator(sc.Manipulator):
 
     @property
     def camera_gestures(self) -> List[Any]:
-        """Return ``[tumble, pan, look, zoom]`` in that order.
-
-        Matches the old ``register_camera_gestures`` contract so existing
-        unpacking patterns still work.
-        """
+        """The drag gestures (one per button), the wheel zoom, then the fly-speed wheel of the fly button."""
         return list(self._camera_gestures)
 
     @property
     def tumble_gesture(self) -> Any:
+        """The gesture that orbits (None when no binding orbits)."""
         return self._tumble
 
     @property
     def tumble_alt_gesture(self) -> Any:
-        """Alt+LMB-bound tumble alias — same class and inertia singleton as
-        :attr:`tumble_gesture`, distinct instance. See
-        ``the camera-navigation acceptance notes`` Step 1.
-        """
-        return self._tumble_alt
+        """The Alt+LMB tumble of Kit's layout: :attr:`tumble_gesture`."""
+        return self._tumble
+
+    @property
+    def dolly_gesture(self) -> Any:
+        return self._dolly
 
     @property
     def pan_gesture(self) -> Any:
@@ -341,7 +329,7 @@ class CameraManipulator(sc.Manipulator):
     # -- sc.Manipulator hooks --------------------------------------------
 
     def on_build(self) -> None:
-        """Attach the four gesture instances to an ``sc.Screen``.
+        """Attach the gesture instances to an ``sc.Screen``.
 
         Called by ``sc.SceneView``'s draw pipeline whenever the manipulator
         is invalidated (or on first display). The same gesture instances

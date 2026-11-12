@@ -7,11 +7,57 @@ These exercise the public binding contract without rendering: constructing a
 list model from each supported value type, walking its items via the
 inherited AbstractItemModel API, mutating the list, and verifying that the
 model can be plugged into a ``ui.ComboBox`` (the documented primary use).
+
+An item must not stay after its removal or after the end of its model: the
+callback in an item's value model kept the item, and the item kept the value
+model. A ComboBox built from a list of labels kept every item, value model and
+callback for the life of the app.
 """
 
+import ctypes
+import sys
 import unittest
 
 import omni.ui as ui
+
+
+class _MallInfo2(ctypes.Structure):
+    _fields_ = [
+        (name, ctypes.c_size_t)
+        for name in ("arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks", "fsmblks", "uordblks",
+                     "fordblks", "keepcost")
+    ]
+
+
+class _ProcessMemoryCounters(ctypes.Structure):
+    _fields_ = [("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32)] + [
+        (name, ctypes.c_size_t)
+        for name in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                     "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage",
+                     "PeakPagefileUsage", "PrivateUsage")
+    ]
+
+
+def _heap_bytes() -> int:
+    """Bytes that the process allocated: the allocator total on Linux, private bytes on Windows, else peak RSS."""
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallinfo2.restype = _MallInfo2
+        return int(libc.mallinfo2().uordblks)
+    if sys.platform == "win32":
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+        if not psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+            raise OSError(ctypes.get_last_error(), "GetProcessMemoryInfo failed")
+        return int(counters.PrivateUsage)
+    import resource
+
+    # ru_maxrss is in KiB on Linux and in bytes on macOS; only macOS reaches this line.
+    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
 
 class TestSimpleListModel(unittest.TestCase):
@@ -126,6 +172,33 @@ class TestSimpleListModel(unittest.TestCase):
         self.assertIsNotNone(combo.model)
         root = combo.model.get_item_value_model(None, 0)
         self.assertEqual(root.get_value_as_int(), 1)
+
+    def test_a_removed_item_no_longer_notifies_the_model(self):
+        model = ui.SimpleListModel(["a"])
+        extra = ui.SimpleStringModel("b")
+        model.append_child_item(None, extra)
+        model.remove_item(model.get_item_children(None)[-1])
+        events = []
+        sub = model.subscribe_item_changed_fn(lambda sender, item: events.append(item))
+        try:
+            extra.set_value("c")
+            self.assertEqual(events, [], "the removed item stayed and still reports changes of its value model")
+        finally:
+            sub.unsubscribe()
+
+    def test_a_deleted_model_frees_its_items(self):
+        labels = [f"Render mode {index}" for index in range(10)]
+
+        def build_and_delete(count):
+            for _ in range(count):
+                ui.ComboBox(0, *labels)
+
+        build_and_delete(200)
+        before = _heap_bytes()
+        build_and_delete(2000)
+        grown = _heap_bytes() - before
+        # Kept items cost about 3 KB for each ComboBox of 10 labels (6 MB here).
+        self.assertLess(grown, 1_000_000, f"2000 deleted ComboBoxes kept {grown} bytes")
 
     def test_unsupported_type_raises(self):
         with self.assertRaises(TypeError):

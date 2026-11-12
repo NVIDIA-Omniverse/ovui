@@ -17,9 +17,12 @@ from ovui_data_adapters.common import (
     LayerStackAdapter,
     PrimSpecDescriptor,
     PrimSpecifier,
+    SublayerEntry,
 )
 
+from ovui_widgets.app.testing import MockLayerStackAdapter
 from ovui_widgets.common.settings import Subscription
+from ovui_widgets.common.testing.mock_layer_stack import ROOT_LAYER_IDENTIFIER
 
 # ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -497,3 +500,16 @@ class TestSubscribeEvents:
         sub.cancel()
         sub.cancel()  # must not raise
         assert adapter._subscribers == []
+
+
+# ─── Sublayer entry defaults ────────────────────────────────────
+
+
+class TestSublayerEntryDefault:
+    def test_insert_refuses_a_time_offset_it_cannot_store(self) -> None:
+        # The mock keeps the default methods: it has no time offsets.
+        adapter = MockLayerStackAdapter(include_session=False)
+        entry = SublayerEntry("./anim.usda", offset=-20.0)
+        with pytest.raises(NotImplementedError):
+            adapter.insert_sublayer_entry(ROOT_LAYER_IDENTIFIER, 0, entry)
+        assert adapter.get_sublayer_identifiers(adapter.get_root_layer()) == []

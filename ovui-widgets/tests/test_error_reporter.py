@@ -360,14 +360,9 @@ class TestStatusBarLifecycle:
 # Part G: StatusBar widget (requires omni.ui)
 # ---------------------------------------------------------------------------
 
-try:
-    import omni.ui as ui
-    _OMNI_UI_AVAILABLE = True
-except ImportError:
-    _OMNI_UI_AVAILABLE = False
+import omni.ui as ui
 
 
-@pytest.mark.skipif(not _OMNI_UI_AVAILABLE, reason="omni.ui not available")
 class TestStatusBarWidget:
     def _make_bar(self):
         from ovui_widgets.app.status_bar import StatusBar

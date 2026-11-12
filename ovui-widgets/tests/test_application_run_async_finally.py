@@ -3,7 +3,7 @@
 
 """Tests for Application.run_async()'s ``finally:`` block.
 
-Issue #35, Step 5 originally widened ``run_async``'s ``try`` around
+Regression, Step 5 originally widened ``run_async``'s ``try`` around
 ``ui.DockSpace`` construction. The application now uses ``ui.MainWindow``
 for the menu bar, root docker, and status bar frame, so this test pins the
 same structural guarantee around ``self._main_win = ui.MainWindow()``.
@@ -242,12 +242,12 @@ def test_frame_loop_inside_try(_run_async_ast: ast.AsyncFunctionDef) -> None:
 def test_finally_calls_shutdown(_run_async_ast: ast.AsyncFunctionDef) -> None:
     """The outer ``finally`` MUST call ``self.shutdown()``. Without
     this, ``Application.shutdown()`` never runs on the normal exit
-    path — the headline bug of issue #35.
+    path — the headline bug of the regression.
     """
     outer = _find_outer_try(_run_async_ast)
     finally_src = "\n".join(ast.unparse(stmt) for stmt in outer.finalbody)
     assert "self.shutdown()" in finally_src, (
-        "issue #35 headline: finally MUST call self.shutdown(); current "
+        "the regression headline: finally MUST call self.shutdown(); current "
         f"finally body:\n{finally_src}"
     )
 

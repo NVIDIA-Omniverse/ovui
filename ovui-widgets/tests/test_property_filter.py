@@ -803,3 +803,135 @@ class TestPropertyWindowNestedBuild:
             "transform:rotate:z",
             "mesh:subdivisionScheme",
         }
+
+
+@pytest.fixture(scope="module")
+def frames():
+    """One headless ovui start for the module; ``frames()`` draws frames."""
+    from omni.ui import standalone
+
+    from tests._vulkan_device import use_headless_vulkan
+
+    patch = pytest.MonkeyPatch()
+    use_headless_vulkan(patch)
+    standalone.init("_test_property_filter_focus", 800, 700)
+
+    def tick(count=3):
+        for _ in range(count):
+            standalone._tick_one_frame()
+
+    yield tick
+    standalone.shutdown()
+    patch.undo()
+
+
+def _adapter_for(paths):
+    """The two-group adapter, selected on ``paths``."""
+    return _make_mock_adapter(
+        paths=paths, attributes=_two_group_adapter()._attributes
+    )
+
+
+class TestFilterKeepsKeyboardFocusInRenderedFrames:
+    """A filter change must not take keyboard focus from the filter field.
+
+    With real frames, a real focus and a real Backspace key. A new filter
+    field has no focus, so the next Backspace would reach the application
+    delete shortcut and delete the selected prims. The large selection
+    (banner, no attribute groups) must behave the same as a small one.
+    """
+
+    @pytest.fixture()
+    def window_and_pending(self, frames):
+        """A real PropertyWindow and the list of debounced filter callbacks."""
+        from ovui_widgets.common import scheduler
+        from ovui_widgets.property.window import PropertyWindow
+
+        pending = []
+
+        def call_later(delay, callback):
+            handle = scheduler.CallbackHandle(delay, callback)
+            pending.append(handle)
+            return handle
+
+        scheduler.set_call_later(call_later)
+        window = PropertyWindow()
+        try:
+            yield window, pending
+        finally:
+            scheduler.set_call_later(None)
+            window.destroy()
+            frames()
+
+    @staticmethod
+    def _select(window, count):
+        paths = [f"/World/Cube_{i:03d}" for i in range(count)]
+        window.set_adapter(_adapter_for(paths))
+        window.set_selection(paths)
+
+    @pytest.mark.parametrize("count", [1, 150], ids=["one_prim", "150_prims"])
+    def test_typing_and_backspace_edit_the_filter_and_delete_nothing(
+        self, frames, window_and_pending, count
+    ):
+        from omni.ui import _ui, standalone
+
+        from tests.test_keyboard_shortcuts import _KEY_BACKSPACE, _make_app
+
+        window, pending = window_and_pending
+        self._select(window, count)
+        frames()
+        field = window._filter_field
+        assert field is not None
+
+        window._focus_filter_field()
+        frames()
+        assert standalone.is_text_input_active()
+
+        _ui._inject_text_input("si")
+        frames()
+        assert field.model.get_value_as_string() == "si"
+        # The debounce time ends: the filter is applied.
+        pending[-1]._callback()
+        frames()
+
+        assert window._filter_text == "si"
+        assert window._filter_field is field
+        assert standalone.is_text_input_active()
+
+        # The application delete shortcut must see the text input and
+        # leave the selected prims alone.
+        app = _make_app()
+        app._stage_window = None
+        app._content_window = None
+        app._delete_selected = MagicMock()
+        app._delete_selected_prim_specs_in_layers = MagicMock(return_value=False)
+        app._on_key_pressed(_KEY_BACKSPACE, 0, True)
+        app._delete_selected.assert_not_called()
+
+        _ui._inject_key_event(_KEY_BACKSPACE, True)
+        _ui._inject_key_event(_KEY_BACKSPACE, False)
+        frames()
+        assert field.model.get_value_as_string() == "s"
+        assert standalone.is_text_input_active()
+
+    def test_load_anyway_after_typing_keeps_the_filter_text(
+        self, frames, window_and_pending
+    ):
+        from omni.ui import _ui
+
+        window, pending = window_and_pending
+        self._select(window, 150)
+        frames()
+        window._focus_filter_field()
+        frames()
+        _ui._inject_text_input("si")
+        frames()
+        pending[-1]._callback()
+        frames()
+        assert window._group_stack_container is None
+
+        window._on_ignore_threshold_clicked()
+        frames()
+
+        assert window._group_stack_container is not None
+        assert window._filter_field.model.get_value_as_string() == "si"

@@ -44,6 +44,45 @@ def _is_transform_only_info_change(event: ChangeEvent) -> bool:
     return bool(event.changed_paths) and not bool(event.resynced_paths)
 
 
+def _is_property_value_only_info_change(event: ChangeEvent) -> bool:
+    """Return true for value edits of properties, such as a slider drag.
+
+    Such an edit cannot add, remove, rename or retype a row, and the name
+    filter does not read values. Visibility edits keep their own path: a
+    hidden parent changes the rows below it.
+    """
+    if event.event_type is not ChangeEventType.INFO_CHANGE:
+        return False
+    if event.resynced_paths:
+        return False
+    if not event.changed_paths:
+        return False
+    for path in event.changed_paths:
+        prim_path, dot, name = str(path).rpartition(".")
+        if not dot or not prim_path or "/" in name or "[" in name or name == "visibility":
+            return False
+    return True
+
+
+def _report_refused_reparent(adapter: Any, source: Any, target: Any) -> None:
+    """Tell the user why ``adapter`` refuses to move ``source`` into ``target``.
+
+    Nothing is shown when the adapter gives no reason, for example for a move
+    into itself.
+    """
+    reason = adapter.get_reparent_refusal_reason([source], target)
+    if not reason:
+        return
+    from ovui_widgets.common.error_reporter import ErrorReporter
+
+    message = (
+        f"Cannot move {adapter.get_display_name(source)} into "
+        f"{adapter.get_display_name(target)}: {reason}"
+    )
+    ErrorReporter.log_warning("Stage", message)
+    ErrorReporter.show_warning(message)
+
+
 class _NullSubscription:
     """Inert subscription handle for the explicit no-document state."""
 
@@ -316,7 +355,13 @@ class HierarchyModel(ui.AbstractItemModel):
         return DRAG_MIME
 
     def drop_accepted(self, target_item: Any, source_item: Any, drop_location: int = -1) -> bool:
-        """Called while dragging over target. Returns True if reparent is valid."""
+        """Called while dragging over target.
+
+        Returns True if the reparent is valid. Also returns True when the
+        adapter refuses the reparent with a reason, so that the release calls
+        :meth:`drop`, which shows the reason and changes nothing. The drop
+        target is shown only for a valid reparent.
+        """
         if not isinstance(target_item, HierarchyItem) or not isinstance(source_item, HierarchyItem):
             return False
         can = self._adapter.can_reparent(
@@ -327,7 +372,13 @@ class HierarchyModel(ui.AbstractItemModel):
                 self._drop_visual.show_drop_target(target_item, drop_location)
             else:
                 self._drop_visual.clear()
-        return can
+        if can:
+            return True
+        return bool(
+            self._adapter.get_reparent_refusal_reason(
+                [source_item.adapter_item], target_item.adapter_item
+            )
+        )
 
     def drop(self, target_item: Any, source_item: Any, drop_location: int = -1) -> None:
         """Schedule a reparent after the native TreeView drop callback returns.
@@ -348,6 +399,9 @@ class HierarchyModel(ui.AbstractItemModel):
         if not adapter.can_reparent(
             [source_item.adapter_item], target_item.adapter_item
         ):
+            _report_refused_reparent(
+                adapter, source_item.adapter_item, target_item.adapter_item
+            )
             return
         source_path = adapter.get_item_path(source_item.adapter_item)
         target_parent_path = adapter.get_item_path(target_item.adapter_item)
@@ -368,6 +422,9 @@ class HierarchyModel(ui.AbstractItemModel):
                 if not adapter.can_reparent(
                     [source_adapter_item], target_adapter_item
                 ):
+                    _report_refused_reparent(
+                        adapter, source_adapter_item, target_adapter_item
+                    )
                     return
             except Exception as exc:
                 from ovui_widgets.common.error_reporter import ErrorReporter
@@ -491,15 +548,6 @@ class HierarchyModel(ui.AbstractItemModel):
             return self._root
         cached = self._path_cache.get(path)
         if cached is not None:
-            # A cached item outlives topology revisions, but the adapter item
-            # it holds does not: loading children through a superseded one
-            # reports none. Re-anchor to the adapter's current item — and drop
-            # the entry outright when the path is gone — so a cache hit is
-            # never staler than the walk below.
-            current = self._adapter.get_item_at_path(path)
-            if current is None:
-                return None
-            cached.adapter_item = current
             return cached
         if self._adapter.get_item_at_path(path) is None:
             return None
@@ -677,7 +725,27 @@ class HierarchyModel(ui.AbstractItemModel):
         if self._is_visibility_only_event(event):
             self._apply_visibility_event(event)
             return
+        if _is_property_value_only_info_change(event):
+            self._apply_property_value_event(event)
+            return
         self._on_adapter_changed(event)
+
+    def _apply_property_value_event(self, event: ChangeEvent) -> None:
+        """Repaint only the rows of the edited prims.
+
+        A full rebuild here ran at each edit of a slider drag. With a filter
+        it walked the whole stage at each edit (about 150 ms on a scene of
+        41,000 prims). The badges of an edited row can change (its first edit
+        can author an ``over``), so the row reads its flags again.
+        """
+        repainted: set[int] = set()
+        for path in event.changed_paths:
+            item = self._path_cache.get(str(path).rpartition(".")[0])
+            if item is None or id(item) in repainted:
+                continue
+            repainted.add(id(item))
+            item.mark_dirty()
+            self._item_changed(item)
 
     # ── Visibility events: per-item invalidation ──────────────────────────────
     #
@@ -947,9 +1015,17 @@ class HierarchyModel(ui.AbstractItemModel):
         self._pending_expand_paths.clear()
         # Best-effort prune: drop cache entries for paths the adapter no
         # longer knows about so they can't mask newer items at the same
-        # path after a delete-and-recreate.
-        stale = [p for p in self._path_cache
-                 if self._adapter.get_item_at_path(p) is None]
+        # path after a delete-and-recreate. A cached item outlives topology
+        # revisions, but the adapter item it holds does not: loading
+        # children through a superseded one reports none, so re-anchor the
+        # rest to the adapter's current item.
+        stale = []
+        for p, item in self._path_cache.items():
+            current = self._adapter.get_item_at_path(p)
+            if current is None:
+                stale.append(p)
+            else:
+                item.adapter_item = current
         for p in stale:
             self._path_cache.pop(p, None)
             self._expanded_paths.discard(p)

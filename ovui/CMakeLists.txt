@@ -11,6 +11,12 @@ endif()
 
 project(ovui VERSION 0.1.1 LANGUAGES C CXX)
 
+# macOS: the bundled GLFW Cocoa sources need the Objective-C languages,
+# enabled here in the common parent of every target.
+if(APPLE)
+    enable_language(OBJC OBJCXX)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -25,12 +31,8 @@ set(OVUI_IMGUI_ROOT "${CMAKE_SOURCE_DIR}/third_party" CACHE PATH "Directory cont
 option(OMNIUI_USE_BUNDLED_FREETYPE "Build the pinned FetchContent FreeType as a static library" OFF)
 option(OMNIUI_USE_BUNDLED_GLFW "Build the pinned FetchContent GLFW as a static library" OFF)
 option(OMNIUI_REQUIRE_VULKAN "Fail configuration when the Vulkan SDK is unavailable" OFF)
+option(OMNIUI_ENABLE_SVG "Build the standalone SVG reader and painter so that ui.ImageWithProvider can draw .svg files" ON)
 option(OMNIUI_REQUIRE_CUDA "Fail configuration when the CUDA Toolkit is unavailable" OFF)
-option(OMNIUI_BUILD_OVRTX_UI_APP "Generate the Visual Studio OVRTX application startup project" OFF)
-
-if(OMNIUI_BUILD_OVRTX_UI_APP AND NOT CMAKE_GENERATOR MATCHES "^Visual Studio")
-    message(FATAL_ERROR "OMNIUI_BUILD_OVRTX_UI_APP requires a Visual Studio generator")
-endif()
 
 # The bundled dependency mode is used by binary-wheel builds. Both upstream
 # projects honor BUILD_SHARED_LIBS, and GLFW also exposes an explicit library
@@ -115,31 +117,12 @@ if(OMNIUI_REQUIRE_CUDA AND NOT CUDAToolkit_FOUND)
     message(FATAL_ERROR "OMNIUI_REQUIRE_CUDA=ON but the CUDA Toolkit was not found")
 endif()
 if(NOT (EMSCRIPTEN AND (OMNI_UI_BUILD_PYODIDE_BINDINGS OR OMNI_UI_BUILD_WEB_RUNTIME)))
-    if(OMNIUI_BUILD_OVRTX_UI_APP)
-        # A development solution must include the Python projects and use the
-        # same Python version as the Kit-compatible wheel builds.
-        if(PYTHON_EXECUTABLE)
-            set(Python_EXECUTABLE "${PYTHON_EXECUTABLE}")
-        endif()
-        find_package(Python 3.12 EXACT REQUIRED COMPONENTS Interpreter Development)
-        set(PYTHON_EXECUTABLE "${Python_EXECUTABLE}")
-        find_package(pybind11 2.11.1 EXACT QUIET)
-        if(NOT pybind11_FOUND)
-            # Match the wheel dependency without requiring a Python package install.
-            FetchContent_Declare(
-                pybind11
-                GIT_REPOSITORY https://github.com/pybind/pybind11.git
-                GIT_TAG        v2.11.1
-                GIT_SHALLOW    TRUE
-            )
-            FetchContent_MakeAvailable(pybind11)
-            set(pybind11_FOUND TRUE)
-            get_directory_property(pybind11_VERSION DIRECTORY "${pybind11_SOURCE_DIR}" DEFINITION pybind11_VERSION)
-        endif()
-    else()
-        # Native-only CI jobs do not require Python bindings.
-        find_package(pybind11 2.11.1 EXACT QUIET)
-    endif()
+    find_package(pybind11 2.11.1 CONFIG QUIET)
+endif()
+if(MSVC)
+    # pybind11 2.13.6, unlike 2.11.1, adds the compiler version to the key of the shared type registry on Windows.
+    # Without it the key is the one of pybind11 2.11.1 (Kit's), so the modules share types with Kit's, as on Linux.
+    add_compile_definitions("PYBIND11_BUILD_ABI=\"\"")
 endif()
 if(CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION} found at ${CUDAToolkit_TARGET_DIR}")
@@ -217,6 +200,70 @@ if(OMNI_UI_BUILD_IMAGE_PROVIDER_TESTS)
 
     add_test(NAME raster_image_provider_contract_tests COMMAND raster_image_provider_contract_tests)
 
+    # Upload results of ByteImageProvider against a fake backend: rejected and
+    # stale uploads, device masks, completion events and the failure hook.
+    add_executable(byte_image_upload_status_tests
+        tests/cpp/test_byte_image_upload_status.cpp
+    )
+    target_include_directories(byte_image_upload_status_tests
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/src
+    )
+    target_link_libraries(byte_image_upload_status_tests PRIVATE ovui)
+    if(NOT MSVC)
+        target_compile_options(byte_image_upload_status_tests PRIVATE -Wno-error)
+    endif()
+
+    add_test(NAME byte_image_upload_status_tests COMMAND byte_image_upload_status_tests)
+
+    # Drives presentation-key mode of ImageProvider with a fake renderer and a
+    # fake byte-image GPU: failed and good key entry, the exit from key mode,
+    # byte-upload transitions, independent feeds and the draw-side guard.
+    add_executable(presentation_key_tests
+        tests/cpp/test_presentation_key_modes.cpp
+    )
+    target_include_directories(presentation_key_tests
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/src
+            ${OVUI_IMGUI_ROOT}/imgui
+    )
+    target_link_libraries(presentation_key_tests PRIVATE ovui)
+    if(NOT MSVC)
+        target_compile_options(presentation_key_tests PRIVATE -Wno-error)
+    endif()
+
+    add_test(NAME presentation_key_tests COMMAND presentation_key_tests)
+
+    # A ui::Window and its callback with a fake window callback manager whose app
+    # window lookup can fail: a failed move keeps the callback's app window, and
+    # a callback is removed after its set lost its app window. No GPU or window.
+    add_executable(window_callback_owner_tests
+        tests/cpp/test_window_callback_owner.cpp
+    )
+    target_link_libraries(window_callback_owner_tests PRIVATE ovui)
+    if(NOT MSVC)
+        target_compile_options(window_callback_owner_tests PRIVATE -Wno-error)
+    endif()
+
+    add_test(NAME window_callback_owner_tests COMMAND window_callback_owner_tests)
+
+    # Thread rules of ImageProvider: changes given from another thread run on
+    # the UI thread, and a changing call on another thread is reported.
+    add_executable(image_provider_thread_tests
+        tests/cpp/test_image_provider_threads.cpp
+    )
+    target_include_directories(image_provider_thread_tests
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/src
+    )
+    find_package(Threads REQUIRED)
+    target_link_libraries(image_provider_thread_tests PRIVATE ovui Threads::Threads)
+    if(NOT MSVC)
+        target_compile_options(image_provider_thread_tests PRIVATE -Wno-error)
+    endif()
+
+    add_test(NAME image_provider_thread_tests COMMAND image_provider_thread_tests)
+
     # Drives the standalone loader's sharing contract with the loader source
     # compiled in and a counting fake IByteImageGpu: several consumers of one
     # file share one upload, closing one of them keeps that sharing, and a
@@ -235,6 +282,150 @@ if(OMNI_UI_BUILD_IMAGE_PROVIDER_TESTS)
     endif()
 
     add_test(NAME standalone_raster_image_loader_tests COMMAND standalone_raster_image_loader_tests)
+
+    # PNG export compresses with the standalone pngZlibCompress instead of
+    # stb_image_write's built-in compressor. This compares both byte for byte,
+    # with the pinned stb compiled in as the reference, and checks that the
+    # export one is faster and holds no more memory. CPU only.
+    add_executable(png_zlib_compress_tests
+        tests/cpp/test_png_zlib_compress.cpp
+        standalone/src/PngZlibCompress.cpp
+    )
+    target_link_libraries(png_zlib_compress_tests PRIVATE stb)
+    if(NOT MSVC)
+        target_compile_options(png_zlib_compress_tests PRIVATE -Wno-error)
+    endif()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # The memory check counts what each compressor asks the allocator for.
+        # --wrap is a GNU ld and lld option, so the count is compiled in where
+        # the native tests run; elsewhere the test says that it is not counting.
+        target_compile_definitions(png_zlib_compress_tests PRIVATE OMNIUI_PNG_TEST_COUNT_ALLOCATIONS=1)
+        # -fno-builtin-*: an optimizing build calls the compiler's own malloc,
+        # which --wrap does not see.
+        target_compile_options(png_zlib_compress_tests PRIVATE
+            -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free)
+        target_link_options(png_zlib_compress_tests PRIVATE
+            -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free)
+    endif()
+
+    add_test(NAME png_zlib_compress_tests COMMAND png_zlib_compress_tests)
+
+    # Drives the standalone file IO's asynchronous reads with its source
+    # compiled in: destroying it waits for a running read, and a failed read
+    # reports the cause. No GPU, window or running application is involved.
+    add_executable(standalone_file_io_tests
+        tests/cpp/test_standalone_file_io.cpp
+        standalone/src/StandaloneFileIO.cpp
+    )
+    target_include_directories(standalone_file_io_tests
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/src
+    )
+    target_link_libraries(standalone_file_io_tests PRIVATE ovui stb ${CMAKE_DL_LIBS})
+    # Compiles a test-only seam into this binary that arms a one-shot read
+    # failure; the product library is built without it.
+    target_compile_definitions(standalone_file_io_tests PRIVATE OVUI_FILE_IO_TEST_SEAM)
+    if(NOT MSVC)
+        target_compile_options(standalone_file_io_tests PRIVATE -Wno-error)
+    endif()
+
+    add_test(NAME standalone_file_io_tests COMMAND standalone_file_io_tests)
+
+    # Drives VectorImageProvider with the standalone SVG rasterizer compiled in
+    # (when OMNIUI_ENABLE_SVG is ON) and a counting fake IByteImageGpu: the SVG
+    # is drawn with the right pixels, textures are shared and freed, and a bad
+    # file is logged once. The ui.Image backend must share the texture of an
+    # .svg file with VectorImageProvider. It also paints each file of
+    # tests/svg_corpus and compares the pixels with the picture that Google
+    # Chrome made of the same
+    # file (tests/svg_corpus/chrome/). In both builds it checks the rasterizer
+    # that `init` registers with the option OFF: a provider has no image, and
+    # each URL logs one error that names the option. Files that multiply work
+    # (entities, <use>, selectors, style rules, gradient stops, nesting, layers,
+    # curves) must be refused with their limit within a time and memory bound.
+    # No GPU or window is involved.
+    set(_svg_test_sources
+        tests/cpp/test_standalone_svg_rasterizer.cpp
+        standalone/src/StandaloneSvgOffRasterizer.cpp
+    )
+    if(OMNIUI_ENABLE_SVG)
+        list(APPEND _svg_test_sources
+            standalone/src/StandaloneSvgRasterizer.cpp
+            standalone/src/StandaloneSvgDocument.cpp
+            standalone/src/StandaloneSvgRender.cpp
+            standalone/src/StandaloneImageBackend.cpp
+            standalone/src/StandaloneRasterImageLoader.cpp
+        )
+    endif()
+    add_executable(standalone_svg_rasterizer_tests ${_svg_test_sources})
+    target_include_directories(standalone_svg_rasterizer_tests
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/src
+    )
+    target_link_libraries(standalone_svg_rasterizer_tests PRIVATE ovui stb)
+    # OVUI_SVG_TEST_SEAM compiles a test-only seam into this binary that makes
+    # the next SVG read throw (std::bad_alloc or another exception), so that
+    # the catch in the rasterizer is tested; the product library is built
+    # without it.
+    target_compile_definitions(standalone_svg_rasterizer_tests PRIVATE
+        OVUI_SVG_CORPUS_DIR="${CMAKE_SOURCE_DIR}/tests/svg_corpus"
+        OVUI_SVG_TEST_SEAM)
+    if(OMNIUI_ENABLE_SVG)
+        target_compile_definitions(standalone_svg_rasterizer_tests PRIVATE OMNIUI_HAS_SVG=1)
+        target_include_directories(standalone_svg_rasterizer_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/standalone/src)
+    endif()
+    if(NOT MSVC)
+        target_compile_options(standalone_svg_rasterizer_tests PRIVATE -Wno-error)
+    endif()
+
+    add_test(NAME standalone_svg_rasterizer_tests COMMAND standalone_svg_rasterizer_tests)
+endif()
+option(OMNI_UI_BUILD_OPENGL3_RENDERER_TESTS "Build the native ImGui OpenGL3 renderer upload tests" ON)
+if(OMNI_UI_BUILD_OPENGL3_RENDERER_TESTS AND NOT EMSCRIPTEN)
+    # Runs the vendored ImGui OpenGL3 renderer against fake OpenGL entry points
+    # (its imgl3w table): no GPU, window or driver. Checks one vertex and one
+    # index upload for each frame and the draw offsets.
+    add_executable(opengl3_renderer_upload_tests
+        tests/cpp/test_opengl3_renderer_upload.cpp
+        ${OVUI_IMGUI_ROOT}/imgui/backends/imgui_impl_opengl3.cpp
+    )
+    target_include_directories(opengl3_renderer_upload_tests
+        PRIVATE
+            ${OVUI_IMGUI_ROOT}/imgui
+            ${OVUI_IMGUI_ROOT}/imgui/backends
+    )
+    target_link_libraries(opengl3_renderer_upload_tests PRIVATE imgui ${CMAKE_DL_LIBS})
+    if(NOT MSVC)
+        target_compile_options(opengl3_renderer_upload_tests PRIVATE -Wno-error)
+    endif()
+    add_test(NAME opengl3_renderer_upload_tests COMMAND opengl3_renderer_upload_tests)
+endif()
+
+option(OMNI_UI_BUILD_RASTER_CONTRACT_TESTS "Build native raster-invalidation contract tests" ON)
+if(OMNI_UI_BUILD_RASTER_CONTRACT_TESTS)
+    # Counts the invalidations that reach a probe frame when a multi-field's model changes. Widgets lay
+    # themselves out with an ImGui context and its default font; nothing is drawn, no window or GPU.
+    add_executable(multifield_raster_contract_tests
+        tests/cpp/test_multifield_raster_contract.cpp
+    )
+    target_link_libraries(multifield_raster_contract_tests PRIVATE ovui)
+    if(NOT MSVC)
+        target_compile_options(multifield_raster_contract_tests PRIVATE -Wno-error)
+    endif()
+
+    add_test(NAME multifield_raster_contract_tests COMMAND multifield_raster_contract_tests)
+endif()
+
+option(OMNI_UI_BUILD_WORKSPACE_TESTS "Build native Workspace callback tests" ON)
+if(OMNI_UI_BUILD_WORKSPACE_TESTS)
+    # A first-interaction callback that unregisters or replaces itself while it runs.
+    add_executable(workspace_first_interaction_tests
+        tests/cpp/test_workspace_first_interaction.cpp
+    )
+    target_link_libraries(workspace_first_interaction_tests PRIVATE ovui)
+
+    add_test(NAME workspace_first_interaction_tests COMMAND workspace_first_interaction_tests)
 endif()
 
 if(EMSCRIPTEN AND OMNI_UI_BUILD_WEB_RUNTIME)
@@ -259,11 +450,6 @@ elseif(pybind11_FOUND)
     add_subdirectory(bindings)
 else()
     message(WARNING "pybind11 not found - Python bindings skipped")
-endif()
-
-if(OMNIUI_BUILD_OVRTX_UI_APP)
-    add_subdirectory(app)
-    set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT ovrtx_ui_app)
 endif()
 
 if(glfw3_FOUND AND OpenGL_FOUND)

@@ -29,6 +29,7 @@ rg -n 'ImDrawFlags_ShadowCutOutShapeBackground' ovui/core/CMakeLists.txt ovui/co
 | 3 | 2 | `ImPow`/`ImLog` double overload namespace qualification fix. |
 | 4 | 4 | Build-system alias and core call sites for the shadow cut-out flag layout mismatch. |
 | 5 | 1 | Dead `#if 0` font atlas debug writer block removed because it referenced the deleted vendored stb path. |
+| 6 | 1 | OpenGL3 renderer uploads the vertices and indices of all draw lists once per `RenderDrawData()` call (issue #518). |
 
 The broad `Shadow|AddShadow|ShadowRect` audit also reports 8 upstream
 `ImGuiCol_BorderShadow` hits. Those are listed under "Non-patch audit hits"
@@ -91,7 +92,7 @@ Affected vendored files:
 | `imgui.h` | 3515-3521 | Adds `IMGUI_HAS_SHADOWS` and `ImDrawList::AddShadowRect`, `AddShadowCircle`, `AddShadowConvexPoly`, and `AddShadowNGon`. |
 | `imgui.h` | 3832-3847 | Adds `ImFontAtlasShadowTexConfig`. |
 | `imgui.h` | 3967-3969 | Adds `ShadowRectIds[2]`, `ShadowRectUvs[10]`, and `ShadowTexConfig` to `ImFontAtlas`. |
-| `imgui_internal.h` | 892-893 | Adds cached shadow atlas pointers to `ImDrawListSharedData`. |
+| `imgui_internal.h` | 893-894 | Adds cached shadow atlas pointers to `ImDrawListSharedData`. |
 | `imgui.cpp` | 1558-1560 | Initializes the three `WindowShadow*` style fields. |
 | `imgui.cpp` | 3874 | Adds `WindowShadow` to `GetStyleColorName()`. |
 | `imgui_draw.cpp` | 254, 327, 401 | Adds default `ImGuiCol_WindowShadow` values to dark/classic/light styles. |
@@ -109,7 +110,7 @@ Affected vendored files:
 
 Requested broad shadow audit coverage:
 
-- Local extension hits: `imgui_internal.h:892-893`; `imgui.h:243`,
+- Local extension hits: `imgui_internal.h:893-894`; `imgui.h:243`,
   `1885`, `2443-2445`, `3412-3416`, `3515`, `3518-3521`,
   `3832-3841`, `3967-3969`; `imgui_draw.cpp:254`, `327`, `401`,
   `408`, `411`, `420`, `425`, `2153`, `2158-2161`, `2424`,
@@ -165,13 +166,13 @@ Affected vendored files:
 
 | File | Lines | Local change |
 | --- | --- | --- |
-| `imgui_internal.h` | 500 | `ImPow(double, double)` calls `::pow(x, y)`. |
-| `imgui_internal.h` | 502 | `ImLog(double)` calls `::log(x)` and carries the `PR7` comment. |
+| `imgui_internal.h` | 501 | `ImPow(double, double)` calls `::pow(x, y)`. |
+| `imgui_internal.h` | 503 | `ImLog(double)` calls `::log(x)` and carries the `PR7` comment. |
 
 Requested `ImPow|ImLog` audit coverage:
 
-- Patch definitions: `imgui_internal.h:500`, `502`.
-- Nearby unmodified float overloads: `imgui_internal.h:499`, `501`.
+- Patch definitions: `imgui_internal.h:501`, `503`.
+- Nearby unmodified float overloads: `imgui_internal.h:500`, `502`.
 - Config/comment hit: `imconfig.h:48`.
 - Callers/macros that depend on the overload set: `imgui_draw.cpp:148`,
   `4264`, `4333`; `imgui_widgets.cpp:2475`, `2593`, `3007`, `3009`,
@@ -235,6 +236,48 @@ Upgrade notes:
   it deliberately and include `stb_image_write.h` through the build target's
   dependency include path instead of a relative vendored path.
 
+## Class 6: OpenGL3 Renderer Uploads Once Per Frame
+
+Upstream `ImGui_ImplOpenGL3_RenderDrawData()` calls `glBufferData()` for the
+vertex buffer and for the index buffer of each draw list. So the same two
+buffer objects get a new data store several times in one frame, while earlier
+draws of the same frame still use the old store. With the NVIDIA OpenGL driver
+on Windows (driver 595.97, threaded optimization), each frame of that pattern
+kept about 16 KB of process-private memory in 8096-byte blocks that the driver
+allocated during the draws and did not release while the windows stayed open
+(issue #518: about 150 MiB/min in an idle USD Viewer on the OpenGL backend).
+
+With OpenGL 3.2 or later (`glDrawElementsBaseVertex()`), the local patch copies
+the vertices and the indices of all draw lists into two arrays of the backend
+data (`FrameVtxBuffer`, `FrameIdxBuffer`) and uploads each with one
+`glBufferData()` call. Each draw adds the start of its draw list to its index
+offset and base vertex. Older OpenGL, and the upstream `UseBufferSubData` path,
+keep the upstream upload for each draw list.
+
+Affected vendored files:
+
+| File | Lines | Local change |
+| --- | --- | --- |
+| `backends/imgui_impl_opengl3.cpp` | 259-260 | Adds `FrameVtxBuffer` and `FrameIdxBuffer` to `ImGui_ImplOpenGL3_Data`. |
+| `backends/imgui_impl_opengl3.cpp` | 622-658 | Builds and uploads the shared vertex and index data once (`upload_once`). |
+| `backends/imgui_impl_opengl3.cpp` | 663-695 | Skips the upload for each draw list when `upload_once` is set. |
+| `backends/imgui_impl_opengl3.cpp` | 724, 730-734 | Adds the draw list start to the draw offsets and moves it after each draw list. |
+
+Test: `ovui/tests/cpp/test_opengl3_renderer_upload.cpp`
+(`opengl3_renderer_upload_tests`, B2 ASan job) runs the renderer against fake
+OpenGL entry points and checks one upload of each kind for each frame, the
+uploaded bytes and every draw offset; with OpenGL 3.1 it checks the upload for
+each draw list.
+
+Upgrade notes:
+
+- Keep this patch when upstream still calls `glBufferData()` for each draw list.
+  Measure the idle private memory of the USD Viewer on Windows with
+  `OMNIUI_BACKEND=opengl` before you remove it.
+- Upstream disabled its `glBufferSubData()` path after display corruption
+  reports on some drivers. This patch keeps `glBufferData()` with data, the
+  call upstream uses, only once for each frame.
+
 ## Other Marker Audit
 
 The focused marker search found no additional local patch classes beyond the
@@ -245,7 +288,7 @@ ones above:
   texture baking sections in Class 2.
 - `Compatibility helper` at `imgui_draw.cpp:2164` and the ASan note at
   `imgui_draw.cpp:4236` are part of Class 2.
-- `PR7` at `imgui_internal.h:502` is Class 3.
+- `PR7` at `imgui_internal.h:503` is Class 3.
 - Broad `custom`/`patch` searches also find normal upstream ImGui comments such
   as custom backends, custom rectangles, and changelog text. Those are not local
   patches unless listed above.

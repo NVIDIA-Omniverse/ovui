@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ovui_data_adapters.common import AdapterFactories
 from ovui_data_adapters.ovstage.provider import (
     PROVIDER_ENTRY_POINT_VALUE,
     PROVIDER_NAME,
@@ -14,6 +15,7 @@ from ovui_data_adapters.ovstage.provider import (
     PROVIDER_REQUIREMENTS,
     build_factories,
 )
+from ovui_data_adapters.ovstage.renderer_adapter import OvstageRendererAdapter
 from ovui_data_adapters.ovstage.runtime_preflight import OvstageRuntimePreflightError
 
 
@@ -33,4 +35,12 @@ def register(registry: Any) -> None:
         priority=PROVIDER_PRIORITY,
         requirements=PROVIDER_REQUIREMENTS,
         factories=factories,
+    )
+
+
+def register_native_renderer(registry: Any) -> None:
+    """Register the renderer that start-up must build before ``omni.ui``."""
+    registry.register_adapter(
+        name=PROVIDER_NAME,
+        factories=AdapterFactories(renderer=OvstageRendererAdapter),
     )

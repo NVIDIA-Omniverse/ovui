@@ -231,7 +231,7 @@
         <li>The viewport update runs every tick, so camera flight and inertia keep moving even when rendering is throttled.</li>
         <li><code>FrameClock</code> decides when rendering is due; it commits only after <code>ViewportWidget.render()</code> returns <code>True</code>.</li>
         <li>A successful render asks the active <code>RendererAdapter</code> for a frame, sends it through <code>ImageBridge</code>, updates HUD values, and keeps scene drawing aligned with the camera.</li>
-        <li>Exit requests flip the running flag, and the <code>run_async()</code> cleanup code releases windows, subscriptions, adapters, callbacks, and shared singletons.</li>
+        <li>Exit requests flip the running flag, and the <code>run_async()</code> cleanup code releases windows, subscriptions, adapters, callbacks, and shared singletons. When a layer has unsaved user changes, File &gt; Exit first asks the user to save, to exit without saving, or to cancel. The viewer's own state under <code>/OvGearSession</code> in the session layer does not count; a prim that the user made in the session layer, a session sublayer, or the session layer as the authoring layer does.</li>
       </ul>
       <p>This keeps frame work predictable. User input and queued messages land before the next draw, rendered pixels land after the render gate allows them, and cleanup runs from the same application owner that created the objects.</p>
     </section>

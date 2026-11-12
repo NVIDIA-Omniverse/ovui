@@ -8,17 +8,20 @@ USD Viewer process, including Settings, UndoManager, SelectionBus, global styles
 the frame loop, and call_later() deferred execution.
 """
 
+import filecmp
 import functools
 import inspect
 import logging
 import math
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
-from typing import Any, Callable, List, Mapping, Optional
+from typing import Any, Callable, List, Mapping, NamedTuple, Optional
 
 from ovui_data_adapters.common import (
     AdapterFactories,
@@ -26,6 +29,7 @@ from ovui_data_adapters.common import (
     AdapterRegistry,
     ChangeEventType,
     Command,
+    RendererStageMismatchError,
     UnresolvedDeliveryDebtError,
     discover_adapter_modules,
     omniui_headless_enabled,
@@ -41,6 +45,7 @@ from ovui_widgets.app.settings_dialog import SettingsDialog
 from ovui_widgets.app.widget_registry import AppWidgetRegistry
 from ovui_widgets.app.window_hooks import AppWindowRegistry
 from ovui_widgets.common import scheduler as _common_scheduler
+from ovui_widgets.common.keyboard import end_text_input as _end_text_input
 from ovui_widgets.common.keyboard import is_text_input_active as _is_text_input_active
 from ovui_widgets.common.keyboard import normalize_printable_key as _normalize_printable_key
 from ovui_widgets.common.recent_files import RecentFileList
@@ -96,6 +101,10 @@ def _native_fast_exit_enabled() -> bool:
 def _fast_exit_after_successful_native_shutdown() -> None:
     if not _native_fast_exit_enabled():
         return
+    from ovui_data_adapters.common.render_native_log import remove_native_logs
+
+    # os._exit below skips atexit, which removes the renderer log that the adapters named.
+    remove_native_logs()
     if os.environ.get(_SHUTDOWN_TRACE_ENV) == "1":
         print(
             "[Application] shutdown complete; native fast exit",
@@ -110,6 +119,41 @@ def _fast_exit_after_successful_native_shutdown() -> None:
         # atexit teardown in Carbonite/USDRT stacks after CUDA/Vulkan state has
         # been released by the owning native libraries.
         os._exit(0)
+
+
+def _exit_at_once_when_a_task_is_stuck(error: BaseException) -> None:
+    """End the process with status 1 when shutdown failed because a task did not stop in its time limit.
+
+    Such a task still runs, for example the renderer step that builds the
+    scene again after a stage edit, which cannot be cancelled. The ordinary
+    end of Python would wait for it again, with no limit. The error is
+    printed first, with its traceback.
+    """
+    if not _native_fast_exit_enabled():
+        return
+    from ovui_data_adapters.common.render_diagnostics import BackgroundTaskStuckError
+
+    seen: set[int] = set()
+    cause: Optional[BaseException] = error
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, BackgroundTaskStuckError):
+            break
+        seen.add(id(cause))
+        cause = cause.__cause__ or cause.__context__
+    else:
+        return
+    try:
+        traceback.print_exception(error)
+        print(
+            "[Application] a task did not stop in its time limit at shutdown; "
+            "the application exits with status 1",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        os._exit(1)
 
 
 def _resolve_window_size(settings: Settings) -> tuple[int, int]:
@@ -129,6 +173,79 @@ def _resolve_window_position(settings: Settings) -> tuple[Optional[int], Optiona
     x = settings.get("app.window.x")
     y = settings.get("app.window.y")
     return (None if x is None else int(x), None if y is None else int(y))
+
+
+class _SettingsLoadFailure(NamedTuple):
+    """A settings file that did not load, and the copy kept of it."""
+
+    path: str
+    cause: str
+    copy_path: Optional[str]
+    copy_error: Optional[str]
+
+
+def _find_identical_damaged_copy(path: str, stem: str, extension: str) -> Optional[str]:
+    """Return an earlier copy of ``path`` that has the same bytes, or ``None``.
+
+    Only regular files named ``<name>.damaged-*<extension>`` next to ``path``
+    count. A link to ``path`` itself is not a copy, because the save at exit
+    writes over ``path``.
+    """
+    folder = os.path.dirname(stem) or os.curdir
+    prefix = os.path.basename(stem) + ".damaged-"
+    try:
+        size = os.path.getsize(path)
+        names = sorted(os.listdir(folder), reverse=True)
+    except OSError:
+        return None
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith(extension)):
+            continue
+        candidate = os.path.join(folder, name)
+        try:
+            if (
+                stat.S_ISREG(os.lstat(candidate).st_mode)
+                and os.path.getsize(candidate) == size
+                and not os.path.samefile(path, candidate)
+                and filecmp.cmp(path, candidate, shallow=False)
+            ):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _keep_damaged_settings_copy(path: str) -> str:
+    """Keep a copy of the settings file at ``path`` in a file next to it.
+
+    When an earlier start already kept a copy with the same bytes, that copy
+    is used and no new file is made, so repeated starts with the same damaged
+    file do not fill the disk. Otherwise the copy is
+    ``<name>.damaged-<date>-<time>[-<n>]<extension>``. An existing file is
+    never replaced, and the copy gets no more permission bits than the
+    original, because a settings file can be private. Returns the path of the
+    copy; raises ``OSError`` when no copy is made.
+    """
+    stem, extension = os.path.splitext(path)
+    existing = _find_identical_damaged_copy(path, stem, extension)
+    if existing is not None:
+        return existing
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    # Open the original first: a file that cannot be read leaves no empty copy.
+    with open(path, "rb") as source:
+        for number in range(100):
+            suffix = f"-{number}" if number else ""
+            copy_path = f"{stem}.damaged-{stamp}{suffix}{extension}"
+            try:
+                fd = os.open(copy_path, flags, mode)
+            except FileExistsError:
+                continue
+            with os.fdopen(fd, "wb") as target:
+                shutil.copyfileobj(source, target)
+            return copy_path
+    raise FileExistsError(f"no free name for a copy of {path!r}")
 
 
 def _ui_init_supports_kwarg(init_fn: Callable, kwarg: str) -> bool:
@@ -327,6 +444,25 @@ def _should_close() -> bool:
         return False
 
 
+
+def _freeze_scene_open_objects() -> None:
+    """Keep the objects of a scene open out of later full garbage collections.
+
+    Opening a scene creates hundreds of thousands of long-lived Python
+    objects (stage, adapters, render settings). Every later full collection
+    walks them again, which takes about 30 ms on the Factory scene and lands
+    as one long UI frame. Collect once now, while the open already holds the
+    UI, and move the survivors out of the collector's reach. The objects
+    frozen by the previous open go back first: the scene they belonged to is
+    gone, and its reference cycles must still be collected.
+    """
+
+    import gc
+
+    gc.unfreeze()
+    gc.collect()
+    gc.freeze()
+
 class Application:
     """
     Central application singleton.
@@ -345,6 +481,8 @@ class Application:
     # ``--/app/runLoops/main/rateLimitFrequency=N`` works on the app CLI.
     RATE_LIMIT_FPS_SETTING_KEY = _RATE_LIMIT_FPS_SETTING_KEY
     _instance: Optional["Application"] = None
+    # Set by _load_settings when the settings file does not load.
+    _settings_load_failure: Optional[_SettingsLoadFailure] = None
 
     def __init__(
         self,
@@ -541,6 +679,8 @@ class Application:
         # File > Save writes directly (path present) or re-routes
         # through Save As (path ``None`` — e.g. a mock/in-memory stage
         # or the app's default stage). See the content browser implementation step 55.
+        # Also read by :meth:`_save_document_before_root_save`: a New Stage
+        # with this path saves its root layer to this file too.
         self._current_file_path: Optional[str] = None
         self._scratch_stage_dirs: list[str] = []
         self._adapter_registry: AdapterRegistry | None = None
@@ -723,7 +863,14 @@ class Application:
         return os.path.expanduser(str(configured))
 
     def _load_settings(self) -> None:
-        """Load persistent app settings before widgets consume them."""
+        """Load persistent app settings before widgets consume them.
+
+        When the file does not load, the default settings stay in use. The
+        save at exit writes over the file, so a copy of the damaged file is
+        kept first. When no copy can be made, _save_settings
+        leaves the file as it is. _report_settings_load_failure tells the
+        user when the UI is up.
+        """
 
         if not self._settings_persistence_enabled():
             return
@@ -733,11 +880,67 @@ class Application:
         try:
             self._settings.load_from_file(path)
         except Exception as exc:
+            copy_path: Optional[str] = None
+            copy_error: Optional[str] = None
+            try:
+                copy_path = _keep_damaged_settings_copy(path)
+            except OSError as copy_exc:
+                copy_error = f"{type(copy_exc).__name__}: {copy_exc}"
+            self._settings_load_failure = _SettingsLoadFailure(
+                path=path,
+                cause=str(exc) or type(exc).__name__,
+                copy_path=copy_path,
+                copy_error=copy_error,
+            )
+            if copy_path is not None:
+                kept = (
+                    f"A copy of the damaged file is kept at {copy_path!r}. "
+                    "At exit, the app tries to save the current settings to "
+                    "the settings file."
+                )
+            else:
+                kept = (
+                    f"No copy of the damaged file could be made ({copy_error}), "
+                    "so the settings are not saved at exit and the file stays "
+                    "as it is."
+                )
             print(
-                f"[Application] failed to load settings from {path!r}: {exc}",
+                f"[Application] failed to load settings from {path!r}: {exc}. "
+                f"The default settings are used. {kept}",
                 file=sys.stderr,
                 flush=True,
             )
+
+    def _report_settings_load_failure(self) -> None:
+        """Show the user that the settings did not load and defaults are used."""
+
+        from ovui_widgets.common.dialogs import message_dialog
+
+        failure = self._settings_load_failure
+        if failure is None:
+            return
+        lines = [
+            "The app could not load the settings file. "
+            "It uses the default settings.",
+            f"File: {failure.path}",
+            f"Cause: {failure.cause}",
+        ]
+        if failure.copy_path is not None:
+            lines.append(f"A copy of the damaged file is kept at: {failure.copy_path}")
+            lines.append(
+                "At exit, the app tries to save the current settings to the "
+                "settings file."
+            )
+        else:
+            lines.append(
+                "The app could not keep a copy of the damaged file "
+                f"({failure.copy_error})."
+            )
+            lines.append(
+                "The app does not save the settings at exit, so the damaged "
+                "file stays as it is."
+            )
+        message_dialog("Settings Not Loaded", "\n".join(lines))
 
     def _save_settings(self) -> None:
         """Save persistent app settings on the normal shutdown path."""
@@ -746,6 +949,16 @@ class Application:
             return
         path = self._resolve_settings_save_path()
         if not path:
+            return
+        failure = self._settings_load_failure
+        if failure is not None and failure.copy_path is None and failure.path == path:
+            print(
+                f"[Application] settings are not saved to {path!r}: the file "
+                "did not load at start and no copy of it was made, so it "
+                "stays as it is.",
+                file=sys.stderr,
+                flush=True,
+            )
             return
         try:
             self._settings.save_to_file(path)
@@ -1123,17 +1336,20 @@ class Application:
 
             if not self._viewport_visibility_paused:
                 render_dt = self._viewport_render_clock.should_render(render_now)
-                if render_dt is not None:
+                # Under native frame pacing render() only hands the camera to
+                # the render thread: hand it over on every tick, so a frame
+                # rate cap never makes the renderer show an old camera.
+                if render_dt is not None or viewport._owned_pacing_session():
                     try:
                         rendered = self._profile_ovui_main_thread_call(
-                            "Application.native_pacing.viewport_render", viewport.render, render_dt
+                            "Application.native_pacing.viewport_render", viewport.render, render_dt or 0.0
                         )
                     except Exception as exc:
                         ErrorReporter.log_error(
                             "Application", "viewport render raised", exc
                         )
                         rendered = False
-                    if rendered:
+                    if rendered and render_dt is not None:
                         self._viewport_render_clock.commit(render_now)
 
     def _start_main_thread_scope(self) -> tuple[Any, Any] | None:
@@ -1743,6 +1959,15 @@ class Application:
             lambda: self.selection_bus,
         ).commands() + media_commands(self.get_media)
 
+    def get_renderer_adapter(self) -> Optional[Any]:
+        """Return the renderer adapter of the primary viewport (or ``None``).
+
+        Optional Inspector commands, such as the render diagnostics of
+        ``ovui-data-adapters-common``, use it to work with the renderer that
+        shows the open scene.
+        """
+        return getattr(self._viewport_window, "renderer_adapter", None)
+
     def get_media(self):
         """Lazily adopt shared media control without a second export owner."""
         if getattr(self, "_inspector_media", None) is None:
@@ -1874,10 +2099,14 @@ class Application:
 
         # Before ui.init, so that the native start-up phases are measured.
         from ovui_widgets.app.native_runtime_bootstrap import (
+            install_native_frame_pacing_hooks,
             install_native_timing_hooks,
         )
 
         install_native_timing_hooks()
+        # Before ui.init too: ovui calls this table for every renderer
+        # operation of its frame pacing, from the first viewport session on.
+        install_native_frame_pacing_hooks()
 
         from ovui_widgets.app.layout import write_split_ini
         from ovui_widgets.app.style import apply_global_styles, set_theme
@@ -1947,6 +2176,7 @@ class Application:
             self._running = False
             self._end_ovui_init_phase()
         if self._run_exception is not None:
+            _exit_at_once_when_a_task_is_stuck(self._run_exception)
             raise self._run_exception
         if not getattr(self, "_shutdown_done", False):
             raise RuntimeError(
@@ -2056,6 +2286,7 @@ class Application:
             self._layer_window = LayerWindow(
                 services=self,
                 before_save_all_fn=self._persist_layer_state_before_save,
+                before_root_save_fn=self._save_document_before_root_save,
             )
             for widget in (
                 self._stage_window,
@@ -2122,6 +2353,8 @@ class Application:
                 # the active adapter supports it. Adapters without scene
                 # creation launch with no active document.
                 self._load_empty_startup_stage()
+            # Tell the user now that the windows exist.
+            self._report_settings_load_failure()
 
             # Step 2.6: bring up the headless full-UI export pipeline if
             # ``OMNIUI_HEADLESS=1`` and ``OVGEAR_LIVESTREAM`` are both set.
@@ -2260,6 +2493,8 @@ class Application:
         pattern. Attach the same handler to every panel window so the
         shortcut dispatcher runs regardless of which panel owns focus.
         Only one window is focused at a time, so no duplicate events fire.
+        The Property Inspector gets :meth:`_on_property_key_pressed`, which
+        runs the same dispatcher without the selection delete.
         """
         handler = self._on_key_pressed
         if self._main_win is not None and hasattr(self._main_win, "set_key_pressed_fn"):
@@ -2276,7 +2511,10 @@ class Application:
                 continue
             win = getattr(mw, "window", None)
             if win is not None and hasattr(win, "set_key_pressed_fn"):
-                win.set_key_pressed_fn(handler)
+                if mw is self._property_window:
+                    win.set_key_pressed_fn(self._on_property_key_pressed)
+                else:
+                    win.set_key_pressed_fn(handler)
 
     def _register_drop_handler(self) -> None:
         """Register drag-and-drop handlers on the main window and per-panel
@@ -2356,7 +2594,32 @@ class Application:
                     level="warning",
                 )
 
-    def _on_key_pressed(self, key: int, modifiers: int, pressed: bool) -> None:
+    def _on_property_key_pressed(self, key: int, modifiers: int, pressed: bool) -> None:
+        """Run the shortcuts for a key pressed in the Property Inspector.
+
+        ``ui.Window`` calls this only while the Property Inspector has focus.
+        Backspace and Delete there belong to its fields, so they never delete
+        the selected prims. ``is_text_input_active`` cannot tell this for a
+        read-only text field (Extent, Display Color, arrays), a dropdown or a
+        checkbox: none of them is an editing text input. Ctrl+S while one of
+        its fields is in typing mode (a value field, or the filter field)
+        first ends that typing as a commit, then saves. A mouse drag of a
+        number field is not typing mode: Ctrl+S saves at once, and the drag
+        continues. All other keys run as in the other panels.
+        """
+        self._on_key_pressed(
+            key, modifiers, pressed, delete_selection=False, commit_field_edit_before_save=True,
+        )
+
+    def _on_key_pressed(
+        self,
+        key: int,
+        modifiers: int,
+        pressed: bool,
+        *,
+        delete_selection: bool = True,
+        commit_field_edit_before_save: bool = False,
+    ) -> None:
         # Forward every key event (press AND release) to the viewport's
         # flight-mode keyboard so it can track W/A/S/D/Q/E/Space/C.
         # Releases are ignored by the app-level shortcut dispatch below
@@ -2414,7 +2677,16 @@ class Application:
             self.save_focused_layer_as()
         # Ctrl+S — save every dirty layer in one undo group.
         elif ctrl and not shift and not alt and key in (ord("S"), ord("s")):
-            self.save_stage()
+            if commit_field_edit_before_save and _end_text_input():
+                # A Property Inspector field that edits writes each typed
+                # value to the stage, and Escape puts the old value back.
+                # The save must not write a value that the field can still
+                # cancel. The edit ends as a commit, as when a mouse click
+                # on Layer > Save All ends it, and the save runs after this
+                # frame, when the field has run its end-edit callback.
+                self.call_later(0.0, self.save_stage)
+            else:
+                self.save_stage()
         # Ctrl+L — toggle Layers window visibility.
         elif ctrl and not shift and not alt and key in (ord("L"), ord("l")):
             self._toggle_layers_window()
@@ -2424,8 +2696,10 @@ class Application:
         # :class:`FileBrowserWidget`'s selection resolver. Each is a
         # no-op when nothing is selected (Ctrl+C / Ctrl+X) or the
         # clipboard is empty (Ctrl+V) — matches the fan-out rule
-        # used by F2 and Del so the shortcut reaches the user's active
-        # surface without needing a focus signal. ``not alt`` / ``not
+        # used by F2 so the shortcut reaches the user's active
+        # surface without needing a focus signal. Delete / Backspace
+        # do not follow this rule: they need the Content Browser focus
+        # (see below). ``not alt`` / ``not
         # shift`` guard against a future Ctrl-Alt / Ctrl-Shift chord
         # accidentally firing the clipboard op.
         elif (ctrl and not alt and not shift
@@ -2451,12 +2725,16 @@ class Application:
               and key in (ord("D"), ord("d"))):
             if self._content_window is not None:
                 self._content_window.duplicate_selected()
-        # Delete / Backspace — Layers panel takes priority when it has
-        # selected prim specs (Step 50: ``RemovePrimSpecsCommand``);
-        # otherwise the stage prim-delete path runs and the content
-        # browser independently fires its own confirm-and-delete dialog.
-        # Stage and content selections are independent models, so both
-        # are notified — Del fires wherever the user's selection lives.
+        # Delete / Backspace — the key acts only on the surface that has
+        # focus. When the Content Browser has focus, only its confirm-and-
+        # delete dialog opens; no prim is deleted. When the Property
+        # Inspector has focus, nothing is deleted. Otherwise the Layers
+        # panel takes priority when it has selected prim specs (Step 50:
+        # ``RemovePrimSpecsCommand``) and the stage prim-delete path runs.
+        # Stage and content selections are independent models, so one
+        # key press must never start a delete in both. When the Property
+        # Inspector has focus (``delete_selection`` is False), the key
+        # belongs to its fields and deletes nothing.
         elif key in (_KEY_DELETE, _KEY_BACKSPACE):
             # When a text input owns keyboard input (a Property Inspector
             # number or text field in keyboard-edit mode, the Stage Browser
@@ -2465,30 +2743,55 @@ class Application:
             # destructive selection-delete fan-out (Layers prim-spec / Stage
             # prim / Content Browser). When no field is editing, the
             # intentional delete shortcut runs unchanged.
-            filter_editing = (
-                self._stage_window is not None
-                and self._stage_window.is_filter_editing()
+            # The Property Inspector edits property values, not the stage
+            # tree. Its empty space, a read-only field (Proxy Prim) or a
+            # dropdown can have focus with no text input active, and the
+            # key must then not delete the selected prim.
+            property_focused = (
+                self._property_window is not None
+                and self._property_window.is_focused
             )
-            text_editing = filter_editing or _is_text_input_active()
-            if not text_editing and not self._delete_selected_prim_specs_in_layers():
-                self._delete_selected()
-                if self._content_window is not None:
+            if (
+                delete_selection
+                and not self._text_input_owns_keyboard()
+                and not property_focused
+            ):
+                content_focused = (
+                    self._content_window is not None
+                    and self._content_window.is_focused
+                )
+                if content_focused:
                     self._content_window.delete_selected()
-        # F — frame selected in viewport
+                elif not self._delete_selected_prim_specs_in_layers():
+                    self._delete_selected()
+        # F — frame selected in viewport (the whole stage without a
+        # selection). While a text input owns keyboard input (the Content
+        # Browser path bar, a filter or any other field), "f" is text typed
+        # into that field, not the shortcut.
         elif key in (ord("F"), ord("f")):
-            self._frame_selected()
+            if not self._text_input_owns_keyboard():
+                self._frame_selected()
+        # H — home: the camera the stage opened with. Same text-input rule
+        # as F.
+        elif key in (ord("H"), ord("h")) and not ctrl and not alt and self._viewport_window is not None:
+            if not self._text_input_owns_keyboard():
+                self._viewport_window.go_camera_home()
         # F2 — rename selected in stage browser or content browser.
         # Both begin_rename_selected calls are guarded: each window's
         # widget reads its own selection surface and no-ops when it is
         # empty. Dispatching to both means F2 fires the rename in
         # whichever pane the user is actually interacting with —
         # Stage's selection tracks prims, Content's tracks files, and
-        # the two are independent selection models.
+        # the two are independent selection models. Same text-input rule
+        # as F: while a field edits (a Property Inspector number field, a
+        # filter or any other field), F2 must not open a rename field that
+        # takes the focus and the next typed text from that field.
         elif key == _KEY_F2:
-            if self._stage_window is not None:
-                self._stage_window.begin_rename_selected()
-            if self._content_window is not None:
-                self._content_window.begin_rename_selected()
+            if not self._text_input_owns_keyboard():
+                if self._stage_window is not None:
+                    self._stage_window.begin_rename_selected()
+                if self._content_window is not None:
+                    self._content_window.begin_rename_selected()
         # Alt+Left / Alt+Right — content-browser visited-history
         # back/forward (Content-Browser Step 20). Dispatched to the
         # :class:`ContentBrowserWindow`'s ``go_back`` / ``go_forward``
@@ -2503,10 +2806,12 @@ class Application:
                 self._content_window.go_forward()
         # W / E / R — transform-tool switch (the viewport behavior).
         # Gated on RMB not being held so W/E in flight mode still reach
-        # the camera flight keyboard unambiguously.
+        # the camera flight keyboard unambiguously. Same text-input rule
+        # as F.
         elif key in (ord("W"), ord("E"), ord("R"),
                      ord("w"), ord("e"), ord("r")) and not ctrl and not shift:
-            self._dispatch_tool_hotkey(key, modifiers)
+            if not self._text_input_owns_keyboard():
+                self._dispatch_tool_hotkey(key, modifiers)
         else:
             # Escape cancels an active gizmo drag (preview rolls back;
             # mouse-up cannot commit); otherwise normal routing below.
@@ -2535,6 +2840,24 @@ class Application:
             ):
                 self._content_window._on_key_pressed(key, modifiers, pressed)
 
+    def _text_input_owns_keyboard(self) -> bool:
+        """Return ``True`` while a text input owns keyboard input.
+
+        The Stage Browser filter, the Property Inspector filter, or any other
+        field that is editing (``is_text_input_active``). A key typed into
+        such a field must not also run a one-key application shortcut.
+        """
+        if self._stage_window is not None and self._stage_window.is_filter_editing():
+            return True
+        property_window = self._property_window
+        if (
+            property_window is not None
+            and callable(getattr(property_window, "is_filter_editing", None))
+            and property_window.is_filter_editing()
+        ):
+            return True
+        return _is_text_input_active()
+
     def _dispatch_tool_hotkey(self, key: int, modifiers: int) -> None:
         """Route W/E/R to the viewport's :class:`ToolRegistry`.
 
@@ -2559,6 +2882,9 @@ class Application:
             show = getattr(self._viewport_window, "set_transform_manipulator_visible", None)
             if callable(show):
                 show(True)
+            report = getattr(self._viewport_window, "report_transform_controls_off", None)
+            if callable(report):
+                report()
 
     def register_shortcut_window(self, window: Any) -> None:
         """Attach the shared shortcut dispatcher to a late-created window.
@@ -2730,12 +3056,39 @@ class Application:
             def undo(self) -> None:
                 bus.publish(prior_paths, source=prior_source)
 
-        self._undo_manager.begin_group("Delete")
-        self._undo_manager.push(_SelectionDuringDeleteCommand())
-        for path in prior_paths:
-            cmd = session.make_delete_prim_command(self._stage_adapter.stage, path)
-            self._undo_manager.push(cmd)
-        self._undo_manager.end_group()
+        undo = self._undo_manager
+        undo.begin_group("Delete")
+        depth = undo.open_group_depth
+        selected = set(prior_paths)
+        path = ", ".join(prior_paths)
+        try:
+            undo.push(_SelectionDuringDeleteCommand())
+            for path in prior_paths:
+                parent = path.rpartition("/")[0]
+                while parent and parent not in selected:
+                    parent = parent.rpartition("/")[0]
+                if parent:
+                    continue
+                cmd = session.make_delete_prim_command(self._stage_adapter.stage, path)
+                undo.push(cmd)
+        except Exception as exc:  # noqa: BLE001 - reported below, then the group closes
+            from ovui_widgets.common.error_reporter import ErrorReporter
+
+            # Undo the deletes of this group, so that nothing is half done.
+            try:
+                undo.cancel_group()
+            except Exception as cancel_exc:  # noqa: BLE001 - reported
+                ErrorReporter.log_error(
+                    "Application", "Delete could not undo its partial deletes", cancel_exc
+                )
+                if undo.open_group_depth >= depth:
+                    undo.force_discard_group()
+            ErrorReporter.log_error("Application", f"Delete of {path} failed", exc)
+            ErrorReporter.show_error(
+                f"Cannot delete {path}: {type(exc).__name__}: {exc}"
+            )
+            return
+        undo.end_group()
 
     def _persist_layer_state_before_save(self) -> bool:
         """Persist layer-window state into the active backing USD stage.
@@ -2775,6 +3128,67 @@ class Application:
             return False
         return True
 
+    def _save_document_before_root_save(
+        self, layer_state_saved: bool,
+    ) -> Optional[bool]:
+        """Write the document file before the root layer of a New Stage is saved.
+
+        The root layer of a New Stage is a file in a temporary folder that the
+        application deletes at exit. File > Save As writes the stage to the
+        file that the user selects and makes it the document file
+        (:attr:`_current_file_path`), but the root layer stays the temporary
+        file. So, before Layer > Save All (Ctrl+S) or the Save of the root row
+        writes the root layer, this writes the root layer, with its sublayer
+        list, to the document file. The Layers model then saves the temporary
+        file too, which removes the modified mark only after the document file
+        has the edits.
+
+        Only the root layer is written. A sublayer with unsaved changes keeps
+        them and its modified mark: Save All saves it to its own file in the
+        same click, and the Save of the root row does not save it, as for
+        every other stage.
+
+        As File > Save does, the layer state (authoring layer and locks) is
+        written into the root layer first. ``layer_state_saved`` is ``True``
+        when Save All already wrote it in the same click
+        (:meth:`_persist_layer_state_before_save`); it is not written again.
+
+        Returns ``None`` when the root layer is not such a temporary file, or
+        when the stage has no document file yet: the root layer is then saved
+        as before. ``False`` means that the document file was not written: the
+        cause is shown, and the root layer is not saved and keeps its mark.
+        """
+        document_path = self._current_file_path
+        if not document_path:
+            return None
+        from ovui_widgets.app.menu_bar import _root_layer_is_temporary
+
+        if not _root_layer_is_temporary(self):
+            return None
+        from ovui_widgets.common.error_reporter import ErrorReporter
+
+        stage = getattr(self._stage_adapter, "stage", None)
+        export_root_layer = getattr(
+            self.get_adapter_session(), "export_root_layer", None
+        )
+        if stage is None or not callable(export_root_layer):
+            ErrorReporter.show_error(
+                f"Cannot save file: the active data adapter cannot save the "
+                f"root layer alone to {document_path!r}. Use File > Save."
+            )
+            return False
+        if not layer_state_saved and not self._persist_layer_state_before_save():
+            return False
+        try:
+            export_root_layer(stage, document_path)
+        except Exception as exc:  # noqa: BLE001 - reported; the layer stays modified
+            ErrorReporter.log_error("Application", "root layer save failed", exc)
+            ErrorReporter.show_error(
+                f"Cannot save file: {type(exc).__name__}: {exc}",
+            )
+            return False
+        return True
+
     def save_stage(self) -> None:
         """Save every dirty layer in the current stage (LAYERS-PLAN Step 59).
 
@@ -2782,10 +3196,12 @@ class Application:
         :meth:`LayerModel._request_save_all` so anonymous layers are
         skipped (they have no file path) and every dirty, concrete
         layer saves inside a single ``"Save All"`` undo group — same
-        path the Save-All toolbar button uses. Shows a "No stage open"
-        toast when invoked before any stage is loaded; this is the
-        Logic M6 gap the step closes (users coming from Kit muscle-
-        memory Ctrl+S and expect feedback).
+        path the Save-All toolbar button uses. When File > Save As gave
+        a New Stage a document file, the root layer is also written to
+        that file (:meth:`_save_document_before_root_save`). Shows a "No
+        stage open" toast when invoked before any stage is loaded; this
+        is the Logic M6 gap the step closes (users coming from Kit
+        muscle-memory Ctrl+S and expect feedback).
         """
         if not self._require_layer_stage_or_warn():
             return
@@ -2866,7 +3282,7 @@ class Application:
         if snap is None or self._viewport_window is None:
             return
         paths = [item.path for item in snap.items]
-        self._viewport_window.frame_paths(paths)
+        self._viewport_window.frame_paths(paths or ["/"])
 
     def _save_layout(self) -> None:
         """Persist current window layout to settings and JSON file."""
@@ -3361,6 +3777,8 @@ class Application:
                 # state instead, then surface the failure.
                 self._note_secondary_failures(
                     primary, self._enter_no_document_state())
+                if isinstance(primary, RendererStageMismatchError):
+                    self._report_renderer_stage_mismatch(primary)
                 raise
             prebuilt_renderer = _NO_PREBUILT_RENDERER  # consumed
             self._recent_files.add(path)
@@ -3381,6 +3799,22 @@ class Application:
                     failures.append(exc)
             self._note_secondary_failures(primary, failures)
             raise
+
+    def _report_renderer_stage_mismatch(self, error: BaseException) -> None:
+        """Tell the user that the renderer and stage libraries do not match.
+
+        The viewports stop showing their last image: it is the placeholder
+        for a missing renderer, which is not the cause here.
+        """
+        from ovui_widgets.common.dialogs import message_dialog
+
+        for viewport_window in (
+            self._viewport_window,
+            self._secondary_viewport_window,
+        ):
+            if viewport_window is not None:
+                viewport_window.clear_image()
+        message_dialog("Renderer and Stage Libraries Do Not Match", str(error))
 
     @_owns_lifecycle_attempt
     def open_stage(self, stage: Any) -> None:
@@ -3537,10 +3971,12 @@ class Application:
         return stage
 
     def save_stage_to(self, path: str) -> bool:
-        """Export the current USD stage to ``path`` — the content browser implementation step 55.
+        """Save the current USD stage to ``path`` — the content browser implementation step 55.
 
         Delegates to the selected provider's ``export_stage(stage, path)``
-        operation using the adapter's live stage. On success, updates
+        operation using the adapter's live stage. The OpenUSD provider writes
+        the root layer with its layer stack; it does not flatten the
+        sublayers into the file. On success, updates
         :attr:`_current_file_path` so a subsequent File > Save writes
         directly to the same path (no dialog), appends ``path`` to the
         recent-files list, and returns ``True``. On failure — no stage
@@ -4087,6 +4523,7 @@ class Application:
                 pose = self._stage_adapter.read_bound_camera()
                 if pose is None or not self._viewport_window.apply_camera_pose(pose):
                     self._viewport_window.frame_paths(["/"])
+                self._viewport_window.mark_camera_home()
             if self._secondary_viewport_window is not None:
                 create_secondary_renderer = getattr(
                     new_renderer,
@@ -4116,6 +4553,7 @@ class Application:
                     )
                 ):
                     self._secondary_viewport_window.frame_paths(["/"])
+            _freeze_scene_open_objects()
         except BaseException as primary:
             failures = self._enter_no_document_state()
             failures.append(_reclaim_unoffered_fresh_renderer())
@@ -4506,6 +4944,9 @@ class Application:
                     "safely shut down"
                 ) from exc
             if renderer_required:
+                if isinstance(exc, RendererStageMismatchError):
+                    # Its message already names the cause in plain words.
+                    raise
                 raise RuntimeError(
                     "ovrtx is required, but the renderer could not load the stage "
                     f"({type(exc).__name__}: {exc})."
@@ -4591,16 +5032,22 @@ class Application:
 
     @staticmethod
     def _selection_resync_paths(event: Any) -> tuple[str, ...]:
-        """Return de-duplicated prim paths carried by one change event."""
+        """Return de-duplicated prim paths carried by one change event.
+
+        A property path is not a namespace change of its prim. For example
+        the move of a material also changes the ``material:binding`` of each
+        prim that uses it; such a prim must not become a candidate for the
+        moved selection.
+        """
 
         return tuple(
             dict.fromkeys(
-                str(path).partition(".")[0]
+                str(path)
                 for path in (
                     *(getattr(event, "changed_paths", ()) or ()),
                     *(getattr(event, "resynced_paths", ()) or ()),
                 )
-                if str(path).startswith("/")
+                if str(path).startswith("/") and "." not in str(path)
             )
         )
 

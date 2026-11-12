@@ -19,13 +19,13 @@ from test_base import OmniUiTest
 
 class TestByteImageProviderReplacement(OmniUiTest):
     async def test_replacing_drawn_textures_inside_a_frame_keeps_every_replacement(self):
-        count = 60
+        count = 600
 
         def make_providers(seed):
             providers = []
             for index in range(count):
                 provider = ui.ByteImageProvider()
-                provider.set_bytes_data([seed, index * 4, 30, 255] * 16, [4, 4])
+                provider.set_bytes_data([seed, index * 4 % 256, 30, 255] * 16, [4, 4])
                 providers.append(provider)
             return providers
 

@@ -10,6 +10,7 @@ and brackets the operation in an undo group.
 from __future__ import annotations
 
 import math
+import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ovui_data_adapters.common import (
@@ -37,6 +38,10 @@ def _shielded_log(message: str, exc: Exception) -> None:
         pass
 
 
+class _NoParentMatrix(Exception):
+    """No world matrix of the parent of a prim for the drag; the message is the cause."""
+
+
 class PrimTransformModel:
     """Manages multi-prim transform drag state."""
 
@@ -56,11 +61,27 @@ class PrimTransformModel:
         self._renderer = renderer
         self._raw_selected_paths: List[str] = []
         self._selected_paths: List[str] = []
+        # The selected paths that a drag does not change. ``set_selection`` keeps them, so a drag start does not search.
+        self._refused_paths: List[str] = []
         self._selection_policies: Dict[str, TransformEditPolicy] = {}
         self._initial_transforms: Dict[str, List[List[float]]] = {}
         self._live_transforms: Dict[str, List[List[float]]] = {}
         self._live_parent_world_transforms: Dict[str, List[List[float]]] = {}
+        # The inverses of the parent world matrices of the drag: they turn the world-space move of the translate gizmo into
+        # the move of the local translation (see ``_delta_in_parent_space``).
+        self._inverse_parent_world_transforms: Dict[str, List[List[float]]] = {}
+        # What the first move of the drag reports, once (see ``_report_parent_spaces``): the prims whose parent matrix is the
+        # world matrix of the parent prim (path, parent path), and the prims that move along the axes of their parent because
+        # there is no inverse parent matrix (path, cause).
+        self._parent_matrix_notes: List[Tuple[str, str]] = []
+        self._no_parent_space_notes: List[Tuple[str, str]] = []
+        # The world matrices that the adapter gave at the start of the drag: the world transform of a prim whose live local
+        # transform is still the drag-start one.
+        self._initial_world_transforms: Dict[str, List[List[float]]] = {}
         self._drag_active = False
+        # Views of the live transforms (the transform gizmo) that are told, inside ``on_drag_moved``, that the live transforms
+        # changed, so that they show the movement in the same call as the gesture that reported it.
+        self._live_listeners: List[Any] = []
         # Paths whose preview write landed — cancellation owes these.
         self._preview_applied_paths: set[str] = set()
         # Cancel-rollback failures (path → drag-start matrix), retried.
@@ -183,8 +204,13 @@ class PrimTransformModel:
         # Row-major: translation in row 3, columns 0..2.
         return (float(mat[3][0]), float(mat[3][1]), float(mat[3][2]))
 
-    def get_first_world_transform(self) -> Optional[List[float]]:
-        """Return the selected prim's live world matrix in scene-flat form."""
+    def get_first_world_transform(self, *, raise_errors: bool = False) -> Optional[List[float]]:
+        """Return the selected prim's live world matrix in scene-flat form.
+
+        ``None`` means that no prim is selected or that the matrix could not
+        be read. With ``raise_errors``, a failed read raises instead, so that
+        the caller can report its cause.
+        """
         if self._transform is None or not self._selected_paths:
             return None
         path = self._selected_paths[0]
@@ -199,10 +225,14 @@ class PrimTransformModel:
             try:
                 matrix = self._transform.get_world_transform(path)
             except Exception:
+                if raise_errors:
+                    raise
                 return None
         try:
             return [float(matrix[row][column]) for row in range(4) for column in range(4)]
         except (IndexError, TypeError, ValueError):
+            if raise_errors:
+                raise
             return None
 
     def set_selection(self, paths: List[str]) -> None:
@@ -211,6 +241,7 @@ class PrimTransformModel:
             self.retry_failed_preview_restores()
         self._raw_selected_paths = list(paths)
         self._selection_policies = {}
+        self._refused_paths = []
         if self._transform is None:
             # Without a transform adapter we can't test ``can_transform`` —
             # keep the raw list so the manipulator still sees a selection
@@ -229,9 +260,13 @@ class PrimTransformModel:
                     self._selection_policies[path] = policy
                     if getattr(policy, "is_editable", False):
                         selected.append(path)
+                    else:
+                        self._refused_paths.append(path)
                     continue
             if self._transform.can_transform(path):
                 selected.append(path)
+            else:
+                self._refused_paths.append(path)
         self._selected_paths = selected
 
     def has_transformable_selection(self) -> bool:
@@ -254,6 +289,20 @@ class PrimTransformModel:
     def selection_edit_policies(self) -> Dict[str, TransformEditPolicy]:
         return dict(self._selection_policies)
 
+    def report_transform_controls_off(self) -> bool:
+        """Show in the status bar why Move, Rotate and Scale are off for the selection; ``False`` when they are on.
+
+        The viewport calls this one time when the user asks for a transform tool (W, E, R or the Tools menu, also for
+        the tool that is already active). The tool buttons are off then, and their tooltip shows the cause only on
+        hover. A plain selection shows no message.
+        """
+        if self.transform_controls_enabled() or not self._refused_paths:
+            return False
+        refused = self._refused_paths
+        subject = refused[0] if len(refused) == 1 else f"{refused[0]} and {len(refused) - 1} more prims"
+        ErrorReporter.show_warning(f"{subject}: {self.transform_controls_tooltip()}")
+        return True
+
     def on_drag_start(self, label: str = "Move Prims") -> None:
         if self._drag_active:
             raise RuntimeError("transform drag already active")
@@ -269,14 +318,31 @@ class PrimTransformModel:
         self._drag_label = label
         self._live_transforms.clear()
         self._live_parent_world_transforms.clear()
+        self._inverse_parent_world_transforms.clear()
+        self._parent_matrix_notes = []
+        self._no_parent_space_notes = []
+        self._initial_world_transforms.clear()
         self._preview_applied_paths.clear()
         self._initial_transforms = {}
         for path in self._selected_paths:
             initial = self._transform.get_local_transform(path)
             self._initial_transforms[path] = initial
-            parent_world = self._capture_parent_world_transform(path, initial)
-            if parent_world is not None:
-                self._live_parent_world_transforms[path] = parent_world
+            try:
+                parent_world = self._capture_parent_world_transform(path, initial)
+            except _NoParentMatrix as exc:
+                self._no_parent_space_notes.append((path, str(exc)))
+                continue
+            self._live_parent_world_transforms[path] = parent_world
+            inverse_parent_world = _invert_matrix_4x4(parent_world)
+            if inverse_parent_world is None:
+                self._no_parent_space_notes.append((path, "the world matrix of its parent cannot be inverted"))
+            # A parent that does not turn or scale needs no conversion: the move is the same in its space.
+            elif any(
+                inverse_parent_world[row][column] != (1.0 if row == column else 0.0)
+                for row in range(3)
+                for column in range(3)
+            ):
+                self._inverse_parent_world_transforms[path] = inverse_parent_world
         try:
             self._stage.begin_undo_group(label)
         except BaseException:
@@ -285,6 +351,10 @@ class PrimTransformModel:
             self._initial_transforms = {}
             self._live_transforms = {}
             self._live_parent_world_transforms = {}
+            self._inverse_parent_world_transforms = {}
+            self._parent_matrix_notes = []
+            self._no_parent_space_notes = []
+            self._initial_world_transforms = {}
             self._preview_applied_paths = set()
             # Infallible latch FIRST; identity recording may fail.
             self._undo_fail_closed = True
@@ -295,10 +365,44 @@ class PrimTransformModel:
                 _shielded_log("undo contamination recording failed", record_exc)
             raise
         self._drag_active = True
+        self._report_refused_paths()
+
+    def _report_refused_paths(self) -> None:
+        """Report the selected prims that the drag does not change, with the cause that the transform adapter gives."""
+        refused = self._refused_paths
+        if not refused:
+            return
+        # The prim and the cause first: the status bar cuts a long text.
+        message = f"{self._drag_label}: " + "; ".join(
+            f"{path} is not changed: "
+            + (getattr(self._selection_policies.get(path), "reason", "") or "its transform cannot be edited")
+            for path in refused
+        )
+        ErrorReporter.log_warning("PrimTransformModel", message)
+        ErrorReporter.show_warning(message)
+
+    def add_live_listener(self, listener: Any) -> None:
+        """Call ``listener()`` after each change of the live transforms of a drag.
+
+        ``listener`` is a callable, or a ``weakref.WeakMethod`` that is dropped when its object is gone.
+        """
+        self._live_listeners.append(listener)
+
+    def _notify_live_listeners(self) -> None:
+        alive = []
+        for listener in self._live_listeners:
+            call = listener() if isinstance(listener, weakref.WeakMethod) else listener
+            if call is None:
+                continue
+            alive.append(listener)
+            call()
+        self._live_listeners = alive
 
     def on_drag_moved(self, delta_matrix: List[List[float]]) -> None:
+        """Move each selected prim by ``delta_matrix``, a translation along the world axes of the gizmo."""
         for path, initial in self._initial_transforms.items():
-            new_local = _apply_delta(initial, delta_matrix, self._mode)
+            local_delta = _delta_in_parent_space(delta_matrix, self._inverse_parent_world_transforms.get(path))
+            new_local = _apply_delta(initial, local_delta, self._mode)
             if self._snap is not None:
                 pos = [new_local[3][0], new_local[3][1], new_local[3][2]]
                 snapped = self._snap.snap(pos, None)
@@ -306,6 +410,31 @@ class PrimTransformModel:
                 new_local[3][1] = snapped[1]
                 new_local[3][2] = snapped[2]
             self._set_live_local_transform(path, new_local)
+        self._notify_live_listeners()
+        if self._parent_matrix_notes or self._no_parent_space_notes:
+            self._report_parent_spaces()
+
+    def _report_parent_spaces(self) -> None:
+        """Report, once for each drag, the prims whose move does not use ``inverse(local) × world`` as the parent matrix."""
+        parent_matrix_notes, self._parent_matrix_notes = self._parent_matrix_notes, []
+        no_parent_space_notes, self._no_parent_space_notes = self._no_parent_space_notes, []
+        if parent_matrix_notes:
+            ErrorReporter.log_info(
+                "PrimTransformModel",
+                f"{self._drag_label}: "
+                + "; ".join(
+                    f"the local matrix of {path} cannot be inverted, so its parent matrix is the world matrix of {parent_path}"
+                    for path, parent_path in parent_matrix_notes
+                ),
+            )
+        if no_parent_space_notes:
+            # The prim and the cause first: the status bar cuts a long text.
+            message = f"{self._drag_label}: " + "; ".join(
+                f"{path}: {cause}, so it moves along the axes of its parent, which can differ from the dragged arrow"
+                for path, cause in no_parent_space_notes
+            )
+            ErrorReporter.log_warning("PrimTransformModel", message)
+            ErrorReporter.show_warning(message)
 
     def on_drag_rotated(
         self, axis: Tuple[float, float, float], angle: float
@@ -356,6 +485,7 @@ class PrimTransformModel:
     def on_drag_ended(self) -> None:
         label = self._drag_label
         changed_paths: List[str] = []
+        write_notes: List[str] = []
         live_preview_paths = list(self._live_transforms)
         operation_error: BaseException | None = None
         stage_group_open = self._drag_active
@@ -378,6 +508,8 @@ class PrimTransformModel:
                             final,
                         )
                         self._undo.push(cmd)
+                        if getattr(cmd, "write_note", None):
+                            write_notes.append(cmd.write_note)
                     self._undo.end_group()
                     undo_group_open = False
                 except BaseException as commit_error:
@@ -397,6 +529,13 @@ class PrimTransformModel:
             if stage_group_open:
                 self._stage.end_undo_group()
                 stage_group_open = False
+            if write_notes:
+                # The transform adapter stored a prim in another form (for
+                # example one matrix in place of its operations): the prim
+                # has the exact result, and the message gives the cause.
+                message = f"{label}: " + "; ".join(write_notes)
+                ErrorReporter.log_warning("PrimTransformModel", message)
+                ErrorReporter.show_warning(message)
             self._notify_transform_changed(
                 changed_paths,
                 source=_FINAL_TRANSFORM_CHANGE_SOURCE,
@@ -426,6 +565,10 @@ class PrimTransformModel:
                 self._initial_transforms.clear()
                 self._live_transforms.clear()
                 self._live_parent_world_transforms.clear()
+                self._inverse_parent_world_transforms.clear()
+                self._parent_matrix_notes = []
+                self._no_parent_space_notes = []
+                self._initial_world_transforms.clear()
                 self._preview_applied_paths.clear()
                 self._drag_active = False
 
@@ -462,6 +605,10 @@ class PrimTransformModel:
             self._initial_transforms.clear()
             self._live_transforms.clear()
             self._live_parent_world_transforms.clear()
+            self._inverse_parent_world_transforms.clear()
+            self._parent_matrix_notes = []
+            self._no_parent_space_notes = []
+            self._initial_world_transforms.clear()
             self._preview_applied_paths.clear()
             self._drag_active = False
 
@@ -566,24 +713,60 @@ class PrimTransformModel:
         self,
         path: str,
         local_matrix: List[List[float]],
-    ) -> Optional[List[List[float]]]:
+    ) -> List[List[float]]:
+        """The world matrix of the parent of ``path`` at the drag start. Raises ``_NoParentMatrix`` with the cause.
+
+        Row-major: ``world = local × parent``, so the parent matrix is ``inverse(local) × world``. A local matrix that cannot
+        be inverted (a scale of 0, for example a flat cube) does not give it. Then the parent matrix is the world matrix of
+        the parent prim, when ``local × parent`` is the world matrix of the prim (it is not, for example, for a prim that
+        does not take the transform of its parent).
+        """
         get_world_transform = getattr(self._transform, "get_world_transform", None)
         if not callable(get_world_transform):
-            return None
+            raise _NoParentMatrix("the transform adapter gives no world matrix")
         try:
             world_matrix = get_world_transform(path)
-        except Exception:
-            return None
+        except Exception as exc:
+            raise _NoParentMatrix(f"its world matrix cannot be read: {type(exc).__name__}: {exc}") from exc
+        try:
+            self._initial_world_transforms[path] = [[float(v) for v in row] for row in world_matrix]
+        except (IndexError, TypeError, ValueError):
+            pass
         inverse_local = _invert_matrix_4x4(local_matrix)
-        if inverse_local is None:
-            return None
-        return _matrix_multiply(inverse_local, world_matrix)
+        if inverse_local is not None:
+            return _matrix_multiply(inverse_local, world_matrix)
+        parent_path = path.rsplit("/", 1)[0] or "/"
+        try:
+            parent_world = [[float(v) for v in row] for row in get_world_transform(parent_path)]
+            local_times_parent = _matrix_multiply(local_matrix, parent_world)
+        except Exception as exc:
+            raise _NoParentMatrix(
+                f"its local matrix cannot be inverted, and the world matrix of its parent {parent_path} cannot be read: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        world = self._initial_world_transforms.get(path)
+        if world is None or not _matrices_close(
+            local_times_parent, world, tolerance=1.0e-6 * max(1.0, *(abs(v) for row in world for v in row))
+        ):
+            raise _NoParentMatrix(
+                f"its local matrix cannot be inverted, and the world matrix of its parent {parent_path} does not give its "
+                "world matrix"
+            )
+        self._parent_matrix_notes.append((path, parent_path))
+        return parent_world
 
     def _live_world_transform(
         self,
         path: str,
         local_matrix: List[List[float]],
     ) -> List[List[float]]:
+        initial_world = self._initial_world_transforms.get(path)
+        if initial_world is not None and local_matrix == self._initial_transforms.get(path):
+            # Not moved: the world transform of the adapter itself, as the gizmo had it before the drag. The parent matrix
+            # below is derived from it (``inverse(local) * world``), so ``local * parent`` is not the same number to the
+            # last digit when the parent turns or scales, and the gizmo would be written (and report a change) when the
+            # pointer has not moved.
+            return [row[:] for row in initial_world]
         parent_world = self._live_parent_world_transforms.get(path)
         if parent_world is None:
             return [row[:] for row in local_matrix]
@@ -643,6 +826,36 @@ def _apply_delta(
 ) -> List[List[float]]:
     """4×4 row-major matrix multiply: initial × delta."""
     return _matrix_multiply(initial, delta)
+
+
+def _delta_in_parent_space(
+    delta: List[List[float]],
+    inverse_parent_world: Optional[List[List[float]]],
+) -> List[List[float]]:
+    """The world-space translation ``delta`` as a translation of the local matrix.
+
+    Row-major: ``world = local × parent``, so a change ``t`` of the local translation moves the prim by ``t × parent``
+    (3×3 part) in the world. The translation row of the result is ``d × inverse(parent)``, so that ``initial × result``
+    moves the prim by the world translation ``d`` of ``delta`` also when the parent turns or scales. The 3×3 part of
+    ``delta`` is kept. Without an inverse parent matrix (the parent does not turn or scale, or there is no parent matrix or
+    it cannot be inverted, which the first move of the drag reports) ``delta`` is returned unchanged.
+    """
+    if inverse_parent_world is None:
+        return delta
+    dx, dy, dz, dw = delta[3]
+    r0, r1, r2 = inverse_parent_world[0], inverse_parent_world[1], inverse_parent_world[2]
+    # The rows of the 3×3 part are shared with ``delta``: the result is only read (one call per pointer move).
+    return [
+        delta[0],
+        delta[1],
+        delta[2],
+        [
+            dx * r0[0] + dy * r1[0] + dz * r2[0],
+            dx * r0[1] + dy * r1[1] + dz * r2[1],
+            dx * r0[2] + dy * r1[2] + dz * r2[2],
+            dw,
+        ],
+    ]
 
 
 def _rotation_matrix_row_major(

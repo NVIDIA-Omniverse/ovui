@@ -578,3 +578,16 @@ class ControlStateIndicator:
             self._widget.set_mouse_pressed_fn(self._on_click)
         else:
             self._widget.set_mouse_pressed_fn(lambda x, y, b, m: None)
+
+
+def build_empty_state_slot() -> None:
+    """Build an empty slot with the layout of a :class:`ControlStateIndicator`.
+
+    A row with no state icon of its own (for example a Translate row above
+    the grid of a matrix transform) uses it, so its fields stay in line with
+    the fields of the other rows.
+    """
+    with ui.HStack(width=_SLOT_WIDTH):
+        ui.Spacer(width=(_SLOT_WIDTH - _ICON_SIZE) // 2)
+        with ui.VStack(width=_ICON_SIZE):
+            ui.Spacer()

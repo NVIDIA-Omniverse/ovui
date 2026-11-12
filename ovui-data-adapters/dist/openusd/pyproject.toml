@@ -20,11 +20,19 @@ camera, picking, selection-highlight, session authoring, and undoable command
 support behind the common adapter contracts.
 
 It depends on `ovui-data-adapters-common` and `numpy`. The `standalone` extra
-supplies `usd-core==25.11`; Kit and custom-USD environments supply their own
+supplies `usd-core==25.11`, which publishes wheels for Python 3.12 and 3.13
+only (see the Python 3.14 and 3.15 note in the ovui-data-adapters README); Kit and custom-USD environments supply their own
 matching `pxr` runtime. Supply ovrtx separately when using renderer-backed
 viewport work.
 """}
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
 
 [project.optional-dependencies]
 standalone = ["usd-core==25.11"]

@@ -9,19 +9,11 @@ together without mocks. They verify cross-component flows:
   - Undo/redo across the adapter stack
   - Visibility, rename, and delete writing to USD
   - Application lifecycle without crashes
-
-All tests are skipped when the pxr (USD) package is unavailable.
 """
 
 import pytest
 
-try:
-    from pxr import Sdf, Usd, UsdGeom
-    HAS_USD = True
-except ImportError:
-    HAS_USD = False
-
-pytestmark = pytest.mark.skipif(not HAS_USD, reason="pxr not available")
+from pxr import Sdf, Usd, UsdGeom
 
 from ovui_widgets.app.application import Application
 from ovui_widgets.common.selection import SelectionBus

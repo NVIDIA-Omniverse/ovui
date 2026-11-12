@@ -29,6 +29,7 @@ def provider():
             pick=lambda x, y, cb, request: (calls.append((x, y)), callbacks.append(cb)),
             cancel_pick=lambda request: calls.append("cancel"),
         ),
+        resolve_pick_path=lambda x, y, path: path,
         apply_pick_selection=lambda path, mode: selection.append((path, mode)),
         get_viewport_state_snapshot=lambda: SimpleNamespace(
             active_camera_path="/Camera",

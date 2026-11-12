@@ -146,7 +146,7 @@ Verify that the expected OpenUSD Python bindings are used:
 & $env:PYTHON_BIN -c "import os; os.add_dll_directory(os.environ['USD_INSTALL_ROOT'] + r'\lib'); from pxr import Usd; print(Usd.GetVersion())"
 ```
 
-## Install ovrtx 0.3.0
+## Install ovrtx
 
 ovui-widgets imports ovrtx from the `ovrtx\python` package and loads native
 libraries from the ovrtx runtime `bin` directory.
@@ -155,7 +155,7 @@ libraries from the ovrtx runtime `bin` directory.
 Push-Location $env:OVRTX_ROOT
 git checkout main
 git pull --ff-only
-Get-Content python\pyproject.toml | Select-String 'version = "0.3.0"'
+Get-Content python\pyproject.toml | Select-String '^version'
 Pop-Location
 
 & $env:PYTHON_BIN -m pip install -e "$env:OVRTX_ROOT\python"
